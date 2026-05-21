@@ -8,7 +8,8 @@ use application_query::{
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
 use dto_shared::{
-    LocateResponseDto, RepoAttachOutcomeDto, RepoBindingDto, SyncSummaryDto, TaskDto, WorkspaceDto,
+    FindRepoResponseDto, LocateResponseDto, RepoAttachOutcomeDto, RepoBindingDto, SyncSummaryDto,
+    TaskDto, WorkspaceDto,
 };
 use serde::Serialize;
 
@@ -48,6 +49,10 @@ pub fn attach_outcome(dto: &RepoAttachOutcomeDto) {
 }
 
 pub fn locate(dto: &LocateResponseDto) {
+    print_json(dto);
+}
+
+pub fn find(dto: &FindRepoResponseDto) {
     print_json(dto);
 }
 

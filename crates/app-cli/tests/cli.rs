@@ -629,3 +629,205 @@ fn invalid_priority_exits_nonzero_with_readable_error() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.to_lowercase().contains("priority"), "stderr: {stderr}");
 }
+
+// ---------- Phase B: names + aliases + find --------------------------------
+
+/// Helper: attach a repo with --no-link, return the binding id.
+fn attach_no_link(dir: &TempDir, workspace: &str, url: &str, canonical: &str) -> String {
+    run_json(
+        &mut bin("repo-link", dir),
+        &[
+            "repo", "attach",
+            "--workspace", workspace,
+            "--url", url,
+            "--canonical", canonical,
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn repo_show_resolves_by_name() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // canonical "github.com/o/r" → derived name is "r"
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", "r"]);
+    assert_eq!(shown["id"].as_str().unwrap(), repo_id);
+}
+
+#[test]
+fn repo_show_resolves_by_alias() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    // Add alias "gateway"
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &repo_id, "--alias", "gateway"],
+    );
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", "gateway"]);
+    assert_eq!(shown["id"].as_str().unwrap(), repo_id);
+}
+
+#[test]
+fn repo_show_errors_with_candidates_on_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let id1 = attach_no_link(&dir, &workspace, "git@github.com:o/a.git", "github.com/o/a");
+    let id2 = attach_no_link(&dir, &workspace, "git@github.com:o/b.git", "github.com/o/b");
+
+    // Add the same alias "shared" to both bindings
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &id1, "--alias", "shared"],
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &id2, "--alias", "shared"],
+    );
+
+    let output = bin("repo-link", &dir)
+        .args(["repo", "show", "shared"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let body: serde_json::Value = serde_json::from_str(&stderr)
+        .unwrap_or_else(|e| panic!("stderr is not JSON ({e}): {stderr}"));
+    assert_eq!(body["error"], "ambiguous");
+    let candidates = body["candidates"].as_array().expect("candidates array");
+    assert_eq!(candidates.len(), 2);
+}
+
+#[test]
+fn repo_rename_persists() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    // Rename to "myrep"
+    let renamed = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "rename", "--repo", &repo_id, "--name", "myrep"],
+    );
+    assert_eq!(renamed["name"], "myrep");
+
+    // show by new name should find it
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", "myrep"]);
+    assert_eq!(shown["id"].as_str().unwrap(), repo_id);
+}
+
+#[test]
+fn repo_alias_add_dedup() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    // Add alias twice — second add should be idempotent
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &repo_id, "--alias", "x"],
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &repo_id, "--alias", "x"],
+    );
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
+    let aliases = shown["aliases"].as_array().expect("aliases array");
+    assert_eq!(aliases.len(), 1, "duplicate alias should be deduplicated; got {:?}", aliases);
+}
+
+#[test]
+fn repo_find_ranks_and_marks_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // "search" — exact name match
+    attach_no_link(&dir, &workspace, "git@github.com:o/search.git", "github.com/o/search");
+    // "finder" — canonical substring match for query "search" (canonical contains "search" as substring via "o/search")
+    attach_no_link(&dir, &workspace, "git@github.com:o/finder.git", "github.com/o/search-tools");
+
+    let result = run_json(&mut bin("repo-link", &dir), &["repo", "find", "search"]);
+    assert_eq!(result["query"], "search");
+    assert_eq!(result["ambiguous"], true);
+    let matches = result["matches"].as_array().expect("matches array");
+    assert!(matches.len() >= 2, "expected at least 2 matches");
+    // First match should be the exact name match ("search")
+    assert_eq!(matches[0]["binding"]["name"], "search");
+}
+
+#[test]
+fn repo_alias_rm_returns_error_when_absent() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    // Try removing an alias that was never set
+    let output = bin("repo-link", &dir)
+        .args(["repo", "alias", "rm", "--repo", &repo_id, "--alias", "nonexistent"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.is_empty(), "expected an error message on stderr; got empty");
+}
