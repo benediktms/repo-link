@@ -9,7 +9,7 @@ fn bin(name: &str, dir: &TempDir) -> Command {
 }
 
 fn run_json(cmd: &mut Command, args: &[&str]) -> Value {
-    let output = cmd.args(args).arg("--json").assert().success().get_output().clone();
+    let output = cmd.args(args).assert().success().get_output().clone();
     let stdout = String::from_utf8(output.stdout).expect("utf-8");
     serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {stdout}"))
 }
@@ -55,23 +55,64 @@ fn task_create_list_includes_state_filter() {
         ],
     );
     let task_id = task["id"].as_str().unwrap().to_string();
-    assert_eq!(task["state"], "draft");
+    assert_eq!(task["status"], "open");
+    assert_eq!(task["sync_state"], "local_only");
 
-    // Move to staged.
-    let staged = run_json(&mut bin("repo-link", &dir), &["task", "stage", &task_id]);
-    assert_eq!(staged["state"], "staged");
+    // Stage takes Vec<task ids> now → returns a batch array.
+    let staged_batch = run_json(&mut bin("repo-link", &dir), &["task", "stage", &task_id]);
+    assert_eq!(staged_batch.as_array().unwrap().len(), 1);
+    assert_eq!(staged_batch[0]["ok"], true);
+    assert_eq!(staged_batch[0]["task"]["sync_state"], "staged");
 
-    // Filter list by state.
-    let drafts = run_json(
+    // Filter list by sync_state (not status — status is still `open` for both).
+    let local_only = run_json(
         &mut bin("repo-link", &dir),
-        &["task", "list", "--state", "draft"],
+        &["task", "list", "--sync-state", "local_only"],
     );
-    assert!(drafts.as_array().unwrap().is_empty());
+    assert!(local_only.as_array().unwrap().is_empty());
     let staged_list = run_json(
         &mut bin("repo-link", &dir),
-        &["task", "list", "--state", "staged"],
+        &["task", "list", "--sync-state", "staged"],
     );
     assert_eq!(staged_list.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn task_batch_lifecycle_commands_emit_per_task_results() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let mut ids: Vec<String> = Vec::new();
+    for n in 0..3 {
+        let t = run_json(
+            &mut bin("repo-link", &dir),
+            &[
+                "task",
+                "create",
+                "--workspace",
+                &workspace,
+                "--title",
+                &format!("t{n}"),
+            ],
+        );
+        ids.push(t["id"].as_str().unwrap().to_string());
+    }
+
+    // Start all three; expect three per-task success entries.
+    let mut args = vec!["task".to_string(), "start".to_string()];
+    args.extend(ids.iter().cloned());
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let started = run_json(&mut bin("repo-link", &dir), &arg_refs);
+    let rows = started.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        assert_eq!(row["ok"], true);
+        assert_eq!(row["task"]["status"], "in_progress");
+    }
 }
 
 #[test]
@@ -152,20 +193,19 @@ fn query_overview_reports_counts() {
         &["query", "overview", "--workspace", &workspace],
     );
     assert_eq!(ov["repo_count"], 0);
-    assert_eq!(ov["task_states"]["draft"], 3);
+    assert_eq!(ov["by_status"]["open"], 3);
+    assert_eq!(ov["by_sync"]["local_only"], 3);
     assert_eq!(ov["unsynced_task_count"], 3);
 }
 
 #[test]
 fn rl_alias_is_a_working_binary() {
     let dir = TempDir::new().unwrap();
-    // First create via the canonical bin.
     bin("repo-link", &dir)
         .args(["workspace", "create", "viaroot", "--local-only"])
         .assert()
         .success();
 
-    // Then read it back via the alias to prove both share state + behavior.
     let listed = run_json(&mut bin("rl", &dir), &["workspace", "list"]);
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert_eq!(listed[0]["name"], "viaroot");
@@ -198,7 +238,6 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .unwrap()
         .to_string();
 
-    // Create one path that exists and one that doesn't.
     let alive_dir = TempDir::new().unwrap();
     let alive = alive_dir.path().display().to_string();
     let gone = "/tmp/repo-link-never-exists-zzz".to_string();
@@ -223,7 +262,6 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     assert_eq!(summary["marked_missing"], 1);
     assert_eq!(summary["pruned"], 0);
 
-    // Verify the binding shows the missing path.
     let show = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
     let by_path: std::collections::HashMap<String, String> = show["worktrees"]
         .as_array()
@@ -234,7 +272,6 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     assert_eq!(by_path[&alive], "linked");
     assert_eq!(by_path[&gone], "missing_path");
 
-    // Run again with --prune; only /tmp/...zzz should be dropped.
     let summary2 = run_json(
         &mut bin("repo-link", &dir),
         &["worktree", "reconcile", "--workspace", &workspace, "--prune"],
@@ -242,6 +279,65 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     assert_eq!(summary2["pruned"], 1);
     let show_after = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
     assert_eq!(show_after["worktrees"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn task_snapshots_lists_history_after_edits() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "original"],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Start the task — produces a second snapshot.
+    bin("repo-link", &dir)
+        .args(["task", "start", &task_id])
+        .assert()
+        .success();
+
+    let snaps = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "snapshots", &task_id],
+    );
+    let arr = snaps.as_array().expect("snapshots is array");
+    assert!(arr.len() >= 2, "expected ≥2 snapshots, got {}", arr.len());
+    assert_eq!(arr[0]["version"], 1);
+}
+
+#[test]
+fn task_rollback_restores_previous_title() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "v1 title"],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // A second mutation so version 2 exists (start changes status → new snapshot).
+    bin("repo-link", &dir)
+        .args(["task", "start", &task_id])
+        .assert()
+        .success();
+
+    // Roll back to version 1.
+    let rolled = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "rollback", &task_id, "--to-version", "1"],
+    );
+    assert_eq!(rolled["title"], "v1 title");
 }
 
 #[test]

@@ -1,6 +1,10 @@
-//! domain-sync — pure reconciliation rules over task states. No I/O.
+//! domain-sync — pure reconciliation rules over [`SyncState`]. No I/O.
+//!
+//! Decoupled from [`TaskStatus`]: `decide` only inspects sync state. The
+//! caller is responsible for filtering out tasks whose status (archived,
+//! blocked, etc.) makes them ineligible for sync.
 
-use domain_task::TaskState;
+use domain_task::SyncState;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,16 +36,16 @@ pub enum ConflictKind {
     TargetRemapped,
 }
 
-/// Decide what to do for a single task given local state, whether the remote
-/// snapshot is known-dirty, and the configured policy.
-pub fn decide(local: TaskState, remote_dirty: bool, policy: SyncPolicy) -> SyncDecision {
-    match local {
-        TaskState::Draft | TaskState::Archived | TaskState::Blocked => SyncDecision::Noop,
-        TaskState::Staged | TaskState::DirtyLocal => SyncDecision::PushLocal,
-        TaskState::Pushed | TaskState::Synced if remote_dirty => SyncDecision::PullRemote,
-        TaskState::Pushed | TaskState::Synced => SyncDecision::Noop,
-        TaskState::DirtyRemote => SyncDecision::PullRemote,
-        TaskState::Conflict => match policy {
+/// Decide what to do for a single task given its sync state, whether the
+/// remote snapshot is known-dirty, and the configured policy.
+pub fn decide(sync: SyncState, remote_dirty: bool, policy: SyncPolicy) -> SyncDecision {
+    match sync {
+        SyncState::LocalOnly => SyncDecision::Noop,
+        SyncState::Staged | SyncState::DirtyLocal => SyncDecision::PushLocal,
+        SyncState::Synced if remote_dirty => SyncDecision::PullRemote,
+        SyncState::Synced => SyncDecision::Noop,
+        SyncState::DirtyRemote => SyncDecision::PullRemote,
+        SyncState::Conflict => match policy {
             SyncPolicy::LocalWins => SyncDecision::PushLocal,
             SyncPolicy::RemoteWins => SyncDecision::PullRemote,
             SyncPolicy::ManualMerge => SyncDecision::RequireManualMerge,
@@ -54,9 +58,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn draft_is_never_synced() {
+    fn local_only_is_never_synced() {
         assert_eq!(
-            decide(TaskState::Draft, true, SyncPolicy::ManualMerge),
+            decide(SyncState::LocalOnly, true, SyncPolicy::ManualMerge),
             SyncDecision::Noop
         );
     }
@@ -64,11 +68,11 @@ mod tests {
     #[test]
     fn staged_pushes_regardless_of_remote() {
         assert_eq!(
-            decide(TaskState::Staged, false, SyncPolicy::ManualMerge),
+            decide(SyncState::Staged, false, SyncPolicy::ManualMerge),
             SyncDecision::PushLocal
         );
         assert_eq!(
-            decide(TaskState::Staged, true, SyncPolicy::ManualMerge),
+            decide(SyncState::Staged, true, SyncPolicy::ManualMerge),
             SyncDecision::PushLocal
         );
     }
@@ -76,11 +80,11 @@ mod tests {
     #[test]
     fn synced_with_dirty_remote_pulls() {
         assert_eq!(
-            decide(TaskState::Synced, true, SyncPolicy::ManualMerge),
+            decide(SyncState::Synced, true, SyncPolicy::ManualMerge),
             SyncDecision::PullRemote
         );
         assert_eq!(
-            decide(TaskState::Synced, false, SyncPolicy::ManualMerge),
+            decide(SyncState::Synced, false, SyncPolicy::ManualMerge),
             SyncDecision::Noop
         );
     }
@@ -88,15 +92,15 @@ mod tests {
     #[test]
     fn conflict_respects_policy() {
         assert_eq!(
-            decide(TaskState::Conflict, false, SyncPolicy::LocalWins),
+            decide(SyncState::Conflict, false, SyncPolicy::LocalWins),
             SyncDecision::PushLocal
         );
         assert_eq!(
-            decide(TaskState::Conflict, false, SyncPolicy::RemoteWins),
+            decide(SyncState::Conflict, false, SyncPolicy::RemoteWins),
             SyncDecision::PullRemote
         );
         assert_eq!(
-            decide(TaskState::Conflict, false, SyncPolicy::ManualMerge),
+            decide(SyncState::Conflict, false, SyncPolicy::ManualMerge),
             SyncDecision::RequireManualMerge
         );
     }

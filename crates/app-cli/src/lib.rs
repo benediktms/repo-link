@@ -18,21 +18,22 @@ use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
 use infra_git::discover_canonical;
 use infra_github::GithubTaskProvider;
 use infra_sqlite::{
-    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteTaskSnapshotRepository,
+    SqliteWorkspaceRepository, open_from_path,
 };
 
 mod render;
 
 #[derive(Parser, Debug)]
-#[command(name = "repo-link", version, about = "Local-first workspace + task manager")]
+#[command(
+    name = "repo-link",
+    version,
+    about = "Local-first workspace + task manager. All output is JSON; pipe through `jq` for human-friendly views."
+)]
 struct Cli {
     /// SQLite database path. Falls back to platform data dir.
     #[arg(long, env = "REPO_LINK_DB", global = true)]
     db: Option<PathBuf>,
-
-    /// Emit JSON instead of a table.
-    #[arg(long, global = true)]
-    json: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -167,19 +168,49 @@ enum TaskCmd {
     List {
         #[arg(long)]
         workspace: Option<String>,
+        /// Filter by lifecycle status (`open` / `in_progress` / `blocked` / `done` / `archived`).
         #[arg(long)]
-        state: Option<String>,
+        status: Option<String>,
+        /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
+        #[arg(long)]
+        sync_state: Option<String>,
         #[arg(long)]
         include_archived: bool,
     },
+    /// Stage one or more tasks for sync.
     Stage {
-        id: String,
+        #[arg(required = true)]
+        tasks: Vec<String>,
     },
+    /// Start work on one or more tasks (Open|Blocked → InProgress).
+    Start {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Mark one or more tasks complete.
+    Complete {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Reopen one or more `Done` tasks back to `Open`.
+    Reopen {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Move one or more tasks to `Blocked`.
     Block {
-        id: String,
+        #[arg(required = true)]
+        tasks: Vec<String>,
     },
+    /// Move one or more `Blocked` tasks back to `Open`.
+    Unblock {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Archive one or more tasks.
     Archive {
-        id: String,
+        #[arg(required = true)]
+        tasks: Vec<String>,
     },
     Relate {
         id: String,
@@ -187,6 +218,16 @@ enum TaskCmd {
         kind: String,
         #[arg(long)]
         other: String,
+    },
+    /// List the full snapshot history for a task.
+    Snapshots {
+        id: String,
+    },
+    /// Roll a task back to a historical snapshot version.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        to_version: u64,
     },
 }
 
@@ -278,7 +319,9 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     let bindings_repo: Arc<dyn ports::RepoBindingRepository> =
         Arc::new(SqliteRepoBindingRepository::new(db.clone()));
     let tasks_repo: Arc<dyn ports::TaskRepository> =
-        Arc::new(SqliteTaskRepository::new(db));
+        Arc::new(SqliteTaskRepository::new(db.clone()));
+    let snapshots_repo: Arc<dyn ports::TaskSnapshotRepository> =
+        Arc::new(SqliteTaskSnapshotRepository::new(db));
 
     // Sync is only available when a GitHub token resolved from config.
     let sync = cfg.github_token.clone().map(|token| {
@@ -290,25 +333,24 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     Ok(Services {
         workspaces: WorkspaceService::new(workspaces_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
-        tasks: TaskService::new(tasks_repo.clone()),
+        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo),
         query: QueryService::new(workspaces_repo, bindings_repo, tasks_repo),
         sync,
     })
 }
 
 async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
-    let json = cli.json;
     match cli.cmd {
-        Cmd::Workspace(c) => workspace_dispatch(c, svc, json).await,
-        Cmd::Repo(c) => repo_dispatch(c, svc, json).await,
-        Cmd::Worktree(c) => worktree_dispatch(c, svc, json).await,
-        Cmd::Task(c) => task_dispatch(c, svc, json).await,
-        Cmd::Query(c) => query_dispatch(c, svc, cfg, json).await,
-        Cmd::Sync(c) => sync_dispatch(c, svc, json).await,
+        Cmd::Workspace(c) => workspace_dispatch(c, svc).await,
+        Cmd::Repo(c) => repo_dispatch(c, svc).await,
+        Cmd::Worktree(c) => worktree_dispatch(c, svc).await,
+        Cmd::Task(c) => task_dispatch(c, svc).await,
+        Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
+        Cmd::Sync(c) => sync_dispatch(c, svc).await,
     }
 }
 
-async fn sync_dispatch(cmd: SyncCmd, svc: &Services, json: bool) -> Result<()> {
+async fn sync_dispatch(cmd: SyncCmd, svc: &Services) -> Result<()> {
     let sync = svc.sync.as_ref().ok_or_else(|| {
         anyhow!("sync requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set")
     })?;
@@ -317,11 +359,11 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, json: bool) -> Result<()> {
         SyncCmd::Push { task } => sync.push(&task).await?,
         SyncCmd::Pull { task } => sync.pull(&task).await?,
     };
-    render::sync(&summary, json);
+    render::sync(&summary);
     Ok(())
 }
 
-async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services, json: bool) -> Result<()> {
+async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Result<()> {
     match cmd {
         WorkspaceCmd::Create {
             name,
@@ -336,28 +378,28 @@ async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services, json: bool) -> Re
                     local_only,
                 })
                 .await?;
-            render::workspace(&dto, json);
+            render::workspace(&dto);
         }
         WorkspaceCmd::List { include_archived } => {
             let rows = svc
                 .workspaces
                 .list(ListWorkspacesQuery { include_archived })
                 .await?;
-            render::workspaces(&rows, json);
+            render::workspaces(&rows);
         }
-        WorkspaceCmd::Show { id } => render::workspace(&svc.workspaces.show(&id).await?, json),
+        WorkspaceCmd::Show { id } => render::workspace(&svc.workspaces.show(&id).await?),
         WorkspaceCmd::Activate { id } => {
-            render::workspace(&svc.workspaces.activate(&id).await?, json)
+            render::workspace(&svc.workspaces.activate(&id).await?)
         }
-        WorkspaceCmd::Pause { id } => render::workspace(&svc.workspaces.pause(&id).await?, json),
+        WorkspaceCmd::Pause { id } => render::workspace(&svc.workspaces.pause(&id).await?),
         WorkspaceCmd::Archive { id } => {
-            render::workspace(&svc.workspaces.archive(&id).await?, json)
+            render::workspace(&svc.workspaces.archive(&id).await?)
         }
     }
     Ok(())
 }
 
-async fn repo_dispatch(cmd: RepoCmd, svc: &Services, json: bool) -> Result<()> {
+async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
     match cmd {
         RepoCmd::Attach {
             workspace,
@@ -374,20 +416,16 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services, json: bool) -> Result<()> {
                     tracked_branch: branch,
                 })
                 .await?;
-            render::repo(&dto, json);
+            render::repo(&dto);
         }
         RepoCmd::Detach { id } => {
             svc.bindings.detach(&id).await?;
-            if json {
-                println!("{}", serde_json::json!({ "detached": id }));
-            } else {
-                println!("detached {id}");
-            }
+            println!("{}", serde_json::json!({ "detached": id }));
         }
         RepoCmd::List { workspace } => {
-            render::repos(&svc.bindings.list(&workspace).await?, json)
+            render::repos(&svc.bindings.list(&workspace).await?)
         }
-        RepoCmd::Show { id } => render::repo(&svc.bindings.show(&id).await?, json),
+        RepoCmd::Show { id } => render::repo(&svc.bindings.show(&id).await?),
         RepoCmd::Discover { path } => {
             let mut rows = Vec::new();
             for repo_path in discover_repos_under(&path) {
@@ -397,7 +435,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services, json: bool) -> Result<()> {
                     canonical,
                 });
             }
-            render::discovered(&rows, json);
+            render::discovered(&rows);
         }
     }
     Ok(())
@@ -409,7 +447,7 @@ pub struct DiscoveredRepo {
     pub canonical: Option<String>,
 }
 
-async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services, json: bool) -> Result<()> {
+async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
     match cmd {
         WorktreeCmd::Link { repo, path, branch } => {
             let dto = svc
@@ -420,7 +458,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services, json: bool) -> Resu
                     branch,
                 })
                 .await?;
-            render::repo(&dto, json);
+            render::repo(&dto);
         }
         WorktreeCmd::Unlink { repo, path } => {
             let dto = svc
@@ -430,11 +468,11 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services, json: bool) -> Resu
                     path,
                 })
                 .await?;
-            render::repo(&dto, json);
+            render::repo(&dto);
         }
         WorktreeCmd::PruneMissing { repo } => {
             let dto = svc.bindings.prune_missing(&repo).await?;
-            render::repo(&dto, json);
+            render::repo(&dto);
         }
         WorktreeCmd::Reconcile { workspace, prune } => {
             let probe = TokioFilesystemProbe::new();
@@ -442,13 +480,67 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services, json: bool) -> Resu
                 .bindings
                 .reconcile_worktrees(&workspace, &probe, prune)
                 .await?;
-            render::reconcile(&summary, json);
+            render::reconcile(&summary);
         }
     }
     Ok(())
 }
 
-async fn task_dispatch(cmd: TaskCmd, svc: &Services, json: bool) -> Result<()> {
+/// Read `git config user.name` from the surrounding git repo. Returns
+/// `None` if git isn't on PATH, the cwd isn't inside a repo, or the value
+/// is empty. Used as a sensible default for `query mine --assignee`.
+fn git_user_name() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Apply a per-task service op to a batch of IDs and emit a per-task
+/// success/error JSON array. We don't bail on the first failure so the
+/// caller can see partial progress — a missing or stale ID in the middle
+/// shouldn't hide what worked.
+async fn batch_task_op<F, Fut>(tasks: Vec<String>, mut op: F) -> Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<dto_shared::TaskDto, application_task::ServiceError>,
+    >,
+{
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+    for id in tasks {
+        let recorded = id.clone();
+        match op(id).await {
+            Ok(dto) => results.push(serde_json::json!({
+                "task_id": recorded,
+                "ok": true,
+                "task": dto,
+            })),
+            Err(e) => results.push(serde_json::json!({
+                "task_id": recorded,
+                "ok": false,
+                "error": e.to_string(),
+            })),
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".into())
+    );
+    Ok(())
+}
+
+async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
     match cmd {
         TaskCmd::Create {
             workspace,
@@ -467,12 +559,13 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, json: bool) -> Result<()> {
                     priority,
                 })
                 .await?;
-            render::task(&dto, json);
+            render::task(&dto);
         }
-        TaskCmd::Show { id } => render::task(&svc.tasks.show(&id).await?, json),
+        TaskCmd::Show { id } => render::task(&svc.tasks.show(&id).await?),
         TaskCmd::List {
             workspace,
-            state,
+            status,
+            sync_state,
             include_archived,
         } => {
             let rows = svc
@@ -480,15 +573,34 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, json: bool) -> Result<()> {
                 .list(ListTasksQuery {
                     workspace_id: workspace,
                     repo_id: None,
-                    state,
+                    status,
+                    sync_state,
                     include_archived,
                 })
                 .await?;
-            render::tasks(&rows, json);
+            render::tasks(&rows);
         }
-        TaskCmd::Stage { id } => render::task(&svc.tasks.stage_for_sync(&id).await?, json),
-        TaskCmd::Block { id } => render::task(&svc.tasks.mark_blocked(&id).await?, json),
-        TaskCmd::Archive { id } => render::task(&svc.tasks.archive(&id).await?, json),
+        TaskCmd::Stage { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.stage_for_sync(&id).await }).await?;
+        }
+        TaskCmd::Start { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.start(&id).await }).await?;
+        }
+        TaskCmd::Complete { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.complete(&id).await }).await?;
+        }
+        TaskCmd::Reopen { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.reopen(&id).await }).await?;
+        }
+        TaskCmd::Block { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.mark_blocked(&id).await }).await?;
+        }
+        TaskCmd::Unblock { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.unblock(&id).await }).await?;
+        }
+        TaskCmd::Archive { tasks } => {
+            batch_task_op(tasks, |id| async move { svc.tasks.archive(&id).await }).await?;
+        }
         TaskCmd::Relate { id, kind, other } => {
             let dto = svc
                 .tasks
@@ -498,48 +610,69 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, json: bool) -> Result<()> {
                     other,
                 })
                 .await?;
-            render::task(&dto, json);
+            render::task(&dto);
+        }
+        TaskCmd::Snapshots { id } => {
+            let task_id: domain_core::TaskId =
+                id.parse().map_err(|e| anyhow!("invalid task id: {e}"))?;
+            let snaps = svc.tasks.snapshots_repo().list(task_id).await
+                .map_err(|e| anyhow!("{e}"))?;
+            render::snapshots(&snaps);
+        }
+        TaskCmd::Rollback { id, to_version } => {
+            let dto = svc.tasks.rollback(&id, to_version).await
+                .map_err(|e| anyhow!("{e}"))?;
+            render::task(&dto);
         }
     }
     Ok(())
 }
 
-async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig, json: bool) -> Result<()> {
+async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
         QueryCmd::Overview { workspace } => {
             let v = svc.query.overview(&workspace).await?;
-            render::overview(&v, json);
+            render::overview(&v);
         }
         QueryCmd::Blocked { workspace } => {
             let v = svc.query.blocked_tasks(&workspace).await?;
-            render::blocked(&v, json);
+            render::blocked(&v);
         }
         QueryCmd::Stale { workspace } => {
             let v = svc.query.stale_worktrees(&workspace).await?;
-            render::stale(&v, json);
+            render::stale(&v);
         }
         QueryCmd::Unsynced { workspace } => {
             let v = svc.query.unsynced_tasks(&workspace).await?;
-            render::unsynced(&v, json);
+            render::unsynced(&v);
         }
         QueryCmd::Contributors { workspace } => {
             let v = svc.query.contributors(&workspace).await?;
-            render::contributors(&v, json);
+            render::contributors(&v);
         }
         QueryCmd::Drift { workspace } => {
             let v = svc.query.drift(&workspace).await?;
-            render::drift(&v, json);
+            render::drift(&v);
         }
         QueryCmd::Ready { workspace } => {
             let v = svc.query.ready_tasks(&workspace).await?;
-            render::ready(&v, json);
+            render::ready(&v);
         }
         QueryCmd::Mine { workspace, assignee } => {
+            let _ = cfg; // RepoLinkConfig is currently the env-var fallback chain.
+            // Precedence: explicit --assignee > git config user.name >
+            // REPO_LINK_USER > $USER. Git user comes ahead of env vars so
+            // multi-repo dev setups where each repo has a different
+            // committer identity stay accurate by default.
             let assignee = assignee
-                .or_else(|| cfg.default_user.clone())
-                .ok_or_else(|| anyhow!("set --assignee, REPO_LINK_USER, or USER"))?;
+                .or_else(git_user_name)
+                .or_else(|| std::env::var("REPO_LINK_USER").ok())
+                .or_else(|| std::env::var("USER").ok())
+                .ok_or_else(|| {
+                    anyhow!("set --assignee, configure `git config user.name`, or set REPO_LINK_USER / USER")
+                })?;
             let v = svc.query.assigned_to(&workspace, &assignee).await?;
-            render::assigned(&v, json);
+            render::assigned(&v);
         }
     }
     Ok(())

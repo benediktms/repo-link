@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
-use domain_task::{Priority, RelationKind, RemoteRef, Task, TaskRelation, TaskState};
+use domain_task::{
+    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskRelation, TaskSnapshot,
+    TaskStatus,
+};
 use ports::{PortError, PortResult, TaskFilter, TaskRepository};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
@@ -22,10 +25,10 @@ impl SqliteTaskRepository {
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
-    async fn save(&self, t: &Task) -> PortResult<()> {
+    async fn save(&self, t: &Task, source: SnapshotSource) -> PortResult<()> {
         // BEGIN IMMEDIATE: take the writer lock up front so we don't risk a
         // mid-flight SQLITE_BUSY during the parent + relations + remote
-        // mapping multi-step write.
+        // mapping + snapshot multi-step write.
         let mut tx = self
             .db
             .writes
@@ -33,16 +36,29 @@ impl TaskRepository for SqliteTaskRepository {
             .await
             .map_err(map_sqlx_err)?;
 
+        // Assign the next monotonic version for this task. COALESCE handles
+        // the first-snapshot case (no rows yet → version 1).
+        let next_version: i64 = sqlx::query(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM task_snapshots WHERE task_id = ?",
+        )
+        .bind(t.id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?
+        .try_get(0)
+        .map_err(map_sqlx_err)?;
+
         sqlx::query(
             r#"
-            INSERT INTO tasks (id, workspace_id, repo_id, title, body, state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 repo_id = excluded.repo_id,
                 title = excluded.title,
                 body = excluded.body,
-                state = excluded.state,
+                status = excluded.status,
+                sync_state = excluded.sync_state,
                 priority = excluded.priority,
                 assignees_json = excluded.assignees_json,
                 remote_provider = excluded.remote_provider,
@@ -55,13 +71,38 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(t.repo_id.map(|r| r.to_string()))
         .bind(&t.title)
         .bind(&t.body)
-        .bind(enum_to_str(&t.state))
+        .bind(enum_to_str(&t.status))
+        .bind(enum_to_str(&t.sync))
         .bind(enum_to_str(&t.priority))
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
         .bind(t.created_at.into_inner())
         .bind(t.updated_at.into_inner())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
+
+        // Append the snapshot row after the task upsert so the FK constraint
+        // (task_snapshots.task_id → tasks.id) is satisfied.
+        sqlx::query(
+            r#"
+            INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, source, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(t.id.to_string())
+        .bind(next_version)
+        .bind(&t.title)
+        .bind(&t.body)
+        .bind(enum_to_str(&t.status))
+        .bind(enum_to_str(&t.sync))
+        .bind(enum_to_str(&t.priority))
+        .bind(json_to_string(&t.assignees)?)
+        .bind(t.remote.as_ref().map(|r| r.provider.clone()))
+        .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+        .bind(enum_to_str(&source))
+        .bind(Timestamp::now().into_inner())
         .execute(&mut *tx)
         .await
         .map_err(map_sqlx_err)?;
@@ -124,6 +165,7 @@ impl TaskRepository for SqliteTaskRepository {
             .ok_or_else(|| PortError::NotFound(format!("task {id}")))?;
         let mut task = row_to_task(&row)?;
         task.relations = load_relations(&self.db.reads, id).await?;
+        task.synced_baseline = load_latest_baseline(&self.db.reads, id).await?;
         Ok(task)
     }
 
@@ -135,11 +177,15 @@ impl TaskRepository for SqliteTaskRepository {
         if let Some(r) = filter.repo_id {
             qb.push(" AND repo_id = ").push_bind(r.to_string());
         }
-        if let Some(s) = filter.state {
-            qb.push(" AND state = ").push_bind(enum_to_str(&s));
+        if let Some(s) = filter.status {
+            qb.push(" AND status = ").push_bind(enum_to_str(&s));
+        } else if !filter.include_archived {
+            // Explicit status filter takes precedence; otherwise default to
+            // hiding Archived rows.
+            qb.push(" AND status != 'archived'");
         }
-        if !filter.include_archived {
-            qb.push(" AND state != 'archived'");
+        if let Some(s) = filter.sync_state {
+            qb.push(" AND sync_state = ").push_bind(enum_to_str(&s));
         }
         qb.push(" ORDER BY created_at");
 
@@ -153,6 +199,7 @@ impl TaskRepository for SqliteTaskRepository {
         for row in &rows {
             let mut task = row_to_task(row)?;
             task.relations = load_relations(&self.db.reads, task.id).await?;
+            task.synced_baseline = load_latest_baseline(&self.db.reads, task.id).await?;
             out.push(task);
         }
         Ok(out)
@@ -174,7 +221,8 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let repo_id_str: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
     let body: String = row.try_get("body").map_err(map_sqlx_err)?;
-    let state: String = row.try_get("state").map_err(map_sqlx_err)?;
+    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
     let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
@@ -201,11 +249,13 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         repo_id,
         title,
         body,
-        state: enum_from_str::<TaskState>("task state", &state)?,
+        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        sync: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         relations: Vec::new(),
+        synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),
     })
@@ -230,4 +280,60 @@ async fn load_relations(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<Ta
             })
         })
         .collect()
+}
+
+async fn load_latest_baseline(
+    pool: &SqlitePool,
+    task_id: TaskId,
+) -> PortResult<Option<TaskSnapshot>> {
+    let row = sqlx::query(
+        r#"
+        SELECT version, title, body, status, sync_state, priority,
+               assignees_json, remote_provider, remote_id, source, captured_at
+        FROM task_snapshots
+        WHERE task_id = ?
+          AND source IN ('promote', 'push', 'pull', 'conflict_resolve')
+        ORDER BY version DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
+    let title: String = row.try_get("title").map_err(map_sqlx_err)?;
+    let body: String = row.try_get("body").map_err(map_sqlx_err)?;
+    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
+    let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
+    let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
+    let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
+    let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let source: String = row.try_get("source").map_err(map_sqlx_err)?;
+    let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
+
+    let remote = match (remote_provider, remote_id) {
+        (Some(provider), Some(remote_id)) => Some(RemoteRef { provider, remote_id }),
+        _ => None,
+    };
+
+    Ok(Some(TaskSnapshot {
+        task_id,
+        version: version as u64,
+        title,
+        body,
+        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        sync_state: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
+        priority: enum_from_str::<Priority>("priority", &priority)?,
+        assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
+        remote,
+        source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
+        captured_at: Timestamp::from_utc(captured_at),
+    }))
 }

@@ -1,0 +1,87 @@
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use domain_core::{TaskId, Timestamp};
+use domain_task::{Priority, RemoteRef, SnapshotSource, SyncState, TaskSnapshot, TaskStatus};
+use ports::{PortError, PortResult, TaskSnapshotRepository};
+use sqlx::Row;
+
+use crate::Db;
+use crate::mapping::{enum_from_str, json_from_string, map_sqlx_err, parse_uuid};
+
+pub struct SqliteTaskSnapshotRepository {
+    db: Db,
+}
+
+impl SqliteTaskSnapshotRepository {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
+    async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>> {
+        let rows = sqlx::query(
+            "SELECT * FROM task_snapshots WHERE task_id = ? ORDER BY version ASC",
+        )
+        .bind(task_id.to_string())
+        .fetch_all(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
+
+        rows.iter().map(|row| row_to_snapshot(task_id, row)).collect()
+    }
+
+    async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot> {
+        let row = sqlx::query(
+            "SELECT * FROM task_snapshots WHERE task_id = ? AND version = ?",
+        )
+        .bind(task_id.to_string())
+        .bind(version as i64)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?
+        .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))?;
+
+        row_to_snapshot(task_id, &row)
+    }
+}
+
+fn row_to_snapshot(
+    task_id: TaskId,
+    row: &sqlx::sqlite::SqliteRow,
+) -> PortResult<TaskSnapshot> {
+    let id_str: String = row.try_get("task_id").map_err(map_sqlx_err)?;
+    let version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
+    let title: String = row.try_get("title").map_err(map_sqlx_err)?;
+    let body: String = row.try_get("body").map_err(map_sqlx_err)?;
+    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
+    let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
+    let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
+    let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
+    let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let source: String = row.try_get("source").map_err(map_sqlx_err)?;
+    let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
+
+    let _ = parse_uuid::<TaskId>("task_id", &id_str)?;
+
+    let remote = match (remote_provider, remote_id) {
+        (Some(provider), Some(remote_id)) => Some(RemoteRef { provider, remote_id }),
+        _ => None,
+    };
+
+    Ok(TaskSnapshot {
+        task_id,
+        version: version as u64,
+        title,
+        body,
+        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        sync_state: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
+        priority: enum_from_str::<Priority>("priority", &priority)?,
+        assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
+        remote,
+        source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
+        captured_at: Timestamp::from_utc(captured_at),
+    })
+}

@@ -121,6 +121,10 @@ impl Aggregate for RepoBinding {
         self.id
     }
 
+    fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
     fn updated_at(&self) -> Timestamp {
         self.updated_at
     }

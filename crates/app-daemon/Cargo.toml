@@ -33,6 +33,5 @@ tempfile = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 
-[[bin]]
-name = "repo-link-daemon"
-path = "src/main.rs"
+# `src/bin/repo-link-daemon.rs` and `src/bin/rld.rs` are auto-discovered.
+# Both are thin shims around `app_daemon::run_cli()` in `src/lib.rs`.

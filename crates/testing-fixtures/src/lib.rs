@@ -1,19 +1,30 @@
 //! testing-fixtures — in-memory port impls + deterministic clock for tests.
+//!
+//! These are **pure-Rust** fakes backed by `Mutex<HashMap<Id, T>>` — no
+//! SQLite, no sqlx, no tokio runtime spin-up beyond what `#[tokio::test]`
+//! already does. They exist so that `application-*` unit tests can run
+//! fast and side-effect-free.
+//!
+//! For tests that need the real adapter, exercise `infra-sqlite` directly
+//! — those tests open an on-disk SQLite in a `tempfile::TempDir`. The
+//! CLI end-to-end tests in `app-cli/tests/` also use a real on-disk
+//! SQLite (necessary because the child process can't see the parent's
+//! in-memory DB).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
-use domain_task::Task;
+use domain_task::{SnapshotSource, Task, TaskSnapshot};
 use domain_workspace::Workspace;
 use dto_events::EventEnvelope;
 use ports::{
     Clock, EventSink, FilesystemProbe, PortError, PortResult, RepoBindingRepository, TaskFilter,
-    TaskRepository, WorkspaceRepository,
+    TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
 };
 
 // ---------- Clock --------------------------------------------------------
@@ -171,35 +182,72 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
 
 // ---------- Task repository -----------------------------------------------
 
-#[derive(Default)]
 pub struct InMemoryTaskRepository {
     inner: Mutex<HashMap<TaskId, Task>>,
+    snapshots: Arc<Mutex<HashMap<TaskId, Vec<TaskSnapshot>>>>,
 }
 
 impl InMemoryTaskRepository {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn snapshots_handle(&self) -> Arc<Mutex<HashMap<TaskId, Vec<TaskSnapshot>>>> {
+        Arc::clone(&self.snapshots)
+    }
+}
+
+impl Default for InMemoryTaskRepository {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[async_trait]
 impl TaskRepository for InMemoryTaskRepository {
-    async fn save(&self, task: &Task) -> PortResult<()> {
+    async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()> {
+        let mut snaps = self.snapshots.lock().unwrap();
+        let history = snaps.entry(task.id).or_default();
+        let next_version = history.iter().map(|s| s.version).max().unwrap_or(0) + 1;
+        history.push(TaskSnapshot {
+            task_id: task.id,
+            version: next_version,
+            title: task.title.clone(),
+            body: task.body.clone(),
+            status: task.status,
+            sync_state: task.sync,
+            priority: task.priority,
+            assignees: task.assignees.clone(),
+            remote: task.remote.clone(),
+            source,
+            captured_at: Timestamp::now(),
+        });
+        drop(snaps);
         self.inner.lock().unwrap().insert(task.id, task.clone());
         Ok(())
     }
 
     async fn get(&self, id: TaskId) -> PortResult<Task> {
-        self.inner
+        let mut task = self
+            .inner
             .lock()
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or_else(|| PortError::NotFound(format!("task {id}")))
+            .ok_or_else(|| PortError::NotFound(format!("task {id}")))?;
+        let snaps = self.snapshots.lock().unwrap();
+        task.synced_baseline = snaps
+            .get(&id)
+            .and_then(|h| h.iter().filter(|s| s.source.is_baseline()).last().cloned());
+        Ok(task)
     }
 
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>> {
         let g = self.inner.lock().unwrap();
+        let snaps = self.snapshots.lock().unwrap();
         let mut rows: Vec<_> = g
             .values()
             .filter(|t| match filter.workspace_id {
@@ -210,12 +258,28 @@ impl TaskRepository for InMemoryTaskRepository {
                 Some(r) => t.repo_id == Some(r),
                 None => true,
             })
-            .filter(|t| match filter.state {
-                Some(s) => t.state == s,
+            .filter(|t| match filter.status {
+                Some(s) => t.status == s,
                 None => true,
             })
-            .filter(|t| filter.include_archived || t.state != domain_task::TaskState::Archived)
-            .cloned()
+            .filter(|t| match filter.sync_state {
+                Some(s) => t.sync == s,
+                None => true,
+            })
+            .filter(|t| match (filter.status, filter.include_archived) {
+                // Explicit status filter is authoritative.
+                (Some(_), _) => true,
+                // No status filter + include_archived=false → exclude Archived.
+                (None, false) => t.status != domain_task::TaskStatus::Archived,
+                (None, true) => true,
+            })
+            .map(|t| {
+                let mut task = t.clone();
+                task.synced_baseline = snaps
+                    .get(&t.id)
+                    .and_then(|h| h.iter().filter(|s| s.source.is_baseline()).last().cloned());
+                task
+            })
             .collect();
         rows.sort_by_key(|t| t.created_at);
         Ok(rows)
@@ -224,6 +288,51 @@ impl TaskRepository for InMemoryTaskRepository {
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())
+    }
+}
+
+// ---------- Task snapshot repository -------------------------------------
+
+pub struct InMemoryTaskSnapshotRepository {
+    inner: Arc<Mutex<HashMap<TaskId, Vec<TaskSnapshot>>>>,
+}
+
+impl InMemoryTaskSnapshotRepository {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn linked_to(repo: &InMemoryTaskRepository) -> Self {
+        Self {
+            inner: repo.snapshots_handle(),
+        }
+    }
+}
+
+impl Default for InMemoryTaskSnapshotRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl TaskSnapshotRepository for InMemoryTaskSnapshotRepository {
+    async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>> {
+        let g = self.inner.lock().unwrap();
+        let mut rows = g.get(&task_id).cloned().unwrap_or_default();
+        rows.sort_by_key(|s| s.version);
+        Ok(rows)
+    }
+
+    async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .and_then(|h| h.iter().find(|s| s.version == version).cloned())
+            .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))
     }
 }
 

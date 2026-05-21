@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use domain_repo::RepoBinding;
-use domain_task::{Priority, RelationKind, RemoteRef, Task};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
@@ -119,8 +119,8 @@ async fn task_with_relations_and_remote_roundtrip() {
     .unwrap();
     other.archive().unwrap();
 
-    ts.save(&other).await.unwrap();
-    ts.save(&task).await.unwrap();
+    ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();
+    ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
 
     let back = ts.get(task.id).await.unwrap();
     assert_eq!(back.priority, Priority::P1);
@@ -156,7 +156,7 @@ async fn list_filters_compose() {
 
     for ws_id in [w1.id, w2.id] {
         for n in 0..2 {
-            ts.save(&Task::new_draft(ws_id, None, format!("t{n}")).unwrap())
+            ts.save(&Task::new_draft(ws_id, None, format!("t{n}")).unwrap(), SnapshotSource::LocalEdit)
                 .await
                 .unwrap();
         }
@@ -180,7 +180,7 @@ async fn deleting_workspace_cascades_to_tasks() {
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
     ws.save(&w).await.unwrap();
     let t = Task::new_draft(w.id, None, "t".into()).unwrap();
-    ts.save(&t).await.unwrap();
+    ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
     ws.delete(w.id).await.unwrap();
     let after = ts.list(TaskFilter::default()).await.unwrap();

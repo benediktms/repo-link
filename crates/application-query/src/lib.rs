@@ -2,6 +2,10 @@
 //!
 //! CQRS-light: each view returns a flat DTO shape ready for CLI rendering
 //! or JSON output. No domain mutation lives here.
+//!
+//! Status (lifecycle: Open / InProgress / Blocked / Done / Archived) and
+//! sync state (LocalOnly / Staged / Synced / DirtyLocal / DirtyRemote /
+//! Conflict) are surfaced as separate fields wherever both matter.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,7 +13,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use domain_core::{IdParseError, WorkspaceId};
 use domain_repo::LinkStatus;
-use domain_task::TaskState;
+use domain_task::{SyncState, TaskStatus};
 use ports::{PortError, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -36,11 +40,14 @@ pub type Result<T> = std::result::Result<T, QueryError>;
 pub struct WorkspaceOverview {
     pub workspace_id: String,
     pub workspace_name: String,
-    pub status: String,
+    pub workspace_status: String,
     pub repo_count: usize,
     pub worktree_count: usize,
     pub stale_worktree_count: usize,
-    pub task_states: BTreeMap<String, usize>,
+    /// Task counts grouped by lifecycle status.
+    pub by_status: BTreeMap<String, usize>,
+    /// Task counts grouped by sync state.
+    pub by_sync: BTreeMap<String, usize>,
     pub unsynced_task_count: usize,
     pub generated_at: DateTime<Utc>,
 }
@@ -65,21 +72,22 @@ pub struct StaleWorktreeRow {
 pub struct UnsyncedTaskRow {
     pub task_id: String,
     pub title: String,
-    pub state: String,
+    pub sync_state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContributorRow {
     pub assignee: String,
     pub total: usize,
-    pub by_state: BTreeMap<String, usize>,
+    pub by_status: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyTaskRow {
     pub task_id: String,
     pub title: String,
-    pub state: String,
+    pub status: String,
+    pub sync_state: String,
     pub priority: String,
     pub assignees: Vec<String>,
 }
@@ -88,7 +96,8 @@ pub struct ReadyTaskRow {
 pub struct AssignedTaskRow {
     pub task_id: String,
     pub title: String,
-    pub state: String,
+    pub status: String,
+    pub sync_state: String,
     pub priority: String,
     pub blocked: bool,
     pub remote_id: Option<String>,
@@ -98,7 +107,7 @@ pub struct AssignedTaskRow {
 pub struct DriftRow {
     pub task_id: String,
     pub title: String,
-    pub state: String,
+    pub sync_state: String,
     pub remote_id: Option<String>,
 }
 
@@ -143,20 +152,23 @@ impl QueryService {
             .filter(|w| matches!(w.status, LinkStatus::Stale | LinkStatus::MissingPath))
             .count();
 
-        let mut task_states: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+        let mut by_sync: BTreeMap<String, usize> = BTreeMap::new();
         for t in &tasks {
-            *task_states.entry(enum_str(&t.state)).or_insert(0) += 1;
+            *by_status.entry(enum_str(&t.status)).or_insert(0) += 1;
+            *by_sync.entry(enum_str(&t.sync)).or_insert(0) += 1;
         }
-        let unsynced_task_count = tasks.iter().filter(|t| is_unsynced(t.state)).count();
+        let unsynced_task_count = tasks.iter().filter(|t| is_unsynced(t.sync)).count();
 
         Ok(WorkspaceOverview {
             workspace_id: ws.id.to_string(),
             workspace_name: ws.name.as_str().to_string(),
-            status: enum_str(&ws.status),
+            workspace_status: enum_str(&ws.status),
             repo_count: bindings.len(),
             worktree_count,
             stale_worktree_count,
-            task_states,
+            by_status,
+            by_sync,
             unsynced_task_count,
             generated_at: Utc::now(),
         })
@@ -168,7 +180,7 @@ impl QueryService {
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                state: Some(TaskState::Blocked),
+                status: Some(TaskStatus::Blocked),
                 ..TaskFilter::default()
             })
             .await?;
@@ -207,12 +219,8 @@ impl QueryService {
         Ok(out)
     }
 
-    /// Open tasks assigned to `assignee` in this workspace.
-    ///
-    /// "Open" excludes only `Archived` for now. Remote-closed issues stay
-    /// listed until they're pulled and archived locally — the daemon (G011)
-    /// will close that loop. `blocked` is computed from BlockedBy relations,
-    /// matching `ready_tasks` semantics.
+    /// Tasks assigned to `assignee` that aren't archived. Sorted unblocked-
+    /// first, then by priority.
     pub async fn assigned_to(
         &self,
         workspace_id: &str,
@@ -234,20 +242,21 @@ impl QueryService {
 
         let mut rows: Vec<AssignedTaskRow> = tasks
             .iter()
-            .filter(|t| t.state != TaskState::Archived)
+            .filter(|t| t.status != TaskStatus::Archived)
             .filter(|t| t.assignees.iter().any(|a| a == assignee))
             .map(|t| {
                 let blocked = t.relations.iter().any(|r| {
                     r.kind == domain_task::RelationKind::BlockedBy
                         && by_id
                             .get(&r.other)
-                            .map(|other| other.state != TaskState::Archived)
+                            .map(|other| !is_done_or_archived(other.status))
                             .unwrap_or(false)
                 });
                 AssignedTaskRow {
                     task_id: t.id.to_string(),
                     title: t.title.clone(),
-                    state: enum_str(&t.state),
+                    status: enum_str(&t.status),
+                    sync_state: enum_str(&t.sync),
                     priority: enum_str(&t.priority),
                     blocked,
                     remote_id: t.remote.as_ref().map(|r| r.remote_id.clone()),
@@ -255,18 +264,13 @@ impl QueryService {
             })
             .collect();
 
-        // Surface unblocked + highest priority first, then by updated_at asc.
         rows.sort_by(|a, b| a.blocked.cmp(&b.blocked).then_with(|| a.priority.cmp(&b.priority)));
         Ok(rows)
     }
 
-    /// Tasks ready to work on right now: open + actionable + not transitively
-    /// blocked. A task is treated as "blocking" if it is still in the
-    /// workspace and not yet `Archived` — so closing/archiving the blocker is
-    /// what unlocks the dependents.
-    ///
-    /// Sorted by priority (P0 first), then by `updated_at` ascending so the
-    /// oldest waiting work surfaces first.
+    /// Tasks ready to work on right now: status ∈ {Open, InProgress}, sync
+    /// not in Conflict, and not transitively blocked by another non-done
+    /// task. Sorted by priority (P0 first), then `updated_at` asc.
     pub async fn ready_tasks(&self, workspace_id: &str) -> Result<Vec<ReadyTaskRow>> {
         use std::collections::HashMap;
 
@@ -275,43 +279,35 @@ impl QueryService {
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                include_archived: true, // need archived to evaluate blocker status
+                include_archived: true, // need them to evaluate blocker status
                 ..TaskFilter::default()
             })
             .await?;
 
         let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
 
-        let is_actionable = |t: &domain_task::Task| {
-            matches!(
-                t.state,
-                TaskState::Draft
-                    | TaskState::Staged
-                    | TaskState::Pushed
-                    | TaskState::Synced
-                    | TaskState::DirtyLocal
-                    | TaskState::DirtyRemote
-            )
+        let is_open_or_in_progress = |t: &domain_task::Task| {
+            matches!(t.status, TaskStatus::Open | TaskStatus::InProgress)
+                && t.sync != SyncState::Conflict
         };
 
         let is_open_blocker = |other: domain_core::TaskId| {
             by_id
                 .get(&other)
-                .map(|t| t.state != TaskState::Archived)
+                .map(|t| !is_done_or_archived(t.status))
                 .unwrap_or(false)
         };
 
         let mut ready: Vec<&domain_task::Task> = tasks
             .iter()
-            .filter(|t| is_actionable(t))
+            .filter(|t| is_open_or_in_progress(t))
             .filter(|t| {
-                !t.relations
-                    .iter()
-                    .any(|r| r.kind == domain_task::RelationKind::BlockedBy && is_open_blocker(r.other))
+                !t.relations.iter().any(|r| {
+                    r.kind == domain_task::RelationKind::BlockedBy && is_open_blocker(r.other)
+                })
             })
             .collect();
 
-        // Sort: priority asc (P0 first), then updated_at asc.
         ready.sort_by(|a, b| {
             a.priority
                 .cmp(&b.priority)
@@ -323,14 +319,16 @@ impl QueryService {
             .map(|t| ReadyTaskRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
-                state: enum_str(&t.state),
+                status: enum_str(&t.status),
+                sync_state: enum_str(&t.sync),
                 priority: enum_str(&t.priority),
                 assignees: t.assignees.clone(),
             })
             .collect())
     }
 
-    /// Group tasks by assignee. Tasks with no assignee land under "(unassigned)".
+    /// Group non-archived tasks by assignee with lifecycle-status counts.
+    /// Tasks with no assignee land under "(unassigned)".
     pub async fn contributors(&self, workspace_id: &str) -> Result<Vec<ContributorRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
@@ -344,7 +342,7 @@ impl QueryService {
         use std::collections::HashMap;
         let mut buckets: HashMap<String, (usize, BTreeMap<String, usize>)> = HashMap::new();
         for t in &tasks {
-            let state = enum_str(&t.state);
+            let status = enum_str(&t.status);
             let assignees: Vec<String> = if t.assignees.is_empty() {
                 vec!["(unassigned)".into()]
             } else {
@@ -353,24 +351,23 @@ impl QueryService {
             for name in assignees {
                 let entry = buckets.entry(name).or_default();
                 entry.0 += 1;
-                *entry.1.entry(state.clone()).or_insert(0) += 1;
+                *entry.1.entry(status.clone()).or_insert(0) += 1;
             }
         }
 
         let mut rows: Vec<ContributorRow> = buckets
             .into_iter()
-            .map(|(assignee, (total, by_state))| ContributorRow {
+            .map(|(assignee, (total, by_status))| ContributorRow {
                 assignee,
                 total,
-                by_state,
+                by_status,
             })
             .collect();
         rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.assignee.cmp(&b.assignee)));
         Ok(rows)
     }
 
-    /// Tasks that have diverged from the remote (DirtyLocal/DirtyRemote/Conflict).
-    /// This is the subset of unsynced tasks that need a reconciliation action.
+    /// Tasks whose local sync state has diverged from the remote.
     pub async fn drift(&self, workspace_id: &str) -> Result<Vec<DriftRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
@@ -384,14 +381,14 @@ impl QueryService {
             .iter()
             .filter(|t| {
                 matches!(
-                    t.state,
-                    TaskState::DirtyLocal | TaskState::DirtyRemote | TaskState::Conflict
+                    t.sync,
+                    SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
                 )
             })
             .map(|t| DriftRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
-                state: enum_str(&t.state),
+                sync_state: enum_str(&t.sync),
                 remote_id: t.remote.as_ref().map(|r| r.remote_id.clone()),
             })
             .collect())
@@ -408,11 +405,11 @@ impl QueryService {
             .await?;
         Ok(tasks
             .iter()
-            .filter(|t| is_unsynced(t.state))
+            .filter(|t| is_unsynced(t.sync))
             .map(|t| UnsyncedTaskRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
-                state: enum_str(&t.state),
+                sync_state: enum_str(&t.sync),
             })
             .collect())
     }
@@ -427,22 +424,19 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
         .unwrap_or_default()
 }
 
-fn is_unsynced(state: TaskState) -> bool {
-    matches!(
-        state,
-        TaskState::Draft
-            | TaskState::Staged
-            | TaskState::DirtyLocal
-            | TaskState::DirtyRemote
-            | TaskState::Conflict
-    )
+fn is_unsynced(sync: SyncState) -> bool {
+    !matches!(sync, SyncState::Synced)
+}
+
+fn is_done_or_archived(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Done | TaskStatus::Archived)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use domain_repo::RepoBinding;
-    use domain_task::Task;
+    use domain_task::{SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use std::path::PathBuf;
     use testing_fixtures::{
@@ -463,7 +457,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overview_counts_states_and_stale_worktrees() {
+    async fn overview_counts_status_sync_and_stale_worktrees() {
         let (svc, ws, bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let workspace_id = workspace.id;
@@ -480,18 +474,21 @@ mod tests {
         b.mark_path_missing(std::path::Path::new("/tmp/b")).unwrap();
         bs.save(&b).await.unwrap();
 
-        let draft = Task::new_draft(workspace_id, None, "draft thing".into()).unwrap();
+        let local_only = Task::new_draft(workspace_id, None, "still local".into()).unwrap();
         let mut staged = Task::new_draft(workspace_id, None, "staged thing".into()).unwrap();
         staged.stage_for_sync().unwrap();
-        ts.save(&draft).await.unwrap();
-        ts.save(&staged).await.unwrap();
+        ts.save(&local_only, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&staged, SnapshotSource::LocalEdit).await.unwrap();
 
         let ov = svc.overview(&workspace_id.to_string()).await.unwrap();
         assert_eq!(ov.repo_count, 1);
         assert_eq!(ov.worktree_count, 2);
         assert_eq!(ov.stale_worktree_count, 1);
-        assert_eq!(ov.task_states.get("draft"), Some(&1));
-        assert_eq!(ov.task_states.get("staged"), Some(&1));
+        // Both tasks land in `Open` lifecycle status.
+        assert_eq!(ov.by_status.get("open"), Some(&2));
+        // But they differ in sync state.
+        assert_eq!(ov.by_sync.get("local_only"), Some(&1));
+        assert_eq!(ov.by_sync.get("staged"), Some(&1));
         assert_eq!(ov.unsynced_task_count, 2);
     }
 
@@ -505,9 +502,9 @@ mod tests {
         let other = Task::new_draft(wid, None, "blocker".into()).unwrap();
         let mut blocked = Task::new_draft(wid, None, "the work".into()).unwrap();
         blocked.add_relation(domain_task::RelationKind::BlockedBy, other.id);
-        blocked.mark_blocked();
-        ts.save(&other).await.unwrap();
-        ts.save(&blocked).await.unwrap();
+        blocked.mark_blocked().unwrap();
+        ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&blocked, SnapshotSource::LocalEdit).await.unwrap();
 
         let rows = svc.blocked_tasks(&wid.to_string()).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -515,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contributors_view_groups_and_sorts() {
+    async fn contributors_view_groups_and_sorts_by_status() {
         let (svc, ws, _bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
@@ -525,20 +522,19 @@ mod tests {
         a.assignees = vec!["alice".into(), "bob".into()];
         let mut b = Task::new_draft(wid, None, "b".into()).unwrap();
         b.assignees = vec!["alice".into()];
-        let c = Task::new_draft(wid, None, "c".into()).unwrap(); // unassigned
-        ts.save(&a).await.unwrap();
-        ts.save(&b).await.unwrap();
-        ts.save(&c).await.unwrap();
+        let c = Task::new_draft(wid, None, "c".into()).unwrap();
+        ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&c, SnapshotSource::LocalEdit).await.unwrap();
 
         let rows = svc.contributors(&wid.to_string()).await.unwrap();
         let alice = rows.iter().find(|r| r.assignee == "alice").unwrap();
         assert_eq!(alice.total, 2);
-        assert_eq!(alice.by_state.get("draft"), Some(&2));
+        assert_eq!(alice.by_status.get("open"), Some(&2));
         let bob = rows.iter().find(|r| r.assignee == "bob").unwrap();
         assert_eq!(bob.total, 1);
         let unassigned = rows.iter().find(|r| r.assignee == "(unassigned)").unwrap();
         assert_eq!(unassigned.total, 1);
-        // alice (2) sorts before bob/unassigned (1 each).
         assert_eq!(rows[0].assignee, "alice");
     }
 
@@ -549,9 +545,7 @@ mod tests {
         let wid = workspace.id;
         ws.save(&workspace).await.unwrap();
 
-        // A is a blocker that's still open.
         let blocker_a = Task::new_draft(wid, None, "blocker a".into()).unwrap();
-        // B is a blocker that's been archived → no longer blocks.
         let mut blocker_b = Task::new_draft(wid, None, "blocker b".into()).unwrap();
         blocker_b.archive().unwrap();
 
@@ -566,19 +560,16 @@ mod tests {
         also_unblocked.set_priority(domain_task::Priority::P3);
 
         for t in [&blocker_a, &blocker_b, &blocked_by_a, &unblocked, &also_unblocked] {
-            ts.save(t).await.unwrap();
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
         let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
-        // blocked_by_a is excluded; blocker_a + unblocked + also_unblocked are ready.
-        // (blocker_b is archived, so it's not actionable.)
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert!(titles.contains(&"freed up"));
         assert!(titles.contains(&"low pri"));
         assert!(titles.contains(&"blocker a"));
         assert!(!titles.contains(&"needs a"));
         assert!(!titles.contains(&"blocker b"));
-        // P0 ("freed up") sorts before P3 ("low pri").
         let freed_idx = titles.iter().position(|t| *t == "freed up").unwrap();
         let low_idx = titles.iter().position(|t| *t == "low pri").unwrap();
         assert!(freed_idx < low_idx);
@@ -599,23 +590,23 @@ mod tests {
         mine_blocked.add_relation(domain_task::RelationKind::BlockedBy, blocker.id);
         let mut someone_elses = Task::new_draft(wid, None, "not me".into()).unwrap();
         someone_elses.assignees = vec!["alice".into()];
-        let mut mine_done = Task::new_draft(wid, None, "done".into()).unwrap();
-        mine_done.assignees = vec!["benedikt".into()];
-        mine_done.archive().unwrap();
+        let mut mine_archived = Task::new_draft(wid, None, "archived".into()).unwrap();
+        mine_archived.assignees = vec!["benedikt".into()];
+        mine_archived.archive().unwrap();
 
-        for t in [&blocker, &mine_open, &mine_blocked, &someone_elses, &mine_done] {
-            ts.save(t).await.unwrap();
+        for t in [&blocker, &mine_open, &mine_blocked, &someone_elses, &mine_archived] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
         let rows = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
-        assert_eq!(titles, vec!["open", "blocked"]); // sorted unblocked-first, then by priority
+        assert_eq!(titles, vec!["open", "blocked"]);
         assert!(!rows[0].blocked);
         assert!(rows[1].blocked);
     }
 
     #[tokio::test]
-    async fn drift_view_returns_only_divergent_states() {
+    async fn drift_view_returns_only_divergent_sync_states() {
         let (svc, ws, _bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
@@ -630,14 +621,14 @@ mod tests {
                 remote_id: "42".into(),
             })
             .unwrap();
-        dirty.mark_synced().unwrap();
+        // promote_to_remote lands on Synced; flip to DirtyLocal to exercise drift.
         dirty.mark_dirty_local().unwrap();
-        ts.save(&draft).await.unwrap();
-        ts.save(&dirty).await.unwrap();
+        ts.save(&draft, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&dirty, SnapshotSource::LocalEdit).await.unwrap();
 
         let rows = svc.drift(&wid.to_string()).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state, "dirty_local");
+        assert_eq!(rows[0].sync_state, "dirty_local");
         assert_eq!(rows[0].remote_id.as_deref(), Some("42"));
     }
 

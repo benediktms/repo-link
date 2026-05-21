@@ -12,13 +12,14 @@ application-query = { workspace = true }
 application-sync = { workspace = true }
 infra-github = { workspace = true }
 dto-shared = { workspace = true }
+domain-task = { workspace = true }
+domain-core = { workspace = true }
 ports = { workspace = true }
 infra-sqlite = { workspace = true }
 infra-filesystem = { workspace = true }
 infra-git = { workspace = true }
 infra-config = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-comfy-table = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

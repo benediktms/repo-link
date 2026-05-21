@@ -96,7 +96,10 @@ pub struct TaskDto {
     pub repo_id: Option<String>,
     pub title: String,
     pub body: String,
-    pub state: String,
+    /// Lifecycle status: `open` / `in_progress` / `blocked` / `done` / `archived`.
+    pub status: String,
+    /// Sync state: `local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`.
+    pub sync_state: String,
     pub priority: String,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRefDto>,
@@ -134,7 +137,8 @@ pub struct AddTaskRelationCmd {
 pub struct ListTasksQuery {
     pub workspace_id: Option<String>,
     pub repo_id: Option<String>,
-    pub state: Option<String>,
+    pub status: Option<String>,
+    pub sync_state: Option<String>,
     pub include_archived: bool,
 }
 

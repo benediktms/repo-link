@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use domain_core::{IdParseError, RepoId, TaskId, WorkspaceId};
-use domain_task::{Priority, RelationKind, Task, TaskState};
+use domain_task::{Priority, RelationKind, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoteRefDto, TaskDto, TaskRelationDto,
     UpdateTaskCmd,
 };
-use ports::{PortError, TaskFilter, TaskRepository};
+use ports::{PortError, TaskFilter, TaskRepository, TaskSnapshotRepository};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -36,16 +36,25 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 
 pub struct TaskService {
     repo: Arc<dyn TaskRepository>,
+    snapshots: Arc<dyn TaskSnapshotRepository>,
 }
 
 impl TaskService {
-    pub fn new(repo: Arc<dyn TaskRepository>) -> Self {
-        Self { repo }
+    pub fn new(repo: Arc<dyn TaskRepository>, snapshots: Arc<dyn TaskSnapshotRepository>) -> Self {
+        Self { repo, snapshots }
+    }
+
+    pub fn snapshots_repo(&self) -> &Arc<dyn TaskSnapshotRepository> {
+        &self.snapshots
     }
 
     pub async fn create(&self, cmd: CreateTaskCmd) -> Result<TaskDto> {
         let workspace_id: WorkspaceId = cmd.workspace_id.parse()?;
-        let repo_id = cmd.repo_id.as_deref().map(|s| s.parse::<RepoId>()).transpose()?;
+        let repo_id = cmd
+            .repo_id
+            .as_deref()
+            .map(|s| s.parse::<RepoId>())
+            .transpose()?;
         let mut t = Task::new_draft(workspace_id, repo_id, cmd.title)?;
         if let Some(body) = cmd.body {
             t.set_body(body);
@@ -53,7 +62,7 @@ impl TaskService {
         if let Some(p) = cmd.priority {
             t.set_priority(parse_enum::<Priority>("priority", &p)?);
         }
-        self.repo.save(&t).await?;
+        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
     }
 
@@ -66,12 +75,7 @@ impl TaskService {
         let id: TaskId = cmd.task_id.parse()?;
         let mut t = self.repo.get(id).await?;
         if let Some(title) = cmd.title {
-            if title.trim().is_empty() {
-                return Err(ServiceError::Domain(domain_core::DomainError::validation(
-                    "task title is empty",
-                )));
-            }
-            t.title = title;
+            t.set_title(title)?;
         }
         if let Some(body) = cmd.body {
             t.set_body(body);
@@ -80,9 +84,9 @@ impl TaskService {
             t.set_priority(parse_enum::<Priority>("priority", &p)?);
         }
         if let Some(assignees) = cmd.assignees {
-            t.assignees = assignees;
+            t.set_assignees(assignees);
         }
-        self.repo.save(&t).await?;
+        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
     }
 
@@ -98,10 +102,15 @@ impl TaskService {
                 .as_deref()
                 .map(|s| s.parse::<RepoId>())
                 .transpose()?,
-            state: query
-                .state
+            status: query
+                .status
                 .as_deref()
-                .map(|s| parse_enum::<TaskState>("state", s))
+                .map(|s| parse_enum::<TaskStatus>("status", s))
+                .transpose()?,
+            sync_state: query
+                .sync_state
+                .as_deref()
+                .map(|s| parse_enum::<SyncState>("sync_state", s))
                 .transpose()?,
             include_archived: query.include_archived,
         };
@@ -109,16 +118,32 @@ impl TaskService {
         Ok(rows.iter().map(task_to_dto).collect())
     }
 
+    // ---------- Sync transitions -----------------------------------------
+
     pub async fn stage_for_sync(&self, id: &str) -> Result<TaskDto> {
         self.transition(id, |t| t.stage_for_sync()).await
     }
 
+    // ---------- Lifecycle transitions ------------------------------------
+
+    pub async fn start(&self, id: &str) -> Result<TaskDto> {
+        self.transition(id, |t| t.start()).await
+    }
+
+    pub async fn complete(&self, id: &str) -> Result<TaskDto> {
+        self.transition(id, |t| t.complete()).await
+    }
+
+    pub async fn reopen(&self, id: &str) -> Result<TaskDto> {
+        self.transition(id, |t| t.reopen()).await
+    }
+
     pub async fn mark_blocked(&self, id: &str) -> Result<TaskDto> {
-        let id: TaskId = id.parse()?;
-        let mut t = self.repo.get(id).await?;
-        t.mark_blocked();
-        self.repo.save(&t).await?;
-        Ok(task_to_dto(&t))
+        self.transition(id, |t| t.mark_blocked()).await
+    }
+
+    pub async fn unblock(&self, id: &str) -> Result<TaskDto> {
+        self.transition(id, |t| t.unblock()).await
     }
 
     pub async fn archive(&self, id: &str) -> Result<TaskDto> {
@@ -131,8 +156,24 @@ impl TaskService {
         let kind = parse_enum::<RelationKind>("kind", &cmd.kind)?;
         let mut t = self.repo.get(id).await?;
         t.add_relation(kind, other);
-        self.repo.save(&t).await?;
+        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
+    }
+
+    pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
+        let task_id: domain_core::TaskId = id.parse()?;
+        let snapshot = self.snapshots.get(task_id, to_version).await?;
+        let mut task = self.repo.get(task_id).await?;
+        task.title = snapshot.title;
+        task.body = snapshot.body;
+        task.status = snapshot.status;
+        task.sync = snapshot.sync_state;
+        task.priority = snapshot.priority;
+        task.assignees = snapshot.assignees;
+        task.remote = snapshot.remote;
+        task.reconcile_dirty_against_baseline();
+        self.repo.save(&task, SnapshotSource::Rollback).await?;
+        Ok(task_to_dto(&task))
     }
 
     async fn transition<F>(&self, id: &str, op: F) -> Result<TaskDto>
@@ -142,7 +183,7 @@ impl TaskService {
         let id: TaskId = id.parse()?;
         let mut t = self.repo.get(id).await?;
         op(&mut t)?;
-        self.repo.save(&t).await?;
+        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
     }
 }
@@ -172,7 +213,8 @@ pub fn task_to_dto(t: &Task) -> TaskDto {
         repo_id: t.repo_id.map(|r| r.to_string()),
         title: t.title.clone(),
         body: t.body.clone(),
-        state: enum_str(&t.state),
+        status: enum_str(&t.status),
+        sync_state: enum_str(&t.sync),
         priority: enum_str(&t.priority),
         assignees: t.assignees.clone(),
         remote: t.remote.as_ref().map(|r| RemoteRefDto {
@@ -195,10 +237,14 @@ pub fn task_to_dto(t: &Task) -> TaskDto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use testing_fixtures::InMemoryTaskRepository;
+    use ports::TaskSnapshotRepository;
+    use testing_fixtures::{InMemoryTaskRepository, InMemoryTaskSnapshotRepository};
 
     fn svc() -> TaskService {
-        TaskService::new(Arc::new(InMemoryTaskRepository::new()))
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        TaskService::new(repo, snaps)
     }
 
     fn ws_id() -> String {
@@ -218,7 +264,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(dto.state, "draft");
+        assert_eq!(dto.status, "open");
+        assert_eq!(dto.sync_state, "local_only");
         assert_eq!(dto.priority, "p1");
         let updated = svc
             .update(UpdateTaskCmd {
@@ -236,10 +283,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_filters_by_state() {
+    async fn list_filters_independently_by_status_and_sync_state() {
         let svc = svc();
         let workspace = ws_id();
-        let _draft = svc
+        let _open_localonly = svc
             .create(CreateTaskCmd {
                 workspace_id: workspace.clone(),
                 repo_id: None,
@@ -249,7 +296,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let staged = svc
+        let to_stage = svc
             .create(CreateTaskCmd {
                 workspace_id: workspace.clone(),
                 repo_id: None,
@@ -259,16 +306,35 @@ mod tests {
             })
             .await
             .unwrap();
-        svc.stage_for_sync(&staged.id).await.unwrap();
-        let drafts = svc
+        svc.stage_for_sync(&to_stage.id).await.unwrap();
+
+        // Both are status=Open. Filter by status returns both.
+        let opens = svc
             .list(ListTasksQuery {
-                state: Some("draft".into()),
+                status: Some("open".into()),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].state, "draft");
+        assert_eq!(opens.len(), 2);
+
+        // But sync state distinguishes them.
+        let local_only = svc
+            .list(ListTasksQuery {
+                sync_state: Some("local_only".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(local_only.len(), 1);
+        let staged = svc
+            .list(ListTasksQuery {
+                sync_state: Some("staged".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(staged.len(), 1);
     }
 
     #[tokio::test]
@@ -324,7 +390,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_then_archive_task() {
+    async fn lifecycle_start_complete_archive() {
+        let svc = svc();
+        let t = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "t".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        let started = svc.start(&t.id).await.unwrap();
+        assert_eq!(started.status, "in_progress");
+        let done = svc.complete(&t.id).await.unwrap();
+        assert_eq!(done.status, "done");
+        let archived = svc.archive(&t.id).await.unwrap();
+        assert_eq!(archived.status, "archived");
+    }
+
+    #[tokio::test]
+    async fn block_and_unblock() {
         let svc = svc();
         let t = svc
             .create(CreateTaskCmd {
@@ -337,8 +424,37 @@ mod tests {
             .await
             .unwrap();
         let blocked = svc.mark_blocked(&t.id).await.unwrap();
-        assert_eq!(blocked.state, "blocked");
-        let archived = svc.archive(&t.id).await.unwrap();
-        assert_eq!(archived.state, "archived");
+        assert_eq!(blocked.status, "blocked");
+        let unblocked = svc.unblock(&t.id).await.unwrap();
+        assert_eq!(unblocked.status, "open");
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_original_title() {
+        let svc = svc();
+        // Create task — this writes version 1.
+        let original = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "original title".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        // Edit title — this writes version 2.
+        svc.update(UpdateTaskCmd {
+            task_id: original.id.clone(),
+            title: Some("edited title".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+        })
+        .await
+        .unwrap();
+        // Rollback to version 1 — title should revert.
+        let rolled_back = svc.rollback(&original.id, 1).await.unwrap();
+        assert_eq!(rolled_back.title, "original title");
     }
 }

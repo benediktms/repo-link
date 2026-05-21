@@ -83,6 +83,14 @@ pub fn discover_canonical(path: &Path) -> Result<Option<String>> {
     Ok(discover_origin_url(path)?.and_then(|u| parse_canonical(&u)))
 }
 
+// TODO(sibling-repo-detection): we can link worktrees back to their primary
+// repo today, but two sibling directories that happen to point at the same
+// `origin` URL aren't recognised as the same logical repo. We'd want a
+// helper like `same_logical_repo(a, b) -> bool` that compares canonical
+// URLs of both, so `repo discover` could merge duplicate clones into a
+// single binding with two worktrees. Not needed for the current MVP — punt
+// until the use case shows up.
+
 #[cfg(test)]
 mod tests {
     use super::*;

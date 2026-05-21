@@ -5,7 +5,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
-use domain_task::{Task, TaskState};
+use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
 use domain_workspace::Workspace;
 use thiserror::Error;
 
@@ -58,16 +58,38 @@ pub trait RepoBindingRepository: Send + Sync {
 pub struct TaskFilter {
     pub workspace_id: Option<WorkspaceId>,
     pub repo_id: Option<RepoId>,
-    pub state: Option<TaskState>,
+    /// Filter by lifecycle status. When `None`, callers usually want
+    /// non-archived rows only — see `include_archived`.
+    pub status: Option<TaskStatus>,
+    /// Filter by sync state.
+    pub sync_state: Option<SyncState>,
+    /// When `status` is `None`, include `Archived` rows. Ignored if
+    /// `status` is set explicitly.
     pub include_archived: bool,
 }
 
 #[async_trait]
 pub trait TaskRepository: Send + Sync {
-    async fn save(&self, task: &Task) -> PortResult<()>;
+    /// Persist `task` and append a new row to its snapshot history,
+    /// tagged with `source`. The adapter assigns the next monotonic
+    /// `version`. Both writes are committed in a single transaction.
+    async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()>;
     async fn get(&self, id: TaskId) -> PortResult<Task>;
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
+}
+
+/// History queries over [`TaskSnapshot`] rows. Reads only — appends are
+/// the side-effect of [`TaskRepository::save`] (so the snapshot table and
+/// the task projection can't drift apart).
+#[async_trait]
+pub trait TaskSnapshotRepository: Send + Sync {
+    /// All snapshots for a task, oldest version first.
+    async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>>;
+
+    /// Fetch a specific version. Returns `NotFound` if the version
+    /// doesn't exist.
+    async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot>;
 }
 
 // ---------- Remote task provider (GitHub etc.) ---------------------------
@@ -81,6 +103,23 @@ pub struct RemoteTaskCreate<'a> {
     pub labels: &'a [String],
 }
 
+/// Why a remote task is changing state. Providers that don't model this
+/// (GitLab, custom backends) can silently drop it. Names mirror GitHub's
+/// `state_reason` vocab because that's the most expressive enumeration
+/// currently in the wild; adapters map to their wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteStateReason {
+    /// Work finished as planned.
+    Completed,
+    /// Won't be done — dropped, abandoned, deferred indefinitely.
+    NotPlanned,
+    /// Closed because it's a duplicate of another task.
+    Duplicate,
+    /// Closed → open transition.
+    Reopened,
+}
+
 #[derive(Clone, Debug)]
 pub struct RemoteTaskUpdate<'a> {
     pub canonical_repo: &'a str,
@@ -88,6 +127,11 @@ pub struct RemoteTaskUpdate<'a> {
     pub title: Option<&'a str>,
     pub body: Option<&'a str>,
     pub closed: Option<bool>,
+    /// Annotates a state transition. Meaningful with `closed = Some(true)`
+    /// (Completed / NotPlanned / Duplicate) or when reopening
+    /// (`Reopened`). Adapters ignore the field if their backend has no
+    /// equivalent concept.
+    pub state_reason: Option<RemoteStateReason>,
 }
 
 #[derive(Clone, Debug)]

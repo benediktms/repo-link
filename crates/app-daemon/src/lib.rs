@@ -10,15 +10,79 @@
 //! The runtime is `tokio` with a single ticker + a ctrl-c watcher. The loop
 //! is fully testable via `Daemon::tick_once`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use application_sync::SyncService;
 use application_workspace::{RepoBindingService, WorkspaceService};
-use domain_task::TaskState;
+use clap::Parser;
+use domain_task::SyncState;
+use infra_config::RepoLinkConfig;
+use infra_filesystem::TokioFilesystemProbe;
+use infra_github::GithubTaskProvider;
+use infra_sqlite::{
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
+};
 use ports::{FilesystemProbe, TaskFilter, TaskRepository};
 use thiserror::Error;
 use tokio::signal;
+
+#[derive(Parser, Debug)]
+#[command(name = "repo-link-daemon", version, about = "Background reconciler for repo-link")]
+pub struct Args {
+    /// Tick interval in seconds.
+    #[arg(long, default_value_t = 60, env = "REPO_LINK_INTERVAL_SECS")]
+    pub interval_secs: u64,
+
+    /// When set, the daemon prunes worktree entries it just marked missing.
+    #[arg(long)]
+    pub prune: bool,
+
+    /// Database path override (defaults to platform data dir).
+    #[arg(long, env = "REPO_LINK_DB")]
+    pub db: Option<PathBuf>,
+}
+
+/// Library entrypoint shared by both `repo-link-daemon` and `rld` bin shims.
+pub async fn run_cli() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let mut cfg = RepoLinkConfig::from_env()?;
+    if let Some(db) = args.db {
+        cfg = cfg.with_database_path(db);
+    }
+    if let Some(parent) = cfg.database_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let db = open_from_path(&cfg.database_path).await?;
+    let workspaces_repo: Arc<dyn ports::WorkspaceRepository> =
+        Arc::new(SqliteWorkspaceRepository::new(db.clone()));
+    let bindings_repo: Arc<dyn ports::RepoBindingRepository> =
+        Arc::new(SqliteRepoBindingRepository::new(db.clone()));
+    let tasks_repo: Arc<dyn ports::TaskRepository> = Arc::new(SqliteTaskRepository::new(db));
+
+    let workspaces = WorkspaceService::new(workspaces_repo.clone());
+    let bindings = RepoBindingService::new(workspaces_repo, bindings_repo.clone());
+
+    let probe: Arc<dyn ports::FilesystemProbe> = Arc::new(TokioFilesystemProbe::new());
+
+    let sync = cfg.github_token.clone().map(|token| {
+        let provider: Arc<dyn ports::RemoteTaskProvider> =
+            Arc::new(GithubTaskProvider::new(token));
+        SyncService::new(tasks_repo.clone(), bindings_repo, provider)
+    });
+
+    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync).with_prune(args.prune);
+    eprintln!(
+        "[daemon] starting (interval={}s prune={} db={})",
+        args.interval_secs,
+        args.prune,
+        cfg.database_path.display()
+    );
+    daemon.run(Duration::from_secs(args.interval_secs)).await?;
+    Ok(())
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -97,7 +161,7 @@ impl Daemon {
                     .tasks
                     .list(TaskFilter {
                         workspace_id: Some(id),
-                        state: Some(TaskState::DirtyLocal),
+                        sync_state: Some(SyncState::DirtyLocal),
                         ..TaskFilter::default()
                     })
                     .await?;
@@ -154,7 +218,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use domain_repo::RepoBinding;
-    use domain_task::Task;
+    use domain_task::{SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
         PortResult, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot, RemoteTaskUpdate,
@@ -250,10 +314,11 @@ mod tests {
             remote_id: "777".into(),
         })
         .unwrap();
-        task.mark_synced().unwrap();
+        // promote_to_remote already lands on Synced — go straight to DirtyLocal
+        // to simulate a post-sync local edit.
         task.mark_dirty_local().unwrap();
         task.set_body("new body".into());
-        task_repo.save(&task).await.unwrap();
+        task_repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
 
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());

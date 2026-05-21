@@ -1,41 +1,46 @@
-//! infra-github — GitHub REST adapter implementing [`ports::RemoteTaskProvider`].
+//! infra-github — GitHub adapter implementing [`ports::RemoteTaskProvider`].
 //!
 //! Issues are the underlying remote task object. Promotion creates an issue;
-//! push updates it; pull fetches its current state. The adapter is stateless
-//! beyond the HTTP client + auth token; sync logic lives in
-//! `application-sync`.
+//! push updates it; pull fetches its current state.
+//!
+//! # Internals
+//!
+//! Protocol-specific code is split into submodules so REST and GraphQL stay
+//! distinct:
+//!
+//! - [`rest`] — issue CRUD via the REST API (today's full implementation).
+//!   Owns the JSON wire types, URL parsing, and the `state_reason` enum →
+//!   string mapping.
+//! - `graphql` *(future)* — sibling module for capabilities only exposed
+//!   via GraphQL (Projects v2 status fields, sub-issue parents, custom
+//!   fields). The wrapper struct below will compose both clients.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use domain_core::Timestamp;
 use ports::{
-    PortError, PortResult, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
-    RemoteTaskUpdate,
+    PortResult, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot, RemoteTaskUpdate,
 };
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 
-const DEFAULT_BASE_URL: &str = "https://api.github.com";
-const USER_AGENT: &str = "repo-link";
+mod rest;
 
+/// Single public face of the GitHub adapter. Today this is a thin wrapper
+/// around [`rest::RestClient`]; when the GraphQL adapter lands, it will
+/// also hold a `graphql::GqlClient` and route capability-specific methods
+/// to whichever one supports them.
 pub struct GithubTaskProvider {
-    client: Client,
-    base_url: String,
-    token: String,
+    rest: rest::RestClient,
 }
 
 impl GithubTaskProvider {
+    /// Default constructor — talks to `api.github.com`.
     pub fn new(token: impl Into<String>) -> Self {
-        Self::with_base_url(token, DEFAULT_BASE_URL)
+        Self::with_base_url(token, rest::DEFAULT_BASE_URL)
     }
 
     /// `base_url` exists for tests: point it at a `wiremock::MockServer::uri()`
     /// to exercise the HTTP path without hitting api.github.com.
     pub fn with_base_url(token: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
-            base_url: base_url.into(),
-            token: token.into(),
+            rest: rest::RestClient::new(token, base_url),
         }
     }
 }
@@ -43,39 +48,11 @@ impl GithubTaskProvider {
 #[async_trait]
 impl RemoteTaskProvider for GithubTaskProvider {
     async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
-        let (owner, repo) = split_owner_repo(cmd.canonical_repo)?;
-        let body = CreateIssueBody {
-            title: cmd.title,
-            body: cmd.body,
-            assignees: cmd.assignees,
-            labels: cmd.labels,
-        };
-        let resp = self
-            .request(reqwest::Method::POST, &format!("/repos/{owner}/{repo}/issues"))
-            .json(&body)
-            .send()
-            .await
-            .map_err(net)?;
-        decode_issue(resp).await
+        self.rest.create_issue(cmd).await
     }
 
     async fn update_remote(&self, cmd: RemoteTaskUpdate<'_>) -> PortResult<RemoteTaskSnapshot> {
-        let (owner, repo) = split_owner_repo(cmd.canonical_repo)?;
-        let body = UpdateIssueBody {
-            title: cmd.title,
-            body: cmd.body,
-            state: cmd.closed.map(|c| if c { "closed" } else { "open" }),
-        };
-        let resp = self
-            .request(
-                reqwest::Method::PATCH,
-                &format!("/repos/{owner}/{repo}/issues/{}", cmd.remote_id),
-            )
-            .json(&body)
-            .send()
-            .await
-            .map_err(net)?;
-        decode_issue(resp).await
+        self.rest.update_issue(cmd).await
     }
 
     async fn fetch_remote(
@@ -83,118 +60,19 @@ impl RemoteTaskProvider for GithubTaskProvider {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<RemoteTaskSnapshot> {
-        let (owner, repo) = split_owner_repo(canonical_repo)?;
-        let resp = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/repos/{owner}/{repo}/issues/{remote_id}"),
-            )
-            .send()
-            .await
-            .map_err(net)?;
-        decode_issue(resp).await
+        self.rest.fetch_issue(canonical_repo, remote_id).await
     }
-}
-
-impl GithubTaskProvider {
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.client
-            .request(method, format!("{}{}", self.base_url, path))
-            .bearer_auth(&self.token)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-    }
-}
-
-// ---------- Wire types ---------------------------------------------------
-
-#[derive(Serialize)]
-struct CreateIssueBody<'a> {
-    title: &'a str,
-    body: &'a str,
-    assignees: &'a [String],
-    labels: &'a [String],
-}
-
-#[derive(Serialize)]
-struct UpdateIssueBody<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<&'static str>,
-}
-
-#[derive(Deserialize)]
-struct IssueResponse {
-    number: u64,
-    title: String,
-    #[serde(default)]
-    body: Option<String>,
-    state: String,
-    updated_at: DateTime<Utc>,
-    #[serde(default)]
-    assignees: Vec<UserRef>,
-    #[serde(default)]
-    labels: Vec<LabelRef>,
-}
-
-#[derive(Deserialize)]
-struct UserRef {
-    login: String,
-}
-
-#[derive(Deserialize)]
-struct LabelRef {
-    name: String,
-}
-
-// ---------- Helpers ------------------------------------------------------
-
-fn split_owner_repo(canonical: &str) -> PortResult<(String, String)> {
-    let stripped = canonical
-        .strip_prefix("github.com/")
-        .ok_or_else(|| PortError::Backend(format!("not a github canonical url: {canonical}")))?;
-    let parts: Vec<&str> = stripped.split('/').collect();
-    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(PortError::Backend(format!(
-            "expected github.com/<owner>/<repo>, got {canonical}"
-        )));
-    }
-    Ok((parts[0].to_string(), parts[1].to_string()))
-}
-
-async fn decode_issue(resp: reqwest::Response) -> PortResult<RemoteTaskSnapshot> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(match status.as_u16() {
-            404 => PortError::NotFound(body),
-            409 | 422 => PortError::Conflict(body),
-            _ => PortError::Network(format!("github {status}: {body}")),
-        });
-    }
-    let issue: IssueResponse = resp.json().await.map_err(net)?;
-    Ok(RemoteTaskSnapshot {
-        remote_id: issue.number.to_string(),
-        title: issue.title,
-        body: issue.body.unwrap_or_default(),
-        closed: issue.state == "closed",
-        updated_at: Timestamp::from_utc(issue.updated_at),
-        assignees: issue.assignees.into_iter().map(|u| u.login).collect(),
-        labels: issue.labels.into_iter().map(|l| l.name).collect(),
-    })
-}
-
-fn net(e: reqwest::Error) -> PortError {
-    PortError::Network(e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    //! Integration-style wiremock tests — exercise the public
+    //! `GithubTaskProvider` end-to-end through the trait surface. REST-
+    //! internal unit tests (URL parsing, etc.) live next to their code in
+    //! `rest.rs`.
+
     use super::*;
+    use ports::RemoteStateReason;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -262,10 +140,39 @@ mod tests {
                 title: None,
                 body: None,
                 closed: Some(true),
+                state_reason: None,
             })
             .await
             .unwrap();
         assert!(snap.closed);
+    }
+
+    #[tokio::test]
+    async fn update_issue_sends_state_reason_when_closing() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/repos/o/r/issues/42"))
+            .and(body_partial_json(
+                serde_json::json!({"state": "closed", "state_reason": "not_planned"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(issue_payload(42, "x", "y", "closed")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri());
+        provider
+            .update_remote(RemoteTaskUpdate {
+                canonical_repo: "github.com/o/r",
+                remote_id: "42",
+                title: None,
+                body: None,
+                closed: Some(true),
+                state_reason: Some(RemoteStateReason::NotPlanned),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -282,16 +189,6 @@ mod tests {
             .fetch_remote("github.com/o/r", "99")
             .await
             .unwrap_err();
-        assert!(matches!(err, PortError::NotFound(_)));
-    }
-
-    #[test]
-    fn rejects_non_github_canonical() {
-        assert!(split_owner_repo("gitlab.com/o/r").is_err());
-        assert!(split_owner_repo("github.com/o").is_err());
-        assert_eq!(
-            split_owner_repo("github.com/o/r").unwrap(),
-            ("o".into(), "r".into())
-        );
+        assert!(matches!(err, ports::PortError::NotFound(_)));
     }
 }
