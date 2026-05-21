@@ -43,6 +43,15 @@ use tracing::{Instrument, error, info, info_span, warn};
 mod logging;
 pub use logging::{LogFormat, init_subscriber};
 
+/// Serde-serialised form of `domain_repo::LinkStatus::MissingPath` —
+/// the enum carries `#[serde(rename_all = "snake_case")]`, so the DTO
+/// surfaces it as this literal. Defined once here so a future rename of
+/// the enum (or a casing change on the serde rename) doesn't silently
+/// disable the grace-prune match. The daemon's unit tests round-trip a
+/// real binding through the DTO mapping, so drift between this constant
+/// and the actual serialised form fails the test suite on the next run.
+const STATUS_MISSING_PATH: &str = "missing_path";
+
 #[derive(Parser, Debug)]
 #[command(name = "repo-link-daemon", version, about = "Background reconciler for repo-link")]
 pub struct Args {
@@ -116,17 +125,17 @@ pub async fn run_cli() -> anyhow::Result<()> {
         SyncService::new(tasks_repo.clone(), bindings_repo, provider)
     });
 
-    // `with_missing_grace_ticks` coerces values below 1 up to 1. Bind the
-    // post-coercion value once so the startup log reflects the daemon's
-    // effective behaviour rather than the raw CLI/env input.
-    let effective_grace_ticks = args.missing_grace_ticks.max(1);
     let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
         .with_prune(args.prune)
-        .with_missing_grace_ticks(effective_grace_ticks);
+        .with_missing_grace_ticks(args.missing_grace_ticks);
+    // Read the coerced value back from the daemon so a run with
+    // `REPO_LINK_MISSING_GRACE_TICKS=0` logs the effective `1` rather
+    // than the raw input. Single source of truth lives in
+    // `with_missing_grace_ticks`.
     info!(
         interval_secs = args.interval_secs,
         prune = args.prune,
-        missing_grace_ticks = effective_grace_ticks,
+        missing_grace_ticks = daemon.missing_grace_ticks(),
         db = %cfg.database_path.display(),
         log_format = ?args.log_format,
         "daemon starting"
@@ -192,10 +201,20 @@ impl Daemon {
 
     /// How many consecutive missed probes must elapse before `--prune`
     /// actually unlinks a `MissingPath` worktree. Values below 1 are coerced
-    /// to 1 (legacy "prune on first miss" behaviour).
+    /// to 1 (legacy "prune on first miss" behaviour). This builder is the
+    /// canonical enforcement point for that floor — callers should not
+    /// pre-coerce, they should pass the raw CLI/env value through.
     pub fn with_missing_grace_ticks(mut self, n: u32) -> Self {
         self.missing_grace_ticks = n.max(1);
         self
+    }
+
+    /// Effective grace threshold after coercion. Exposed so the startup
+    /// log (or future diagnostics) can surface the actual behaviour
+    /// instead of recomputing `args.missing_grace_ticks.max(1)` at the
+    /// call site.
+    pub fn missing_grace_ticks(&self) -> u32 {
+        self.missing_grace_ticks
     }
 
     /// One full reconcile + push pass. Returns counts so callers can log
@@ -338,7 +357,7 @@ impl Daemon {
                 .map_err(|e: domain_core::IdParseError| DaemonError::Binding(e.to_string()))?;
 
             for wt in &b.worktrees {
-                if wt.status != "missing_path" {
+                if wt.status != STATUS_MISSING_PATH {
                     continue;
                 }
                 let path = PathBuf::from(&wt.path);
@@ -619,6 +638,16 @@ mod tests {
         }
     }
 
+    /// Build a daemon with one workspace + one binding linked to each path
+    /// in `link_paths`. The probe parameter controls which paths report as
+    /// present.
+    ///
+    /// IMPORTANT — the returned daemon has `prune` defaulted to `false` and
+    /// `missing_grace_ticks = 3`. Tests that exercise the grace pass MUST
+    /// chain `.with_prune(true)` (and usually `.with_missing_grace_ticks(N)`
+    /// for the threshold under test). Forgetting `with_prune(true)` will
+    /// silently produce `pruned = 0` and a counter map that stays empty,
+    /// because `apply_grace_prune` is gated on `self.prune`.
     async fn seeded_grace_setup(
         probe: Arc<MutableProbe>,
         link_paths: &[&str],
@@ -653,7 +682,7 @@ mod tests {
     async fn grace_counter_defers_prune_until_threshold() {
         let probe = Arc::new(MutableProbe::new());
         // /tmp/gone is absent from the probe → marked missing on tick 1.
-        let (daemon, bind_repo, _bid) =
+        let (daemon, bind_repo, bid) =
             seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
         let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
 
@@ -675,7 +704,7 @@ mod tests {
         assert!(daemon.miss_counts.lock().unwrap().is_empty());
 
         // Verify the worktree is actually gone from the binding.
-        let after = bind_repo.get(_bid).await.unwrap();
+        let after = bind_repo.get(bid).await.unwrap();
         assert_eq!(after.worktrees.len(), 0);
     }
 
