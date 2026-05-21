@@ -35,12 +35,14 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, name, aliases, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 remote_url = excluded.remote_url,
                 canonical_url = excluded.canonical_url,
                 tracked_branch = excluded.tracked_branch,
+                name = excluded.name,
+                aliases = excluded.aliases,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -49,6 +51,8 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         .bind(&b.remote_url)
         .bind(&b.canonical_url)
         .bind(b.tracked_branch.as_deref())
+        .bind(&b.name)
+        .bind(serde_json::to_string(&b.aliases).unwrap_or_else(|_| "[]".to_string()))
         .bind(b.created_at.into_inner())
         .bind(b.updated_at.into_inner())
         .execute(&mut *tx)
@@ -146,6 +150,14 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
     let remote_url: String = row.try_get("remote_url").map_err(map_sqlx_err)?;
     let canonical_url: String = row.try_get("canonical_url").map_err(map_sqlx_err)?;
     let tracked_branch: Option<String> = row.try_get("tracked_branch").map_err(map_sqlx_err)?;
+    let name_raw: String = row.try_get("name").map_err(map_sqlx_err)?;
+    let name = if name_raw.is_empty() {
+        domain_repo::derive_name(&canonical_url)
+    } else {
+        name_raw
+    };
+    let aliases_json: String = row.try_get("aliases").map_err(map_sqlx_err)?;
+    let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
 
@@ -155,6 +167,8 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
         remote_url,
         canonical_url,
         tracked_branch,
+        name,
+        aliases,
         worktrees: Vec::new(),
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),

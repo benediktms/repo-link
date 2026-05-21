@@ -6,6 +6,7 @@ use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
+    backfill_empty_repo_names,
 };
 use ports::{RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
 use tempfile::TempDir;
@@ -242,6 +243,70 @@ async fn concurrent_reads_during_active_write() {
     assert_eq!(read, "scratch");
 
     tx.commit().await.unwrap();
+}
+
+// ---------------- Phase B: backfill helper ----------------------------------
+
+#[tokio::test]
+async fn backfill_derives_name_for_empty_rows() {
+    let (_dir, db, ws, _rb, _ts) = setup_with_db().await;
+
+    // Seed a workspace so the FK constraint on repos is satisfied.
+    let w = Workspace::new(WorkspaceName::new("bf-ws").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Insert a repos row with name = '' directly, bypassing the repository
+    // layer to simulate a row that predates the name column.
+    sqlx::query(
+        "INSERT INTO repos (id, workspace_id, remote_url, canonical_url, name, aliases, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, '', '[]', datetime('now'), datetime('now'))",
+    )
+    .bind("aaaaaaaa-0000-0000-0000-000000000001")
+    .bind(w.id.to_string())
+    .bind("git@github.com:org/myrepo.git")
+    .bind("github.com/org/myrepo")
+    .execute(&db.writes)
+    .await
+    .unwrap();
+
+    // Run the backfill — should derive "myrepo" from the canonical URL.
+    backfill_empty_repo_names(&db.writes).await.unwrap();
+
+    let (name,): (String,) =
+        sqlx::query_as("SELECT name FROM repos WHERE id = ?")
+            .bind("aaaaaaaa-0000-0000-0000-000000000001")
+            .fetch_one(&db.reads)
+            .await
+            .unwrap();
+
+    assert_eq!(name, "myrepo");
+}
+
+#[tokio::test]
+async fn backfill_is_idempotent_on_populated_rows() {
+    let (_dir, db, ws, rb, _ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("bf-ws2").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let binding = RepoBinding::new(
+        w.id,
+        "git@github.com:org/proj.git".into(),
+        "github.com/org/proj".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    // Running backfill again should be a no-op and not error.
+    backfill_empty_repo_names(&db.writes).await.unwrap();
+
+    let (name,): (String,) =
+        sqlx::query_as("SELECT name FROM repos WHERE id = ?")
+            .bind(binding.id.to_string())
+            .fetch_one(&db.reads)
+            .await
+            .unwrap();
+
+    assert_eq!(name, "proj");
 }
 
 #[tokio::test]
