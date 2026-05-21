@@ -60,6 +60,40 @@ pub struct AttachRepoCmd {
     pub remote_url: String,
     pub canonical_url: String,
     pub tracked_branch: Option<String>,
+    /// Optional checkout path to register as a worktree on the binding.
+    /// The CLI is responsible for verifying that the path's git origin
+    /// canonicalises to `canonical_url`; the service trusts what it's
+    /// handed and just records the link.
+    pub link_path: Option<String>,
+    pub link_branch: Option<String>,
+}
+
+/// Returned by `attach`: carries the resulting binding plus whether the
+/// call merged into an existing one (same `canonical_url`) and which
+/// path, if any, was newly linked. Lets agents distinguish "I created"
+/// from "I joined" without comparing IDs out-of-band.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoAttachOutcomeDto {
+    pub binding: RepoBindingDto,
+    pub merged: bool,
+    pub worktree_added: Option<String>,
+}
+
+/// One matching binding for a `repo locate` query.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocateMatchDto {
+    pub workspace_id: String,
+    pub binding: RepoBindingDto,
+}
+
+/// Full result of a `repo locate` lookup. `canonical_url` is `None` when
+/// the queried path isn't a git repo with an origin remote; `matches` is
+/// empty when no binding references the discovered remote.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocateResponseDto {
+    pub query_path: String,
+    pub canonical_url: Option<String>,
+    pub matches: Vec<LocateMatchDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

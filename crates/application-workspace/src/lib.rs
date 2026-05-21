@@ -7,8 +7,8 @@ use domain_core::{IdParseError, RepoId, WorkspaceId};
 use domain_repo::RepoBinding;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{
-    AttachRepoCmd, CreateWorkspaceCmd, LinkWorktreeCmd, ListWorkspacesQuery, RepoBindingDto,
-    UnlinkWorktreeCmd, WorkspaceDto, WorktreeLinkDto,
+    AttachRepoCmd, CreateWorkspaceCmd, LinkWorktreeCmd, ListWorkspacesQuery, RepoAttachOutcomeDto,
+    RepoBindingDto, UnlinkWorktreeCmd, WorkspaceDto, WorktreeLinkDto,
 };
 use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
@@ -22,8 +22,6 @@ pub enum ServiceError {
     Domain(#[from] domain_core::DomainError),
     #[error("workspace name already in use: {0}")]
     DuplicateName(String),
-    #[error("repo already attached: {0}")]
-    DuplicateRepo(String),
     #[error("invalid id: {0}")]
     BadId(String),
 }
@@ -110,22 +108,45 @@ impl RepoBindingService {
         }
     }
 
-    pub async fn attach(&self, cmd: AttachRepoCmd) -> Result<RepoBindingDto> {
+    /// Idempotent: if a binding for `canonical_url` already exists in the
+    /// workspace, mutate that one and report `merged: true`. Otherwise
+    /// create a fresh binding. In either case, when `link_path` is set we
+    /// register it as a worktree on the resulting binding before saving.
+    ///
+    /// The service does NOT verify that `link_path` actually corresponds
+    /// to a checkout of `canonical_url`; that's the CLI's responsibility
+    /// (so tests and programmatic callers can wire whatever they like
+    /// without git running).
+    pub async fn attach(&self, cmd: AttachRepoCmd) -> Result<RepoAttachOutcomeDto> {
         let workspace_id: WorkspaceId = cmd.workspace_id.parse()?;
         // Confirm the workspace exists; bubbles up as PortError::NotFound otherwise.
         let _ = self.workspaces.get(workspace_id).await?;
-        if self
+
+        let (mut binding, merged) = match self
             .bindings
             .find_by_canonical_url(workspace_id, &cmd.canonical_url)
             .await?
-            .is_some()
         {
-            return Err(ServiceError::DuplicateRepo(cmd.canonical_url));
-        }
-        let mut binding = RepoBinding::new(workspace_id, cmd.remote_url, cmd.canonical_url)?;
-        binding.tracked_branch = cmd.tracked_branch;
+            Some(existing) => (existing, true),
+            None => {
+                let mut b =
+                    RepoBinding::new(workspace_id, cmd.remote_url, cmd.canonical_url)?;
+                b.tracked_branch = cmd.tracked_branch;
+                (b, false)
+            }
+        };
+
+        let worktree_added = cmd.link_path.map(|path| {
+            binding.link_worktree(PathBuf::from(&path), cmd.link_branch);
+            path
+        });
+
         self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        Ok(RepoAttachOutcomeDto {
+            binding: binding_to_dto(&binding),
+            merged,
+            worktree_added,
+        })
     }
 
     pub async fn detach(&self, id: &str) -> Result<()> {
@@ -354,6 +375,8 @@ mod tests {
                 remote_url: "git@github.com:o/r.git".into(),
                 canonical_url: "github.com/o/r".into(),
                 tracked_branch: None,
+                link_path: None,
+                link_branch: None,
             })
             .await
             .unwrap_err();
@@ -377,12 +400,16 @@ mod tests {
                 remote_url: "git@github.com:o/r.git".into(),
                 canonical_url: "github.com/o/r".into(),
                 tracked_branch: Some("main".into()),
+                link_path: None,
+                link_branch: None,
             })
             .await
             .unwrap();
+        assert!(!b.merged);
+        assert!(b.worktree_added.is_none());
         let linked = bsvc
             .link_worktree(LinkWorktreeCmd {
-                repo_id: b.id.clone(),
+                repo_id: b.binding.id.clone(),
                 path: "/tmp/repo".into(),
                 branch: Some("main".into()),
             })
@@ -410,18 +437,20 @@ mod tests {
                 remote_url: "git@github.com:o/r.git".into(),
                 canonical_url: "github.com/o/r".into(),
                 tracked_branch: None,
+                link_path: None,
+                link_branch: None,
             })
             .await
             .unwrap();
         bsvc.link_worktree(LinkWorktreeCmd {
-            repo_id: b.id.clone(),
+            repo_id: b.binding.id.clone(),
             path: "/tmp/alive".into(),
             branch: None,
         })
         .await
         .unwrap();
         bsvc.link_worktree(LinkWorktreeCmd {
-            repo_id: b.id.clone(),
+            repo_id: b.binding.id.clone(),
             path: "/tmp/gone".into(),
             branch: None,
         })
@@ -450,7 +479,7 @@ mod tests {
         assert_eq!(summary2.marked_missing, 0);
         assert_eq!(summary2.pruned, 1);
 
-        let after = bsvc.show(&b.id).await.unwrap();
+        let after = bsvc.show(&b.binding.id).await.unwrap();
         assert_eq!(after.worktrees.len(), 1);
         assert_eq!(after.worktrees[0].path, "/tmp/alive");
     }
@@ -469,7 +498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_canonical_url_rejected() {
+    async fn attach_with_existing_canonical_merges() {
         let (ws_svc, bsvc) = setup();
         let ws = ws_svc
             .create(CreateWorkspaceCmd {
@@ -484,9 +513,86 @@ mod tests {
             remote_url: "git@github.com:o/r.git".into(),
             canonical_url: "github.com/o/r".into(),
             tracked_branch: None,
+            link_path: None,
+            link_branch: None,
         };
-        bsvc.attach(cmd.clone()).await.unwrap();
-        let err = bsvc.attach(cmd).await.unwrap_err();
-        assert!(matches!(err, ServiceError::DuplicateRepo(_)));
+        let first = bsvc.attach(cmd.clone()).await.unwrap();
+        assert!(!first.merged);
+        let second = bsvc.attach(cmd).await.unwrap();
+        assert!(second.merged);
+        assert_eq!(second.binding.id, first.binding.id);
+    }
+
+    #[tokio::test]
+    async fn attach_merges_when_canonical_exists() {
+        let (ws_svc, bsvc) = setup();
+        let ws = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: "w2".into(),
+                description: None,
+                local_only: true,
+            })
+            .await
+            .unwrap();
+        let first = bsvc
+            .attach(AttachRepoCmd {
+                workspace_id: ws.id.clone(),
+                remote_url: "git@github.com:o/r.git".into(),
+                canonical_url: "github.com/o/r".into(),
+                tracked_branch: None,
+                link_path: None,
+                link_branch: None,
+            })
+            .await
+            .unwrap();
+        assert!(!first.merged);
+        assert!(first.worktree_added.is_none());
+        assert_eq!(first.binding.worktrees.len(), 0);
+
+        let second = bsvc
+            .attach(AttachRepoCmd {
+                workspace_id: ws.id.clone(),
+                remote_url: "git@github.com:o/r.git".into(),
+                canonical_url: "github.com/o/r".into(),
+                tracked_branch: None,
+                link_path: Some("/tmp/second".into()),
+                link_branch: None,
+            })
+            .await
+            .unwrap();
+        assert!(second.merged);
+        assert_eq!(second.worktree_added, Some("/tmp/second".into()));
+        assert_eq!(second.binding.id, first.binding.id);
+        assert_eq!(second.binding.worktrees.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attach_links_worktree_when_link_path_given() {
+        let (ws_svc, bsvc) = setup();
+        let ws = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: "w3".into(),
+                description: None,
+                local_only: true,
+            })
+            .await
+            .unwrap();
+        let outcome = bsvc
+            .attach(AttachRepoCmd {
+                workspace_id: ws.id.clone(),
+                remote_url: "git@github.com:o/r.git".into(),
+                canonical_url: "github.com/o/r".into(),
+                tracked_branch: None,
+                link_path: Some("/tmp/checkout".into()),
+                link_branch: Some("main".into()),
+            })
+            .await
+            .unwrap();
+        assert!(!outcome.merged);
+        assert_eq!(outcome.worktree_added, Some("/tmp/checkout".into()));
+        assert_eq!(outcome.binding.worktrees.len(), 1);
+        assert_eq!(outcome.binding.worktrees[0].path, "/tmp/checkout");
+        assert_eq!(outcome.binding.worktrees[0].branch, Some("main".into()));
+        assert_eq!(outcome.binding.worktrees[0].status, "linked");
     }
 }
