@@ -1,23 +1,34 @@
 //! repo-link-daemon — background reconciliation + sync loop.
 //!
 //! One periodic tick performs, for each non-archived workspace:
-//! 1. `RepoBindingService::reconcile_worktrees` — fold any vanished
-//!    worktrees into the binding status (optionally prune).
-//! 2. If a `SyncService` is configured, push every task that is in
+//! 1. `RepoBindingService::reconcile_worktrees` (mark-only) — fold any
+//!    vanished worktrees into the binding status by flipping them to
+//!    `MissingPath`. Never prunes from this call.
+//! 2. Grace-counter pass (only when `--prune` is set) — re-probe each
+//!    `MissingPath` worktree, bump a process-local counter while it stays
+//!    missing, and drop the link once the counter hits
+//!    `missing_grace_ticks` (default 3) consecutive misses. The counter
+//!    resets if the path is observable again, so a transient unmount
+//!    won't trigger a prune. Counts are NOT persisted across daemon
+//!    restarts — restart resets to zero, which is the safer direction.
+//! 3. If a `SyncService` is configured, push every task that is in
 //!    `DirtyLocal` state. (Pull-side reconciliation is opt-in to keep the
 //!    daemon from hammering the GitHub API; trigger it via `rl sync pull`.)
 //!
 //! The runtime is `tokio` with a single ticker + a ctrl-c watcher. The loop
 //! is fully testable via `Daemon::tick_once`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use application_sync::SyncService;
 use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::Parser;
+use domain_core::RepoId;
 use domain_task::SyncState;
+use dto_shared::UnlinkWorktreeCmd;
 use infra_config::RepoLinkConfig;
 use infra_filesystem::TokioFilesystemProbe;
 use infra_github::GithubTaskProvider;
@@ -39,7 +50,10 @@ pub struct Args {
     #[arg(long, default_value_t = 60, env = "REPO_LINK_INTERVAL_SECS")]
     pub interval_secs: u64,
 
-    /// When set, the daemon prunes worktree entries it just marked missing.
+    /// When set, the daemon drops worktree entries whose paths have stayed
+    /// missing across `--missing-grace-ticks` consecutive ticks (default 3).
+    /// Without this flag, missing paths are marked `MissingPath` on the
+    /// binding but never removed.
     #[arg(long)]
     pub prune: bool,
 
@@ -52,6 +66,15 @@ pub struct Args {
     /// `daemon.log` next to the database for use under launchd/systemd.
     #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
     pub log_format: LogFormat,
+
+    /// Number of consecutive ticks a worktree path must be missing before
+    /// `--prune` actually drops it. Wall-clock grace =
+    /// `--interval-secs × --missing-grace-ticks` (defaults: 60s × 3 = 3
+    /// minutes). The counter is process-local — restarting the daemon
+    /// resets it to zero, so short-lived runs cannot trigger a
+    /// grace-protected prune.
+    #[arg(long, default_value_t = 3, env = "REPO_LINK_MISSING_GRACE_TICKS")]
+    pub missing_grace_ticks: u32,
 }
 
 /// Library entrypoint shared by both `repo-link-daemon` and `rld` bin shims.
@@ -93,10 +116,13 @@ pub async fn run_cli() -> anyhow::Result<()> {
         SyncService::new(tasks_repo.clone(), bindings_repo, provider)
     });
 
-    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync).with_prune(args.prune);
+    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
+        .with_prune(args.prune)
+        .with_missing_grace_ticks(args.missing_grace_ticks);
     info!(
         interval_secs = args.interval_secs,
         prune = args.prune,
+        missing_grace_ticks = args.missing_grace_ticks,
         db = %cfg.database_path.display(),
         log_format = ?args.log_format,
         "daemon starting"
@@ -124,6 +150,12 @@ pub struct Daemon {
     probe: Arc<dyn FilesystemProbe>,
     sync: Option<SyncService>,
     prune: bool,
+    missing_grace_ticks: u32,
+    // Process-local grace counter. Keyed on (repo binding id, worktree path);
+    // increments while a path is observed missing this tick, resets to zero
+    // (entry removed) when the path returns. No persistence — daemon restart
+    // forgets all counts, which is the safer direction.
+    miss_counts: Mutex<HashMap<(RepoId, PathBuf), u32>>,
 }
 
 impl Daemon {
@@ -141,12 +173,24 @@ impl Daemon {
             probe,
             sync,
             prune: false,
+            missing_grace_ticks: 3,
+            miss_counts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// When true, reconcile passes also drop entries marked `MissingPath`.
+    /// When true, reconcile passes also drop entries marked `MissingPath` —
+    /// but only after they've been observed missing for
+    /// `missing_grace_ticks` consecutive ticks.
     pub fn with_prune(mut self, prune: bool) -> Self {
         self.prune = prune;
+        self
+    }
+
+    /// How many consecutive missed probes must elapse before `--prune`
+    /// actually unlinks a `MissingPath` worktree. Values below 1 are coerced
+    /// to 1 (legacy "prune on first miss" behaviour).
+    pub fn with_missing_grace_ticks(mut self, n: u32) -> Self {
+        self.missing_grace_ticks = n.max(1);
         self
     }
 
@@ -166,20 +210,31 @@ impl Daemon {
             // under it for json-grep-by-trace-id and `RUST_LOG=…` filtering.
             async {
                 report.workspaces += 1;
+                // Reconcile always runs in mark-only mode now. Pruning is
+                // gated by the grace counter below so transient unmounts
+                // don't nuke a worktree on the first missed tick.
                 let summary = self
                     .bindings
-                    .reconcile_worktrees(&ws.id, self.probe.as_ref(), self.prune)
+                    .reconcile_worktrees(&ws.id, self.probe.as_ref(), false)
                     .await
                     .map_err(|e| DaemonError::Binding(e.to_string()))?;
                 report.repos_checked += summary.repos_checked;
                 report.worktrees_checked += summary.worktrees_checked;
                 report.marked_missing += summary.marked_missing;
-                report.pruned += summary.pruned;
+
+                let pruned_this_workspace = if self.prune {
+                    let pruned = self.apply_grace_prune(&ws.id).await?;
+                    report.pruned += pruned;
+                    pruned
+                } else {
+                    0
+                };
+
                 info!(
                     repos_checked = summary.repos_checked,
                     worktrees_checked = summary.worktrees_checked,
                     marked_missing = summary.marked_missing,
-                    pruned = summary.pruned,
+                    pruned = pruned_this_workspace,
                     "reconcile complete"
                 );
 
@@ -217,6 +272,95 @@ impl Daemon {
         }
 
         Ok(report)
+    }
+
+    /// Grace-counter pass. For each binding in the workspace, re-probe every
+    /// worktree currently in `MissingPath` status:
+    /// - If the path is still missing this tick, bump the counter. When it
+    ///   reaches `missing_grace_ticks`, drop the worktree via
+    ///   `unlink_worktree` and forget the counter entry.
+    /// - If the path is observable again, drop the counter entry (consecutive
+    ///   misses, not cumulative). We deliberately don't transition the link
+    ///   status back to `Linked` here — that's the domain's job on an
+    ///   explicit re-link, and conflating recovery with the prune janitor
+    ///   would expand this phase's scope.
+    /// - At the end, garbage-collect any counter entries whose `(RepoId,
+    ///   PathBuf)` no longer corresponds to a `MissingPath` worktree (binding
+    ///   deleted, user manually unlinked, etc.).
+    ///
+    /// Returns the number of paths pruned this tick.
+    async fn apply_grace_prune(&self, workspace_id: &str) -> Result<usize, DaemonError> {
+        let bindings = self
+            .bindings
+            .list(workspace_id)
+            .await
+            .map_err(|e| DaemonError::Binding(e.to_string()))?;
+
+        let mut still_valid: HashSet<(RepoId, PathBuf)> = HashSet::new();
+        let mut pruned = 0usize;
+
+        for b in &bindings {
+            let repo_id: RepoId = b
+                .id
+                .parse()
+                .map_err(|e: domain_core::IdParseError| DaemonError::Binding(e.to_string()))?;
+
+            for wt in &b.worktrees {
+                if wt.status != "missing_path" {
+                    continue;
+                }
+                let path = PathBuf::from(&wt.path);
+                let key = (repo_id, path.clone());
+
+                let observed_missing = !self.probe.path_exists(&path).await?;
+
+                let new_count = {
+                    let mut counts = self.miss_counts.lock().unwrap();
+                    if observed_missing {
+                        let entry = counts.entry(key.clone()).or_insert(0);
+                        *entry = entry.saturating_add(1);
+                        still_valid.insert(key.clone());
+                        *entry
+                    } else {
+                        counts.remove(&key);
+                        0
+                    }
+                };
+
+                if new_count == 0 {
+                    continue;
+                }
+                if new_count >= self.missing_grace_ticks {
+                    self.bindings
+                        .unlink_worktree(UnlinkWorktreeCmd {
+                            repo_id: b.id.clone(),
+                            path: wt.path.clone(),
+                        })
+                        .await
+                        .map_err(|e| DaemonError::Binding(e.to_string()))?;
+                    self.miss_counts.lock().unwrap().remove(&key);
+                    still_valid.remove(&key);
+                    pruned += 1;
+                } else {
+                    warn!(
+                        path = %wt.path,
+                        consecutive = new_count,
+                        threshold = self.missing_grace_ticks,
+                        "deferring prune"
+                    );
+                }
+            }
+        }
+
+        // Drop counter entries that no longer correspond to any MissingPath
+        // worktree this tick. Without this, a binding deleted out from under
+        // us would leave a permanent ghost in the map.
+        self.miss_counts
+            .lock()
+            .unwrap()
+            .retain(|k, _| still_valid.contains(k));
+
+        Ok(pruned)
     }
 
     /// Drive `tick_once` on a fixed interval until ctrl-c.
@@ -416,5 +560,184 @@ mod tests {
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.workspaces, 1);
         assert_eq!(report.pushed, 0);
+    }
+
+    // ---- Phase C: grace counter ------------------------------------------
+
+    // Mutable probe local to these tests so we can flip path presence between
+    // ticks for the "path returns" case. Kept here (rather than extended onto
+    // `StubFilesystemProbe`) to honour the plan's "touches app-daemon only"
+    // constraint.
+    #[derive(Default)]
+    struct MutableProbe {
+        present: Mutex<HashSet<PathBuf>>,
+    }
+
+    impl MutableProbe {
+        fn new() -> Self {
+            Self::default()
+        }
+        fn add(&self, path: impl Into<PathBuf>) {
+            self.present.lock().unwrap().insert(path.into());
+        }
+        fn remove(&self, path: impl AsRef<std::path::Path>) {
+            self.present.lock().unwrap().remove(path.as_ref());
+        }
+    }
+
+    #[async_trait]
+    impl FilesystemProbe for MutableProbe {
+        async fn path_exists(&self, path: &std::path::Path) -> ports::PortResult<bool> {
+            Ok(self.present.lock().unwrap().contains(path))
+        }
+        async fn is_git_worktree(&self, _path: &std::path::Path) -> ports::PortResult<bool> {
+            Ok(false)
+        }
+    }
+
+    async fn seeded_grace_setup(
+        probe: Arc<MutableProbe>,
+        link_paths: &[&str],
+    ) -> (Daemon, Arc<InMemoryRepoBindingRepository>, RepoId) {
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+
+        let mut binding = RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        for p in link_paths {
+            binding.link_worktree(PathBuf::from(p), None);
+        }
+        let binding_id = binding.id;
+        bind_repo.save(&binding).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
+        let probe_dyn: Arc<dyn FilesystemProbe> = probe;
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None);
+        (daemon, bind_repo, binding_id)
+    }
+
+    #[tokio::test]
+    async fn grace_counter_defers_prune_until_threshold() {
+        let probe = Arc::new(MutableProbe::new());
+        // /tmp/gone is absent from the probe → marked missing on tick 1.
+        let (daemon, bind_repo, _bid) =
+            seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
+        let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
+
+        // Tick 1: marks missing + counter=1, no prune.
+        let r1 = daemon.tick_once().await.unwrap();
+        assert_eq!(r1.marked_missing, 1);
+        assert_eq!(r1.pruned, 0);
+        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+
+        // Tick 2: counter=2, still defers.
+        let r2 = daemon.tick_once().await.unwrap();
+        assert_eq!(r2.marked_missing, 0);
+        assert_eq!(r2.pruned, 0);
+        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 2);
+
+        // Tick 3: counter hits 3 → prune fires, entry GC'd.
+        let r3 = daemon.tick_once().await.unwrap();
+        assert_eq!(r3.pruned, 1);
+        assert!(daemon.miss_counts.lock().unwrap().is_empty());
+
+        // Verify the worktree is actually gone from the binding.
+        let after = bind_repo.get(_bid).await.unwrap();
+        assert_eq!(after.worktrees.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn grace_counter_resets_when_path_returns() {
+        let probe = Arc::new(MutableProbe::new());
+        let (daemon, _bind_repo, _bid) =
+            seeded_grace_setup(probe.clone(), &["/tmp/flicker"]).await;
+        let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
+
+        // Tick 1: missing → counter=1.
+        let r1 = daemon.tick_once().await.unwrap();
+        assert_eq!(r1.marked_missing, 1);
+        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+
+        // Path returns before tick 2. Counter resets.
+        probe.add("/tmp/flicker");
+        let r2 = daemon.tick_once().await.unwrap();
+        assert_eq!(r2.pruned, 0);
+        assert!(
+            daemon.miss_counts.lock().unwrap().is_empty(),
+            "counter must be empty after path returns"
+        );
+
+        // Path vanishes again — counter restarts at 1, not at 2.
+        probe.remove("/tmp/flicker");
+        let r3 = daemon.tick_once().await.unwrap();
+        assert_eq!(r3.pruned, 0);
+        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_disabled_skips_grace_pass() {
+        let probe = Arc::new(MutableProbe::new());
+        let (daemon, _bind_repo, _bid) =
+            seeded_grace_setup(probe.clone(), &["/tmp/a", "/tmp/b", "/tmp/c"]).await;
+        // prune=false (default); grace ticks irrelevant
+        let daemon = daemon.with_missing_grace_ticks(2);
+
+        for _ in 0..5 {
+            let r = daemon.tick_once().await.unwrap();
+            assert_eq!(r.pruned, 0);
+        }
+        // Counter is never touched when prune is off.
+        assert!(daemon.miss_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grace_ticks_one_is_legacy_behaviour() {
+        let probe = Arc::new(MutableProbe::new());
+        let (daemon, _bind_repo, _bid) =
+            seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
+        let daemon = daemon.with_prune(true).with_missing_grace_ticks(1);
+
+        // With threshold=1, first miss is enough to prune.
+        let r = daemon.tick_once().await.unwrap();
+        assert_eq!(r.marked_missing, 1);
+        assert_eq!(r.pruned, 1);
+        assert!(daemon.miss_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grace_counter_garbage_collects_orphan_entries() {
+        let probe = Arc::new(MutableProbe::new());
+        // Healthy worktree: present in probe, will never get marked missing.
+        probe.add("/tmp/healthy");
+        let (daemon, _bind_repo, _bid) =
+            seeded_grace_setup(probe.clone(), &["/tmp/healthy"]).await;
+        let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
+
+        // Pre-seed a ghost entry: a key that has no corresponding MissingPath
+        // worktree (e.g. a binding that was deleted externally).
+        let ghost_key = (RepoId::new(), PathBuf::from("/tmp/ghost"));
+        daemon
+            .miss_counts
+            .lock()
+            .unwrap()
+            .insert(ghost_key.clone(), 42);
+        assert_eq!(daemon.miss_counts.lock().unwrap().len(), 1);
+
+        // One tick — grace pass runs (prune=true), GCs the orphan.
+        let r = daemon.tick_once().await.unwrap();
+        assert_eq!(r.pruned, 0);
+        assert!(
+            !daemon.miss_counts.lock().unwrap().contains_key(&ghost_key),
+            "ghost entry should be GC'd"
+        );
     }
 }
