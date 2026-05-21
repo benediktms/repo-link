@@ -794,7 +794,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
                 .bindings
                 .link_worktree(LinkWorktreeCmd {
                     repo_id: repo,
-                    path,
+                    path: abs_path.display().to_string(),
                     branch,
                 })
                 .await?;
