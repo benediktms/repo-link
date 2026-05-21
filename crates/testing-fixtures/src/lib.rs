@@ -241,7 +241,7 @@ impl TaskRepository for InMemoryTaskRepository {
         let snaps = self.snapshots.lock().unwrap();
         task.synced_baseline = snaps
             .get(&id)
-            .and_then(|h| h.iter().filter(|s| s.source.is_baseline()).last().cloned());
+            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
         Ok(task)
     }
 
@@ -277,7 +277,7 @@ impl TaskRepository for InMemoryTaskRepository {
                 let mut task = t.clone();
                 task.synced_baseline = snaps
                     .get(&t.id)
-                    .and_then(|h| h.iter().filter(|s| s.source.is_baseline()).last().cloned());
+                    .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
                 task
             })
             .collect();

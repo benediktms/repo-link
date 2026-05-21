@@ -265,10 +265,18 @@ mod tests {
     use std::sync::Mutex;
     use testing_fixtures::{InMemoryRepoBindingRepository, InMemoryTaskRepository};
 
+    #[derive(Clone)]
+    struct RecordedUpdate {
+        remote_id: String,
+        body: Option<String>,
+        closed: Option<bool>,
+        state_reason: Option<RemoteStateReason>,
+    }
+
     #[derive(Default)]
     struct FakeProvider {
         last_create: Mutex<Option<String>>,
-        last_update: Mutex<Option<(String, Option<String>, Option<bool>, Option<RemoteStateReason>)>>,
+        last_update: Mutex<Option<RecordedUpdate>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
     }
 
@@ -300,8 +308,12 @@ mod tests {
             &self,
             cmd: RemoteTaskUpdate<'_>,
         ) -> PortResult<RemoteTaskSnapshot> {
-            *self.last_update.lock().unwrap() =
-                Some((cmd.remote_id.into(), cmd.body.map(str::to_owned), cmd.closed, cmd.state_reason));
+            *self.last_update.lock().unwrap() = Some(RecordedUpdate {
+                remote_id: cmd.remote_id.into(),
+                body: cmd.body.map(str::to_owned),
+                closed: cmd.closed,
+                state_reason: cmd.state_reason,
+            });
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
                 title: cmd.title.unwrap_or("").into(),
@@ -381,9 +393,9 @@ mod tests {
         let s = svc.push(&task.id.to_string()).await.unwrap();
         assert_eq!(s.previous_state, "dirty_local");
         assert_eq!(s.new_state, "synced");
-        let (rid, body, _, _) = provider.last_update.lock().unwrap().clone().unwrap();
-        assert_eq!(rid, "100");
-        assert_eq!(body.as_deref(), Some("revised"));
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.remote_id, "100");
+        assert_eq!(recorded.body.as_deref(), Some("revised"));
     }
 
     #[tokio::test]
@@ -425,10 +437,13 @@ mod tests {
         let s = svc.push(&task.id.to_string()).await.unwrap();
         assert_eq!(s.new_state, "synced");
 
-        let (rid, _, closed, state_reason) = provider.last_update.lock().unwrap().clone().unwrap();
-        assert_eq!(rid, "100");
-        assert_eq!(closed, Some(true));
-        assert!(matches!(state_reason, Some(RemoteStateReason::NotPlanned)));
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.remote_id, "100");
+        assert_eq!(recorded.closed, Some(true));
+        assert!(matches!(
+            recorded.state_reason,
+            Some(RemoteStateReason::NotPlanned)
+        ));
     }
 
     #[tokio::test]
