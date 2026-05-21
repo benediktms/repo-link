@@ -7,7 +7,9 @@ use application_query::{
 };
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
-use dto_shared::{RepoBindingDto, SyncSummaryDto, TaskDto, WorkspaceDto};
+use dto_shared::{
+    LocateResponseDto, RepoAttachOutcomeDto, RepoBindingDto, SyncSummaryDto, TaskDto, WorkspaceDto,
+};
 use serde::Serialize;
 
 fn print_json<T: Serialize>(value: &T) {
@@ -39,6 +41,14 @@ pub fn repos(rows: &[RepoBindingDto]) {
 
 pub fn discovered(rows: &[crate::DiscoveredRepo]) {
     print_json(&rows);
+}
+
+pub fn attach_outcome(dto: &RepoAttachOutcomeDto) {
+    print_json(dto);
+}
+
+pub fn locate(dto: &LocateResponseDto) {
+    print_json(dto);
 }
 
 // ---------- Task ---------------------------------------------------------

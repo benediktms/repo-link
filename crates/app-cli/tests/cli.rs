@@ -115,6 +115,21 @@ fn task_batch_lifecycle_commands_emit_per_task_results() {
     }
 }
 
+fn init_git_repo_with_origin(path: &std::path::Path, url: &str) {
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(path)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    let status = std::process::Command::new("git")
+        .args(["remote", "add", "origin", url])
+        .current_dir(path)
+        .status()
+        .expect("git remote add");
+    assert!(status.success());
+}
+
 #[test]
 fn repo_and_worktree_lifecycle() {
     let dir = TempDir::new().unwrap();
@@ -124,7 +139,13 @@ fn repo_and_worktree_lifecycle() {
     );
     let workspace = ws["id"].as_str().unwrap().to_string();
 
-    let repo = run_json(
+    // Create a temp git repo with the matching origin so the attach + link
+    // canonical checks pass.
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    let repo_path = repo_dir.path().display().to_string();
+
+    let outcome = run_json(
         &mut bin("repo-link", &dir),
         &[
             "repo",
@@ -137,10 +158,18 @@ fn repo_and_worktree_lifecycle() {
             "github.com/o/r",
             "--branch",
             "main",
+            "--path",
+            &repo_path,
         ],
     );
-    let repo_id = repo["id"].as_str().unwrap().to_string();
-    assert!(repo["worktrees"].as_array().unwrap().is_empty());
+    let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
+    // The attach linked the worktree (repo_path), so worktrees is non-empty.
+    assert!(!outcome["binding"]["worktrees"].as_array().unwrap().is_empty());
+
+    // Link a second worktree (different checkout of same origin).
+    let second_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(second_dir.path(), "git@github.com:o/r.git");
+    let second_path = second_dir.path().display().to_string();
 
     let linked = run_json(
         &mut bin("repo-link", &dir),
@@ -150,19 +179,23 @@ fn repo_and_worktree_lifecycle() {
             "--repo",
             &repo_id,
             "--path",
-            "/tmp/r",
+            &second_path,
             "--branch",
             "main",
         ],
     );
-    assert_eq!(linked["worktrees"].as_array().unwrap().len(), 1);
-    assert_eq!(linked["worktrees"][0]["status"], "linked");
+    assert_eq!(linked["worktrees"].as_array().unwrap().len(), 2);
+    assert!(linked["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|w| w["status"] == "linked"));
 
     let unlinked = run_json(
         &mut bin("repo-link", &dir),
-        &["worktree", "unlink", "--repo", &repo_id, "--path", "/tmp/r"],
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &second_path],
     );
-    assert!(unlinked["worktrees"].as_array().unwrap().is_empty());
+    assert_eq!(unlinked["worktrees"].as_array().unwrap().len(), 1);
 }
 
 #[test]
@@ -221,6 +254,8 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .as_str()
         .unwrap()
         .to_string();
+
+    // Attach with --no-link so we can control worktree registration below.
     let repo_id = run_json(
         &mut bin("repo-link", &dir),
         &[
@@ -232,15 +267,23 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
             "git@github.com:o/r.git",
             "--canonical",
             "github.com/o/r",
+            "--no-link",
         ],
-    )["id"]
+    )["binding"]["id"]
         .as_str()
         .unwrap()
         .to_string();
 
+    // alive_dir is a real git repo with the matching origin.
     let alive_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(alive_dir.path(), "git@github.com:o/r.git");
     let alive = alive_dir.path().display().to_string();
-    let gone = "/tmp/repo-link-never-exists-zzz".to_string();
+
+    // gone is a path that doesn't exist yet; create a git repo there first so
+    // the link canonical check passes, then the reconcile will see it missing.
+    let gone_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(gone_dir.path(), "git@github.com:o/r.git");
+    let gone = gone_dir.path().display().to_string();
 
     bin("repo-link", &dir)
         .args([
@@ -252,6 +295,9 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .args(["worktree", "link", "--repo", &repo_id, "--path", &gone])
         .assert()
         .success();
+
+    // Drop the gone_dir so the path disappears from the filesystem.
+    drop(gone_dir);
 
     let summary = run_json(
         &mut bin("repo-link", &dir),
