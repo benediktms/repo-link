@@ -635,8 +635,14 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 .unwrap_or_else(|_| candidate.clone());
             let query_path = abs.display().to_string();
 
+            // Only "not a git repo" (or "git repo with no origin") maps to
+            // null — those are legitimate no-matches. Any other error (git
+            // binary missing, I/O failure, permission denied) is a real
+            // problem worth surfacing so callers can distinguish broken
+            // tooling from an unmapped path.
             let canonical_url = match discover_canonical(&abs) {
-                Err(_) | Ok(None) => None,
+                Err(infra_git::GitError::NotARepo(_)) | Ok(None) => None,
+                Err(e) => return Err(anyhow!("{e}")),
                 Ok(Some(c)) => Some(c),
             };
 
