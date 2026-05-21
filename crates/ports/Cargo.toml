@@ -1,0 +1,17 @@
+[package]
+name = "ports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+domain-core = { workspace = true }
+domain-workspace = { workspace = true }
+domain-repo = { workspace = true }
+domain-task = { workspace = true }
+domain-sync = { workspace = true }
+dto-shared = { workspace = true }
+dto-events = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

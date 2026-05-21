@@ -1,0 +1,28 @@
+[package]
+name = "application-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+domain-core = { workspace = true }
+domain-task = { workspace = true }
+domain-sync = { workspace = true }
+domain-repo = { workspace = true }
+ports = { workspace = true }
+dto-shared = { workspace = true }
+dto-events = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+testing-fixtures = { workspace = true }
+domain-workspace = { workspace = true }
+domain-repo = { workspace = true }
+tokio = { workspace = true }
+pretty_assertions = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }

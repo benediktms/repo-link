@@ -1,0 +1,35 @@
+[package]
+name = "app-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+application-workspace = { workspace = true }
+application-task = { workspace = true }
+application-query = { workspace = true }
+application-sync = { workspace = true }
+infra-github = { workspace = true }
+dto-shared = { workspace = true }
+ports = { workspace = true }
+infra-sqlite = { workspace = true }
+infra-filesystem = { workspace = true }
+infra-git = { workspace = true }
+infra-config = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+comfy-table = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+tempfile = { workspace = true }
+pretty_assertions = { workspace = true }
+
+# `src/bin/repo-link.rs` and `src/bin/rl.rs` are auto-discovered.
+# Both are thin shims around `app_cli::run()` in `src/lib.rs`.

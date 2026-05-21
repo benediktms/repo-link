@@ -1,6 +1,76 @@
-[package]
-name = "repo-link"
+[workspace]
+resolver = "3"
+members = [
+    "crates/app-cli",
+    "crates/app-daemon",
+    "crates/domain-core",
+    "crates/domain-workspace",
+    "crates/domain-repo",
+    "crates/domain-task",
+    "crates/domain-sync",
+    "crates/application-workspace",
+    "crates/application-task",
+    "crates/application-sync",
+    "crates/application-query",
+    "crates/dto-shared",
+    "crates/dto-events",
+    "crates/infra-sqlite",
+    "crates/infra-github",
+    "crates/infra-git",
+    "crates/infra-filesystem",
+    "crates/infra-config",
+    "crates/ports",
+    "crates/testing-fixtures",
+    "crates/testing-integration",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates — wired by path so the workspace is self-contained.
+domain-core = { path = "crates/domain-core" }
+domain-workspace = { path = "crates/domain-workspace" }
+domain-repo = { path = "crates/domain-repo" }
+domain-task = { path = "crates/domain-task" }
+domain-sync = { path = "crates/domain-sync" }
+application-workspace = { path = "crates/application-workspace" }
+application-task = { path = "crates/application-task" }
+application-sync = { path = "crates/application-sync" }
+application-query = { path = "crates/application-query" }
+dto-shared = { path = "crates/dto-shared" }
+dto-events = { path = "crates/dto-events" }
+infra-sqlite = { path = "crates/infra-sqlite" }
+infra-github = { path = "crates/infra-github" }
+infra-git = { path = "crates/infra-git" }
+infra-filesystem = { path = "crates/infra-filesystem" }
+infra-config = { path = "crates/infra-config" }
+ports = { path = "crates/ports" }
+testing-fixtures = { path = "crates/testing-fixtures" }
+
+# Third-party — pinned here so every crate uses the same major.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+gix = { version = "0.66", default-features = false, features = ["max-performance-safe"] }
+notify = "6"
+walkdir = "2"
+figment = { version = "0.10", features = ["toml", "env"] }
+directories = "5"
+tempfile = "3"
+rstest = "0.23"
+pretty_assertions = "1"
+assert_cmd = "2"
+wiremock = "0.6"
