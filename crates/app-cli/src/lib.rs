@@ -11,7 +11,7 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::{Parser, Subcommand};
 use dto_shared::{
     AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, LinkWorktreeCmd,
-    ListTasksQuery, ListWorkspacesQuery, UnlinkWorktreeCmd,
+    ListTasksQuery, ListWorkspacesQuery, LocateMatchDto, LocateResponseDto, UnlinkWorktreeCmd,
 };
 use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
@@ -102,6 +102,26 @@ enum RepoCmd {
         canonical: String,
         #[arg(long)]
         branch: Option<String>,
+        /// Local checkout to register as a worktree of this binding.
+        /// Defaults to the current working directory. The path's git
+        /// origin must canonicalise to `--canonical`; otherwise the
+        /// command errors.
+        ///
+        /// When the same repo is cloned to multiple folders on disk
+        /// (separate `.git` dirs rather than `git worktree`-linked
+        /// checkouts), call `attach` once per path with `--path`;
+        /// each call merges into the same binding and accumulates
+        /// another worktree entry.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Skip auto-linking the current path. Use this when you're
+        /// sitting in one clone but don't want it recorded under this
+        /// binding — e.g. you have the same repo cloned twice and
+        /// only the *other* clone should be the tracked checkout.
+        /// Combine with `--path <other-clone>` (or follow up with
+        /// `rl worktree link`) to register the intended path instead.
+        #[arg(long)]
+        no_link: bool,
     },
     Detach {
         id: String,
@@ -118,6 +138,14 @@ enum RepoCmd {
     Discover {
         #[arg(long)]
         path: PathBuf,
+    },
+    /// Discover which repo binding (if any) owns the given path.
+    /// Reads the path's git origin, canonicalises it, and looks for a
+    /// matching binding across all non-archived workspaces.
+    Locate {
+        /// Path to probe. Defaults to current working directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
 }
 
@@ -560,17 +588,23 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             url,
             canonical,
             branch,
+            path,
+            no_link,
         } => {
-            let dto = svc
+            let link_path = resolve_attach_link_path(path.as_deref(), no_link, &canonical)?;
+
+            let outcome = svc
                 .bindings
                 .attach(AttachRepoCmd {
                     workspace_id: workspace,
                     remote_url: url,
                     canonical_url: canonical,
-                    tracked_branch: branch,
+                    tracked_branch: branch.clone(),
+                    link_path,
+                    link_branch: branch,
                 })
                 .await?;
-            render::repo(&dto);
+            render::attach_outcome(&outcome);
         }
         RepoCmd::Detach { id } => {
             svc.bindings.detach(&id).await?;
@@ -591,8 +625,149 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             }
             render::discovered(&rows);
         }
+        RepoCmd::Locate { path } => {
+            let candidate = match path {
+                Some(p) => p,
+                None => std::env::current_dir()
+                    .map_err(|e| anyhow!("failed to determine current directory: {e}"))?,
+            };
+            let abs = std::fs::canonicalize(&candidate)
+                .unwrap_or_else(|_| candidate.clone());
+            let query_path = abs.display().to_string();
+
+            let canonical_url = match discover_canonical(&abs) {
+                Err(_) | Ok(None) => None,
+                Ok(Some(c)) => Some(c),
+            };
+
+            let matches = if let Some(ref canonical) = canonical_url {
+                let workspaces = svc
+                    .workspaces
+                    .list(ListWorkspacesQuery::default())
+                    .await?;
+                let mut found: Vec<LocateMatchDto> = Vec::new();
+                for ws in &workspaces {
+                    let ws_id: domain_core::WorkspaceId = ws
+                        .id
+                        .parse()
+                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
+                    if let Some(binding) = svc
+                        .bindings_repo
+                        .find_by_canonical_url(ws_id, canonical)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        found.push(LocateMatchDto {
+                            workspace_id: ws.id.clone(),
+                            binding: application_workspace::binding_to_dto(&binding),
+                        });
+                    }
+                }
+                found
+            } else {
+                vec![]
+            };
+
+            render::locate(&LocateResponseDto {
+                query_path,
+                canonical_url,
+                matches,
+            });
+        }
     }
     Ok(())
+}
+
+/// Resolve the path that `repo attach` should register as a worktree.
+///
+/// Returns `Ok(None)` when the caller opted out via `--no-link`.
+/// Otherwise discovers the cwd (or the explicit `--path`), verifies its
+/// git origin canonicalises to `expected_canonical`, and returns the
+/// absolute path string. All failure modes bail with a CLI-friendly
+/// message that names the available escape hatches.
+fn resolve_attach_link_path(
+    path: Option<&std::path::Path>,
+    no_link: bool,
+    expected_canonical: &str,
+) -> Result<Option<String>> {
+    if no_link {
+        return Ok(None);
+    }
+
+    let explicit_path = path.is_some();
+    let candidate = match path {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|e| anyhow!("failed to determine current directory: {e}"))?,
+    };
+    let abs = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+
+    match discover_canonical(&abs) {
+        Err(infra_git::GitError::NotARepo(_)) if explicit_path => anyhow::bail!(
+            "path is not a git repo: {}; pass a different --path or --no-link",
+            abs.display()
+        ),
+        Err(infra_git::GitError::NotARepo(_)) => anyhow::bail!(
+            "cwd is not a git repo: {}; pass --path <p> or --no-link",
+            abs.display()
+        ),
+        Err(e) => return Err(anyhow!("{e}")),
+        Ok(None) => anyhow::bail!(
+            "git repo at {} has no `origin` remote; pass --path <p> or --no-link",
+            abs.display()
+        ),
+        Ok(Some(discovered)) if discovered != expected_canonical => anyhow::bail!(
+            "path origin canonicalises to '{discovered}', not '{expected_canonical}'; pass --path or --no-link"
+        ),
+        Ok(Some(_)) => Ok(Some(abs.display().to_string())),
+    }
+}
+
+/// Best-effort canonical form of `input` for looking up a stored worktree.
+///
+/// If `canonicalize` succeeds outright, use it. Otherwise walk up the path
+/// to the longest *existing* prefix, canonicalise that (so any symlinked
+/// component gets resolved), and rejoin the missing tail components. This
+/// makes `unlink` match `link`-stored entries even after the target leaf
+/// has been deleted, including the macOS `/var → /private/var` case.
+///
+/// Last-resort fallback: convert to absolute via cwd for relative inputs,
+/// or pass the raw string through if even that fails.
+fn canonicalize_for_lookup(input: &str) -> String {
+    let raw = PathBuf::from(input);
+
+    if let Ok(p) = std::fs::canonicalize(&raw) {
+        return p.display().to_string();
+    }
+
+    // Pop components until we find a prefix that canonicalises. The popped
+    // pieces get rejoined to that resolved prefix to reconstruct the full
+    // intended path.
+    let mut prefix = raw.clone();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(name) = prefix.file_name().map(|n| n.to_owned()) {
+        if !prefix.pop() || prefix.as_os_str().is_empty() {
+            break;
+        }
+        suffix.push(name);
+        if let Ok(canonical) = std::fs::canonicalize(&prefix) {
+            let mut result = canonical;
+            for piece in suffix.iter().rev() {
+                result.push(piece);
+            }
+            return result.display().to_string();
+        }
+    }
+
+    // Nothing in the path existed. For relative inputs, anchor to cwd so
+    // we at least produce an absolute string the service can compare.
+    if raw.is_absolute() {
+        raw.display().to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&raw).display().to_string())
+            .unwrap_or_else(|_| input.to_string())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -604,22 +779,85 @@ pub struct DiscoveredRepo {
 async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
     match cmd {
         WorktreeCmd::Link { repo, path, branch } => {
+            let raw_path = std::path::Path::new(&path);
+            let abs_path = std::fs::canonicalize(raw_path)
+                .unwrap_or_else(|_| raw_path.to_path_buf());
+
+            let discovered = match discover_canonical(&abs_path) {
+                Err(infra_git::GitError::NotARepo(_)) => {
+                    anyhow::bail!("path is not a git repo: {}", abs_path.display());
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+                Ok(None) => {
+                    anyhow::bail!(
+                        "git repo at {} has no `origin` remote",
+                        abs_path.display()
+                    );
+                }
+                Ok(Some(c)) => c,
+            };
+
+            let binding = svc.bindings.show(&repo).await?;
+            if discovered != binding.canonical_url {
+                // Try to find a matching binding across all workspaces.
+                let workspaces = svc
+                    .workspaces
+                    .list(ListWorkspacesQuery::default())
+                    .await?;
+                let mut found_id: Option<String> = None;
+                'outer: for ws in &workspaces {
+                    let ws_id: domain_core::WorkspaceId = ws
+                        .id
+                        .parse()
+                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
+                    if let Some(b) = svc
+                        .bindings_repo
+                        .find_by_canonical_url(ws_id, &discovered)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        found_id = Some(b.id.to_string());
+                        break 'outer;
+                    }
+                }
+                let repo_short = &repo;
+                if let Some(found) = found_id {
+                    anyhow::bail!(
+                        "path origin '{discovered}' doesn't match repo {repo_short} \
+                         ('{}'); use --repo {found} instead",
+                        binding.canonical_url
+                    );
+                } else {
+                    anyhow::bail!(
+                        "path origin '{discovered}' doesn't match repo \
+                         ('{}') and no binding matches '{discovered}'; \
+                         run `rl repo attach` first",
+                        binding.canonical_url
+                    );
+                }
+            }
+
             let dto = svc
                 .bindings
                 .link_worktree(LinkWorktreeCmd {
                     repo_id: repo,
-                    path,
+                    path: abs_path.display().to_string(),
                     branch,
                 })
                 .await?;
             render::repo(&dto);
         }
         WorktreeCmd::Unlink { repo, path } => {
+            // Mirror link's canonicalisation so identical --path input
+            // round-trips. When the leaf is gone we still try to resolve
+            // any symlinked prefix so e.g. macOS `/var/...` matches the
+            // stored `/private/var/...`.
+            let canonical_path = canonicalize_for_lookup(&path);
             let dto = svc
                 .bindings
                 .unlink_worktree(UnlinkWorktreeCmd {
                     repo_id: repo,
-                    path,
+                    path: canonical_path,
                 })
                 .await?;
             render::repo(&dto);

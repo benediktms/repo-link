@@ -115,6 +115,21 @@ fn task_batch_lifecycle_commands_emit_per_task_results() {
     }
 }
 
+fn init_git_repo_with_origin(path: &std::path::Path, url: &str) {
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(path)
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    let status = std::process::Command::new("git")
+        .args(["remote", "add", "origin", url])
+        .current_dir(path)
+        .status()
+        .expect("git remote add");
+    assert!(status.success());
+}
+
 #[test]
 fn repo_and_worktree_lifecycle() {
     let dir = TempDir::new().unwrap();
@@ -124,7 +139,13 @@ fn repo_and_worktree_lifecycle() {
     );
     let workspace = ws["id"].as_str().unwrap().to_string();
 
-    let repo = run_json(
+    // Create a temp git repo with the matching origin so the attach + link
+    // canonical checks pass.
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    let repo_path = repo_dir.path().display().to_string();
+
+    let outcome = run_json(
         &mut bin("repo-link", &dir),
         &[
             "repo",
@@ -137,10 +158,18 @@ fn repo_and_worktree_lifecycle() {
             "github.com/o/r",
             "--branch",
             "main",
+            "--path",
+            &repo_path,
         ],
     );
-    let repo_id = repo["id"].as_str().unwrap().to_string();
-    assert!(repo["worktrees"].as_array().unwrap().is_empty());
+    let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
+    // The attach linked the worktree (repo_path), so worktrees is non-empty.
+    assert!(!outcome["binding"]["worktrees"].as_array().unwrap().is_empty());
+
+    // Link a second worktree (different checkout of same origin).
+    let second_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(second_dir.path(), "git@github.com:o/r.git");
+    let second_path = second_dir.path().display().to_string();
 
     let linked = run_json(
         &mut bin("repo-link", &dir),
@@ -150,19 +179,154 @@ fn repo_and_worktree_lifecycle() {
             "--repo",
             &repo_id,
             "--path",
-            "/tmp/r",
+            &second_path,
             "--branch",
             "main",
         ],
     );
-    assert_eq!(linked["worktrees"].as_array().unwrap().len(), 1);
-    assert_eq!(linked["worktrees"][0]["status"], "linked");
+    assert_eq!(linked["worktrees"].as_array().unwrap().len(), 2);
+    assert!(linked["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|w| w["status"] == "linked"));
 
     let unlinked = run_json(
         &mut bin("repo-link", &dir),
-        &["worktree", "unlink", "--repo", &repo_id, "--path", "/tmp/r"],
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &second_path],
     );
-    assert!(unlinked["worktrees"].as_array().unwrap().is_empty());
+    assert_eq!(unlinked["worktrees"].as_array().unwrap().len(), 1);
+}
+
+/// Tombstone invariant: even when the linked path's *leaf* has been deleted
+/// (so `canonicalize` of the user's input fails), unlinking with the same
+/// input string must still find the stored entry — as long as a *prefix*
+/// of the input still exists and can resolve any symlinks. Specifically
+/// covers the case the reviewer's partial fix wouldn't catch: an absolute
+/// path with a symlinked parent (e.g. macOS `/var → /private/var`).
+#[cfg(unix)]
+#[test]
+fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Filesystem shape:
+    //   tmpdir/real_root/child/.git  (a real git repo with origin)
+    //   tmpdir/alias_root          -> real_root (symlink)
+    // User links via the symlinked path; CLI canonicalises and stores the
+    // real path. Then the leaf (`child`) is deleted, and unlink is called
+    // with the original symlinked input — canonicalize fails on the input
+    // (leaf gone) but the parent `alias_root` is still a live symlink.
+    let real_root = dir.path().join("real_root");
+    let child = real_root.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    init_git_repo_with_origin(&child, "git@github.com:o/r.git");
+
+    let alias_root = dir.path().join("alias_root");
+    symlink(&real_root, &alias_root).unwrap();
+
+    let user_path = alias_root.join("child").display().to_string();
+
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/r.git",
+            "--canonical", "github.com/o/r",
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Link via the symlinked input. Stored path should be the canonical form.
+    bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &repo_id, "--path", &user_path])
+        .assert()
+        .success();
+    let stored = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])
+        ["worktrees"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let expected_canonical = std::fs::canonicalize(&child).unwrap().display().to_string();
+    assert_eq!(stored, expected_canonical, "link should store canonical form");
+
+    // Delete the target so canonicalize(user_path) will fail.
+    std::fs::remove_dir_all(&child).unwrap();
+
+    // Unlink with the *same* user input. Must succeed.
+    let unlinked = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &user_path],
+    );
+    assert!(
+        unlinked["worktrees"].as_array().unwrap().is_empty(),
+        "unlink with same input as link must succeed even when leaf is gone; \
+         got worktrees: {:?}",
+        unlinked["worktrees"]
+    );
+}
+
+/// Invariant: `worktree link --path X` followed by `worktree unlink --path X`
+/// with the *exact same input string* X must round-trip — the worktree should
+/// be gone. Before the canonicalisation fix, link persisted the canonical
+/// form while unlink looked up the raw form, so on platforms where
+/// `canonicalize` rewrites the prefix (macOS `/var` → `/private/var`) the
+/// unlink couldn't find the entry.
+#[test]
+fn worktree_link_unlink_round_trips_with_same_input() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    // Raw path as the user would type it — on macOS this is the symlink
+    // form (`/var/folders/...`), not the canonical (`/private/var/...`).
+    let path = repo_dir.path().display().to_string();
+
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/r.git",
+            "--canonical", "github.com/o/r",
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &repo_id, "--path", &path])
+        .assert()
+        .success();
+
+    let unlinked = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &path],
+    );
+    assert!(
+        unlinked["worktrees"].as_array().unwrap().is_empty(),
+        "link/unlink with identical --path input must round-trip; got worktrees: {:?}",
+        unlinked["worktrees"]
+    );
 }
 
 #[test]
@@ -221,6 +385,8 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .as_str()
         .unwrap()
         .to_string();
+
+    // Attach with --no-link so we can control worktree registration below.
     let repo_id = run_json(
         &mut bin("repo-link", &dir),
         &[
@@ -232,15 +398,26 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
             "git@github.com:o/r.git",
             "--canonical",
             "github.com/o/r",
+            "--no-link",
         ],
-    )["id"]
+    )["binding"]["id"]
         .as_str()
         .unwrap()
         .to_string();
 
+    // alive_dir is a real git repo with the matching origin.
+    // We compare assertions against the canonical form because the CLI
+    // canonicalises before persisting (e.g. macOS rewrites `/var` →
+    // `/private/var`).
     let alive_dir = TempDir::new().unwrap();
-    let alive = alive_dir.path().display().to_string();
-    let gone = "/tmp/repo-link-never-exists-zzz".to_string();
+    init_git_repo_with_origin(alive_dir.path(), "git@github.com:o/r.git");
+    let alive = std::fs::canonicalize(alive_dir.path()).unwrap().display().to_string();
+
+    // gone is a path that doesn't exist yet; create a git repo there first so
+    // the link canonical check passes, then the reconcile will see it missing.
+    let gone_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(gone_dir.path(), "git@github.com:o/r.git");
+    let gone = std::fs::canonicalize(gone_dir.path()).unwrap().display().to_string();
 
     bin("repo-link", &dir)
         .args([
@@ -252,6 +429,9 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .args(["worktree", "link", "--repo", &repo_id, "--path", &gone])
         .assert()
         .success();
+
+    // Drop the gone_dir so the path disappears from the filesystem.
+    drop(gone_dir);
 
     let summary = run_json(
         &mut bin("repo-link", &dir),
