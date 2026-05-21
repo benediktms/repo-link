@@ -723,6 +723,53 @@ fn resolve_attach_link_path(
     }
 }
 
+/// Best-effort canonical form of `input` for looking up a stored worktree.
+///
+/// If `canonicalize` succeeds outright, use it. Otherwise walk up the path
+/// to the longest *existing* prefix, canonicalise that (so any symlinked
+/// component gets resolved), and rejoin the missing tail components. This
+/// makes `unlink` match `link`-stored entries even after the target leaf
+/// has been deleted, including the macOS `/var → /private/var` case.
+///
+/// Last-resort fallback: convert to absolute via cwd for relative inputs,
+/// or pass the raw string through if even that fails.
+fn canonicalize_for_lookup(input: &str) -> String {
+    let raw = PathBuf::from(input);
+
+    if let Ok(p) = std::fs::canonicalize(&raw) {
+        return p.display().to_string();
+    }
+
+    // Pop components until we find a prefix that canonicalises. The popped
+    // pieces get rejoined to that resolved prefix to reconstruct the full
+    // intended path.
+    let mut prefix = raw.clone();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(name) = prefix.file_name().map(|n| n.to_owned()) {
+        if !prefix.pop() || prefix.as_os_str().is_empty() {
+            break;
+        }
+        suffix.push(name);
+        if let Ok(canonical) = std::fs::canonicalize(&prefix) {
+            let mut result = canonical;
+            for piece in suffix.iter().rev() {
+                result.push(piece);
+            }
+            return result.display().to_string();
+        }
+    }
+
+    // Nothing in the path existed. For relative inputs, anchor to cwd so
+    // we at least produce an absolute string the service can compare.
+    if raw.is_absolute() {
+        raw.display().to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&raw).display().to_string())
+            .unwrap_or_else(|_| input.to_string())
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct DiscoveredRepo {
     pub path: String,
@@ -802,12 +849,10 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
         }
         WorktreeCmd::Unlink { repo, path } => {
             // Mirror link's canonicalisation so identical --path input
-            // round-trips. Falls back to the raw path when the target is
-            // gone (canonicalize requires an existing file) so users can
-            // still remove tombstoned entries by typing the original name.
-            let canonical_path = std::fs::canonicalize(&path)
-                .map(|p| p.display().to_string())
-                .unwrap_or(path);
+            // round-trips. When the leaf is gone we still try to resolve
+            // any symlinked prefix so e.g. macOS `/var/...` matches the
+            // stored `/private/var/...`.
+            let canonical_path = canonicalize_for_lookup(&path);
             let dto = svc
                 .bindings
                 .unlink_worktree(UnlinkWorktreeCmd {

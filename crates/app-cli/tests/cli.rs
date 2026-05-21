@@ -198,6 +198,85 @@ fn repo_and_worktree_lifecycle() {
     assert_eq!(unlinked["worktrees"].as_array().unwrap().len(), 1);
 }
 
+/// Tombstone invariant: even when the linked path's *leaf* has been deleted
+/// (so `canonicalize` of the user's input fails), unlinking with the same
+/// input string must still find the stored entry — as long as a *prefix*
+/// of the input still exists and can resolve any symlinks. Specifically
+/// covers the case the reviewer's partial fix wouldn't catch: an absolute
+/// path with a symlinked parent (e.g. macOS `/var → /private/var`).
+#[cfg(unix)]
+#[test]
+fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Filesystem shape:
+    //   tmpdir/real_root/child/.git  (a real git repo with origin)
+    //   tmpdir/alias_root          -> real_root (symlink)
+    // User links via the symlinked path; CLI canonicalises and stores the
+    // real path. Then the leaf (`child`) is deleted, and unlink is called
+    // with the original symlinked input — canonicalize fails on the input
+    // (leaf gone) but the parent `alias_root` is still a live symlink.
+    let real_root = dir.path().join("real_root");
+    let child = real_root.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    init_git_repo_with_origin(&child, "git@github.com:o/r.git");
+
+    let alias_root = dir.path().join("alias_root");
+    symlink(&real_root, &alias_root).unwrap();
+
+    let user_path = alias_root.join("child").display().to_string();
+
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/r.git",
+            "--canonical", "github.com/o/r",
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Link via the symlinked input. Stored path should be the canonical form.
+    bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &repo_id, "--path", &user_path])
+        .assert()
+        .success();
+    let stored = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])
+        ["worktrees"][0]["path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let expected_canonical = std::fs::canonicalize(&child).unwrap().display().to_string();
+    assert_eq!(stored, expected_canonical, "link should store canonical form");
+
+    // Delete the target so canonicalize(user_path) will fail.
+    std::fs::remove_dir_all(&child).unwrap();
+
+    // Unlink with the *same* user input. Must succeed.
+    let unlinked = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &user_path],
+    );
+    assert!(
+        unlinked["worktrees"].as_array().unwrap().is_empty(),
+        "unlink with same input as link must succeed even when leaf is gone; \
+         got worktrees: {:?}",
+        unlinked["worktrees"]
+    );
+}
+
 /// Invariant: `worktree link --path X` followed by `worktree unlink --path X`
 /// with the *exact same input string* X must round-trip — the worktree should
 /// be gone. Before the canonicalisation fix, link persisted the canonical
