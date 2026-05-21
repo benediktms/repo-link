@@ -157,7 +157,18 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
         name_raw
     };
     let aliases_json: String = row.try_get("aliases").map_err(map_sqlx_err)?;
-    let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+    // The CHECK constraint on `repos.aliases` enforces JSON array shape
+    // at write time, so this branch should be unreachable through our
+    // code path. If a row's JSON does fail to decode (external tool
+    // bypassing the constraint, future schema evolution leaving
+    // partial state), prefer a loud mapping error over silently
+    // dropping aliases — the latter would corrupt the in-memory model
+    // and propagate as missing-alias bugs at the CLI boundary.
+    let aliases: Vec<String> = serde_json::from_str(&aliases_json).map_err(|e| {
+        PortError::Backend(format!(
+            "repo {id_str}: aliases column has malformed JSON: {e}"
+        ))
+    })?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
 
