@@ -66,6 +66,7 @@ pub async fn open_read_pool(database_url: &str) -> Result<SqlitePool, PoolError>
 pub async fn open_db(database_url: &str) -> Result<Db, PoolError> {
     let writes = open_write_pool(database_url).await?;
     crate::migrate(&writes).await?;
+    crate::backfill_empty_repo_names(&writes).await?;
     let reads = open_read_pool(database_url).await?;
     Ok(Db { reads, writes })
 }

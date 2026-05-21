@@ -49,9 +49,26 @@ pub struct RepoBindingDto {
     pub remote_url: String,
     pub canonical_url: String,
     pub tracked_branch: Option<String>,
+    pub name: String,
+    pub aliases: Vec<String>,
     pub worktrees: Vec<WorktreeLinkDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindRepoMatchDto {
+    pub binding: RepoBindingDto,
+    pub workspace_id: String,
+    /// Which field matched: "name" | "alias" | "canonical_url" | "name_substring".
+    pub matched_by: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindRepoResponseDto {
+    pub query: String,
+    pub matches: Vec<FindRepoMatchDto>,
+    pub ambiguous: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

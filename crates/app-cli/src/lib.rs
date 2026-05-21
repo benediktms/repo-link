@@ -130,6 +130,9 @@ enum RepoCmd {
         #[arg(long)]
         workspace: String,
     },
+    /// Show a binding. Accepts a UUID, an exact `name`, or an exact alias.
+    /// Returns a JSON error with candidate IDs if a non-UUID handle matches
+    /// more than one binding — re-issue with a UUID.
     Show {
         id: String,
     },
@@ -146,6 +149,40 @@ enum RepoCmd {
         /// Path to probe. Defaults to current working directory.
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+    /// Set a new short name on a binding. Identity stays at canonical_url —
+    /// rename is purely a display affordance.
+    Rename {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Manage aliases — alternative short names for a binding.
+    #[command(subcommand)]
+    Alias(RepoAliasCmd),
+    /// Search bindings across non-archived workspaces by name / alias /
+    /// canonical substring. Ranked: exact name > exact alias > canonical
+    /// substring > name substring. `ambiguous` is set when more than one
+    /// hit is returned.
+    Find {
+        query: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RepoAliasCmd {
+    Add {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        alias: String,
+    },
+    Rm {
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        alias: String,
     },
 }
 
@@ -581,6 +618,18 @@ async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Result<()> {
     Ok(())
 }
 
+/// Print a JSON ambiguous-handle error to stderr and exit with code 2.
+/// Used by any resolver command when `ServiceError::AmbiguousHandle` fires.
+fn handle_ambiguous(query: String, candidates: Vec<application_workspace::AmbiguousCandidate>) -> ! {
+    let body = serde_json::json!({
+        "error": "ambiguous",
+        "query": query,
+        "candidates": candidates,
+    });
+    eprintln!("{body}");
+    std::process::exit(2);
+}
+
 async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
     match cmd {
         RepoCmd::Attach {
@@ -613,7 +662,43 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
         RepoCmd::List { workspace } => {
             render::repos(&svc.bindings.list(&workspace).await?)
         }
-        RepoCmd::Show { id } => render::repo(&svc.bindings.show(&id).await?),
+        RepoCmd::Show { id } => {
+            match svc.bindings.show(&id).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        RepoCmd::Rename { repo, name } => {
+            match svc.bindings.rename(&repo, name).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        RepoCmd::Alias(RepoAliasCmd::Add { repo, alias }) => {
+            match svc.bindings.add_alias(&repo, alias).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        RepoCmd::Alias(RepoAliasCmd::Rm { repo, alias }) => {
+            match svc.bindings.remove_alias(&repo, &alias).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            }
+        }
+        RepoCmd::Find { query } => render::find(&svc.bindings.find(&query).await?),
         RepoCmd::Discover { path } => {
             let mut rows = Vec::new();
             for repo_path in discover_repos_under(&path) {
