@@ -89,10 +89,13 @@ impl RepoLinkConfig {
             .extract()
             .map_err(|e| ConfigError::Figment(e.to_string()))?;
 
+        // Filter empties per-source so a blank REPO_LINK_GITHUB_TOKEN (common
+        // in CI where vars are set but unpopulated) cascades to GITHUB_TOKEN
+        // instead of short-circuiting the precedence chain.
         let github_token = raw
             .github_token
-            .or_else(|| std::env::var("GITHUB_TOKEN").ok())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()));
         let default_user = raw.user.or_else(|| std::env::var("USER").ok());
         let database_path = match raw.db {
             Some(p) => p,
@@ -141,8 +144,13 @@ pub fn default_token_file_path() -> Result<PathBuf, ConfigError> {
 }
 
 fn read_token_file(path: &Path) -> Result<Option<String>, TokenFileError> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+    use std::io::Read;
+
+    // Open first, then fstat through the file handle so the permission check
+    // and the content read both target the same inode. Avoids a TOCTOU swap
+    // between two path-based syscalls.
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(TokenFileError::Io {
@@ -151,11 +159,17 @@ fn read_token_file(path: &Path) -> Result<Option<String>, TokenFileError> {
             });
         }
     };
-    enforce_secure_permissions(&metadata, path)?;
-    let raw = std::fs::read_to_string(path).map_err(|source| TokenFileError::Io {
+    let metadata = file.metadata().map_err(|source| TokenFileError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    enforce_secure_permissions(&metadata, path)?;
+    let mut raw = String::new();
+    file.read_to_string(&mut raw)
+        .map_err(|source| TokenFileError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let trimmed = raw.trim();
     Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
 }
