@@ -808,6 +808,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grace_counters_advance_independently_across_workspaces() {
+        // Late-added second workspace: counters for WS1 and WS2 advance on
+        // their own schedules and prune at different ticks. Exercises the
+        // tick-level GC merging `still_valid` across workspaces *and* the
+        // independence of (RepoId, PathBuf) keys.
+        let probe = Arc::new(MutableProbe::new());
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+
+        // T0: only WS1 exists, with a missing worktree.
+        let ws1 = Workspace::new(WorkspaceName::new("alpha").unwrap(), None, true);
+        ws_repo.save(&ws1).await.unwrap();
+        let mut b1 = RepoBinding::new(
+            ws1.id,
+            "git@github.com:o/r1.git".into(),
+            "github.com/o/r1".into(),
+        )
+        .unwrap();
+        b1.link_worktree(PathBuf::from("/tmp/gone-1"), None);
+        bind_repo.save(&b1).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let probe_dyn: Arc<dyn FilesystemProbe> = probe;
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None)
+            .with_prune(true)
+            .with_missing_grace_ticks(3);
+
+        // Tick 1: WS1's counter lands at 1. WS2 doesn't exist yet.
+        daemon.tick_once().await.unwrap();
+        {
+            let counts = daemon.miss_counts.lock().unwrap();
+            assert_eq!(counts.len(), 1, "only WS1's key should be present");
+            assert_eq!(*counts.values().next().unwrap(), 1);
+        }
+
+        // Between ticks: add WS2 with its own missing worktree.
+        let ws2 = Workspace::new(WorkspaceName::new("beta").unwrap(), None, true);
+        ws_repo.save(&ws2).await.unwrap();
+        let mut b2 = RepoBinding::new(
+            ws2.id,
+            "git@github.com:o/r2.git".into(),
+            "github.com/o/r2".into(),
+        )
+        .unwrap();
+        b2.link_worktree(PathBuf::from("/tmp/gone-2"), None);
+        bind_repo.save(&b2).await.unwrap();
+
+        // Tick 2: WS1 → 2 (continues), WS2 → 1 (fresh start, doesn't inherit).
+        daemon.tick_once().await.unwrap();
+        {
+            let counts = daemon.miss_counts.lock().unwrap();
+            assert_eq!(counts.len(), 2);
+            let mut vals: Vec<u32> = counts.values().copied().collect();
+            vals.sort();
+            assert_eq!(vals, vec![1, 2], "WS1=2 (continuing), WS2=1 (fresh)");
+        }
+
+        // Tick 3: WS1 hits threshold → prunes. WS2 → 2. Only one prune fires.
+        let r3 = daemon.tick_once().await.unwrap();
+        assert_eq!(
+            r3.pruned, 1,
+            "only WS1 should prune at tick 3; WS2 still at 2"
+        );
+        {
+            let counts = daemon.miss_counts.lock().unwrap();
+            assert_eq!(counts.len(), 1, "WS1's entry should be gone");
+            assert_eq!(*counts.values().next().unwrap(), 2);
+        }
+
+        // Tick 4: WS2 hits threshold → prunes. Map empty.
+        let r4 = daemon.tick_once().await.unwrap();
+        assert_eq!(r4.pruned, 1, "WS2 should prune at tick 4");
+        assert!(daemon.miss_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn grace_counter_garbage_collects_orphan_entries() {
         let probe = Arc::new(MutableProbe::new());
         // Healthy worktree: present in probe, will never get marked missing.
