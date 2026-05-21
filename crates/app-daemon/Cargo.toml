@@ -1,0 +1,37 @@
+[package]
+name = "app-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+application-workspace = { workspace = true }
+application-sync = { workspace = true }
+application-query = { workspace = true }
+domain-core = { workspace = true }
+domain-task = { workspace = true }
+dto-shared = { workspace = true }
+ports = { workspace = true }
+infra-sqlite = { workspace = true }
+infra-filesystem = { workspace = true }
+infra-github = { workspace = true }
+infra-config = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+testing-fixtures = { workspace = true }
+domain-workspace = { workspace = true }
+domain-repo = { workspace = true }
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+# `src/bin/repo-link-daemon.rs` and `src/bin/rld.rs` are auto-discovered.
+# Both are thin shims around `app_daemon::run_cli()` in `src/lib.rs`.
