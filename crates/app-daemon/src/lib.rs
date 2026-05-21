@@ -116,13 +116,17 @@ pub async fn run_cli() -> anyhow::Result<()> {
         SyncService::new(tasks_repo.clone(), bindings_repo, provider)
     });
 
+    // `with_missing_grace_ticks` coerces values below 1 up to 1. Bind the
+    // post-coercion value once so the startup log reflects the daemon's
+    // effective behaviour rather than the raw CLI/env input.
+    let effective_grace_ticks = args.missing_grace_ticks.max(1);
     let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
         .with_prune(args.prune)
-        .with_missing_grace_ticks(args.missing_grace_ticks);
+        .with_missing_grace_ticks(effective_grace_ticks);
     info!(
         interval_secs = args.interval_secs,
         prune = args.prune,
-        missing_grace_ticks = args.missing_grace_ticks,
+        missing_grace_ticks = effective_grace_ticks,
         db = %cfg.database_path.display(),
         log_format = ?args.log_format,
         "daemon starting"
@@ -205,6 +209,12 @@ impl Daemon {
             .await
             .map_err(|e| DaemonError::Workspace(e.to_string()))?;
 
+        // Accumulated across workspaces and used for a single GC pass after
+        // the loop. Per-workspace GC is incorrect because `miss_counts` is
+        // process-global — retaining only one workspace's keys would drop
+        // every other workspace's counter on each tick.
+        let mut all_valid_keys: HashSet<(RepoId, PathBuf)> = HashSet::new();
+
         for ws in &workspaces {
             // Per-workspace span so subsequent reconcile/push events nest
             // under it for json-grep-by-trace-id and `RUST_LOG=…` filtering.
@@ -223,8 +233,9 @@ impl Daemon {
                 report.marked_missing += summary.marked_missing;
 
                 let pruned_this_workspace = if self.prune {
-                    let pruned = self.apply_grace_prune(&ws.id).await?;
+                    let (pruned, valid) = self.apply_grace_prune(&ws.id).await?;
                     report.pruned += pruned;
+                    all_valid_keys.extend(valid);
                     pruned
                 } else {
                     0
@@ -271,11 +282,26 @@ impl Daemon {
             .await?;
         }
 
+        // Single GC pass across the union of all workspaces' valid-this-tick
+        // keys. Drops counter entries whose `(RepoId, PathBuf)` no longer
+        // corresponds to a `MissingPath` worktree anywhere (binding deleted,
+        // user manually unlinked, etc.). Skipped when `prune` is off because
+        // `apply_grace_prune` never ran, so `all_valid_keys` is empty and
+        // the retain would wipe the whole map — `miss_counts` is also empty
+        // in that case so it's a no-op, but the explicit gate makes the
+        // invariant obvious.
+        if self.prune {
+            self.miss_counts
+                .lock()
+                .unwrap()
+                .retain(|k, _| all_valid_keys.contains(k));
+        }
+
         Ok(report)
     }
 
-    /// Grace-counter pass. For each binding in the workspace, re-probe every
-    /// worktree currently in `MissingPath` status:
+    /// Grace-counter pass for a single workspace. For each binding, re-probe
+    /// every worktree currently in `MissingPath` status:
     /// - If the path is still missing this tick, bump the counter. When it
     ///   reaches `missing_grace_ticks`, drop the worktree via
     ///   `unlink_worktree` and forget the counter entry.
@@ -284,12 +310,18 @@ impl Daemon {
     ///   status back to `Linked` here — that's the domain's job on an
     ///   explicit re-link, and conflating recovery with the prune janitor
     ///   would expand this phase's scope.
-    /// - At the end, garbage-collect any counter entries whose `(RepoId,
-    ///   PathBuf)` no longer corresponds to a `MissingPath` worktree (binding
-    ///   deleted, user manually unlinked, etc.).
     ///
-    /// Returns the number of paths pruned this tick.
-    async fn apply_grace_prune(&self, workspace_id: &str) -> Result<usize, DaemonError> {
+    /// Returns `(pruned, still_valid)`. `still_valid` is the set of counter
+    /// keys this workspace's pass deemed alive this tick — i.e. those whose
+    /// path is in `MissingPath` and observably missing. The caller is
+    /// responsible for unioning these across all workspaces *before* GC,
+    /// because `miss_counts` is process-global: a per-workspace retain would
+    /// drop other workspaces' counters every tick. See
+    /// `grace_counter_survives_across_multiple_workspaces` test.
+    async fn apply_grace_prune(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(usize, HashSet<(RepoId, PathBuf)>), DaemonError> {
         let bindings = self
             .bindings
             .list(workspace_id)
@@ -352,15 +384,7 @@ impl Daemon {
             }
         }
 
-        // Drop counter entries that no longer correspond to any MissingPath
-        // worktree this tick. Without this, a binding deleted out from under
-        // us would leave a permanent ghost in the map.
-        self.miss_counts
-            .lock()
-            .unwrap()
-            .retain(|k, _| still_valid.contains(k));
-
-        Ok(pruned)
+        Ok((pruned, still_valid))
     }
 
     /// Drive `tick_once` on a fixed interval until ctrl-c.
@@ -710,6 +734,76 @@ mod tests {
         let r = daemon.tick_once().await.unwrap();
         assert_eq!(r.marked_missing, 1);
         assert_eq!(r.pruned, 1);
+        assert!(daemon.miss_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grace_counter_survives_across_multiple_workspaces() {
+        // Regression: each per-workspace `apply_grace_prune` must not GC
+        // counters belonging to other workspaces. With the original bug,
+        // workspace A's counter is dropped by workspace B's GC pass within
+        // the same tick, so neither workspace ever reaches the threshold.
+        let probe = Arc::new(MutableProbe::new());
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+
+        let ws_a = Workspace::new(WorkspaceName::new("alpha").unwrap(), None, true);
+        let ws_b = Workspace::new(WorkspaceName::new("beta").unwrap(), None, true);
+        ws_repo.save(&ws_a).await.unwrap();
+        ws_repo.save(&ws_b).await.unwrap();
+
+        let mut binding_a = RepoBinding::new(
+            ws_a.id,
+            "git@github.com:o/r-a.git".into(),
+            "github.com/o/r-a".into(),
+        )
+        .unwrap();
+        binding_a.link_worktree(PathBuf::from("/tmp/gone-a"), None);
+        bind_repo.save(&binding_a).await.unwrap();
+
+        let mut binding_b = RepoBinding::new(
+            ws_b.id,
+            "git@github.com:o/r-b.git".into(),
+            "github.com/o/r-b".into(),
+        )
+        .unwrap();
+        binding_b.link_worktree(PathBuf::from("/tmp/gone-b"), None);
+        bind_repo.save(&binding_b).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
+        let probe_dyn: Arc<dyn FilesystemProbe> = probe;
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None)
+            .with_prune(true)
+            .with_missing_grace_ticks(3);
+
+        // Tick 1: marks both missing, both counters land at 1.
+        daemon.tick_once().await.unwrap();
+        {
+            let counts = daemon.miss_counts.lock().unwrap();
+            assert_eq!(counts.len(), 2, "both workspace counters must survive");
+            assert!(
+                counts.values().all(|&c| c == 1),
+                "both counters should be at 1 after tick 1, got {:?}",
+                counts.values().collect::<Vec<_>>()
+            );
+        }
+
+        // Tick 2: both bump to 2.
+        daemon.tick_once().await.unwrap();
+        {
+            let counts = daemon.miss_counts.lock().unwrap();
+            assert_eq!(counts.len(), 2, "both workspace counters must persist");
+            assert!(counts.values().all(|&c| c == 2));
+        }
+
+        // Tick 3: both hit threshold, both prune in the same tick.
+        let r3 = daemon.tick_once().await.unwrap();
+        assert_eq!(
+            r3.pruned, 2,
+            "both workspaces should prune at the same tick"
+        );
         assert!(daemon.miss_counts.lock().unwrap().is_empty());
     }
 
