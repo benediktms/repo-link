@@ -198,6 +198,58 @@ fn repo_and_worktree_lifecycle() {
     assert_eq!(unlinked["worktrees"].as_array().unwrap().len(), 1);
 }
 
+/// Invariant: `worktree link --path X` followed by `worktree unlink --path X`
+/// with the *exact same input string* X must round-trip — the worktree should
+/// be gone. Before the canonicalisation fix, link persisted the canonical
+/// form while unlink looked up the raw form, so on platforms where
+/// `canonicalize` rewrites the prefix (macOS `/var` → `/private/var`) the
+/// unlink couldn't find the entry.
+#[test]
+fn worktree_link_unlink_round_trips_with_same_input() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    // Raw path as the user would type it — on macOS this is the symlink
+    // form (`/var/folders/...`), not the canonical (`/private/var/...`).
+    let path = repo_dir.path().display().to_string();
+
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/r.git",
+            "--canonical", "github.com/o/r",
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &repo_id, "--path", &path])
+        .assert()
+        .success();
+
+    let unlinked = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "unlink", "--repo", &repo_id, "--path", &path],
+    );
+    assert!(
+        unlinked["worktrees"].as_array().unwrap().is_empty(),
+        "link/unlink with identical --path input must round-trip; got worktrees: {:?}",
+        unlinked["worktrees"]
+    );
+}
+
 #[test]
 fn query_overview_reports_counts() {
     let dir = TempDir::new().unwrap();
@@ -275,15 +327,18 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .to_string();
 
     // alive_dir is a real git repo with the matching origin.
+    // We compare assertions against the canonical form because the CLI
+    // canonicalises before persisting (e.g. macOS rewrites `/var` →
+    // `/private/var`).
     let alive_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(alive_dir.path(), "git@github.com:o/r.git");
-    let alive = alive_dir.path().display().to_string();
+    let alive = std::fs::canonicalize(alive_dir.path()).unwrap().display().to_string();
 
     // gone is a path that doesn't exist yet; create a git repo there first so
     // the link canonical check passes, then the reconcile will see it missing.
     let gone_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(gone_dir.path(), "git@github.com:o/r.git");
-    let gone = gone_dir.path().display().to_string();
+    let gone = std::fs::canonicalize(gone_dir.path()).unwrap().display().to_string();
 
     bin("repo-link", &dir)
         .args([

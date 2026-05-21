@@ -801,11 +801,18 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             render::repo(&dto);
         }
         WorktreeCmd::Unlink { repo, path } => {
+            // Mirror link's canonicalisation so identical --path input
+            // round-trips. Falls back to the raw path when the target is
+            // gone (canonicalize requires an existing file) so users can
+            // still remove tombstoned entries by typing the original name.
+            let canonical_path = std::fs::canonicalize(&path)
+                .map(|p| p.display().to_string())
+                .unwrap_or(path);
             let dto = svc
                 .bindings
                 .unlink_worktree(UnlinkWorktreeCmd {
                     repo_id: repo,
-                    path,
+                    path: canonical_path,
                 })
                 .await?;
             render::repo(&dto);
