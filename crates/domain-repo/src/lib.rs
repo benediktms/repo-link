@@ -96,6 +96,11 @@ impl RepoBinding {
         if trimmed.is_empty() {
             return Err(DomainError::validation("name is empty"));
         }
+        if trimmed.parse::<RepoId>().is_ok() {
+            return Err(DomainError::validation(
+                "name may not be a UUID — that namespace is reserved for ID-based resolution",
+            ));
+        }
         if self.aliases.iter().any(|a| a == trimmed) {
             return Err(DomainError::validation(
                 "name would collide with an existing alias",
@@ -117,6 +122,11 @@ impl RepoBinding {
         let trimmed = alias.trim();
         if trimmed.is_empty() {
             return Err(DomainError::validation("alias is empty"));
+        }
+        if trimmed.parse::<RepoId>().is_ok() {
+            return Err(DomainError::validation(
+                "alias may not be a UUID — that namespace is reserved for ID-based resolution",
+            ));
         }
         if trimmed == self.name {
             return Err(DomainError::validation(
@@ -335,5 +345,28 @@ mod tests {
         b.add_alias("gw".into()).unwrap();
         assert!(b.remove_alias("gw"));
         assert!(b.aliases.is_empty());
+    }
+
+    // UUID-shaped strings are reserved for the UUID resolution path on
+    // the application side; letting them through as names/aliases would
+    // make some handles unreachable (a name equal to a different
+    // binding's UUID can't be resolved via the name path because the
+    // resolver would short-circuit on UUID parse).
+    #[test]
+    fn set_name_rejects_uuid_shaped_value() {
+        let mut b = binding();
+        let err = b
+            .set_name("c08c09c5-4ac2-4a43-96ea-d574a580fde5".into())
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn add_alias_rejects_uuid_shaped_value() {
+        let mut b = binding();
+        let err = b
+            .add_alias("c08c09c5-4ac2-4a43-96ea-d574a580fde5".into())
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
     }
 }
