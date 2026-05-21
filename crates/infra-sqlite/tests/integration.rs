@@ -338,3 +338,40 @@ async fn concurrent_writes_serialize_without_busy_error() {
     let listed = ws.list(false).await.unwrap();
     assert_eq!(listed.len(), 2);
 }
+
+/// The CHECK constraint on `repos.aliases` must reject valid JSON that
+/// isn't a JSON array. Without `json_type(...) = 'array'`, an object or
+/// scalar would slip through and break Vec<String> hydration on load.
+#[tokio::test]
+async fn aliases_check_rejects_non_array_json() {
+    let (_dir, db, ws, _rb, _ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("ws-check").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Try to insert a repo row whose aliases is a valid JSON *object*
+    // (not an array). The CHECK constraint must reject this.
+    let result = sqlx::query(
+        r#"
+        INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch,
+                           name, aliases, created_at, updated_at)
+        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        "#,
+    )
+    .bind("c08c09c5-4ac2-4a43-96ea-d574a580fde5")
+    .bind(w.id.to_string())
+    .bind("git@example.com:o/r.git")
+    .bind("example.com/o/r")
+    .bind("r")
+    .bind(r#"{"not": "an array"}"#)
+    .bind(chrono::Utc::now())
+    .bind(chrono::Utc::now())
+    .execute(&db.writes)
+    .await;
+
+    let err = result.expect_err("inserting a JSON object as aliases must violate CHECK");
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("check"),
+        "expected a CHECK constraint failure, got: {msg}"
+    );
+}
