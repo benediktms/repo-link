@@ -7,8 +7,9 @@ use domain_core::{IdParseError, RepoId, WorkspaceId};
 use domain_repo::RepoBinding;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{
-    AttachRepoCmd, CreateWorkspaceCmd, LinkWorktreeCmd, ListWorkspacesQuery, RepoAttachOutcomeDto,
-    RepoBindingDto, UnlinkWorktreeCmd, WorkspaceDto, WorktreeLinkDto,
+    AttachRepoCmd, CreateWorkspaceCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd,
+    ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, UnlinkWorktreeCmd, WorkspaceDto,
+    WorktreeLinkDto,
 };
 use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,21 @@ pub enum ServiceError {
     DuplicateName(String),
     #[error("invalid id: {0}")]
     BadId(String),
+    #[error("binding not found: no match for '{0}'")]
+    BindingNotFound(String),
+    #[error("ambiguous handle '{query}': matched {count} bindings", count = candidates.len())]
+    AmbiguousHandle {
+        query: String,
+        candidates: Vec<AmbiguousCandidate>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbiguousCandidate {
+    pub id: String,
+    pub workspace_id: String,
+    pub canonical_url: String,
+    pub name: String,
 }
 
 impl From<IdParseError> for ServiceError {
@@ -155,10 +171,110 @@ impl RepoBindingService {
         Ok(())
     }
 
-    pub async fn show(&self, id: &str) -> Result<RepoBindingDto> {
-        let id: RepoId = id.parse()?;
-        let b = self.bindings.get(id).await?;
-        Ok(binding_to_dto(&b))
+    pub async fn show(&self, query: &str) -> Result<RepoBindingDto> {
+        if let Ok(id) = query.parse::<RepoId>() {
+            let b = self.bindings.get(id).await?;
+            return Ok(binding_to_dto(&b));
+        }
+        let binding = self.resolve_by_handle(query).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    /// Resolve a UUID, exact name, or exact alias to a `RepoBinding`.
+    async fn resolve(&self, query: &str) -> Result<RepoBinding> {
+        if let Ok(id) = query.parse::<RepoId>() {
+            return Ok(self.bindings.get(id).await?);
+        }
+        self.resolve_by_handle(query).await
+    }
+
+    /// Scan all non-archived workspaces for a binding matching by exact name or alias.
+    async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
+        let workspaces = self.workspaces.list(false).await?;
+        let mut matches: Vec<RepoBinding> = Vec::new();
+        for ws in &workspaces {
+            let bindings = self.bindings.list_by_workspace(ws.id).await?;
+            for b in bindings {
+                if b.name == query || b.aliases.iter().any(|a| a == query) {
+                    matches.push(b);
+                }
+            }
+        }
+        match matches.len() {
+            0 => Err(ServiceError::BindingNotFound(query.to_string())),
+            1 => Ok(matches.remove(0)),
+            _ => Err(ServiceError::AmbiguousHandle {
+                query: query.to_string(),
+                candidates: matches
+                    .into_iter()
+                    .map(|b| AmbiguousCandidate {
+                        id: b.id.to_string(),
+                        workspace_id: b.workspace_id.to_string(),
+                        canonical_url: b.canonical_url.clone(),
+                        name: b.name.clone(),
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    pub async fn rename(&self, query: &str, new_name: String) -> Result<RepoBindingDto> {
+        let mut binding = self.resolve(query).await?;
+        binding.set_name(new_name)?;
+        self.bindings.save(&binding).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    pub async fn add_alias(&self, query: &str, alias: String) -> Result<RepoBindingDto> {
+        let mut binding = self.resolve(query).await?;
+        binding.add_alias(alias)?;
+        self.bindings.save(&binding).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    pub async fn remove_alias(&self, query: &str, alias: &str) -> Result<RepoBindingDto> {
+        let mut binding = self.resolve(query).await?;
+        if !binding.remove_alias(alias) {
+            return Err(ServiceError::Domain(domain_core::DomainError::validation(
+                format!("alias '{alias}' not found"),
+            )));
+        }
+        self.bindings.save(&binding).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    pub async fn find(&self, query: &str) -> Result<FindRepoResponseDto> {
+        let workspaces = self.workspaces.list(false).await?;
+        let mut hits: Vec<(u8, RepoBinding, String)> = Vec::new();
+        for ws in &workspaces {
+            let bindings = self.bindings.list_by_workspace(ws.id).await?;
+            for b in bindings {
+                if b.name == query {
+                    hits.push((0, b, "name".to_string()));
+                } else if b.aliases.iter().any(|a| a == query) {
+                    hits.push((1, b, "alias".to_string()));
+                } else if b.canonical_url.contains(query) {
+                    hits.push((2, b, "canonical_url".to_string()));
+                } else if b.name.contains(query) {
+                    hits.push((3, b, "name_substring".to_string()));
+                }
+            }
+        }
+        hits.sort_by_key(|(rank, b, _)| (*rank, b.created_at));
+        let matches: Vec<FindRepoMatchDto> = hits
+            .into_iter()
+            .map(|(_, b, matched_by)| FindRepoMatchDto {
+                workspace_id: b.workspace_id.to_string(),
+                binding: binding_to_dto(&b),
+                matched_by,
+            })
+            .collect();
+        let ambiguous = matches.len() > 1;
+        Ok(FindRepoResponseDto {
+            query: query.to_string(),
+            matches,
+            ambiguous,
+        })
     }
 
     pub async fn list(&self, workspace_id: &str) -> Result<Vec<RepoBindingDto>> {
@@ -280,6 +396,8 @@ pub fn binding_to_dto(b: &RepoBinding) -> RepoBindingDto {
         remote_url: b.remote_url.clone(),
         canonical_url: b.canonical_url.clone(),
         tracked_branch: b.tracked_branch.clone(),
+        name: b.name.clone(),
+        aliases: b.aliases.clone(),
         worktrees: b
             .worktrees
             .iter()
@@ -594,5 +712,144 @@ mod tests {
         assert_eq!(outcome.binding.worktrees[0].path, "/tmp/checkout");
         assert_eq!(outcome.binding.worktrees[0].branch, Some("main".into()));
         assert_eq!(outcome.binding.worktrees[0].status, "linked");
+    }
+
+    // ---- Phase B: rename / alias / find / show-resolution ---------------
+
+    async fn seeded(
+        ws_svc: &WorkspaceService,
+        bsvc: &RepoBindingService,
+        ws_name: &str,
+        canonical: &str,
+    ) -> RepoBindingDto {
+        let ws = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: ws_name.into(),
+                description: None,
+                local_only: true,
+            })
+            .await
+            .unwrap();
+        bsvc.attach(AttachRepoCmd {
+            workspace_id: ws.id,
+            remote_url: format!("git@example.com:{canonical}.git"),
+            canonical_url: canonical.into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+        })
+        .await
+        .unwrap()
+        .binding
+    }
+
+    #[tokio::test]
+    async fn rename_persists() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-rename", "github.com/o/r").await;
+        assert_eq!(b.name, "r");
+        let renamed = bsvc.rename(&b.id, "gateway".into()).await.unwrap();
+        assert_eq!(renamed.name, "gateway");
+        // Round-trip via show: the new name is queryable.
+        let shown = bsvc.show("gateway").await.unwrap();
+        assert_eq!(shown.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn add_alias_dedup_persists() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-alias", "github.com/o/r").await;
+        bsvc.add_alias(&b.id, "edge".into()).await.unwrap();
+        let again = bsvc.add_alias(&b.id, "edge".into()).await.unwrap();
+        assert_eq!(again.aliases, vec!["edge".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remove_alias_errors_when_absent() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-rm", "github.com/o/r").await;
+        let err = bsvc.remove_alias(&b.id, "no-such").await.unwrap_err();
+        assert!(matches!(err, ServiceError::Domain(_)));
+    }
+
+    #[tokio::test]
+    async fn show_resolves_uuid_passthrough() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-uuid", "github.com/o/r").await;
+        let by_uuid = bsvc.show(&b.id).await.unwrap();
+        assert_eq!(by_uuid.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn show_resolves_by_exact_name() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-name", "github.com/o/demo-app").await;
+        let by_name = bsvc.show("demo-app").await.unwrap();
+        assert_eq!(by_name.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn show_resolves_by_exact_alias() {
+        let (ws_svc, bsvc) = setup();
+        let b = seeded(&ws_svc, &bsvc, "w-alias-show", "github.com/o/r").await;
+        bsvc.add_alias(&b.id, "gw".into()).await.unwrap();
+        let hit = bsvc.show("gw").await.unwrap();
+        assert_eq!(hit.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn show_errors_on_ambiguous_handle_with_candidates() {
+        let (ws_svc, bsvc) = setup();
+        // Two workspaces, two bindings, same alias on both.
+        let a = seeded(&ws_svc, &bsvc, "ws-a", "github.com/o/a").await;
+        let b = seeded(&ws_svc, &bsvc, "ws-b", "github.com/o/b").await;
+        bsvc.add_alias(&a.id, "gw".into()).await.unwrap();
+        bsvc.add_alias(&b.id, "gw".into()).await.unwrap();
+        let err = bsvc.show("gw").await.unwrap_err();
+        match err {
+            ServiceError::AmbiguousHandle { query, candidates } => {
+                assert_eq!(query, "gw");
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousHandle, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn show_errors_when_handle_unknown() {
+        let (ws_svc, bsvc) = setup();
+        let _ = seeded(&ws_svc, &bsvc, "w-unknown", "github.com/o/r").await;
+        let err = bsvc.show("nothing-matches").await.unwrap_err();
+        assert!(matches!(err, ServiceError::BindingNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn find_ranks_name_over_canonical_substring() {
+        let (ws_svc, bsvc) = setup();
+        // Binding A: canonical contains "foo" in the owner slot, name = "r".
+        let a = seeded(&ws_svc, &bsvc, "ws-a2", "github.com/foo/r").await;
+        // Binding B: name is exactly "foo" (canonical's last segment).
+        let b = seeded(&ws_svc, &bsvc, "ws-b2", "github.com/owner/foo").await;
+        let out = bsvc.find("foo").await.unwrap();
+        assert!(out.ambiguous);
+        assert_eq!(out.matches.len(), 2);
+        // Rank 0 (exact name) must come first.
+        assert_eq!(out.matches[0].binding.id, b.id);
+        assert_eq!(out.matches[0].matched_by, "name");
+        assert_eq!(out.matches[1].binding.id, a.id);
+        assert_eq!(out.matches[1].matched_by, "canonical_url");
+    }
+
+    #[tokio::test]
+    async fn find_marks_ambiguous_when_multi_match() {
+        let (ws_svc, bsvc) = setup();
+        let a = seeded(&ws_svc, &bsvc, "ws-a3", "github.com/o/a").await;
+        let b = seeded(&ws_svc, &bsvc, "ws-b3", "github.com/o/b").await;
+        bsvc.add_alias(&a.id, "common".into()).await.unwrap();
+        bsvc.add_alias(&b.id, "common".into()).await.unwrap();
+        let out = bsvc.find("common").await.unwrap();
+        assert!(out.ambiguous);
+        assert_eq!(out.matches.len(), 2);
+        assert!(out.matches.iter().all(|m| m.matched_by == "alias"));
     }
 }
