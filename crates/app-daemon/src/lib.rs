@@ -27,6 +27,10 @@ use infra_sqlite::{
 use ports::{FilesystemProbe, TaskFilter, TaskRepository};
 use thiserror::Error;
 use tokio::signal;
+use tracing::{Instrument, error, info, info_span, warn};
+
+mod logging;
+pub use logging::{LogFormat, init_subscriber};
 
 #[derive(Parser, Debug)]
 #[command(name = "repo-link-daemon", version, about = "Background reconciler for repo-link")]
@@ -42,6 +46,12 @@ pub struct Args {
     /// Database path override (defaults to platform data dir).
     #[arg(long, env = "REPO_LINK_DB")]
     pub db: Option<PathBuf>,
+
+    /// Log output format. `pretty` writes ANSI-coloured text to stdout
+    /// for foreground/dev runs; `json` writes a daily-rotated
+    /// `daemon.log` next to the database for use under launchd/systemd.
+    #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
+    pub log_format: LogFormat,
 }
 
 /// Library entrypoint shared by both `repo-link-daemon` and `rld` bin shims.
@@ -54,6 +64,16 @@ pub async fn run_cli() -> anyhow::Result<()> {
     if let Some(parent) = cfg.database_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+
+    // Logs live next to the SQLite db so all daemon state co-locates under
+    // the platform data dir. The guard keeps the non-blocking file-write
+    // worker alive; dropping it at process exit flushes any buffered events.
+    let log_dir = cfg
+        .database_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _log_guard = init_subscriber(args.log_format, &log_dir);
 
     let db = open_from_path(&cfg.database_path).await?;
     let workspaces_repo: Arc<dyn ports::WorkspaceRepository> =
@@ -74,11 +94,12 @@ pub async fn run_cli() -> anyhow::Result<()> {
     });
 
     let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync).with_prune(args.prune);
-    eprintln!(
-        "[daemon] starting (interval={}s prune={} db={})",
-        args.interval_secs,
-        args.prune,
-        cfg.database_path.display()
+    info!(
+        interval_secs = args.interval_secs,
+        prune = args.prune,
+        db = %cfg.database_path.display(),
+        log_format = ?args.log_format,
+        "daemon starting"
     );
     daemon.run(Duration::from_secs(args.interval_secs)).await?;
     Ok(())
@@ -141,37 +162,58 @@ impl Daemon {
             .map_err(|e| DaemonError::Workspace(e.to_string()))?;
 
         for ws in &workspaces {
-            report.workspaces += 1;
-            let summary = self
-                .bindings
-                .reconcile_worktrees(&ws.id, self.probe.as_ref(), self.prune)
-                .await
-                .map_err(|e| DaemonError::Binding(e.to_string()))?;
-            report.repos_checked += summary.repos_checked;
-            report.worktrees_checked += summary.worktrees_checked;
-            report.marked_missing += summary.marked_missing;
-            report.pruned += summary.pruned;
+            // Per-workspace span so subsequent reconcile/push events nest
+            // under it for json-grep-by-trace-id and `RUST_LOG=…` filtering.
+            async {
+                report.workspaces += 1;
+                let summary = self
+                    .bindings
+                    .reconcile_worktrees(&ws.id, self.probe.as_ref(), self.prune)
+                    .await
+                    .map_err(|e| DaemonError::Binding(e.to_string()))?;
+                report.repos_checked += summary.repos_checked;
+                report.worktrees_checked += summary.worktrees_checked;
+                report.marked_missing += summary.marked_missing;
+                report.pruned += summary.pruned;
+                info!(
+                    repos_checked = summary.repos_checked,
+                    worktrees_checked = summary.worktrees_checked,
+                    marked_missing = summary.marked_missing,
+                    pruned = summary.pruned,
+                    "reconcile complete"
+                );
 
-            if let Some(sync) = &self.sync {
-                let id: domain_core::WorkspaceId = ws
-                    .id
-                    .parse()
-                    .map_err(|e: domain_core::IdParseError| DaemonError::Sync(e.to_string()))?;
-                let dirty = self
-                    .tasks
-                    .list(TaskFilter {
-                        workspace_id: Some(id),
-                        sync_state: Some(SyncState::DirtyLocal),
-                        ..TaskFilter::default()
-                    })
-                    .await?;
-                for t in dirty {
-                    match sync.push(&t.id.to_string()).await {
-                        Ok(_) => report.pushed += 1,
-                        Err(e) => report.push_failures.push(format!("{}: {e}", t.id)),
+                if let Some(sync) = &self.sync {
+                    let id: domain_core::WorkspaceId = ws
+                        .id
+                        .parse()
+                        .map_err(|e: domain_core::IdParseError| DaemonError::Sync(e.to_string()))?;
+                    let dirty = self
+                        .tasks
+                        .list(TaskFilter {
+                            workspace_id: Some(id),
+                            sync_state: Some(SyncState::DirtyLocal),
+                            ..TaskFilter::default()
+                        })
+                        .await?;
+                    for t in dirty {
+                        match sync.push(&t.id.to_string()).await {
+                            Ok(_) => {
+                                report.pushed += 1;
+                                info!(task_id = %t.id, "pushed dirty task");
+                            }
+                            Err(e) => {
+                                let msg = format!("{}: {e}", t.id);
+                                warn!(task_id = %t.id, error = %e, "push failed");
+                                report.push_failures.push(msg);
+                            }
+                        }
                     }
                 }
+                Ok::<(), DaemonError>(())
             }
+            .instrument(info_span!("workspace_tick", workspace_id = %ws.id, name = %ws.name))
+            .await?;
         }
 
         Ok(report)
@@ -189,12 +231,21 @@ impl Daemon {
             tokio::select! {
                 _ = ticker.tick() => {
                     match self.tick_once().await {
-                        Ok(report) => eprintln!("[daemon] tick: {report:?}"),
-                        Err(e) => eprintln!("[daemon] tick error: {e}"),
+                        Ok(report) => info!(
+                            workspaces = report.workspaces,
+                            repos_checked = report.repos_checked,
+                            worktrees_checked = report.worktrees_checked,
+                            marked_missing = report.marked_missing,
+                            pruned = report.pruned,
+                            pushed = report.pushed,
+                            push_failures = report.push_failures.len(),
+                            "tick complete"
+                        ),
+                        Err(e) => error!(error = %e, "tick failed"),
                     }
                 }
                 _ = signal::ctrl_c() => {
-                    eprintln!("[daemon] shutting down");
+                    info!("ctrl-c received; shutting down");
                     return Ok(());
                 }
             }

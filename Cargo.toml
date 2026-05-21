@@ -75,3 +75,6 @@ pretty_assertions = "1"
 assert_cmd = "2"
 wiremock = "0.6"
 rpassword = "7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2"
