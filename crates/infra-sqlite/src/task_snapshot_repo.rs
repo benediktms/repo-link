@@ -33,11 +33,14 @@ impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
     }
 
     async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot> {
+        let version_i64 = i64::try_from(version).map_err(|e| {
+            PortError::Backend(format!("snapshot version overflow: {e}"))
+        })?;
         let row = sqlx::query(
             "SELECT * FROM task_snapshots WHERE task_id = ? AND version = ?",
         )
         .bind(task_id.to_string())
-        .bind(version as i64)
+        .bind(version_i64)
         .fetch_optional(&self.db.reads)
         .await
         .map_err(map_sqlx_err)?
@@ -71,9 +74,13 @@ fn row_to_snapshot(
         _ => None,
     };
 
+    let version_u64 = u64::try_from(version).map_err(|e| {
+        PortError::Backend(format!("snapshot version overflow: {e}"))
+    })?;
+
     Ok(TaskSnapshot {
         task_id,
-        version: version as u64,
+        version: version_u64,
         title,
         body,
         status: enum_from_str::<TaskStatus>("task status", &status)?,

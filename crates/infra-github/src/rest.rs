@@ -173,7 +173,7 @@ pub(crate) fn split_owner_repo(canonical: &str) -> PortResult<(String, String)> 
         .strip_prefix("github.com/")
         .ok_or_else(|| PortError::Backend(format!("not a github canonical url: {canonical}")))?;
     let parts: Vec<&str> = stripped.split('/').collect();
-    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
         return Err(PortError::Backend(format!(
             "expected github.com/<owner>/<repo>, got {canonical}"
         )));
@@ -215,6 +215,8 @@ mod tests {
     fn rejects_non_github_canonical() {
         assert!(split_owner_repo("gitlab.com/o/r").is_err());
         assert!(split_owner_repo("github.com/o").is_err());
+        assert!(split_owner_repo("github.com/o/r/extra").is_err());
+        assert!(split_owner_repo("github.com/o/r/extra/segments").is_err());
         assert_eq!(
             split_owner_repo("github.com/o/r").unwrap(),
             ("o".into(), "r".into())

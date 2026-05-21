@@ -69,7 +69,8 @@ pub fn discover_origin_url(path: &Path) -> Result<Option<String>> {
         .map_err(|e| GitError::NotARepo(format!("{}: {e}", path.display())))?;
     let remote = match repo.find_remote("origin") {
         Ok(r) => r,
-        Err(_) => return Ok(None),
+        Err(gix::remote::find::existing::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(GitError::Other(e.to_string())),
     };
     Ok(remote
         .url(gix::remote::Direction::Fetch)

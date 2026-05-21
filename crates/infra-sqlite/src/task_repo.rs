@@ -71,9 +71,9 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(t.repo_id.map(|r| r.to_string()))
         .bind(&t.title)
         .bind(&t.body)
-        .bind(enum_to_str(&t.status))
-        .bind(enum_to_str(&t.sync))
-        .bind(enum_to_str(&t.priority))
+        .bind(enum_to_str(&t.status)?)
+        .bind(enum_to_str(&t.sync)?)
+        .bind(enum_to_str(&t.priority)?)
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
@@ -95,13 +95,13 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(next_version)
         .bind(&t.title)
         .bind(&t.body)
-        .bind(enum_to_str(&t.status))
-        .bind(enum_to_str(&t.sync))
-        .bind(enum_to_str(&t.priority))
+        .bind(enum_to_str(&t.status)?)
+        .bind(enum_to_str(&t.sync)?)
+        .bind(enum_to_str(&t.priority)?)
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
-        .bind(enum_to_str(&source))
+        .bind(enum_to_str(&source)?)
         .bind(Timestamp::now().into_inner())
         .execute(&mut *tx)
         .await
@@ -118,7 +118,7 @@ impl TaskRepository for SqliteTaskRepository {
                 "INSERT INTO task_relations (task_id, kind, other_task_id) VALUES (?, ?, ?)",
             )
             .bind(t.id.to_string())
-            .bind(enum_to_str(&r.kind))
+            .bind(enum_to_str(&r.kind)?)
             .bind(r.other.to_string())
             .execute(&mut *tx)
             .await
@@ -178,14 +178,14 @@ impl TaskRepository for SqliteTaskRepository {
             qb.push(" AND repo_id = ").push_bind(r.to_string());
         }
         if let Some(s) = filter.status {
-            qb.push(" AND status = ").push_bind(enum_to_str(&s));
+            qb.push(" AND status = ").push_bind(enum_to_str(&s)?);
         } else if !filter.include_archived {
             // Explicit status filter takes precedence; otherwise default to
             // hiding Archived rows.
             qb.push(" AND status != 'archived'");
         }
         if let Some(s) = filter.sync_state {
-            qb.push(" AND sync_state = ").push_bind(enum_to_str(&s));
+            qb.push(" AND sync_state = ").push_bind(enum_to_str(&s)?);
         }
         qb.push(" ORDER BY created_at");
 

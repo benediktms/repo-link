@@ -120,7 +120,6 @@ impl SyncService {
     pub async fn push(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
-        ensure_not_archived(&task)?;
         let canonical = self.canonical_for(&task).await?;
         let prev = task.sync;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
@@ -269,7 +268,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProvider {
         last_create: Mutex<Option<String>>,
-        last_update: Mutex<Option<(String, Option<String>)>>,
+        last_update: Mutex<Option<(String, Option<String>, Option<bool>, Option<RemoteStateReason>)>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
     }
 
@@ -302,7 +301,7 @@ mod tests {
             cmd: RemoteTaskUpdate<'_>,
         ) -> PortResult<RemoteTaskSnapshot> {
             *self.last_update.lock().unwrap() =
-                Some((cmd.remote_id.into(), cmd.body.map(str::to_owned)));
+                Some((cmd.remote_id.into(), cmd.body.map(str::to_owned), cmd.closed, cmd.state_reason));
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
                 title: cmd.title.unwrap_or("").into(),
@@ -382,7 +381,7 @@ mod tests {
         let s = svc.push(&task.id.to_string()).await.unwrap();
         assert_eq!(s.previous_state, "dirty_local");
         assert_eq!(s.new_state, "synced");
-        let (rid, body) = provider.last_update.lock().unwrap().clone().unwrap();
+        let (rid, body, _, _) = provider.last_update.lock().unwrap().clone().unwrap();
         assert_eq!(rid, "100");
         assert_eq!(body.as_deref(), Some("revised"));
     }
@@ -411,6 +410,25 @@ mod tests {
         assert_eq!(after.body, "remote body");
         assert_eq!(after.assignees, vec!["bob".to_string()]);
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn push_archived_task_closes_remote_with_not_planned() {
+        let (svc, tasks, task, provider) = setup().await;
+        // Promote → Synced, then archive → DirtyLocal.
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.archive().unwrap();
+        // archive() + reconcile_dirty_against_baseline transitions Synced → DirtyLocal.
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let s = svc.push(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.new_state, "synced");
+
+        let (rid, _, closed, state_reason) = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(rid, "100");
+        assert_eq!(closed, Some(true));
+        assert!(matches!(state_reason, Some(RemoteStateReason::NotPlanned)));
     }
 
     #[tokio::test]

@@ -341,6 +341,45 @@ fn task_rollback_restores_previous_title() {
 }
 
 #[test]
+fn batch_failure_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "real task"],
+    );
+    let valid_id = task["id"].as_str().unwrap().to_string();
+    let invalid_id = "00000000-0000-0000-0000-000000000000".to_string();
+
+    // Mix one valid ID and one invalid ID — the batch should fail (nonzero exit)
+    // but still print the full JSON array on stdout.
+    let output = bin("repo-link", &dir)
+        .args(["task", "start", &valid_id, &invalid_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    let batch: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {stdout}"));
+
+    let rows = batch.as_array().expect("expected JSON array on stdout");
+    assert_eq!(rows.len(), 2, "expected both rows even on partial failure");
+
+    let ok_row = rows.iter().find(|r| r["task_id"] == valid_id).expect("valid id row");
+    assert_eq!(ok_row["ok"], true);
+
+    let err_row = rows.iter().find(|r| r["task_id"] == invalid_id).expect("invalid id row");
+    assert_eq!(err_row["ok"], false);
+}
+
+#[test]
 fn invalid_priority_exits_nonzero_with_readable_error() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(

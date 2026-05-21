@@ -113,7 +113,7 @@ pub struct TaskDirtyRemote {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskConflicted {
     pub task_id: String,
-    pub kind: String,
+    pub conflict_kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -21,8 +21,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 testing-fixtures = { workspace = true }
 domain-workspace = { workspace = true }
-domain-repo = { workspace = true }
 tokio = { workspace = true }
 pretty_assertions = { workspace = true }
 chrono = { workspace = true }
-async-trait = { workspace = true }

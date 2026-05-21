@@ -8,11 +8,13 @@ use ports::{PortError, PortResult};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-pub fn enum_to_str<T: Serialize>(t: &T) -> String {
-    serde_json::to_value(t)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default()
+pub fn enum_to_str<T: Serialize>(t: &T) -> PortResult<String> {
+    let value = serde_json::to_value(t)
+        .map_err(|e| PortError::Backend(format!("encode enum: {e}")))?;
+    value
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| PortError::Backend(format!("encode enum: not a string value ({value})")))
 }
 
 pub fn enum_from_str<T: DeserializeOwned>(field: &'static str, value: &str) -> PortResult<T> {

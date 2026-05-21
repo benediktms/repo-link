@@ -518,6 +518,8 @@ where
     >,
 {
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+    let mut had_errors = false;
+    let mut failed_ids: Vec<String> = Vec::new();
     for id in tasks {
         let recorded = id.clone();
         match op(id).await {
@@ -526,17 +528,28 @@ where
                 "ok": true,
                 "task": dto,
             })),
-            Err(e) => results.push(serde_json::json!({
-                "task_id": recorded,
-                "ok": false,
-                "error": e.to_string(),
-            })),
+            Err(e) => {
+                had_errors = true;
+                failed_ids.push(recorded.clone());
+                results.push(serde_json::json!({
+                    "task_id": recorded,
+                    "ok": false,
+                    "error": e.to_string(),
+                }));
+            }
         }
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".into())
     );
+    if had_errors {
+        return Err(anyhow!(
+            "batch had {} failed task(s): {}",
+            failed_ids.len(),
+            failed_ids.join(", ")
+        ));
+    }
     Ok(())
 }
 

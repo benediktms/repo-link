@@ -496,7 +496,7 @@ impl Task {
         let differs = self.title != baseline.title
             || self.body != baseline.body
             || self.status != baseline.status
-            || self.assignees != baseline.assignees;
+            || !assignees_equal(&self.assignees, &baseline.assignees);
         self.sync = match (self.sync, differs) {
             (SyncState::Synced, true) => SyncState::DirtyLocal,
             (SyncState::DirtyLocal, false) => SyncState::Synced,
@@ -508,6 +508,18 @@ impl Task {
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }
+}
+
+/// Order-insensitive assignee comparison. GitHub does not preserve the order
+/// of assignees in its REST responses, so `["alice","bob"]` and `["bob","alice"]`
+/// must be treated as equal to avoid spurious `DirtyLocal` transitions.
+fn assignees_equal(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let a_set: std::collections::HashSet<&String> = a.iter().collect();
+    let b_set: std::collections::HashSet<&String> = b.iter().collect();
+    a_set == b_set
 }
 
 impl Aggregate for Task {
@@ -747,6 +759,27 @@ mod tests {
         t.start().unwrap();
         t.set_assignees(vec!["alice".into()]);
         assert_eq!(t.sync, SyncState::Conflict);
+    }
+
+    /// Reordering assignees (without any other change) must NOT produce a
+    /// false-positive `DirtyLocal`. GitHub's REST API returns assignees in
+    /// arbitrary order, so order has no semantic meaning.
+    #[test]
+    fn assignee_reorder_does_not_dirty() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.set_assignees(vec!["alice".into(), "bob".into()]);
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        // Reorder only — no other field changes.
+        t.set_assignees(vec!["bob".into(), "alice".into()]);
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "reordering assignees must not produce DirtyLocal"
+        );
     }
 
     #[test]

@@ -41,7 +41,13 @@ pub enum ConflictKind {
 pub fn decide(sync: SyncState, remote_dirty: bool, policy: SyncPolicy) -> SyncDecision {
     match sync {
         SyncState::LocalOnly => SyncDecision::Noop,
-        SyncState::Staged | SyncState::DirtyLocal => SyncDecision::PushLocal,
+        SyncState::Staged => SyncDecision::PushLocal,
+        SyncState::DirtyLocal if remote_dirty => match policy {
+            SyncPolicy::LocalWins => SyncDecision::PushLocal,
+            SyncPolicy::RemoteWins => SyncDecision::PullRemote,
+            SyncPolicy::ManualMerge => SyncDecision::RequireManualMerge,
+        },
+        SyncState::DirtyLocal => SyncDecision::PushLocal,
         SyncState::Synced if remote_dirty => SyncDecision::PullRemote,
         SyncState::Synced => SyncDecision::Noop,
         SyncState::DirtyRemote => SyncDecision::PullRemote,
@@ -86,6 +92,30 @@ mod tests {
         assert_eq!(
             decide(SyncState::Synced, false, SyncPolicy::ManualMerge),
             SyncDecision::Noop
+        );
+    }
+
+    #[test]
+    fn dirty_local_with_dirty_remote_respects_policy() {
+        assert_eq!(
+            decide(SyncState::DirtyLocal, true, SyncPolicy::LocalWins),
+            SyncDecision::PushLocal
+        );
+        assert_eq!(
+            decide(SyncState::DirtyLocal, true, SyncPolicy::RemoteWins),
+            SyncDecision::PullRemote
+        );
+        assert_eq!(
+            decide(SyncState::DirtyLocal, true, SyncPolicy::ManualMerge),
+            SyncDecision::RequireManualMerge
+        );
+    }
+
+    #[test]
+    fn dirty_local_without_dirty_remote_always_pushes() {
+        assert_eq!(
+            decide(SyncState::DirtyLocal, false, SyncPolicy::ManualMerge),
+            SyncDecision::PushLocal
         );
     }
 

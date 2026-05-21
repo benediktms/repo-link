@@ -36,7 +36,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         .bind(w.id.to_string())
         .bind(w.name.as_str())
         .bind(w.description.as_deref())
-        .bind(enum_to_str(&w.status))
+        .bind(enum_to_str(&w.status)?)
         .bind(w.local_only as i64)
         .bind(w.created_at.into_inner())
         .bind(w.updated_at.into_inner())

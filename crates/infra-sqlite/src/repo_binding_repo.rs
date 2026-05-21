@@ -71,7 +71,7 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
             .bind(b.id.to_string())
             .bind(w.path.display().to_string())
             .bind(w.branch.as_deref())
-            .bind(enum_to_str(&w.status))
+            .bind(enum_to_str(&w.status)?)
             .bind(w.last_seen_at.into_inner())
             .execute(&mut *tx)
             .await

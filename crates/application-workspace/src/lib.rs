@@ -182,6 +182,8 @@ impl RepoBindingService {
         prune: bool,
     ) -> Result<ReconcileSummary> {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
+        // Confirm the workspace exists; bubbles up as PortError::NotFound otherwise.
+        let _ = self.workspaces.get(workspace_id).await?;
         let bindings = self.bindings.list_by_workspace(workspace_id).await?;
 
         let mut summary = ReconcileSummary::default();
@@ -451,6 +453,19 @@ mod tests {
         let after = bsvc.show(&b.id).await.unwrap();
         assert_eq!(after.worktrees.len(), 1);
         assert_eq!(after.worktrees[0].path, "/tmp/alive");
+    }
+
+    #[tokio::test]
+    async fn reconcile_worktrees_unknown_workspace_returns_not_found() {
+        use testing_fixtures::StubFilesystemProbe;
+        let (_, bsvc) = setup();
+        let unknown_id = domain_core::WorkspaceId::new().to_string();
+        let probe = StubFilesystemProbe::new();
+        let err = bsvc
+            .reconcile_worktrees(&unknown_id, &probe, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::Port(PortError::NotFound(_))));
     }
 
     #[tokio::test]
