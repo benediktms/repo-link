@@ -59,6 +59,9 @@ enum Cmd {
     /// Promote / push / pull tasks against GitHub.
     #[command(subcommand)]
     Sync(SyncCmd),
+    /// GitHub helper commands.
+    #[command(subcommand)]
+    Gh(GhCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -290,12 +293,27 @@ enum SyncCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum GhCmd {
+    /// Save the GitHub token to a permission-restricted config file.
+    Auth {
+        /// Token value. If omitted, prompts on stdin with echo disabled.
+        /// Passing it as a flag avoids stdin but leaves the value in shell history.
+        #[arg(long)]
+        token: Option<String>,
+        /// Skip the overwrite confirmation if the file already exists.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 struct Services {
     workspaces: WorkspaceService,
     bindings: RepoBindingService,
     tasks: TaskService,
     query: QueryService,
-    sync: Option<SyncService>,
+    tasks_repo: Arc<dyn ports::TaskRepository>,
+    bindings_repo: Arc<dyn ports::RepoBindingRepository>,
 }
 
 /// Library entrypoint shared by both `repo-link` and `rl` bin shims.
@@ -323,19 +341,13 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     let snapshots_repo: Arc<dyn ports::TaskSnapshotRepository> =
         Arc::new(SqliteTaskSnapshotRepository::new(db));
 
-    // Sync is only available when a GitHub token resolved from config.
-    let sync = cfg.github_token.clone().map(|token| {
-        let provider: Arc<dyn ports::RemoteTaskProvider> =
-            Arc::new(GithubTaskProvider::new(token));
-        SyncService::new(tasks_repo.clone(), bindings_repo.clone(), provider)
-    });
-
     Ok(Services {
         workspaces: WorkspaceService::new(workspaces_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
         tasks: TaskService::new(tasks_repo.clone(), snapshots_repo),
-        query: QueryService::new(workspaces_repo, bindings_repo, tasks_repo),
-        sync,
+        query: QueryService::new(workspaces_repo, bindings_repo.clone(), tasks_repo.clone()),
+        tasks_repo,
+        bindings_repo,
     })
 }
 
@@ -346,20 +358,162 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Worktree(c) => worktree_dispatch(c, svc).await,
         Cmd::Task(c) => task_dispatch(c, svc).await,
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
-        Cmd::Sync(c) => sync_dispatch(c, svc).await,
+        Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
+        Cmd::Gh(c) => gh_dispatch(c, cfg),
     }
 }
 
-async fn sync_dispatch(cmd: SyncCmd, svc: &Services) -> Result<()> {
-    let sync = svc.sync.as_ref().ok_or_else(|| {
-        anyhow!("sync requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set")
-    })?;
+async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
+    let token = cfg
+        .resolve_github_token()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "sync requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
+                 or a token file at {} (write one with `rl gh auth`)",
+                cfg.token_file_path.display()
+            )
+        })?;
+    let provider: Arc<dyn ports::RemoteTaskProvider> =
+        Arc::new(GithubTaskProvider::new(token));
+    let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
     let summary = match cmd {
         SyncCmd::Promote { task } => sync.promote(&task).await?,
         SyncCmd::Push { task } => sync.push(&task).await?,
         SyncCmd::Pull { task } => sync.pull(&task).await?,
     };
     render::sync(&summary);
+    Ok(())
+}
+
+fn gh_dispatch(cmd: GhCmd, cfg: &RepoLinkConfig) -> Result<()> {
+    match cmd {
+        GhCmd::Auth { token, force } => gh_auth(token, force, cfg),
+    }
+}
+
+fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<()> {
+    // Guard against overwriting an existing token file without explicit consent.
+    if cfg.token_file_path.exists() && !force {
+        eprint!(
+            "token file {} already exists. Overwrite? [y/N]: ",
+            cfg.token_file_path.display()
+        );
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| anyhow!("failed to read confirmation: {e}"))?;
+        let answer = line.trim().to_lowercase();
+        if answer != "y" && answer != "yes" {
+            return Err(anyhow!("aborted; pass --force to overwrite"));
+        }
+    }
+
+    // Resolve the token: explicit --token wins, then a best-effort fetch from
+    // the official `gh` CLI (so `gh auth login` users don't need to copy a
+    // PAT by hand), and finally fall back to a hidden interactive prompt.
+    let raw_token = match token {
+        Some(t) => t,
+        None => match try_gh_cli_token() {
+            Some(t) => {
+                eprintln!("note: using token from `gh auth token`.");
+                t
+            }
+            None => rpassword::prompt_password("Paste GitHub token (input hidden): ")
+                .map_err(|e| anyhow!("failed to read token: {e}"))?,
+        },
+    };
+    let trimmed = raw_token.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(anyhow!("token must not be empty"));
+    }
+
+    write_token_file(&cfg.token_file_path, &trimmed)?;
+
+    let path_str = cfg
+        .token_file_path
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.token_file_path.clone())
+        .display()
+        .to_string();
+
+    #[cfg(unix)]
+    println!("{}", serde_json::json!({ "file": path_str, "mode": "0600" }));
+    #[cfg(not(unix))]
+    println!(
+        "{}",
+        serde_json::json!({ "file": path_str, "mode": "unrestricted" })
+    );
+
+    Ok(())
+}
+
+/// Best-effort: read the token cached by the official `gh` CLI. Any failure
+/// path (gh not on PATH, not logged in, non-zero exit, empty stdout) falls
+/// through to the next source. `gh auth token` is fast in practice; we don't
+/// add an explicit timeout because a user can ctrl-c and `gh` itself doesn't
+/// hang on cached credentials.
+fn try_gh_cli_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(output.stdout).ok()?;
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(unix)]
+fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+    use std::fs::DirBuilder;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    // Ensure parent directory exists with mode 0o700.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| anyhow!("failed to create config dir: {e}"))?;
+    }
+
+    // Create or truncate with mode 0o600. The `mode` on `OpenOptions` only
+    // applies at creation time; `set_permissions` below re-asserts 0o600 so
+    // an existing file that was loosened gets tightened back on overwrite.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| anyhow!("failed to open token file: {e}"))?;
+    file.write_all(token.as_bytes())
+        .map_err(|e| anyhow!("failed to write token: {e}"))?;
+    drop(file);
+
+    // Re-assert permissions in case the file pre-existed with looser bits.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|e| anyhow!("failed to set permissions: {e}"))?;
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("failed to create config dir: {e}"))?;
+        }
+    }
+    std::fs::write(path, token).map_err(|e| anyhow!("failed to write token file: {e}"))?;
     Ok(())
 }
 

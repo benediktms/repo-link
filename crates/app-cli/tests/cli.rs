@@ -380,6 +380,49 @@ fn batch_failure_exits_nonzero() {
 }
 
 #[test]
+#[cfg(unix)]
+fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("github_token");
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
+    // Use canonicalize so symlinks (e.g. /var → /private/var on macOS) don't
+    // cause a mismatch between the path the binary resolves and what we built.
+    let canonical_token_file = token_file.canonicalize().unwrap_or_else(|_| token_file.clone());
+    assert_eq!(result["file"], canonical_token_file.display().to_string());
+    assert_eq!(result["mode"], "0600");
+
+    let mode = std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap().trim(), "abc123");
+
+    // Loosen permissions and assert any sync command rejects it.
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut sync_cmd = bin("rl", &dir);
+    sync_cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    sync_cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    sync_cmd.env_remove("GITHUB_TOKEN");
+    let output = sync_cmd
+        .args(["sync", "push", "--task", "00000000-0000-0000-0000-000000000000"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("insecure permissions"),
+        "expected insecure-permissions error; got: {stderr}"
+    );
+    assert!(stderr.contains("0644"), "expected mode in error; got: {stderr}");
+}
+
+#[test]
 fn invalid_priority_exits_nonzero_with_readable_error() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(
