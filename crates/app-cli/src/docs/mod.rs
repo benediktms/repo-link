@@ -139,7 +139,13 @@ pub fn write_agents_md(path: &Path, body: &str) -> Result<WriteOutcome> {
                 text.push_str(&existing[after_end..]);
                 (text, Action::Updated)
             }
-            _ => {
+            (Some(_), None) => {
+                bail!("{}: partial marker state detected - start marker present but end marker missing", path.display());
+            }
+            (None, Some(_)) => {
+                bail!("{}: partial marker state detected - end marker present but start marker missing", path.display());
+            }
+            (None, None) => {
                 let mut text = existing;
                 if !text.ends_with('\n') {
                     text.push('\n');
