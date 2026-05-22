@@ -22,6 +22,7 @@ use infra_sqlite::{
     SqliteWorkspaceRepository, open_from_path,
 };
 
+mod docs;
 mod render;
 
 #[derive(Parser, Debug)]
@@ -62,6 +63,9 @@ enum Cmd {
     /// GitHub helper commands.
     #[command(subcommand)]
     Gh(GhCmd),
+    /// Documentation helpers for AI agents picking up this repo.
+    #[command(subcommand)]
+    Agents(AgentsCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -372,6 +376,16 @@ enum GhCmd {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum AgentsCmd {
+    /// Render a self-documenting `rl` block into `./AGENTS.md`.
+    ///
+    /// Splices between `<!-- rl:doc:start -->` and `<!-- rl:doc:end -->`,
+    /// creating the file if missing or appending the block if no markers
+    /// are present. Always rewrites the block on every run.
+    Docs,
+}
+
 struct Services {
     workspaces: WorkspaceService,
     bindings: RepoBindingService,
@@ -425,6 +439,22 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg),
+        Cmd::Agents(c) => agents_dispatch(c),
+    }
+}
+
+fn agents_dispatch(cmd: AgentsCmd) -> Result<()> {
+    match cmd {
+        AgentsCmd::Docs => {
+            let app = <Cli as clap::CommandFactory>::command();
+            let body = docs::render_block(&app);
+            let path = std::env::current_dir()
+                .map_err(|e| anyhow!("failed to read current directory: {e}"))?
+                .join("AGENTS.md");
+            let outcome = docs::write_agents_md(&path, &body)?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            Ok(())
+        }
     }
 }
 
@@ -439,8 +469,7 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
                 cfg.token_file_path.display()
             )
         })?;
-    let provider: Arc<dyn ports::RemoteTaskProvider> =
-        Arc::new(GithubTaskProvider::new(token));
+    let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubTaskProvider::new(token));
     let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
     let summary = match cmd {
         SyncCmd::Promote { task } => sync.promote(&task).await?,
@@ -503,7 +532,10 @@ fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<(
         .to_string();
 
     #[cfg(unix)]
-    println!("{}", serde_json::json!({ "file": path_str, "mode": "0600" }));
+    println!(
+        "{}",
+        serde_json::json!({ "file": path_str, "mode": "0600" })
+    );
     #[cfg(not(unix))]
     println!(
         "{}",
@@ -607,20 +639,19 @@ async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Result<()> {
             render::workspaces(&rows);
         }
         WorkspaceCmd::Show { id } => render::workspace(&svc.workspaces.show(&id).await?),
-        WorkspaceCmd::Activate { id } => {
-            render::workspace(&svc.workspaces.activate(&id).await?)
-        }
+        WorkspaceCmd::Activate { id } => render::workspace(&svc.workspaces.activate(&id).await?),
         WorkspaceCmd::Pause { id } => render::workspace(&svc.workspaces.pause(&id).await?),
-        WorkspaceCmd::Archive { id } => {
-            render::workspace(&svc.workspaces.archive(&id).await?)
-        }
+        WorkspaceCmd::Archive { id } => render::workspace(&svc.workspaces.archive(&id).await?),
     }
     Ok(())
 }
 
 /// Print a JSON ambiguous-handle error to stderr and exit with code 2.
 /// Used by any resolver command when `ServiceError::AmbiguousHandle` fires.
-fn handle_ambiguous(query: String, candidates: Vec<application_workspace::AmbiguousCandidate>) -> ! {
+fn handle_ambiguous(
+    query: String,
+    candidates: Vec<application_workspace::AmbiguousCandidate>,
+) -> ! {
     let body = serde_json::json!({
         "error": "ambiguous",
         "query": query,
@@ -659,27 +690,21 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             svc.bindings.detach(&id).await?;
             println!("{}", serde_json::json!({ "detached": id }));
         }
-        RepoCmd::List { workspace } => {
-            render::repos(&svc.bindings.list(&workspace).await?)
-        }
-        RepoCmd::Show { id } => {
-            match svc.bindings.show(&id).await {
-                Ok(dto) => render::repo(&dto),
-                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                    handle_ambiguous(query, candidates);
-                }
-                Err(e) => return Err(anyhow!("{e}")),
+        RepoCmd::List { workspace } => render::repos(&svc.bindings.list(&workspace).await?),
+        RepoCmd::Show { id } => match svc.bindings.show(&id).await {
+            Ok(dto) => render::repo(&dto),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates);
             }
-        }
-        RepoCmd::Rename { repo, name } => {
-            match svc.bindings.rename(&repo, name).await {
-                Ok(dto) => render::repo(&dto),
-                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                    handle_ambiguous(query, candidates);
-                }
-                Err(e) => return Err(anyhow!("{e}")),
+            Err(e) => return Err(anyhow!("{e}")),
+        },
+        RepoCmd::Rename { repo, name } => match svc.bindings.rename(&repo, name).await {
+            Ok(dto) => render::repo(&dto),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates);
             }
-        }
+            Err(e) => return Err(anyhow!("{e}")),
+        },
         RepoCmd::Alias(RepoAliasCmd::Add { repo, alias }) => {
             match svc.bindings.add_alias(&repo, alias).await {
                 Ok(dto) => render::repo(&dto),
@@ -716,8 +741,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 None => std::env::current_dir()
                     .map_err(|e| anyhow!("failed to determine current directory: {e}"))?,
             };
-            let abs = std::fs::canonicalize(&candidate)
-                .unwrap_or_else(|_| candidate.clone());
+            let abs = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
             let query_path = abs.display().to_string();
 
             // Only "not a git repo" (or "git repo with no origin") maps to
@@ -732,10 +756,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             };
 
             let matches = if let Some(ref canonical) = canonical_url {
-                let workspaces = svc
-                    .workspaces
-                    .list(ListWorkspacesQuery::default())
-                    .await?;
+                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
                 let mut found: Vec<LocateMatchDto> = Vec::new();
                 for ws in &workspaces {
                     let ws_id: domain_core::WorkspaceId = ws
@@ -871,8 +892,8 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
     match cmd {
         WorktreeCmd::Link { repo, path, branch } => {
             let raw_path = std::path::Path::new(&path);
-            let abs_path = std::fs::canonicalize(raw_path)
-                .unwrap_or_else(|_| raw_path.to_path_buf());
+            let abs_path =
+                std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
 
             let discovered = match discover_canonical(&abs_path) {
                 Err(infra_git::GitError::NotARepo(_)) => {
@@ -880,10 +901,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
                 }
                 Err(e) => return Err(anyhow!("{e}")),
                 Ok(None) => {
-                    anyhow::bail!(
-                        "git repo at {} has no `origin` remote",
-                        abs_path.display()
-                    );
+                    anyhow::bail!("git repo at {} has no `origin` remote", abs_path.display());
                 }
                 Ok(Some(c)) => c,
             };
@@ -891,10 +909,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             let binding = svc.bindings.show(&repo).await?;
             if discovered != binding.canonical_url {
                 // Try to find a matching binding across all workspaces.
-                let workspaces = svc
-                    .workspaces
-                    .list(ListWorkspacesQuery::default())
-                    .await?;
+                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
                 let mut found_id: Option<String> = None;
                 'outer: for ws in &workspaces {
                     let ws_id: domain_core::WorkspaceId = ws
@@ -997,8 +1012,8 @@ async fn batch_task_op<F, Fut>(tasks: Vec<String>, mut op: F) -> Result<()>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<
-        Output = std::result::Result<dto_shared::TaskDto, application_task::ServiceError>,
-    >,
+            Output = std::result::Result<dto_shared::TaskDto, application_task::ServiceError>,
+        >,
 {
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
     let mut had_errors = false;
@@ -1077,7 +1092,11 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
             render::tasks(&rows);
         }
         TaskCmd::Stage { tasks } => {
-            batch_task_op(tasks, |id| async move { svc.tasks.stage_for_sync(&id).await }).await?;
+            batch_task_op(
+                tasks,
+                |id| async move { svc.tasks.stage_for_sync(&id).await },
+            )
+            .await?;
         }
         TaskCmd::Start { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.start(&id).await }).await?;
@@ -1111,12 +1130,19 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
         TaskCmd::Snapshots { id } => {
             let task_id: domain_core::TaskId =
                 id.parse().map_err(|e| anyhow!("invalid task id: {e}"))?;
-            let snaps = svc.tasks.snapshots_repo().list(task_id).await
+            let snaps = svc
+                .tasks
+                .snapshots_repo()
+                .list(task_id)
+                .await
                 .map_err(|e| anyhow!("{e}"))?;
             render::snapshots(&snaps);
         }
         TaskCmd::Rollback { id, to_version } => {
-            let dto = svc.tasks.rollback(&id, to_version).await
+            let dto = svc
+                .tasks
+                .rollback(&id, to_version)
+                .await
                 .map_err(|e| anyhow!("{e}"))?;
             render::task(&dto);
         }
@@ -1154,7 +1180,10 @@ async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig) -> 
             let v = svc.query.ready_tasks(&workspace).await?;
             render::ready(&v);
         }
-        QueryCmd::Mine { workspace, assignee } => {
+        QueryCmd::Mine {
+            workspace,
+            assignee,
+        } => {
             let _ = cfg; // RepoLinkConfig is currently the env-var fallback chain.
             // Precedence: explicit --assignee > git config user.name >
             // REPO_LINK_USER > $USER. Git user comes ahead of env vars so

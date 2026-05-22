@@ -164,7 +164,12 @@ fn repo_and_worktree_lifecycle() {
     );
     let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
     // The attach linked the worktree (repo_path), so worktrees is non-empty.
-    assert!(!outcome["binding"]["worktrees"].as_array().unwrap().is_empty());
+    assert!(
+        !outcome["binding"]["worktrees"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     // Link a second worktree (different checkout of same origin).
     let second_dir = TempDir::new().unwrap();
@@ -185,15 +190,24 @@ fn repo_and_worktree_lifecycle() {
         ],
     );
     assert_eq!(linked["worktrees"].as_array().unwrap().len(), 2);
-    assert!(linked["worktrees"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|w| w["status"] == "linked"));
+    assert!(
+        linked["worktrees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["status"] == "linked")
+    );
 
     let unlinked = run_json(
         &mut bin("repo-link", &dir),
-        &["worktree", "unlink", "--repo", &repo_id, "--path", &second_path],
+        &[
+            "worktree",
+            "unlink",
+            "--repo",
+            &repo_id,
+            "--path",
+            &second_path,
+        ],
     );
     assert_eq!(unlinked["worktrees"].as_array().unwrap().len(), 1);
 }
@@ -238,9 +252,14 @@ fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
     let repo_id = run_json(
         &mut bin("repo-link", &dir),
         &[
-            "repo", "attach", "--workspace", &workspace,
-            "--url", "git@github.com:o/r.git",
-            "--canonical", "github.com/o/r",
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
             "--no-link",
         ],
     )["binding"]["id"]
@@ -253,13 +272,16 @@ fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
         .args(["worktree", "link", "--repo", &repo_id, "--path", &user_path])
         .assert()
         .success();
-    let stored = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])
-        ["worktrees"][0]["path"]
+    let stored = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])["worktrees"][0]
+        ["path"]
         .as_str()
         .unwrap()
         .to_string();
     let expected_canonical = std::fs::canonicalize(&child).unwrap().display().to_string();
-    assert_eq!(stored, expected_canonical, "link should store canonical form");
+    assert_eq!(
+        stored, expected_canonical,
+        "link should store canonical form"
+    );
 
     // Delete the target so canonicalize(user_path) will fail.
     std::fs::remove_dir_all(&child).unwrap();
@@ -267,7 +289,9 @@ fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
     // Unlink with the *same* user input. Must succeed.
     let unlinked = run_json(
         &mut bin("repo-link", &dir),
-        &["worktree", "unlink", "--repo", &repo_id, "--path", &user_path],
+        &[
+            "worktree", "unlink", "--repo", &repo_id, "--path", &user_path,
+        ],
     );
     assert!(
         unlinked["worktrees"].as_array().unwrap().is_empty(),
@@ -303,9 +327,14 @@ fn worktree_link_unlink_round_trips_with_same_input() {
     let repo_id = run_json(
         &mut bin("repo-link", &dir),
         &[
-            "repo", "attach", "--workspace", &workspace,
-            "--url", "git@github.com:o/r.git",
-            "--canonical", "github.com/o/r",
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
             "--no-link",
         ],
     )["binding"]["id"]
@@ -411,13 +440,19 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     // `/private/var`).
     let alive_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(alive_dir.path(), "git@github.com:o/r.git");
-    let alive = std::fs::canonicalize(alive_dir.path()).unwrap().display().to_string();
+    let alive = std::fs::canonicalize(alive_dir.path())
+        .unwrap()
+        .display()
+        .to_string();
 
     // gone is a path that doesn't exist yet; create a git repo there first so
     // the link canonical check passes, then the reconcile will see it missing.
     let gone_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(gone_dir.path(), "git@github.com:o/r.git");
-    let gone = std::fs::canonicalize(gone_dir.path()).unwrap().display().to_string();
+    let gone = std::fs::canonicalize(gone_dir.path())
+        .unwrap()
+        .display()
+        .to_string();
 
     bin("repo-link", &dir)
         .args([
@@ -447,14 +482,25 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|w| (w["path"].as_str().unwrap().to_string(), w["status"].as_str().unwrap().to_string()))
+        .map(|w| {
+            (
+                w["path"].as_str().unwrap().to_string(),
+                w["status"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     assert_eq!(by_path[&alive], "linked");
     assert_eq!(by_path[&gone], "missing_path");
 
     let summary2 = run_json(
         &mut bin("repo-link", &dir),
-        &["worktree", "reconcile", "--workspace", &workspace, "--prune"],
+        &[
+            "worktree",
+            "reconcile",
+            "--workspace",
+            &workspace,
+            "--prune",
+        ],
     );
     assert_eq!(summary2["pruned"], 1);
     let show_after = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
@@ -472,7 +518,14 @@ fn task_snapshots_lists_history_after_edits() {
 
     let task = run_json(
         &mut bin("repo-link", &dir),
-        &["task", "create", "--workspace", &workspace, "--title", "original"],
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "original",
+        ],
     );
     let task_id = task["id"].as_str().unwrap().to_string();
 
@@ -502,7 +555,14 @@ fn task_rollback_restores_previous_title() {
 
     let task = run_json(
         &mut bin("repo-link", &dir),
-        &["task", "create", "--workspace", &workspace, "--title", "v1 title"],
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "v1 title",
+        ],
     );
     let task_id = task["id"].as_str().unwrap().to_string();
 
@@ -531,7 +591,14 @@ fn batch_failure_exits_nonzero() {
 
     let task = run_json(
         &mut bin("repo-link", &dir),
-        &["task", "create", "--workspace", &workspace, "--title", "real task"],
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "real task",
+        ],
     );
     let valid_id = task["id"].as_str().unwrap().to_string();
     let invalid_id = "00000000-0000-0000-0000-000000000000".to_string();
@@ -552,10 +619,16 @@ fn batch_failure_exits_nonzero() {
     let rows = batch.as_array().expect("expected JSON array on stdout");
     assert_eq!(rows.len(), 2, "expected both rows even on partial failure");
 
-    let ok_row = rows.iter().find(|r| r["task_id"] == valid_id).expect("valid id row");
+    let ok_row = rows
+        .iter()
+        .find(|r| r["task_id"] == valid_id)
+        .expect("valid id row");
     assert_eq!(ok_row["ok"], true);
 
-    let err_row = rows.iter().find(|r| r["task_id"] == invalid_id).expect("invalid id row");
+    let err_row = rows
+        .iter()
+        .find(|r| r["task_id"] == invalid_id)
+        .expect("invalid id row");
     assert_eq!(err_row["ok"], false);
 }
 
@@ -574,13 +647,18 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
     // Use canonicalize so symlinks (e.g. /var → /private/var on macOS) don't
     // cause a mismatch between the path the binary resolves and what we built.
-    let canonical_token_file = token_file.canonicalize().unwrap_or_else(|_| token_file.clone());
+    let canonical_token_file = token_file
+        .canonicalize()
+        .unwrap_or_else(|_| token_file.clone());
     assert_eq!(result["file"], canonical_token_file.display().to_string());
     assert_eq!(result["mode"], "0600");
 
     let mode = std::fs::metadata(&token_file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
-    assert_eq!(std::fs::read_to_string(&token_file).unwrap().trim(), "abc123");
+    assert_eq!(
+        std::fs::read_to_string(&token_file).unwrap().trim(),
+        "abc123"
+    );
 
     // Loosen permissions and assert any sync command rejects it.
     std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -589,7 +667,12 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     sync_cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
     sync_cmd.env_remove("GITHUB_TOKEN");
     let output = sync_cmd
-        .args(["sync", "push", "--task", "00000000-0000-0000-0000-000000000000"])
+        .args([
+            "sync",
+            "push",
+            "--task",
+            "00000000-0000-0000-0000-000000000000",
+        ])
         .assert()
         .failure()
         .get_output()
@@ -599,7 +682,10 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
         stderr.contains("insecure permissions"),
         "expected insecure-permissions error; got: {stderr}"
     );
-    assert!(stderr.contains("0644"), "expected mode in error; got: {stderr}");
+    assert!(
+        stderr.contains("0644"),
+        "expected mode in error; got: {stderr}"
+    );
 }
 
 #[test]
@@ -627,7 +713,10 @@ fn invalid_priority_exits_nonzero_with_readable_error() {
         .get_output()
         .clone();
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.to_lowercase().contains("priority"), "stderr: {stderr}");
+    assert!(
+        stderr.to_lowercase().contains("priority"),
+        "stderr: {stderr}"
+    );
 }
 
 // ---------- Phase B: names + aliases + find --------------------------------
@@ -637,10 +726,14 @@ fn attach_no_link(dir: &TempDir, workspace: &str, url: &str, canonical: &str) ->
     run_json(
         &mut bin("repo-link", dir),
         &[
-            "repo", "attach",
-            "--workspace", workspace,
-            "--url", url,
-            "--canonical", canonical,
+            "repo",
+            "attach",
+            "--workspace",
+            workspace,
+            "--url",
+            url,
+            "--canonical",
+            canonical,
             "--no-link",
         ],
     )["binding"]["id"]
@@ -683,7 +776,9 @@ fn repo_show_resolves_by_alias() {
     // Add alias "gateway"
     run_json(
         &mut bin("repo-link", &dir),
-        &["repo", "alias", "add", "--repo", &repo_id, "--alias", "gateway"],
+        &[
+            "repo", "alias", "add", "--repo", &repo_id, "--alias", "gateway",
+        ],
     );
 
     let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", "gateway"]);
@@ -779,7 +874,12 @@ fn repo_alias_add_dedup() {
 
     let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
     let aliases = shown["aliases"].as_array().expect("aliases array");
-    assert_eq!(aliases.len(), 1, "duplicate alias should be deduplicated; got {:?}", aliases);
+    assert_eq!(
+        aliases.len(),
+        1,
+        "duplicate alias should be deduplicated; got {:?}",
+        aliases
+    );
 }
 
 #[test]
@@ -794,9 +894,19 @@ fn repo_find_ranks_and_marks_ambiguous() {
         .to_string();
 
     // "search" — exact name match
-    attach_no_link(&dir, &workspace, "git@github.com:o/search.git", "github.com/o/search");
+    attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/search.git",
+        "github.com/o/search",
+    );
     // "finder" — canonical substring match for query "search" (canonical contains "search" as substring via "o/search")
-    attach_no_link(&dir, &workspace, "git@github.com:o/finder.git", "github.com/o/search-tools");
+    attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/finder.git",
+        "github.com/o/search-tools",
+    );
 
     let result = run_json(&mut bin("repo-link", &dir), &["repo", "find", "search"]);
     assert_eq!(result["query"], "search");
@@ -822,12 +932,88 @@ fn repo_alias_rm_returns_error_when_absent() {
 
     // Try removing an alias that was never set
     let output = bin("repo-link", &dir)
-        .args(["repo", "alias", "rm", "--repo", &repo_id, "--alias", "nonexistent"])
+        .args([
+            "repo",
+            "alias",
+            "rm",
+            "--repo",
+            &repo_id,
+            "--alias",
+            "nonexistent",
+        ])
         .assert()
         .failure()
         .get_output()
         .clone();
 
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stderr.is_empty(), "expected an error message on stderr; got empty");
+    assert!(
+        !stderr.is_empty(),
+        "expected an error message on stderr; got empty"
+    );
+}
+
+// ---------- agents docs ---------------------------------------------------
+
+#[test]
+fn agents_docs_creates_file_with_markers() {
+    let dir = TempDir::new().unwrap();
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(dir.path());
+    let value = run_json(&mut cmd, &["agents", "docs"]);
+
+    assert_eq!(value["action"], "created");
+    let path = dir.path().join("AGENTS.md");
+    // macOS reports tempdir paths as `/var/folders/...` but `current_dir()` in
+    // the child process resolves the `/var → /private/var` symlink, so compare
+    // by canonical form.
+    let reported = std::path::PathBuf::from(value["file"].as_str().unwrap())
+        .canonicalize()
+        .unwrap();
+    assert_eq!(reported, path.canonicalize().unwrap());
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# AGENTS\n"));
+    assert!(text.contains("<!-- rl:doc:start -->"));
+    assert!(text.contains("<!-- rl:doc:end -->"));
+    assert!(text.contains("`rl workspace create`"));
+    assert_eq!(
+        value["bytes_written"].as_u64().unwrap() as usize,
+        text.len()
+    );
+}
+
+#[test]
+fn agents_docs_appends_when_existing_file_has_no_markers() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("AGENTS.md");
+    std::fs::write(&path, "# AGENTS\n\nhand-written notes.\n").unwrap();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(dir.path());
+    let value = run_json(&mut cmd, &["agents", "docs"]);
+
+    assert_eq!(value["action"], "appended");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("# AGENTS\n\nhand-written notes.\n"));
+    assert!(text.contains("## Using `rl`"));
+    assert!(text.contains("<!-- rl:doc:start -->"));
+}
+
+#[test]
+fn agents_docs_updates_block_on_second_run() {
+    let dir = TempDir::new().unwrap();
+    let mut first = bin("repo-link", &dir);
+    first.current_dir(dir.path());
+    let first_out = run_json(&mut first, &["agents", "docs"]);
+    assert_eq!(first_out["action"], "created");
+    let path = dir.path().join("AGENTS.md");
+    let after_first = std::fs::read_to_string(&path).unwrap();
+
+    let mut second = bin("repo-link", &dir);
+    second.current_dir(dir.path());
+    let second_out = run_json(&mut second, &["agents", "docs"]);
+    assert_eq!(second_out["action"], "updated");
+    let after_second = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(after_first, after_second);
 }
