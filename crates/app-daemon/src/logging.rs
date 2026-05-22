@@ -41,8 +41,8 @@ pub enum LogFormat {
 pub fn init_subscriber(format: LogFormat, log_dir: &Path) -> Option<WorkerGuard> {
     // Default filter: info+ for everything we emit, plus the noisy crates
     // tamped down. `RUST_LOG=…` overrides this for ad-hoc debugging.
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,sqlx=warn,reqwest=warn"));
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,sqlx=warn,reqwest=warn"));
 
     match format {
         LogFormat::Pretty => {

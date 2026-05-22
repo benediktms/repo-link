@@ -288,10 +288,7 @@ mod tests {
 
     #[async_trait]
     impl RemoteTaskProvider for FakeProvider {
-        async fn create_remote(
-            &self,
-            cmd: RemoteTaskCreate<'_>,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
             *self.last_create.lock().unwrap() = Some(cmd.title.to_string());
             Ok(RemoteTaskSnapshot {
                 remote_id: "100".into(),
@@ -304,10 +301,7 @@ mod tests {
             })
         }
 
-        async fn update_remote(
-            &self,
-            cmd: RemoteTaskUpdate<'_>,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn update_remote(&self, cmd: RemoteTaskUpdate<'_>) -> PortResult<RemoteTaskSnapshot> {
             *self.last_update.lock().unwrap() = Some(RecordedUpdate {
                 remote_id: cmd.remote_id.into(),
                 body: cmd.body.map(str::to_owned),
@@ -325,11 +319,7 @@ mod tests {
             })
         }
 
-        async fn fetch_remote(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn fetch_remote(&self, _: &str, _: &str) -> PortResult<RemoteTaskSnapshot> {
             self.fetch_returns
                 .lock()
                 .unwrap()
@@ -338,15 +328,23 @@ mod tests {
         }
     }
 
-    async fn setup() -> (SyncService, Arc<InMemoryTaskRepository>, Task, Arc<FakeProvider>) {
+    async fn setup() -> (
+        SyncService,
+        Arc<InMemoryTaskRepository>,
+        Task,
+        Arc<FakeProvider>,
+    ) {
         let tasks = Arc::new(InMemoryTaskRepository::new());
         let bindings = Arc::new(InMemoryRepoBindingRepository::new());
         let provider = Arc::new(FakeProvider::default());
 
         let workspace_id = WorkspaceId::new();
-        let binding =
-            RepoBinding::new(workspace_id, "git@github.com:o/r.git".into(), "github.com/o/r".into())
-                .unwrap();
+        let binding = RepoBinding::new(
+            workspace_id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
         let repo_id = binding.id;
         bindings.save(&binding).await.unwrap();
 

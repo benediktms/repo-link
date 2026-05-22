@@ -48,7 +48,10 @@ impl RestClient {
             labels: cmd.labels,
         };
         let resp = self
-            .request(reqwest::Method::POST, &format!("/repos/{owner}/{repo}/issues"))
+            .request(
+                reqwest::Method::POST,
+                &format!("/repos/{owner}/{repo}/issues"),
+            )
             .json(&body)
             .send()
             .await
@@ -226,7 +229,10 @@ mod tests {
     #[test]
     fn state_reason_strings_match_github_wire_format() {
         assert_eq!(state_reason_str(RemoteStateReason::Completed), "completed");
-        assert_eq!(state_reason_str(RemoteStateReason::NotPlanned), "not_planned");
+        assert_eq!(
+            state_reason_str(RemoteStateReason::NotPlanned),
+            "not_planned"
+        );
         assert_eq!(state_reason_str(RemoteStateReason::Duplicate), "duplicate");
         assert_eq!(state_reason_str(RemoteStateReason::Reopened), "reopened");
     }

@@ -197,8 +197,7 @@ async fn load_worktrees(pool: &SqlitePool, repo_id: RepoId) -> PortResult<Vec<Wo
             let path: String = row.try_get("path").map_err(map_sqlx_err)?;
             let branch: Option<String> = row.try_get("branch").map_err(map_sqlx_err)?;
             let status: String = row.try_get("status").map_err(map_sqlx_err)?;
-            let last_seen_at: DateTime<Utc> =
-                row.try_get("last_seen_at").map_err(map_sqlx_err)?;
+            let last_seen_at: DateTime<Utc> = row.try_get("last_seen_at").map_err(map_sqlx_err)?;
             Ok(WorktreeLink {
                 path: PathBuf::from(path),
                 branch,

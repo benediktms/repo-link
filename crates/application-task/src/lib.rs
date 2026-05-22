@@ -350,7 +350,13 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(matches!(err, ServiceError::BadEnum { field: "priority", .. }));
+        assert!(matches!(
+            err,
+            ServiceError::BadEnum {
+                field: "priority",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

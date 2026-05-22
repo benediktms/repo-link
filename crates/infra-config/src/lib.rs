@@ -274,6 +274,9 @@ mod tests {
             default_user: None,
             token_file_path: path,
         };
-        assert_eq!(cfg.resolve_github_token().unwrap().as_deref(), Some("from-env"));
+        assert_eq!(
+            cfg.resolve_github_token().unwrap().as_deref(),
+            Some("from-env")
+        );
     }
 }

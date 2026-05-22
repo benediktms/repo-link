@@ -21,39 +21,34 @@ impl SqliteTaskSnapshotRepository {
 #[async_trait]
 impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
     async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>> {
-        let rows = sqlx::query(
-            "SELECT * FROM task_snapshots WHERE task_id = ? ORDER BY version ASC",
-        )
-        .bind(task_id.to_string())
-        .fetch_all(&self.db.reads)
-        .await
-        .map_err(map_sqlx_err)?;
+        let rows =
+            sqlx::query("SELECT * FROM task_snapshots WHERE task_id = ? ORDER BY version ASC")
+                .bind(task_id.to_string())
+                .fetch_all(&self.db.reads)
+                .await
+                .map_err(map_sqlx_err)?;
 
-        rows.iter().map(|row| row_to_snapshot(task_id, row)).collect()
+        rows.iter()
+            .map(|row| row_to_snapshot(task_id, row))
+            .collect()
     }
 
     async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot> {
-        let version_i64 = i64::try_from(version).map_err(|e| {
-            PortError::Backend(format!("snapshot version overflow: {e}"))
-        })?;
-        let row = sqlx::query(
-            "SELECT * FROM task_snapshots WHERE task_id = ? AND version = ?",
-        )
-        .bind(task_id.to_string())
-        .bind(version_i64)
-        .fetch_optional(&self.db.reads)
-        .await
-        .map_err(map_sqlx_err)?
-        .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))?;
+        let version_i64 = i64::try_from(version)
+            .map_err(|e| PortError::Backend(format!("snapshot version overflow: {e}")))?;
+        let row = sqlx::query("SELECT * FROM task_snapshots WHERE task_id = ? AND version = ?")
+            .bind(task_id.to_string())
+            .bind(version_i64)
+            .fetch_optional(&self.db.reads)
+            .await
+            .map_err(map_sqlx_err)?
+            .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))?;
 
         row_to_snapshot(task_id, &row)
     }
 }
 
-fn row_to_snapshot(
-    task_id: TaskId,
-    row: &sqlx::sqlite::SqliteRow,
-) -> PortResult<TaskSnapshot> {
+fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult<TaskSnapshot> {
     let id_str: String = row.try_get("task_id").map_err(map_sqlx_err)?;
     let version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
@@ -70,13 +65,15 @@ fn row_to_snapshot(
     let _ = parse_uuid::<TaskId>("task_id", &id_str)?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef { provider, remote_id }),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef {
+            provider,
+            remote_id,
+        }),
         _ => None,
     };
 
-    let version_u64 = u64::try_from(version).map_err(|e| {
-        PortError::Backend(format!("snapshot version overflow: {e}"))
-    })?;
+    let version_u64 = u64::try_from(version)
+        .map_err(|e| PortError::Backend(format!("snapshot version overflow: {e}")))?;
 
     Ok(TaskSnapshot {
         task_id,

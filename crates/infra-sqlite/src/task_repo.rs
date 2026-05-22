@@ -319,7 +319,10 @@ async fn load_latest_baseline(
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef { provider, remote_id }),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef {
+            provider,
+            remote_id,
+        }),
         _ => None,
     };
 
