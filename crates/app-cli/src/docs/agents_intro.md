@@ -22,24 +22,7 @@ rl repo locate --path .
 
 It returns every workspace this checkout is bound to (a repo can live in more than one).
 
-### Short flags
-
-The worked examples below use long forms (`--workspace`, `--path`, etc.) for clarity, but every hot flag has a single-letter short form. Use either; they're equivalent. The canonical list:
-
-```
--w  --workspace     (every command that takes a workspace UUID)
--p  --path          (repo attach / discover / locate, worktree link / unlink)
--t  --task          (sync promote / push / pull)
--b  --branch        (repo attach, worktree link)
--a  --alias         (repo alias add / rm)
--u  --url           (repo attach)
--c  --canonical     (repo attach)
--n  --name          (repo rename)
--d  --description   (workspace create)
--s  --status        (task list filter)
-```
-
-`--help` on any subcommand is the authoritative source if a flag isn't listed here.
+Most hot flags have single-letter short forms (e.g. `-w` for `--workspace`). The examples below use the long forms for clarity; run `rl <subcommand> --help` to see the shorts for any specific command.
 
 ### Finding work
 
