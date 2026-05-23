@@ -951,28 +951,41 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
 
             let binding = svc.bindings.show(&repo).await?;
             if discovered != binding.canonical_url {
-                // Try to find a matching binding across all workspaces, to
-                // hint at the correct `--repo` value in the error message.
-                let found_id = svc
+                // Surface every binding that matches the discovered canonical so
+                // the user can pick the right `--repo`. Picking arbitrarily (e.g.
+                // `.first()`) misleads when the canonical is bound in multiple
+                // workspaces.
+                let memberships = svc
                     .bindings
                     .memberships_for_canonical_url(&discovered)
-                    .await?
-                    .first()
-                    .map(|m| m.binding.id.clone());
+                    .await?;
                 let repo_short = &repo;
-                if let Some(found) = found_id {
-                    anyhow::bail!(
+                match memberships.as_slice() {
+                    [] => anyhow::bail!(
                         "path origin '{discovered}' doesn't match repo {repo_short} \
-                         ('{}'); use --repo {found} instead",
-                        binding.canonical_url
-                    );
-                } else {
-                    anyhow::bail!(
-                        "path origin '{discovered}' doesn't match repo \
                          ('{}') and no binding matches '{discovered}'; \
                          run `rl repo attach` first",
                         binding.canonical_url
-                    );
+                    ),
+                    [only] => anyhow::bail!(
+                        "path origin '{discovered}' doesn't match repo {repo_short} \
+                         ('{}'); use --repo {} instead",
+                        binding.canonical_url,
+                        only.binding.id
+                    ),
+                    many => {
+                        let candidates = many
+                            .iter()
+                            .map(|m| format!("{} (workspace: {})", m.binding.id, m.workspace.name))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        anyhow::bail!(
+                            "path origin '{discovered}' doesn't match repo {repo_short} \
+                             ('{}'); canonical '{discovered}' is bound in multiple workspaces: \
+                             {candidates}; choose --repo explicitly",
+                            binding.canonical_url
+                        );
+                    }
                 }
             }
 

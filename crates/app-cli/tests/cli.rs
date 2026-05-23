@@ -358,6 +358,165 @@ fn worktree_link_unlink_round_trips_with_same_input() {
     );
 }
 
+/// Helper: attach a binding with explicit canonical, using --no-link so the
+/// test tempdir isn't auto-registered as a worktree.
+fn attach_binding_no_link(
+    dir: &TempDir,
+    workspace: &str,
+    url: &str,
+    canonical: &str,
+) -> String {
+    run_json(
+        &mut bin("repo-link", dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            workspace,
+            "--url",
+            url,
+            "--canonical",
+            canonical,
+            "--no-link",
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn worktree_link_error_suggests_single_repo_hint_when_canonical_matches_one_binding() {
+    // Regression guard: single-match case must keep the existing
+    // "use --repo X instead" message after the multi-match refactor.
+    let dir = TempDir::new().unwrap();
+
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_target = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let b_a = attach_binding_no_link(
+        &dir,
+        &ws_a,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    let b_target = attach_binding_no_link(
+        &dir,
+        &ws_target,
+        "git@github.com:o/other.git",
+        "github.com/o/other",
+    );
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/shared.git");
+    let path = repo_dir.path().display().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &b_target, "--path", &path])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains(&format!("use --repo {b_a} instead")),
+        "single-match path should suggest the lone binding; got: {stderr}"
+    );
+}
+
+#[test]
+fn worktree_link_error_lists_all_candidates_when_canonical_matches_multiple_bindings() {
+    // The bug being fixed: when `discovered` canonical maps to bindings in
+    // multiple workspaces, `.first()` arbitrarily picks one. We want the
+    // error to surface ALL candidates so the user can pick correctly.
+    let dir = TempDir::new().unwrap();
+
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_target = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Same canonical, two different workspaces.
+    let b_a = attach_binding_no_link(
+        &dir,
+        &ws_a,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    let b_b = attach_binding_no_link(
+        &dir,
+        &ws_b,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    // Decoy binding the user is mistakenly passing as --repo.
+    let b_target = attach_binding_no_link(
+        &dir,
+        &ws_target,
+        "git@github.com:o/other.git",
+        "github.com/o/other",
+    );
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/shared.git");
+    let path = repo_dir.path().display().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &b_target, "--path", &path])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains(&b_a),
+        "stderr should mention ws-a binding ({b_a}); got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&b_b),
+        "stderr should mention ws-b binding ({b_b}); got: {stderr}"
+    );
+    assert!(
+        stderr.contains("ws-a") && stderr.contains("ws-b"),
+        "stderr should name both workspaces so the user can disambiguate; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("multiple") || stderr.contains("choose --repo"),
+        "stderr should signal that the user must pick; got: {stderr}"
+    );
+}
+
 #[test]
 fn query_overview_reports_counts() {
     let dir = TempDir::new().unwrap();
