@@ -8,7 +8,7 @@ use application_query::QueryService;
 use application_sync::SyncService;
 use application_task::TaskService;
 use application_workspace::{RepoBindingService, WorkspaceService};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use dto_shared::{
     AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, LinkWorktreeCmd,
     ListTasksQuery, ListWorkspacesQuery, LocateMatchDto, LocateResponseDto, UnlinkWorktreeCmd,
@@ -38,6 +38,38 @@ struct Cli {
 
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+// Shared `#[command(flatten)]` arg groups. One definition per concept,
+// reused by every variant that needs it — short/long mapping, help text,
+// and any future env var or alias live in exactly one place.
+
+#[derive(Args, Debug)]
+struct WorkspaceArg {
+    /// Workspace UUID.
+    #[arg(short = 'w', long)]
+    workspace: String,
+}
+
+#[derive(Args, Debug)]
+struct TaskArg {
+    /// Task UUID.
+    #[arg(short = 't', long)]
+    task: String,
+}
+
+#[derive(Args, Debug)]
+struct BranchArg {
+    /// Tracked branch.
+    #[arg(short = 'b', long)]
+    branch: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct AliasArg {
+    /// Alias string.
+    #[arg(short = 'a', long)]
+    alias: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,7 +104,7 @@ enum Cmd {
 enum WorkspaceCmd {
     Create {
         name: String,
-        #[arg(long)]
+        #[arg(short = 'd', long)]
         description: Option<String>,
         #[arg(long)]
         local_only: bool,
@@ -98,14 +130,14 @@ enum WorkspaceCmd {
 #[derive(Subcommand, Debug)]
 enum RepoCmd {
     Attach {
-        #[arg(long)]
-        workspace: String,
-        #[arg(long)]
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        #[arg(short = 'u', long)]
         url: String,
-        #[arg(long)]
+        #[arg(short = 'c', long)]
         canonical: String,
-        #[arg(long)]
-        branch: Option<String>,
+        #[command(flatten)]
+        br: BranchArg,
         /// Local checkout to register as a worktree of this binding.
         /// Defaults to the current working directory. The path's git
         /// origin must canonicalise to `--canonical`; otherwise the
@@ -116,7 +148,7 @@ enum RepoCmd {
         /// checkouts), call `attach` once per path with `--path`;
         /// each call merges into the same binding and accumulates
         /// another worktree entry.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         path: Option<PathBuf>,
         /// Skip auto-linking the current path. Use this when you're
         /// sitting in one clone but don't want it recorded under this
@@ -131,8 +163,8 @@ enum RepoCmd {
         id: String,
     },
     List {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     /// Show a binding. Accepts a UUID, an exact `name`, or an exact alias.
     /// Returns a JSON error with candidate IDs if a non-UUID handle matches
@@ -143,7 +175,7 @@ enum RepoCmd {
     /// Walk a directory and report every git repo found, with its origin URL.
     /// Use this to populate a workspace from `~/code/` in one shot.
     Discover {
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         path: PathBuf,
     },
     /// Discover which repo binding (if any) owns the given path.
@@ -151,7 +183,7 @@ enum RepoCmd {
     /// matching binding across all non-archived workspaces.
     Locate {
         /// Path to probe. Defaults to current working directory.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         path: Option<PathBuf>,
     },
     /// Set a new short name on a binding. Identity stays at canonical_url —
@@ -159,7 +191,7 @@ enum RepoCmd {
     Rename {
         #[arg(long)]
         repo: String,
-        #[arg(long)]
+        #[arg(short = 'n', long)]
         name: String,
     },
     /// Manage aliases — alternative short names for a binding.
@@ -179,14 +211,14 @@ enum RepoAliasCmd {
     Add {
         #[arg(long)]
         repo: String,
-        #[arg(long)]
-        alias: String,
+        #[command(flatten)]
+        a: AliasArg,
     },
     Rm {
         #[arg(long)]
         repo: String,
-        #[arg(long)]
-        alias: String,
+        #[command(flatten)]
+        a: AliasArg,
     },
 }
 
@@ -195,15 +227,15 @@ enum WorktreeCmd {
     Link {
         #[arg(long)]
         repo: String,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         path: String,
-        #[arg(long)]
-        branch: Option<String>,
+        #[command(flatten)]
+        br: BranchArg,
     },
     Unlink {
         #[arg(long)]
         repo: String,
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         path: String,
     },
     PruneMissing {
@@ -213,8 +245,8 @@ enum WorktreeCmd {
     /// Scan every worktree in a workspace, mark missing paths, optionally
     /// drop them. Use this after switching machines or pruning checkouts.
     Reconcile {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
         #[arg(long)]
         prune: bool,
     },
@@ -223,8 +255,8 @@ enum WorktreeCmd {
 #[derive(Subcommand, Debug)]
 enum TaskCmd {
     Create {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
         #[arg(long)]
         repo: Option<String>,
         #[arg(long)]
@@ -238,10 +270,10 @@ enum TaskCmd {
         id: String,
     },
     List {
-        #[arg(long)]
+        #[arg(short = 'w', long)]
         workspace: Option<String>,
         /// Filter by lifecycle status (`open` / `in_progress` / `blocked` / `done` / `archived`).
-        #[arg(long)]
+        #[arg(short = 's', long)]
         status: Option<String>,
         /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
         #[arg(long)]
@@ -306,38 +338,38 @@ enum TaskCmd {
 #[derive(Subcommand, Debug)]
 enum QueryCmd {
     Overview {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     Blocked {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     Stale {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     Unsynced {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     Contributors {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     Drift {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     /// Tasks that are actionable now: open + not transitively blocked.
     Ready {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
     },
     /// Open tasks assigned to a user. Defaults to $REPO_LINK_USER or $USER.
     Mine {
-        #[arg(long)]
-        workspace: String,
+        #[command(flatten)]
+        ws: WorkspaceArg,
         #[arg(long, env = "REPO_LINK_USER")]
         assignee: Option<String>,
     },
@@ -347,18 +379,18 @@ enum QueryCmd {
 enum SyncCmd {
     /// Create the remote issue for a Draft/Staged task.
     Promote {
-        #[arg(long)]
-        task: String,
+        #[command(flatten)]
+        t: TaskArg,
     },
     /// Push local edits (state = DirtyLocal) to the remote.
     Push {
-        #[arg(long)]
-        task: String,
+        #[command(flatten)]
+        t: TaskArg,
     },
     /// Pull the latest remote snapshot and reconcile.
     Pull {
-        #[arg(long)]
-        task: String,
+        #[command(flatten)]
+        t: TaskArg,
     },
 }
 
@@ -508,9 +540,9 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
     let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubTaskProvider::new(token));
     let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
     let summary = match cmd {
-        SyncCmd::Promote { task } => sync.promote(&task).await?,
-        SyncCmd::Push { task } => sync.push(&task).await?,
-        SyncCmd::Pull { task } => sync.pull(&task).await?,
+        SyncCmd::Promote { t: TaskArg { task } } => sync.promote(&task).await?,
+        SyncCmd::Push { t: TaskArg { task } } => sync.push(&task).await?,
+        SyncCmd::Pull { t: TaskArg { task } } => sync.pull(&task).await?,
     };
     render::sync(&summary);
     Ok(())
@@ -700,10 +732,10 @@ fn handle_ambiguous(
 async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
     match cmd {
         RepoCmd::Attach {
-            workspace,
+            ws: WorkspaceArg { workspace },
             url,
             canonical,
-            branch,
+            br: BranchArg { branch },
             path,
             no_link,
         } => {
@@ -726,7 +758,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             svc.bindings.detach(&id).await?;
             println!("{}", serde_json::json!({ "detached": id }));
         }
-        RepoCmd::List { workspace } => render::repos(&svc.bindings.list(&workspace).await?),
+        RepoCmd::List { ws: WorkspaceArg { workspace } } => render::repos(&svc.bindings.list(&workspace).await?),
         RepoCmd::Show { id } => match svc.bindings.show(&id).await {
             Ok(dto) => render::repo(&dto),
             Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
@@ -741,7 +773,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             }
             Err(e) => return Err(anyhow!("{e}")),
         },
-        RepoCmd::Alias(RepoAliasCmd::Add { repo, alias }) => {
+        RepoCmd::Alias(RepoAliasCmd::Add { repo, a: AliasArg { alias } }) => {
             match svc.bindings.add_alias(&repo, alias).await {
                 Ok(dto) => render::repo(&dto),
                 Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
@@ -750,7 +782,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 Err(e) => return Err(anyhow!("{e}")),
             }
         }
-        RepoCmd::Alias(RepoAliasCmd::Rm { repo, alias }) => {
+        RepoCmd::Alias(RepoAliasCmd::Rm { repo, a: AliasArg { alias } }) => {
             match svc.bindings.remove_alias(&repo, &alias).await {
                 Ok(dto) => render::repo(&dto),
                 Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
@@ -926,7 +958,11 @@ pub struct DiscoveredRepo {
 
 async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
     match cmd {
-        WorktreeCmd::Link { repo, path, branch } => {
+        WorktreeCmd::Link {
+            repo,
+            path,
+            br: BranchArg { branch },
+        } => {
             let raw_path = std::path::Path::new(&path);
             let abs_path =
                 std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
@@ -1008,7 +1044,10 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             let dto = svc.bindings.prune_missing(&repo).await?;
             render::repo(&dto);
         }
-        WorktreeCmd::Reconcile { workspace, prune } => {
+        WorktreeCmd::Reconcile {
+            ws: WorkspaceArg { workspace },
+            prune,
+        } => {
             let probe = TokioFilesystemProbe::new();
             let summary = svc
                 .bindings
@@ -1090,7 +1129,7 @@ where
 async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
     match cmd {
         TaskCmd::Create {
-            workspace,
+            ws: WorkspaceArg { workspace },
             repo,
             title,
             body,
@@ -1188,36 +1227,36 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
 
 async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
-        QueryCmd::Overview { workspace } => {
+        QueryCmd::Overview { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.overview(&workspace).await?;
             render::overview(&v);
         }
-        QueryCmd::Blocked { workspace } => {
+        QueryCmd::Blocked { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.blocked_tasks(&workspace).await?;
             render::blocked(&v);
         }
-        QueryCmd::Stale { workspace } => {
+        QueryCmd::Stale { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.stale_worktrees(&workspace).await?;
             render::stale(&v);
         }
-        QueryCmd::Unsynced { workspace } => {
+        QueryCmd::Unsynced { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.unsynced_tasks(&workspace).await?;
             render::unsynced(&v);
         }
-        QueryCmd::Contributors { workspace } => {
+        QueryCmd::Contributors { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.contributors(&workspace).await?;
             render::contributors(&v);
         }
-        QueryCmd::Drift { workspace } => {
+        QueryCmd::Drift { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.drift(&workspace).await?;
             render::drift(&v);
         }
-        QueryCmd::Ready { workspace } => {
+        QueryCmd::Ready { ws: WorkspaceArg { workspace } } => {
             let v = svc.query.ready_tasks(&workspace).await?;
             render::ready(&v);
         }
         QueryCmd::Mine {
-            workspace,
+            ws: WorkspaceArg { workspace },
             assignee,
         } => {
             let _ = cfg; // RepoLinkConfig is currently the env-var fallback chain.
