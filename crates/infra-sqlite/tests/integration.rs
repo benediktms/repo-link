@@ -5,8 +5,8 @@ use domain_repo::RepoBinding;
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
-    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
-    backfill_empty_repo_names,
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
+    backfill_empty_repo_names, open_from_path,
 };
 use ports::{RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
 use tempfile::TempDir;
@@ -45,7 +45,11 @@ async fn setup_with_db() -> (
 #[tokio::test]
 async fn workspace_roundtrip() {
     let (_dir, ws, _rb, _ts) = setup().await;
-    let w = Workspace::new(WorkspaceName::new("scratch").unwrap(), Some("hi".into()), true);
+    let w = Workspace::new(
+        WorkspaceName::new("scratch").unwrap(),
+        Some("hi".into()),
+        true,
+    );
     ws.save(&w).await.unwrap();
     let back = ws.get(w.id).await.unwrap();
     assert_eq!(back.name.as_str(), "scratch");
@@ -62,7 +66,10 @@ async fn unique_workspace_name_enforced_by_db() {
     ws.save(&a).await.unwrap();
     let err = ws.save(&b).await.expect_err("duplicate name should fail");
     let msg = format!("{err:?}").to_lowercase();
-    assert!(msg.contains("unique") || msg.contains("conflict"), "got: {err:?}");
+    assert!(
+        msg.contains("unique") || msg.contains("conflict"),
+        "got: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -91,7 +98,10 @@ async fn repo_with_worktrees_roundtrip() {
         .map(|w| (w.path.display().to_string(), w))
         .collect();
     assert_eq!(by_path["/tmp/a"].branch.as_deref(), Some("main"));
-    assert_eq!(by_path["/tmp/b"].status, domain_repo::LinkStatus::MissingPath);
+    assert_eq!(
+        by_path["/tmp/b"].status,
+        domain_repo::LinkStatus::MissingPath
+    );
 
     // Replace child collection: prune missing and resave.
     let mut updated = back;
@@ -157,9 +167,12 @@ async fn list_filters_compose() {
 
     for ws_id in [w1.id, w2.id] {
         for n in 0..2 {
-            ts.save(&Task::new_draft(ws_id, None, format!("t{n}")).unwrap(), SnapshotSource::LocalEdit)
-                .await
-                .unwrap();
+            ts.save(
+                &Task::new_draft(ws_id, None, format!("t{n}")).unwrap(),
+                SnapshotSource::LocalEdit,
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -185,7 +198,10 @@ async fn deleting_workspace_cascades_to_tasks() {
 
     ws.delete(w.id).await.unwrap();
     let after = ts.list(TaskFilter::default()).await.unwrap();
-    assert!(after.is_empty(), "tasks should cascade with workspace delete");
+    assert!(
+        after.is_empty(),
+        "tasks should cascade with workspace delete"
+    );
 }
 
 // Wire a one-line use to demonstrate we can construct adapters via Arc<dyn Trait>.
@@ -272,12 +288,11 @@ async fn backfill_derives_name_for_empty_rows() {
     // Run the backfill — should derive "myrepo" from the canonical URL.
     backfill_empty_repo_names(&db.writes).await.unwrap();
 
-    let (name,): (String,) =
-        sqlx::query_as("SELECT name FROM repos WHERE id = ?")
-            .bind("aaaaaaaa-0000-0000-0000-000000000001")
-            .fetch_one(&db.reads)
-            .await
-            .unwrap();
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM repos WHERE id = ?")
+        .bind("aaaaaaaa-0000-0000-0000-000000000001")
+        .fetch_one(&db.reads)
+        .await
+        .unwrap();
 
     assert_eq!(name, "myrepo");
 }
@@ -299,12 +314,11 @@ async fn backfill_is_idempotent_on_populated_rows() {
     // Running backfill again should be a no-op and not error.
     backfill_empty_repo_names(&db.writes).await.unwrap();
 
-    let (name,): (String,) =
-        sqlx::query_as("SELECT name FROM repos WHERE id = ?")
-            .bind(binding.id.to_string())
-            .fetch_one(&db.reads)
-            .await
-            .unwrap();
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM repos WHERE id = ?")
+        .bind(binding.id.to_string())
+        .fetch_one(&db.reads)
+        .await
+        .unwrap();
 
     assert_eq!(name, "proj");
 }

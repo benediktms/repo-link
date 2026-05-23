@@ -145,8 +145,7 @@ impl RepoBindingService {
         {
             Some(existing) => (existing, true),
             None => {
-                let mut b =
-                    RepoBinding::new(workspace_id, cmd.remote_url, cmd.canonical_url)?;
+                let mut b = RepoBinding::new(workspace_id, cmd.remote_url, cmd.canonical_url)?;
                 b.tracked_branch = cmd.tracked_branch;
                 (b, false)
             }
@@ -420,7 +419,8 @@ mod tests {
 
     fn setup() -> (WorkspaceService, RepoBindingService) {
         let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
-        let bindings: Arc<dyn RepoBindingRepository> = Arc::new(InMemoryRepoBindingRepository::new());
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
         (
             WorkspaceService::new(workspaces.clone()),
             RepoBindingService::new(workspaces, bindings),
@@ -441,7 +441,10 @@ mod tests {
         assert_eq!(dto.status, "created");
         assert_eq!(svc.show(&dto.id).await.unwrap(), dto);
         assert_eq!(
-            svc.list(ListWorkspacesQuery::default()).await.unwrap().len(),
+            svc.list(ListWorkspacesQuery::default())
+                .await
+                .unwrap()
+                .len(),
             1
         );
     }

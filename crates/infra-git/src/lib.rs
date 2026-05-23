@@ -65,8 +65,8 @@ pub fn is_inside_git_worktree(path: &Path) -> bool {
 /// `path`. Returns `Ok(None)` if the repo exists but no `origin` remote is
 /// set; `Err` only if we couldn't discover a repo at all.
 pub fn discover_origin_url(path: &Path) -> Result<Option<String>> {
-    let repo = gix::discover(path)
-        .map_err(|e| GitError::NotARepo(format!("{}: {e}", path.display())))?;
+    let repo =
+        gix::discover(path).map_err(|e| GitError::NotARepo(format!("{}: {e}", path.display())))?;
     let remote = match repo.find_remote("origin") {
         Ok(r) => r,
         Err(gix::remote::find::existing::Error::NotFound { .. }) => return Ok(None),

@@ -53,7 +53,11 @@ pub use logging::{LogFormat, init_subscriber};
 const STATUS_MISSING_PATH: &str = "missing_path";
 
 #[derive(Parser, Debug)]
-#[command(name = "repo-link-daemon", version, about = "Background reconciler for repo-link")]
+#[command(
+    name = "repo-link-daemon",
+    version,
+    about = "Background reconciler for repo-link"
+)]
 pub struct Args {
     /// Tick interval in seconds.
     #[arg(long, default_value_t = 60, env = "REPO_LINK_INTERVAL_SECS")]
@@ -120,8 +124,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
     let probe: Arc<dyn ports::FilesystemProbe> = Arc::new(TokioFilesystemProbe::new());
 
     let sync = cfg.github_token.clone().map(|token| {
-        let provider: Arc<dyn ports::RemoteTaskProvider> =
-            Arc::new(GithubTaskProvider::new(token));
+        let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubTaskProvider::new(token));
         SyncService::new(tasks_repo.clone(), bindings_repo, provider)
     });
 
@@ -351,10 +354,9 @@ impl Daemon {
         let mut pruned = 0usize;
 
         for b in &bindings {
-            let repo_id: RepoId = b
-                .id
-                .parse()
-                .map_err(|e: domain_core::IdParseError| DaemonError::Binding(e.to_string()))?;
+            let repo_id: RepoId =
+                b.id.parse()
+                    .map_err(|e: domain_core::IdParseError| DaemonError::Binding(e.to_string()))?;
 
             for wt in &b.worktrees {
                 if wt.status != STATUS_MISSING_PATH {
@@ -478,10 +480,7 @@ mod tests {
 
     #[async_trait]
     impl RemoteTaskProvider for CountingProvider {
-        async fn create_remote(
-            &self,
-            cmd: RemoteTaskCreate<'_>,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
             self.creates.fetch_add(1, Ordering::SeqCst);
             *self.last_remote_id.lock().unwrap() = Some("777".into());
             Ok(RemoteTaskSnapshot {
@@ -495,10 +494,7 @@ mod tests {
             })
         }
 
-        async fn update_remote(
-            &self,
-            cmd: RemoteTaskUpdate<'_>,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn update_remote(&self, cmd: RemoteTaskUpdate<'_>) -> PortResult<RemoteTaskSnapshot> {
             self.updates.fetch_add(1, Ordering::SeqCst);
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
@@ -511,11 +507,7 @@ mod tests {
             })
         }
 
-        async fn fetch_remote(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> PortResult<RemoteTaskSnapshot> {
+        async fn fetch_remote(&self, _: &str, _: &str) -> PortResult<RemoteTaskSnapshot> {
             Err(ports::PortError::NotFound("no fetch fixture".into()))
         }
     }
@@ -556,7 +548,10 @@ mod tests {
         // to simulate a post-sync local edit.
         task.mark_dirty_local().unwrap();
         task.set_body("new body".into());
-        task_repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
 
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
@@ -682,21 +677,26 @@ mod tests {
     async fn grace_counter_defers_prune_until_threshold() {
         let probe = Arc::new(MutableProbe::new());
         // /tmp/gone is absent from the probe → marked missing on tick 1.
-        let (daemon, bind_repo, bid) =
-            seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
+        let (daemon, bind_repo, bid) = seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
         let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
 
         // Tick 1: marks missing + counter=1, no prune.
         let r1 = daemon.tick_once().await.unwrap();
         assert_eq!(r1.marked_missing, 1);
         assert_eq!(r1.pruned, 0);
-        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+        assert_eq!(
+            *daemon.miss_counts.lock().unwrap().values().next().unwrap(),
+            1
+        );
 
         // Tick 2: counter=2, still defers.
         let r2 = daemon.tick_once().await.unwrap();
         assert_eq!(r2.marked_missing, 0);
         assert_eq!(r2.pruned, 0);
-        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 2);
+        assert_eq!(
+            *daemon.miss_counts.lock().unwrap().values().next().unwrap(),
+            2
+        );
 
         // Tick 3: counter hits 3 → prune fires, entry GC'd.
         let r3 = daemon.tick_once().await.unwrap();
@@ -711,14 +711,16 @@ mod tests {
     #[tokio::test]
     async fn grace_counter_resets_when_path_returns() {
         let probe = Arc::new(MutableProbe::new());
-        let (daemon, _bind_repo, _bid) =
-            seeded_grace_setup(probe.clone(), &["/tmp/flicker"]).await;
+        let (daemon, _bind_repo, _bid) = seeded_grace_setup(probe.clone(), &["/tmp/flicker"]).await;
         let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
 
         // Tick 1: missing → counter=1.
         let r1 = daemon.tick_once().await.unwrap();
         assert_eq!(r1.marked_missing, 1);
-        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+        assert_eq!(
+            *daemon.miss_counts.lock().unwrap().values().next().unwrap(),
+            1
+        );
 
         // Path returns before tick 2. Counter resets.
         probe.add("/tmp/flicker");
@@ -733,7 +735,10 @@ mod tests {
         probe.remove("/tmp/flicker");
         let r3 = daemon.tick_once().await.unwrap();
         assert_eq!(r3.pruned, 0);
-        assert_eq!(*daemon.miss_counts.lock().unwrap().values().next().unwrap(), 1);
+        assert_eq!(
+            *daemon.miss_counts.lock().unwrap().values().next().unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -755,8 +760,7 @@ mod tests {
     #[tokio::test]
     async fn grace_ticks_one_is_legacy_behaviour() {
         let probe = Arc::new(MutableProbe::new());
-        let (daemon, _bind_repo, _bid) =
-            seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
+        let (daemon, _bind_repo, _bid) = seeded_grace_setup(probe.clone(), &["/tmp/gone"]).await;
         let daemon = daemon.with_prune(true).with_missing_grace_ticks(1);
 
         // With threshold=1, first miss is enough to prune.
@@ -919,8 +923,7 @@ mod tests {
         let probe = Arc::new(MutableProbe::new());
         // Healthy worktree: present in probe, will never get marked missing.
         probe.add("/tmp/healthy");
-        let (daemon, _bind_repo, _bid) =
-            seeded_grace_setup(probe.clone(), &["/tmp/healthy"]).await;
+        let (daemon, _bind_repo, _bid) = seeded_grace_setup(probe.clone(), &["/tmp/healthy"]).await;
         let daemon = daemon.with_prune(true).with_missing_grace_ticks(3);
 
         // Pre-seed a ghost entry: a key that has no corresponding MissingPath

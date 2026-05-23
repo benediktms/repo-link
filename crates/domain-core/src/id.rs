@@ -55,9 +55,10 @@ macro_rules! define_id {
             type Err = IdParseError;
 
             fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-                Uuid::parse_str(s)
-                    .map(Self)
-                    .map_err(|source| IdParseError { kind: $kind, source })
+                Uuid::parse_str(s).map(Self).map_err(|source| IdParseError {
+                    kind: $kind,
+                    source,
+                })
             }
         }
     };

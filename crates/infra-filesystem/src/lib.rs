@@ -30,10 +30,7 @@ impl FilesystemProbe for TokioFilesystemProbe {
         match tokio::fs::metadata(path).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(PortError::Backend(format!(
-                "stat {}: {e}",
-                path.display()
-            ))),
+            Err(e) => Err(PortError::Backend(format!("stat {}: {e}", path.display()))),
         }
     }
 
@@ -46,10 +43,7 @@ impl FilesystemProbe for TokioFilesystemProbe {
         match tokio::fs::metadata(&git).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(PortError::Backend(format!(
-                "stat {}: {e}",
-                git.display()
-            ))),
+            Err(e) => Err(PortError::Backend(format!("stat {}: {e}", git.display()))),
         }
     }
 }
@@ -92,15 +86,16 @@ impl WorktreeWatcher {
         P: AsRef<Path>,
     {
         let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(event) = res
-                && matches!(event.kind, EventKind::Remove(_))
-            {
-                for p in event.paths {
-                    let _ = tx.send(p);
+        let mut watcher =
+            notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                if let Ok(event) = res
+                    && matches!(event.kind, EventKind::Remove(_))
+                {
+                    for p in event.paths {
+                        let _ = tx.send(p);
+                    }
                 }
-            }
-        })?;
+            })?;
         for p in paths {
             // Watching non-recursively: we only care about the registered
             // path itself disappearing, not its internals churning.
@@ -144,7 +139,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let probe = TokioFilesystemProbe::new();
         assert!(!probe.is_git_worktree(dir.path()).await.unwrap());
-        tokio::fs::create_dir(dir.path().join(".git")).await.unwrap();
+        tokio::fs::create_dir(dir.path().join(".git"))
+            .await
+            .unwrap();
         assert!(probe.is_git_worktree(dir.path()).await.unwrap());
     }
 

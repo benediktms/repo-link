@@ -60,7 +60,11 @@ pub struct RepoBinding {
 }
 
 impl RepoBinding {
-    pub fn new(workspace_id: WorkspaceId, remote_url: String, canonical_url: String) -> Result<Self> {
+    pub fn new(
+        workspace_id: WorkspaceId,
+        remote_url: String,
+        canonical_url: String,
+    ) -> Result<Self> {
         if remote_url.trim().is_empty() {
             return Err(DomainError::validation("remote_url is empty"));
         }

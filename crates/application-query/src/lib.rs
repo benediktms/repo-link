@@ -264,7 +264,11 @@ impl QueryService {
             })
             .collect();
 
-        rows.sort_by(|a, b| a.blocked.cmp(&b.blocked).then_with(|| a.priority.cmp(&b.priority)));
+        rows.sort_by(|a, b| {
+            a.blocked
+                .cmp(&b.blocked)
+                .then_with(|| a.priority.cmp(&b.priority))
+        });
         Ok(rows)
     }
 
@@ -363,7 +367,11 @@ impl QueryService {
                 by_status,
             })
             .collect();
-        rows.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.assignee.cmp(&b.assignee)));
+        rows.sort_by(|a, b| {
+            b.total
+                .cmp(&a.total)
+                .then_with(|| a.assignee.cmp(&b.assignee))
+        });
         Ok(rows)
     }
 
@@ -477,7 +485,9 @@ mod tests {
         let local_only = Task::new_draft(workspace_id, None, "still local".into()).unwrap();
         let mut staged = Task::new_draft(workspace_id, None, "staged thing".into()).unwrap();
         staged.stage_for_sync().unwrap();
-        ts.save(&local_only, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&local_only, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
         ts.save(&staged, SnapshotSource::LocalEdit).await.unwrap();
 
         let ov = svc.overview(&workspace_id.to_string()).await.unwrap();
@@ -559,7 +569,13 @@ mod tests {
         let mut also_unblocked = Task::new_draft(wid, None, "low pri".into()).unwrap();
         also_unblocked.set_priority(domain_task::Priority::P3);
 
-        for t in [&blocker_a, &blocker_b, &blocked_by_a, &unblocked, &also_unblocked] {
+        for t in [
+            &blocker_a,
+            &blocker_b,
+            &blocked_by_a,
+            &unblocked,
+            &also_unblocked,
+        ] {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
@@ -594,7 +610,13 @@ mod tests {
         mine_archived.assignees = vec!["benedikt".into()];
         mine_archived.archive().unwrap();
 
-        for t in [&blocker, &mine_open, &mine_blocked, &someone_elses, &mine_archived] {
+        for t in [
+            &blocker,
+            &mine_open,
+            &mine_blocked,
+            &someone_elses,
+            &mine_archived,
+        ] {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 

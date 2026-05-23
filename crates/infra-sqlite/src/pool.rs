@@ -3,9 +3,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PoolError {
