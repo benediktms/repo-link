@@ -439,18 +439,54 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg),
-        Cmd::Agents(c) => agents_dispatch(c),
+        Cmd::Agents(c) => agents_dispatch(c, svc).await,
     }
 }
 
-fn agents_dispatch(cmd: AgentsCmd) -> Result<()> {
+async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()> {
     match cmd {
         AgentsCmd::Docs => {
-            let app = <Cli as clap::CommandFactory>::command();
-            let body = docs::render_block(&app);
-            let path = std::env::current_dir()
-                .map_err(|e| anyhow!("failed to read current directory: {e}"))?
-                .join("AGENTS.md");
+            let cwd = std::env::current_dir()
+                .map_err(|e| anyhow!("failed to read current directory: {e}"))?;
+            let abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+
+            // Only "not a git repo" / "no origin" maps to None — other
+            // errors (missing git, permission denied, etc.) surface as
+            // hard failures so the agent sees the real cause.
+            let canonical_url = match discover_canonical(&abs) {
+                Err(infra_git::GitError::NotARepo(_)) | Ok(None) => None,
+                Err(e) => return Err(anyhow!("{e}")),
+                Ok(Some(c)) => Some(c),
+            };
+
+            let mut memberships: Vec<docs::DocRepoMembership> = Vec::new();
+            if let Some(ref canonical) = canonical_url {
+                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
+                for ws in &workspaces {
+                    let ws_id: domain_core::WorkspaceId = ws
+                        .id
+                        .parse()
+                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
+                    if let Some(binding) = svc
+                        .bindings_repo
+                        .find_by_canonical_url(ws_id, canonical)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        let binding_dto = application_workspace::binding_to_dto(&binding);
+                        memberships.push(docs::DocRepoMembership {
+                            workspace_id: ws.id.clone(),
+                            workspace_name: ws.name.clone(),
+                            binding_name: binding_dto.name,
+                            aliases: binding_dto.aliases,
+                        });
+                    }
+                }
+            }
+
+            let repo_info = docs::render_repo_info(&memberships, canonical_url.as_deref());
+            let body = docs::render_block(&repo_info);
+            let path = abs.join("AGENTS.md");
             let outcome = docs::write_agents_md(&path, &body)?;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
             Ok(())

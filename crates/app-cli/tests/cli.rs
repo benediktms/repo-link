@@ -976,7 +976,15 @@ fn agents_docs_creates_file_with_markers() {
     assert!(text.starts_with("# AGENTS\n"));
     assert!(text.contains("<!-- rl:doc:start -->"));
     assert!(text.contains("<!-- rl:doc:end -->"));
-    assert!(text.contains("`rl workspace create`"));
+    // Workflow guidance sections — the curated replacement for the
+    // previous auto-generated command reference.
+    assert!(text.contains("### Finding work"));
+    assert!(text.contains("### Before you start: check drift"));
+    assert!(text.contains("### Before you stop: sync your work"));
+    // Per-repo info block. The tempdir is not a git repo, so we expect
+    // the `unbound` notice.
+    assert!(text.contains("## This repo"));
+    assert!(text.contains("status: unbound"));
     assert_eq!(
         value["bytes_written"].as_u64().unwrap() as usize,
         text.len()

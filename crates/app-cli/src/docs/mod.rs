@@ -1,14 +1,19 @@
 //! Self-documenting AGENTS.md writer for `rl agents docs`.
 //!
-//! Renders a curated intro plus a clap-introspected command tree into a
-//! marker-fenced block. The block is always rewritten on every run — no hash
-//! comparison, no stale detection. See issue #6 for the scope decision.
+//! Renders a hand-curated intro plus a per-repo workspace block into a
+//! marker-fenced region. The block is always rewritten on every run — no
+//! hash comparison, no stale detection. See issue #6 for the scope decision.
+//!
+//! The command reference is deliberately not auto-generated from the clap
+//! tree: we accept the small drift risk in exchange for a tailored,
+//! workflow-oriented document that teaches agents how to *use* `rl` rather
+//! than listing every flag. `--help` on each subcommand remains the
+//! authoritative flag reference.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Arg, ArgAction, Command};
 use serde::Serialize;
 
 const START_MARKER: &str = "<!-- rl:doc:start -->";
@@ -30,88 +35,57 @@ pub struct WriteOutcome {
     pub bytes_written: usize,
 }
 
-/// Render the curated intro followed by a recursive walk of the clap
-/// subcommand tree. Returns the *inner* body of the fenced block (markers
-/// are added by [`write_agents_md`]).
-pub fn render_block(cmd: &Command) -> String {
+/// One row of "this checkout belongs to workspace X under binding Y".
+/// A repo can be bound to multiple workspaces; the renderer emits one
+/// entry per membership.
+#[derive(Debug, Clone, Serialize)]
+pub struct DocRepoMembership {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub binding_name: String,
+    pub aliases: Vec<String>,
+}
+
+/// Assemble the inner body of the fenced block: the curated intro
+/// followed by the per-repo info section. Markers are added by
+/// [`write_agents_md`].
+pub fn render_block(repo_info: &str) -> String {
     let mut out = String::new();
     out.push_str(INTRO.trim_end());
-    out.push_str("\n\n## Command reference\n");
-    render_subcommands(cmd, &[], &mut out);
-    // Trim a trailing blank line for cleanliness; the marker writer adds one back.
+    out.push_str("\n\n");
+    out.push_str(repo_info.trim_end());
     while out.ends_with("\n\n") {
         out.pop();
     }
     out
 }
 
-fn render_subcommands(cmd: &Command, path: &[&str], out: &mut String) {
-    for sub in cmd.get_subcommands() {
-        let name = sub.get_name();
-        // clap auto-generates a `help` subcommand; skip to avoid noise.
-        if name == "help" {
-            continue;
+/// Render the "## This repo" section. When `memberships` is empty, emit
+/// an `unbound` notice that points the agent at `rl repo attach`.
+/// Otherwise emit a single fenced JSON array with one entry per
+/// membership.
+pub fn render_repo_info(memberships: &[DocRepoMembership], canonical_url: Option<&str>) -> String {
+    let mut out = String::from("## This repo\n\n");
+    if memberships.is_empty() {
+        out.push_str("```\n");
+        out.push_str("status: unbound\n");
+        match canonical_url {
+            Some(url) => out.push_str(&format!("canonical_url: {url}\n")),
+            None => out.push_str("canonical_url: <not a git repo, or no `origin` remote>\n"),
         }
-        let mut new_path: Vec<&str> = path.to_vec();
-        new_path.push(name);
-        let full = new_path.join(" ");
-        out.push_str(&format!("\n### `rl {full}`\n\n"));
-        if let Some(about) = sub.get_about() {
-            out.push_str(&format!("{about}\n\n"));
-        }
-        let args: Vec<&Arg> = sub
-            .get_arguments()
-            .filter(|a| a.get_id() != "help")
-            .collect();
-        if !args.is_empty() {
-            out.push_str("Arguments:\n\n");
-            for arg in args {
-                out.push_str(&format!("- `{}`", arg_label(arg)));
-                if let Some(help) = arg.get_help() {
-                    out.push_str(&format!(" — {help}"));
-                }
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        render_subcommands(sub, &new_path, out);
-    }
-}
-
-fn arg_label(arg: &Arg) -> String {
-    if arg.is_positional() {
-        return format!("<{}>", arg.get_id());
-    }
-    let mut flags: Vec<String> = Vec::new();
-    if let Some(c) = arg.get_short() {
-        flags.push(format!("-{c}"));
-    }
-    if let Some(l) = arg.get_long() {
-        flags.push(format!("--{l}"));
-    }
-    let head = if flags.is_empty() {
-        arg.get_id().to_string()
+        out.push_str(
+            "hint: run `rl repo attach --workspace <id> --url <git-remote> --canonical <canonical-url>` to bind this checkout to a workspace.\n",
+        );
+        out.push_str("```\n");
     } else {
-        flags.join(", ")
-    };
-    let value_names: Vec<String> = if takes_value(arg) {
-        arg.get_value_names()
-            .map(|v| v.iter().map(|n| format!("<{n}>")).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    if value_names.is_empty() {
-        head
-    } else {
-        format!("{head} {}", value_names.join(" "))
+        out.push_str("```json\n");
+        let json =
+            serde_json::to_string_pretty(memberships).unwrap_or_else(|_| "[]".to_string());
+        out.push_str(&json);
+        out.push('\n');
+        out.push_str("```\n");
     }
-}
-
-/// Whether the arg's action consumes a value. Bool flags and counters do not,
-/// even though `get_value_names()` returns a default placeholder for them.
-fn takes_value(arg: &Arg) -> bool {
-    matches!(arg.get_action(), ArgAction::Set | ArgAction::Append)
+    out
 }
 
 /// Splice `body` into the marker-fenced block in `path`, creating the file
@@ -140,10 +114,16 @@ pub fn write_agents_md(path: &Path, body: &str) -> Result<WriteOutcome> {
                 (text, Action::Updated)
             }
             (Some(_), None) => {
-                bail!("{}: partial marker state detected - start marker present but end marker missing", path.display());
+                bail!(
+                    "{}: partial marker state detected - start marker present but end marker missing",
+                    path.display()
+                );
             }
             (None, Some(_)) => {
-                bail!("{}: partial marker state detected - end marker present but start marker missing", path.display());
+                bail!(
+                    "{}: partial marker state detected - end marker present but start marker missing",
+                    path.display()
+                );
             }
             (None, None) => {
                 let mut text = existing;
@@ -226,5 +206,76 @@ mod tests {
         assert_eq!(second.action, Action::Updated);
         let after_second = fs::read_to_string(&path).unwrap();
         assert_eq!(after_first, after_second);
+    }
+
+    #[test]
+    fn render_repo_info_unbound_with_canonical() {
+        let out = render_repo_info(&[], Some("github.com/foo/bar"));
+        assert!(out.starts_with("## This repo\n\n```\n"));
+        assert!(out.contains("status: unbound"));
+        assert!(out.contains("canonical_url: github.com/foo/bar"));
+        assert!(out.contains("rl repo attach"));
+        assert!(out.trim_end().ends_with("```"));
+    }
+
+    #[test]
+    fn render_repo_info_unbound_without_canonical() {
+        let out = render_repo_info(&[], None);
+        assert!(out.contains("status: unbound"));
+        assert!(out.contains("not a git repo"));
+    }
+
+    #[test]
+    fn render_repo_info_single_membership() {
+        let memberships = vec![DocRepoMembership {
+            workspace_id: "ws-1".to_string(),
+            workspace_name: "repo-link-dev".to_string(),
+            binding_name: "repo-link".to_string(),
+            aliases: vec!["rl".to_string()],
+        }];
+        let out = render_repo_info(&memberships, Some("github.com/foo/bar"));
+        assert!(out.starts_with("## This repo\n\n```json\n"));
+        assert!(out.contains("\"workspace_id\": \"ws-1\""));
+        assert!(out.contains("\"workspace_name\": \"repo-link-dev\""));
+        assert!(out.contains("\"binding_name\": \"repo-link\""));
+        assert!(out.contains("\"rl\""));
+        assert!(!out.contains("status: unbound"));
+    }
+
+    #[test]
+    fn render_repo_info_multiple_memberships() {
+        let memberships = vec![
+            DocRepoMembership {
+                workspace_id: "ws-1".to_string(),
+                workspace_name: "alpha".to_string(),
+                binding_name: "shared-repo".to_string(),
+                aliases: vec![],
+            },
+            DocRepoMembership {
+                workspace_id: "ws-2".to_string(),
+                workspace_name: "beta".to_string(),
+                binding_name: "shared-repo".to_string(),
+                aliases: vec!["sr".to_string()],
+            },
+        ];
+        let out = render_repo_info(&memberships, None);
+        assert!(out.contains("\"workspace_name\": \"alpha\""));
+        assert!(out.contains("\"workspace_name\": \"beta\""));
+        let alpha_idx = out.find("\"alpha\"").unwrap();
+        let beta_idx = out.find("\"beta\"").unwrap();
+        assert!(alpha_idx < beta_idx);
+    }
+
+    #[test]
+    fn render_block_includes_intro_and_repo_section() {
+        let repo = render_repo_info(&[], None);
+        let block = render_block(&repo);
+        assert!(block.contains("`rl` (repo-link) is a local-first workspace"));
+        assert!(block.contains("### Finding work"));
+        assert!(block.contains("### Before you start: check drift"));
+        assert!(block.contains("### Before you stop: sync your work"));
+        assert!(block.contains("## This repo"));
+        assert!(block.contains("status: unbound"));
+        assert!(!block.contains("## Command reference"));
     }
 }
