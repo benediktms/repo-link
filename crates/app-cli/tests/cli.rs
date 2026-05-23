@@ -953,6 +953,72 @@ fn repo_alias_rm_returns_error_when_absent() {
     );
 }
 
+// ---------- repo locate ---------------------------------------------------
+
+#[test]
+fn repo_locate_returns_workspace_and_binding_for_matching_path() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-locate", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/locate.git");
+    let path = repo_dir.path().display().to_string();
+
+    let binding_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/locate.git",
+            "--canonical",
+            "github.com/o/locate",
+            "--path",
+            &path,
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let located = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "locate", "--path", &path],
+    );
+
+    assert_eq!(located["canonical_url"], "github.com/o/locate");
+    let matches = located["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 1);
+    let m = &matches[0];
+    // Workspace is now a nested full DTO (not a bare `workspace_id` string).
+    assert_eq!(m["workspace"]["id"], workspace);
+    assert_eq!(m["workspace"]["name"], "ws-locate");
+    assert_eq!(m["binding"]["id"], binding_id);
+    assert_eq!(m["binding"]["canonical_url"], "github.com/o/locate");
+}
+
+#[test]
+fn repo_locate_returns_empty_matches_for_unbound_repo() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/unbound.git");
+
+    let located = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "locate", "--path", &repo_dir.path().display().to_string()],
+    );
+    assert_eq!(located["canonical_url"], "github.com/o/unbound");
+    assert!(located["matches"].as_array().unwrap().is_empty());
+}
+
 // ---------- agents docs ---------------------------------------------------
 
 #[test]

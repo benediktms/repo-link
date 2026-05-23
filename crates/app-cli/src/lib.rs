@@ -11,7 +11,7 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::{Args, Parser, Subcommand};
 use dto_shared::{
     AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, LinkWorktreeCmd,
-    ListTasksQuery, ListWorkspacesQuery, LocateMatchDto, LocateResponseDto, UnlinkWorktreeCmd,
+    ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd,
 };
 use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
@@ -491,30 +491,21 @@ async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()> {
                 Ok(Some(c)) => Some(c),
             };
 
-            let mut memberships: Vec<docs::DocRepoMembership> = Vec::new();
-            if let Some(ref canonical) = canonical_url {
-                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
-                for ws in &workspaces {
-                    let ws_id: domain_core::WorkspaceId = ws
-                        .id
-                        .parse()
-                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
-                    if let Some(binding) = svc
-                        .bindings_repo
-                        .find_by_canonical_url(ws_id, canonical)
-                        .await
-                        .map_err(|e| anyhow!("{e}"))?
-                    {
-                        let binding_dto = application_workspace::binding_to_dto(&binding);
-                        memberships.push(docs::DocRepoMembership {
-                            workspace_id: ws.id.clone(),
-                            workspace_name: ws.name.clone(),
-                            binding_name: binding_dto.name,
-                            aliases: binding_dto.aliases,
-                        });
-                    }
-                }
-            }
+            let memberships = match canonical_url.as_deref() {
+                Some(c) => svc
+                    .bindings
+                    .memberships_for_canonical_url(c)
+                    .await?
+                    .into_iter()
+                    .map(|m| docs::DocRepoMembership {
+                        workspace_id: m.workspace.id,
+                        workspace_name: m.workspace.name,
+                        binding_name: m.binding.name,
+                        aliases: m.binding.aliases,
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
 
             let repo_info = docs::render_repo_info(&memberships, canonical_url.as_deref());
             let body = docs::render_block(&repo_info);
@@ -823,29 +814,9 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 Ok(Some(c)) => Some(c),
             };
 
-            let matches = if let Some(ref canonical) = canonical_url {
-                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
-                let mut found: Vec<LocateMatchDto> = Vec::new();
-                for ws in &workspaces {
-                    let ws_id: domain_core::WorkspaceId = ws
-                        .id
-                        .parse()
-                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
-                    if let Some(binding) = svc
-                        .bindings_repo
-                        .find_by_canonical_url(ws_id, canonical)
-                        .await
-                        .map_err(|e| anyhow!("{e}"))?
-                    {
-                        found.push(LocateMatchDto {
-                            workspace_id: ws.id.clone(),
-                            binding: application_workspace::binding_to_dto(&binding),
-                        });
-                    }
-                }
-                found
-            } else {
-                vec![]
+            let matches = match canonical_url.as_deref() {
+                Some(c) => svc.bindings.memberships_for_canonical_url(c).await?,
+                None => vec![],
             };
 
             render::locate(&LocateResponseDto {
@@ -980,24 +951,14 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
 
             let binding = svc.bindings.show(&repo).await?;
             if discovered != binding.canonical_url {
-                // Try to find a matching binding across all workspaces.
-                let workspaces = svc.workspaces.list(ListWorkspacesQuery::default()).await?;
-                let mut found_id: Option<String> = None;
-                'outer: for ws in &workspaces {
-                    let ws_id: domain_core::WorkspaceId = ws
-                        .id
-                        .parse()
-                        .map_err(|e| anyhow!("invalid workspace id '{}': {e}", ws.id))?;
-                    if let Some(b) = svc
-                        .bindings_repo
-                        .find_by_canonical_url(ws_id, &discovered)
-                        .await
-                        .map_err(|e| anyhow!("{e}"))?
-                    {
-                        found_id = Some(b.id.to_string());
-                        break 'outer;
-                    }
-                }
+                // Try to find a matching binding across all workspaces, to
+                // hint at the correct `--repo` value in the error message.
+                let found_id = svc
+                    .bindings
+                    .memberships_for_canonical_url(&discovered)
+                    .await?
+                    .first()
+                    .map(|m| m.binding.id.clone());
                 let repo_short = &repo;
                 if let Some(found) = found_id {
                     anyhow::bail!(
