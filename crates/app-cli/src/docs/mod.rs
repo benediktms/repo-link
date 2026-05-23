@@ -20,6 +20,12 @@ const START_MARKER: &str = "<!-- rl:doc:start -->";
 const END_MARKER: &str = "<!-- rl:doc:end -->";
 const INTRO: &str = include_str!("agents_intro.md");
 
+/// Wrap `body` in the start / end markers. Used by every branch of
+/// [`write_agents_md`] that emits a fresh fenced block.
+fn marker_block(body: &str) -> String {
+    format!("{START_MARKER}\n{body}\n{END_MARKER}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
@@ -67,23 +73,14 @@ pub fn render_block(repo_info: &str) -> String {
 pub fn render_repo_info(memberships: &[DocRepoMembership], canonical_url: Option<&str>) -> String {
     let mut out = String::from("## This repo\n\n");
     if memberships.is_empty() {
-        out.push_str("```\n");
-        out.push_str("status: unbound\n");
-        match canonical_url {
-            Some(url) => out.push_str(&format!("canonical_url: {url}\n")),
-            None => out.push_str("canonical_url: <not a git repo, or no `origin` remote>\n"),
-        }
-        out.push_str(
-            "hint: run `rl repo attach --workspace <id> --url <git-remote> --canonical <canonical-url>` to bind this checkout to a workspace.\n",
-        );
-        out.push_str("```\n");
+        let canonical = canonical_url.unwrap_or("<not a git repo, or no `origin` remote>");
+        out.push_str(&format!(
+            "```\nstatus: unbound\ncanonical_url: {canonical}\nhint: run `rl repo attach --workspace <id> --url <git-remote> --canonical <canonical-url>` to bind this checkout to a workspace.\n```\n"
+        ));
     } else {
-        out.push_str("```json\n");
         let json =
             serde_json::to_string_pretty(memberships).unwrap_or_else(|_| "[]".to_string());
-        out.push_str(&json);
-        out.push('\n');
-        out.push_str("```\n");
+        out.push_str(&format!("```json\n{json}\n```\n"));
     }
     out
 }
@@ -91,9 +88,9 @@ pub fn render_repo_info(memberships: &[DocRepoMembership], canonical_url: Option
 /// Splice `body` into the marker-fenced block in `path`, creating the file
 /// (or appending the block) as needed. See issue #6 for the three modes.
 pub fn write_agents_md(path: &Path, body: &str) -> Result<WriteOutcome> {
+    let block = marker_block(body);
     let (final_text, action) = if !path.exists() {
-        let text = format!("# AGENTS\n\n{START_MARKER}\n{body}\n{END_MARKER}\n");
-        (text, Action::Created)
+        (format!("# AGENTS\n\n{block}\n"), Action::Created)
     } else {
         let existing =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -103,13 +100,9 @@ pub fn write_agents_md(path: &Path, body: &str) -> Result<WriteOutcome> {
                     bail!("{}: end marker appears before start marker", path.display());
                 }
                 let after_end = end + END_MARKER.len();
-                let mut text = String::with_capacity(existing.len() + body.len());
+                let mut text = String::with_capacity(existing.len() + block.len());
                 text.push_str(&existing[..start]);
-                text.push_str(START_MARKER);
-                text.push('\n');
-                text.push_str(body);
-                text.push('\n');
-                text.push_str(END_MARKER);
+                text.push_str(&block);
                 text.push_str(&existing[after_end..]);
                 (text, Action::Updated)
             }
@@ -130,9 +123,7 @@ pub fn write_agents_md(path: &Path, body: &str) -> Result<WriteOutcome> {
                 if !text.ends_with('\n') {
                     text.push('\n');
                 }
-                text.push_str(&format!(
-                    "\n## Using `rl`\n\n{START_MARKER}\n{body}\n{END_MARKER}\n"
-                ));
+                text.push_str(&format!("\n## Using `rl`\n\n{block}\n"));
                 (text, Action::Appended)
             }
         }
