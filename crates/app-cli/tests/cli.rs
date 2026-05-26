@@ -1847,3 +1847,268 @@ fn task_rollback_restores_status_across_lifecycle_transition() {
     assert_eq!(rows[2]["source"], "rollback");
     assert_eq!(rows[2]["status"], "open");
 }
+
+// ---- Friendly task IDs ---------------------------------------------------
+//
+// These tests exercise the user-visible surface added in the
+// prefix-hash work: composite display IDs, bare-hash + composite +
+// UUID resolution, prefix-mismatch errors, explicit `--prefix` on
+// `repo attach`, and the `repo set-prefix` override.
+
+#[test]
+fn task_id_renders_as_prefix_hash_when_repo_is_bound() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let outcome = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:org/app-payments.git",
+            "--canonical",
+            "github.com/org/app-payments",
+            "--no-link",
+        ],
+    );
+    let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
+    // `app-payments` → `app` stripped as noise → single-word `payments`
+    // → `p` + first two consonants → `pym`.
+    assert_eq!(outcome["binding"]["prefix"], "pym");
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--repo",
+            &repo_id,
+            "--title",
+            "wire up Stripe webhook",
+        ],
+    );
+
+    let id = task["id"].as_str().unwrap();
+    let (prefix, hash) = id.split_once('-').expect("composite id");
+    assert_eq!(prefix, "pym", "prefix should match the binding");
+    assert!(
+        hash.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')),
+        "hash {hash:?} should be lowercase base32"
+    );
+    assert!(hash.len() >= 3, "hash too short");
+}
+
+#[test]
+fn task_without_repo_falls_back_to_bare_hash() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            workspace,
+            "--title",
+            "no repo on this one",
+        ],
+    );
+    let id = task["id"].as_str().unwrap();
+    // Bare hash → no `-`.
+    assert!(!id.contains('-'), "expected bare hash, got {id:?}");
+    assert!(id.len() >= 3 && id.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')));
+}
+
+#[test]
+fn task_resolves_by_composite_bare_hash_and_uuid() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let outcome = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:org/repo-link.git",
+            "--canonical",
+            "github.com/org/repo-link",
+            "--no-link",
+        ],
+    );
+    let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
+    let prefix = outcome["binding"]["prefix"].as_str().unwrap().to_string();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--repo",
+            &repo_id,
+            "--title",
+            "resolver smoke test",
+        ],
+    );
+    let composite = task["id"].as_str().unwrap().to_string();
+    let hash = composite.split_once('-').unwrap().1.to_string();
+
+    // Composite resolves.
+    let by_composite = run_json(&mut bin("repo-link", &dir), &["task", "show", &composite]);
+    assert_eq!(by_composite["title"], "resolver smoke test");
+
+    // Bare hash resolves.
+    let by_hash = run_json(&mut bin("repo-link", &dir), &["task", "show", &hash]);
+    assert_eq!(by_hash["id"], composite);
+
+    // Wrong prefix produces a hard error mentioning the actual prefix.
+    let err = bin("repo-link", &dir)
+        .args(["task", "show", &format!("wrong-{hash}")])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(err.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("prefix mismatch") && stderr.contains(&prefix),
+        "expected mismatch error mentioning '{prefix}', got: {stderr}"
+    );
+}
+
+#[test]
+fn repo_attach_explicit_prefix_overrides_derived_value() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap();
+
+    let outcome = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            workspace,
+            "--url",
+            "git@github.com:org/some-thing.git",
+            "--canonical",
+            "github.com/org/some-thing",
+            "--no-link",
+            "--prefix",
+            "xyz",
+        ],
+    );
+    // Without override the derived prefix would be something else; the
+    // explicit value wins.
+    assert_eq!(outcome["binding"]["prefix"], "xyz");
+}
+
+#[test]
+fn repo_set_prefix_changes_the_prefix_in_place() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let outcome = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:org/auth-service.git",
+            "--canonical",
+            "github.com/org/auth-service",
+            "--no-link",
+        ],
+    );
+    // `service` is a noise word → derived prefix is `ath`.
+    let original_prefix = outcome["binding"]["prefix"].as_str().unwrap().to_string();
+    assert_eq!(original_prefix, "ath");
+    let repo_id = outcome["binding"]["id"].as_str().unwrap().to_string();
+
+    let renamed = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "set-prefix",
+            "--repo",
+            &repo_id,
+            "--prefix",
+            "auth",
+        ],
+    );
+    assert_eq!(renamed["prefix"], "auth");
+
+    // Repo now resolvable by the new prefix.
+    let by_new = run_json(&mut bin("repo-link", &dir), &["repo", "show", "auth"]);
+    assert_eq!(by_new["id"], repo_id);
+}
+
+#[test]
+fn repo_attach_collision_breaks_with_numeric_suffix() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    // Two repos whose names both derive to `ath` (`service` is a noise
+    // word in both cases, leaving the single-word `auth` → `ath`).
+    let a = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o1/auth-service.git",
+            "--canonical",
+            "github.com/o1/auth-service",
+            "--no-link",
+        ],
+    );
+    let b = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o2/auth-service.git",
+            "--canonical",
+            "github.com/o2/auth-service",
+            "--no-link",
+        ],
+    );
+    assert_eq!(a["binding"]["prefix"], "ath");
+    // Second attach derives the same base but the collision-break
+    // suffix kicks in.
+    assert_eq!(b["binding"]["prefix"], "ath1");
+}
