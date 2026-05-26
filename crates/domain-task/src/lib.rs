@@ -84,6 +84,13 @@ pub struct RemoteRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotSource {
+    /// v1 of a freshly-created task. Distinct from `LocalEdit` so the
+    /// snapshot history tells you when a task came into existence vs. when
+    /// it was later revised. (Previously creations also wrote `LocalEdit`,
+    /// which made `version == 1` the only way to identify the creation
+    /// row — fragile once flows like `sync import` start landing v1 with
+    /// source `Pull`.)
+    Created,
     /// A local mutation: title/body/status/etc. edit driven by the user.
     LocalEdit,
     /// First successful remote create (`promote_to_remote`).

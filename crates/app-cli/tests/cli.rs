@@ -1625,3 +1625,225 @@ fn task_edit_unknown_id_exits_nonzero_with_readable_error() {
         "expected a 'not found' error, got: {stderr}"
     );
 }
+
+// ---- Snapshot coverage audit (GitHub #34 + #35) ---------------------------
+//
+// Every successful mutation of a task must append a row to `task_snapshots`,
+// otherwise `rl task rollback --to-version N` has silent holes. The audit
+// (per ticket #35) verifies this at the CLI layer for each lifecycle verb;
+// the per-status reconcile / dirty-state sharp edges (e.g. archiving a
+// Synced task → DirtyLocal) are already covered at the domain layer in
+// `crates/domain-task/src/lib.rs` and aren't duplicated here.
+//
+// All seven lifecycle verbs route through `application-task::TaskService::
+// transition`, which calls `repo.save(&t, SnapshotSource::LocalEdit)` after
+// the domain method succeeds — so the contract these tests assert is
+// "successful verb call → exactly one new snapshot row with source =
+// local_edit and the expected post-mutation status/sync_state".
+
+/// Create a fresh workspace + open task in a temp DB. Returns the task id.
+fn fresh_task(dir: &TempDir, title: &str) -> String {
+    let ws = run_json(
+        &mut bin("repo-link", dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let task = run_json(
+        &mut bin("repo-link", dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            title,
+        ],
+    );
+    task["id"].as_str().unwrap().to_string()
+}
+
+/// Run a single CLI verb against a known task and assert it succeeds.
+/// Returns nothing — call `task snapshots <id>` separately to inspect state.
+fn run_verb(dir: &TempDir, args: &[&str]) {
+    bin("repo-link", dir).args(args).assert().success();
+}
+
+#[test]
+fn task_create_writes_snapshot_with_source_created() {
+    // Deliverable for #34: v1 of a freshly-created task carries
+    // `source = "created"`, not the misleading `local_edit` that every
+    // creation used to claim. This pins the new contract so a future
+    // refactor of `TaskService::create` can't silently regress.
+    let dir = TempDir::new().unwrap();
+    let task_id = fresh_task(&dir, "fresh");
+    let snaps = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "snapshots", &task_id],
+    );
+    let rows = snaps.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "creation writes exactly one snapshot");
+    assert_eq!(rows[0]["version"], 1);
+    assert_eq!(rows[0]["source"], "created");
+    assert_eq!(rows[0]["status"], "open");
+    assert_eq!(rows[0]["sync_state"], "local_only");
+}
+
+#[test]
+fn task_start_writes_local_edit_snapshot_with_in_progress_status() {
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "start", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let v2 = &rows[1];
+    assert_eq!(v2["version"], 2);
+    assert_eq!(v2["source"], "local_edit");
+    assert_eq!(v2["status"], "in_progress");
+}
+
+#[test]
+fn task_complete_writes_local_edit_snapshot_with_done_status() {
+    // `complete` requires InProgress, so the snapshot sequence is
+    // v1=created → v2=local_edit/start → v3=local_edit/complete.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "start", &id]);
+    run_verb(&dir, &["task", "complete", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let v3 = &rows[2];
+    assert_eq!(v3["version"], 3);
+    assert_eq!(v3["source"], "local_edit");
+    assert_eq!(v3["status"], "done");
+}
+
+#[test]
+fn task_reopen_writes_local_edit_snapshot_with_open_status() {
+    // `reopen` requires Done, so this walks Open → InProgress → Done → Open.
+    // The reopen target is `Open`, not `InProgress` — pinning that so a
+    // future "reopen restores prior status" change can't pass silently.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "start", &id]);
+    run_verb(&dir, &["task", "complete", &id]);
+    run_verb(&dir, &["task", "reopen", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    let v4 = &rows[3];
+    assert_eq!(v4["version"], 4);
+    assert_eq!(v4["source"], "local_edit");
+    assert_eq!(v4["status"], "open");
+}
+
+#[test]
+fn task_block_writes_local_edit_snapshot_with_blocked_status() {
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "block", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let v2 = &rows[1];
+    assert_eq!(v2["source"], "local_edit");
+    assert_eq!(v2["status"], "blocked");
+}
+
+#[test]
+fn task_unblock_writes_local_edit_snapshot_with_open_status() {
+    // Walks Open → Blocked → Open. Same "back to Open, not prior status"
+    // contract as `reopen`.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "block", &id]);
+    run_verb(&dir, &["task", "unblock", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    let v3 = &rows[2];
+    assert_eq!(v3["source"], "local_edit");
+    assert_eq!(v3["status"], "open");
+}
+
+#[test]
+fn task_archive_writes_local_edit_snapshot_with_archived_status() {
+    // Archive accepts any non-Archived status, so we go straight from Open
+    // → Archived without intermediate steps. (The domain-layer test
+    // `lifecycle_mutations_on_synced_remote_task_flip_to_dirty_local`
+    // already covers the sync-state flip for remote-backed tasks.)
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "archive", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let v2 = &rows[1];
+    assert_eq!(v2["source"], "local_edit");
+    assert_eq!(v2["status"], "archived");
+}
+
+#[test]
+fn task_stage_writes_local_edit_snapshot_with_staged_sync_state() {
+    // `stage` is the outlier — it mutates `sync_state`, not `status`.
+    // The domain method deliberately skips `reconcile_dirty_against_baseline`
+    // (lifecycle and sync are orthogonal), but `transition` still calls
+    // `save()`, so a snapshot row appears.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "stage", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let v2 = &rows[1];
+    assert_eq!(v2["source"], "local_edit");
+    assert_eq!(v2["sync_state"], "staged");
+    // Status is unchanged — lifecycle and sync are orthogonal.
+    assert_eq!(v2["status"], "open");
+}
+
+#[test]
+fn task_rollback_restores_status_across_lifecycle_transition() {
+    // The rollback contract this PR is most about: rolling back across a
+    // status transition correctly restores the prior status. Without
+    // complete snapshot coverage at every verb, a rollback could silently
+    // skip a transition and leave the task in an inconsistent state.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "lifecycle rollback");
+    run_verb(&dir, &["task", "start", &id]);
+    let after_start = run_json(&mut bin("repo-link", &dir), &["task", "show", &id]);
+    assert_eq!(after_start["status"], "in_progress");
+
+    let rolled_back = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "rollback", &id, "--to-version", "1"],
+    );
+    assert_eq!(rolled_back["status"], "open");
+
+    // Confirm the rollback itself appended a snapshot (source = rollback),
+    // so the history is v1=created, v2=local_edit/start, v3=rollback/open.
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0]["source"], "created");
+    assert_eq!(rows[1]["source"], "local_edit");
+    assert_eq!(rows[2]["source"], "rollback");
+    assert_eq!(rows[2]["status"], "open");
+}
