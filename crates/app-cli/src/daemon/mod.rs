@@ -89,16 +89,20 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
             let log_path = daemon_log_path(cfg)?;
             let out = if cfg!(target_os = "macos") {
                 macos::install(launcher.as_ref(), bin, log_path)?
-            } else {
+            } else if cfg!(target_os = "linux") {
                 linux::install(launcher.as_ref(), bin, log_path)?
+            } else {
+                return Err(unsupported_platform());
             };
             serde_json::to_string_pretty(&out)?
         }
         DaemonCmd::Uninstall => {
             let out = if cfg!(target_os = "macos") {
                 macos::uninstall(launcher.as_ref())?
-            } else {
+            } else if cfg!(target_os = "linux") {
                 linux::uninstall(launcher.as_ref())?
+            } else {
+                return Err(unsupported_platform());
             };
             serde_json::to_string_pretty(&out)?
         }
@@ -107,30 +111,46 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
             let log_path = daemon_log_path(cfg)?;
             let out = if cfg!(target_os = "macos") {
                 macos::status(launcher.as_ref(), last_tick, log_path)?
-            } else {
+            } else if cfg!(target_os = "linux") {
                 linux::status(launcher.as_ref(), last_tick, log_path)?
+            } else {
+                return Err(unsupported_platform());
             };
             serde_json::to_string_pretty(&out)?
         }
         DaemonCmd::Start => {
             let out = if cfg!(target_os = "macos") {
                 macos::start(launcher.as_ref())?
-            } else {
+            } else if cfg!(target_os = "linux") {
                 linux::start(launcher.as_ref())?
+            } else {
+                return Err(unsupported_platform());
             };
             serde_json::to_string_pretty(&out)?
         }
         DaemonCmd::Stop => {
             let out = if cfg!(target_os = "macos") {
                 macos::stop(launcher.as_ref())?
-            } else {
+            } else if cfg!(target_os = "linux") {
                 linux::stop(launcher.as_ref())?
+            } else {
+                return Err(unsupported_platform());
             };
             serde_json::to_string_pretty(&out)?
         }
     };
     println!("{outcome_json}");
     Ok(())
+}
+
+/// Surface a clear error when `rl daemon` is invoked on something that
+/// isn't macOS or Linux. Better than letting the call fall through into
+/// `systemctl`/`launchctl` and exploding with a confusing "command not
+/// found" further down the stack.
+fn unsupported_platform() -> anyhow::Error {
+    anyhow::anyhow!(
+        "rl daemon is only supported on macOS (launchd) and Linux (systemd --user)"
+    )
 }
 
 /// Absolute path to the `rld` binary the unit will launch. `just install`

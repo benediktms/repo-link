@@ -34,11 +34,17 @@ install:
     {{rl}} daemon install
 
 # uninstall — `rl daemon uninstall` itself reports `manifest_existed: false`
-# on a clean checkout and exits 0, so no `|| true` guard is needed.
+# on a clean checkout and exits 0, but `{{rl}}` points at the freshly-built
+# binary, which may not exist on a clean tree. Fall back to the symlinked
+# `~/.local/bin/rl` (left behind by a previous `just install`), and if
+# neither is present, skip the daemon step — the symlink cleanup below is
+# still useful.
 
 # Unload the unit, delete the manifest, remove the ~/.local/bin symlinks.
 uninstall:
-    {{rl}} daemon uninstall
+    if [ -x {{rl}} ]; then {{rl}} daemon uninstall; \
+    elif [ -x ~/.local/bin/rl ]; then ~/.local/bin/rl daemon uninstall; \
+    else echo "rl not built and not on PATH; skipping daemon uninstall"; fi
     rm -f ~/.local/bin/rl ~/.local/bin/rld
 
 # daemon-restart — `stop` can legitimately fail when the unit was never

@@ -37,8 +37,13 @@ pub(super) fn install(
     let manifest_str = path_to_string(&manifest_path)?;
 
     // bootout first — tolerating NotFound — so a re-install always picks up
-    // the new bytes even when an older copy is already loaded.
-    let _ = launcher.run(&["launchctl", "bootout", &domain, &manifest_str])?;
+    // the new bytes even when an older copy is already loaded. A genuine
+    // Failed (e.g. EPERM, "operation in progress") must surface; only the
+    // "not currently loaded" case is benign.
+    let bootout = launcher.run(&["launchctl", "bootout", &domain, &manifest_str])?;
+    if let LaunchOutcome::Failed { code, stderr } = &bootout {
+        return Err(anyhow!("launchctl bootout failed (exit {code}): {stderr}"));
+    }
     let bootstrap = launcher.run(&["launchctl", "bootstrap", &domain, &manifest_str])?;
     require_success("launchctl bootstrap", &bootstrap)?;
     let enable = launcher.run(&["launchctl", "enable", &label_target])?;
@@ -141,10 +146,17 @@ pub(super) fn start(launcher: &dyn Launcher) -> Result<StartStopOutcome> {
     let manifest_str = path_to_string(&manifest_path)?;
 
     // Probe before bootstrap so we don't try to bootstrap an already-loaded
-    // job (launchd would error out). This is the cheap form of "idempotent
-    // start" — no exit-code spelunking.
+    // job (launchd would error out). Failed must surface — collapsing it to
+    // `false` would mask real launchctl errors and then explode confusingly
+    // inside the subsequent `bootstrap`.
     let probe = launcher.run(&["launchctl", "print", &label_target])?;
-    let already_loaded = matches!(probe, LaunchOutcome::Success { .. });
+    let already_loaded = match probe {
+        LaunchOutcome::Success { .. } => true,
+        LaunchOutcome::NotFound => false,
+        LaunchOutcome::Failed { code, stderr } => {
+            return Err(anyhow!("launchctl print failed (exit {code}): {stderr}"));
+        }
+    };
 
     // enable is always safe — flips the persistent bit on regardless of
     // whether it was already on.

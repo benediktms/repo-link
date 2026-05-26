@@ -191,8 +191,14 @@ fn home_dir() -> Result<PathBuf, ConfigError> {
 }
 
 fn xdg_config_dir() -> Result<PathBuf, ConfigError> {
+    // Per the XDG Base Directory spec: "All paths set in these environment
+    // variables must be absolute. If an implementation encounters a relative
+    // path in any of these variables it should consider the path invalid and
+    // ignore it." Otherwise a stray `XDG_CONFIG_HOME=tmp` from the user's
+    // shell would silently route the systemd unit under `$PWD/tmp/...`.
     if let Ok(v) = std::env::var("XDG_CONFIG_HOME")
         && !v.is_empty()
+        && Path::new(&v).is_absolute()
     {
         return Ok(PathBuf::from(v));
     }

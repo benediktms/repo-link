@@ -14,10 +14,14 @@ pub(super) fn write_if_changed(path: &Path, desired: &str) -> std::io::Result<bo
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if let Ok(current) = std::fs::read(path)
-        && current == desired.as_bytes()
-    {
-        return Ok(false);
+    // Distinguish "file doesn't exist" (write it) from "can't read the file"
+    // (something is wrong with the FS / perms — surface it rather than
+    // pressing on into a write that would fail with a less informative error).
+    match std::fs::read(path) {
+        Ok(current) if current == desired.as_bytes() => return Ok(false),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     write_atomic(path, desired.as_bytes())?;
     Ok(true)
