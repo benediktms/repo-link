@@ -213,16 +213,18 @@ fn newest_log_segment(dir: &std::path::Path) -> Option<PathBuf> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Strict shape: `daemon.<10-char ISO date>.log`. This excludes
-        // the legacy `daemon.log` (the plist's panic catcher) — that
-        // file is the fallback path, not a segment.
+        // Strict shape: `daemon.<ISO-8601 date>.log`. This excludes the
+        // legacy `daemon.log` (the plist's panic catcher — no middle
+        // token at all) and also rejects same-length-but-not-a-date
+        // strings like `daemon.notadate--.log` that could otherwise sort
+        // higher than real segments and corrupt `status.log_path`.
         let Some(stripped) = name_str
             .strip_prefix("daemon.")
             .and_then(|s| s.strip_suffix(".log"))
         else {
             continue;
         };
-        if stripped.len() != 10 {
+        if chrono::NaiveDate::parse_from_str(stripped, "%Y-%m-%d").is_err() {
             continue;
         }
         let path = entry.path();
@@ -330,6 +332,19 @@ mod tests {
         for date in ["2026-05-24", "2026-05-26", "2026-05-25"] {
             std::fs::write(dir.path().join(format!("daemon.{date}.log")), "").unwrap();
         }
+        let newest = newest_log_segment(dir.path()).unwrap();
+        assert_eq!(newest.file_name().unwrap(), "daemon.2026-05-26.log");
+    }
+
+    #[test]
+    fn newest_log_segment_rejects_same_length_non_date_middle_tokens() {
+        // A 10-char middle that isn't a real ISO-8601 date must not be
+        // mistaken for a segment, otherwise a stray
+        // `daemon.zzzz-zz-zz.log` could lex-sort above today's real
+        // segment and corrupt `status.log_path`.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("daemon.zzzz-zz-zz.log"), "").unwrap();
+        std::fs::write(dir.path().join("daemon.2026-05-26.log"), "").unwrap();
         let newest = newest_log_segment(dir.path()).unwrap();
         assert_eq!(newest.file_name().unwrap(), "daemon.2026-05-26.log");
     }
