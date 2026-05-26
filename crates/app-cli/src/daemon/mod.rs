@@ -86,7 +86,7 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
     let outcome_json = match cmd {
         DaemonCmd::Install => {
             let bin = installed_rld_path()?;
-            let log_path = daemon_log_path(cfg)?;
+            let log_path = daemon_install_log_path(cfg)?;
             let out = if cfg!(target_os = "macos") {
                 macos::install(launcher.as_ref(), bin, log_path)?
             } else if cfg!(target_os = "linux") {
@@ -108,7 +108,7 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
         }
         DaemonCmd::Status => {
             let last_tick = last_tick_path(cfg)?;
-            let log_path = daemon_log_path(cfg)?;
+            let log_path = daemon_status_log_path(cfg)?;
             let out = if cfg!(target_os = "macos") {
                 macos::status(launcher.as_ref(), last_tick, log_path)?
             } else if cfg!(target_os = "linux") {
@@ -183,8 +183,55 @@ fn last_tick_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
     Ok(db_parent(cfg)?.join("last_tick.json"))
 }
 
-fn daemon_log_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
+/// Path the launchd plist redirects stdout/stderr to. Stays at the
+/// fixed `daemon.log` name (no date suffix) because it's the catch-all
+/// for output that happens *before* tracing-appender is initialised —
+/// panics, env-var failures, etc. Distinct from the daily-rotated
+/// segments tracing-appender writes (see `daemon_status_log_path`).
+fn daemon_install_log_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
     Ok(db_parent(cfg)?.join("daemon.log"))
+}
+
+/// Path reported by `rl daemon status.log_path` — the file users
+/// actually want to tail to see daemon events. With daily rotation in
+/// `app-daemon::logging`, this is the newest `daemon.YYYY-MM-DD.log`
+/// segment in the log directory. Falls back to `daemon.log` when no
+/// segments exist yet (e.g., fresh install or rld has never logged) so
+/// callers always get a usable path.
+fn daemon_status_log_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
+    let dir = db_parent(cfg)?;
+    Ok(newest_log_segment(dir).unwrap_or_else(|| dir.join("daemon.log")))
+}
+
+/// Glob `<dir>` for tracing-appender's daily segments named
+/// `daemon.YYYY-MM-DD.log` and return the lexicographically-largest
+/// one — which, since ISO-8601 dates sort the same as time, is the
+/// newest. Returns `None` if no matching segments exist.
+fn newest_log_segment(dir: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut latest: Option<(String, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Strict shape: `daemon.<10-char ISO date>.log`. This excludes
+        // the legacy `daemon.log` (the plist's panic catcher) — that
+        // file is the fallback path, not a segment.
+        let Some(stripped) = name_str
+            .strip_prefix("daemon.")
+            .and_then(|s| s.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        if stripped.len() != 10 {
+            continue;
+        }
+        let path = entry.path();
+        match &latest {
+            Some((existing, _)) if existing.as_str() >= stripped => {}
+            _ => latest = Some((stripped.to_string(), path)),
+        }
+    }
+    latest.map(|(_, path)| path)
 }
 
 fn db_parent(cfg: &RepoLinkConfig) -> Result<&std::path::Path> {
@@ -258,5 +305,46 @@ mod tests {
     fn is_wedged_false_at_exactly_one_interval() {
         let lt = last_tick_at(Utc::now() - chrono::Duration::seconds(60), 60);
         assert!(!is_wedged(Some(&lt)));
+    }
+
+    #[test]
+    fn newest_log_segment_returns_none_when_dir_is_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(newest_log_segment(dir.path()), None);
+    }
+
+    #[test]
+    fn newest_log_segment_ignores_the_legacy_undated_daemon_log() {
+        // `daemon.log` is the launchd panic-catcher and must not be
+        // mistaken for a segment — it has no date in the middle, so
+        // strict shape rejects it.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("daemon.log"), "").unwrap();
+        assert_eq!(newest_log_segment(dir.path()), None);
+    }
+
+    #[test]
+    fn newest_log_segment_picks_the_lexicographically_largest_dated_segment() {
+        // ISO-8601 dates sort the same as time, so lex-max == newest.
+        let dir = tempfile::TempDir::new().unwrap();
+        for date in ["2026-05-24", "2026-05-26", "2026-05-25"] {
+            std::fs::write(dir.path().join(format!("daemon.{date}.log")), "").unwrap();
+        }
+        let newest = newest_log_segment(dir.path()).unwrap();
+        assert_eq!(newest.file_name().unwrap(), "daemon.2026-05-26.log");
+    }
+
+    #[test]
+    fn newest_log_segment_ignores_unrelated_files_in_the_dir() {
+        // The log dir is also home to `last_tick.json`, the legacy
+        // `daemon.log`, and (possibly) tracing-appender lock files —
+        // none of those should be returned.
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("last_tick.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("daemon.log"), "").unwrap();
+        std::fs::write(dir.path().join("daemon.2026-05-26.log"), "").unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let newest = newest_log_segment(dir.path()).unwrap();
+        assert_eq!(newest.file_name().unwrap(), "daemon.2026-05-26.log");
     }
 }

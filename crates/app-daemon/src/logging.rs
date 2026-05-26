@@ -3,10 +3,14 @@
 //! Two output lanes, chosen by `--log-format`:
 //! - `pretty`: ANSI-coloured `fmt::Layer` to stdout. Cheap to tail
 //!   locally during development.
-//! - `json`: structured `fmt::Layer().json()` appended to a single file at
-//!   `<log_dir>/daemon.log`. Rotation is intentionally external (logrotate,
-//!   periodic truncate, etc.) so the path stays stable — `rl daemon status`
-//!   emits this exact path in `log_path` for `just daemon-logs` to tail.
+//! - `json`: structured `fmt::Layer().json()` to a daily-rotated file at
+//!   `<log_dir>/daemon.YYYY-MM-DD.log`. The appender keeps the 7 newest
+//!   segments and deletes older ones automatically. `rl daemon status`
+//!   resolves `log_path` by globbing the directory for the newest segment
+//!   so consumers always see the file currently being written to. The
+//!   launchd plist's `StandardOutPath`/`StandardErrorPath` separately
+//!   redirect to `<log_dir>/daemon.log` (no date suffix) — that's a
+//!   pre-tracing panic catcher and is independent of this appender.
 //!
 //! The file sink is wrapped in `tracing_appender::non_blocking` so writes
 //! never block a tick. The returned [`WorkerGuard`] keeps the background
@@ -25,9 +29,12 @@ pub enum LogFormat {
     /// ANSI-coloured pretty text to stdout. The default for foreground runs.
     #[default]
     Pretty,
-    /// JSON-per-line appended to `<log_dir>/daemon.log`. Used by the
-    /// installed daemon manifest so structured ingestion (jq, Datadog, etc.)
-    /// gets a stable shape and a stable filename.
+    /// JSON-per-line written to a daily-rotated segment at
+    /// `<log_dir>/daemon.YYYY-MM-DD.log`, keeping the 7 most recent
+    /// segments. Used by the installed daemon manifest so structured
+    /// ingestion (jq, Datadog, etc.) gets a stable shape. Consumers that
+    /// want a stable path use `rl daemon status.log_path`, which globs
+    /// for the newest segment.
     Json,
 }
 
@@ -65,10 +72,34 @@ pub fn init_subscriber(format: LogFormat, log_dir: &Path) -> Option<WorkerGuard>
                     .init();
                 return None;
             }
-            // `never` writes to a single, stable path so `rl daemon status`'s
-            // `log_path` is something users (and `just daemon-logs`) can
-            // actually tail. External tools handle rotation if needed.
-            let file_appender = tracing_appender::rolling::never(log_dir, "daemon.log");
+            // Daily-rotated segments at `<log_dir>/daemon.YYYY-MM-DD.log`,
+            // keeping 7 days of history. The appender prunes old segments
+            // on its own at midnight UTC. `rl daemon status` resolves the
+            // newest segment via glob, so consumers don't need to know the
+            // date pattern. If the builder fails (e.g., a permissions
+            // change on `log_dir` between the `create_dir_all` above and
+            // here), fall back to stdout JSON so the daemon at least
+            // produces some output instead of silently swallowing events.
+            let file_appender = match tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("daemon")
+                .filename_suffix("log")
+                .max_log_files(7)
+                .build(log_dir)
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!(
+                        "[daemon] could not init rolling appender in {} ({e}); falling back to stdout json",
+                        log_dir.display()
+                    );
+                    tracing_subscriber::registry()
+                        .with(env_filter)
+                        .with(tracing_subscriber::fmt::layer().json())
+                        .init();
+                    return None;
+                }
+            };
             let (writer, guard) = tracing_appender::non_blocking(file_appender);
             tracing_subscriber::registry()
                 .with(env_filter)
