@@ -64,8 +64,43 @@ impl TaskService {
         }
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
         // `SnapshotSource::Created` for why this distinction matters.
-        self.repo.save(&t, SnapshotSource::Created).await?;
+        self.save_with_minted_hash(&mut t).await?;
         Ok(task_to_dto(&t))
+    }
+
+    /// Save a freshly-created task, retrying the hash on `tasks.hash`
+    /// UNIQUE violations and growing the hash length once collisions
+    /// cluster at a given length. Mirrors the spec's mint algorithm:
+    /// fixed `K_RETRIES_AT_LENGTH = 8` attempts at length 3 before
+    /// stepping to 4, then 5, and so on. Capped at length 8 so the
+    /// hash always fits the prefix-hash composite's 8-char ceiling.
+    ///
+    /// Retry is driven by the DB's UNIQUE index, not a pre-flight
+    /// existence check — pre-checks race with concurrent creates.
+    async fn save_with_minted_hash(&self, t: &mut Task) -> Result<()> {
+        const K_RETRIES_AT_LENGTH: u32 = 8;
+        const MAX_LENGTH: usize = 8;
+        let mut length: usize = 3;
+        let mut attempts: u32 = 0;
+        loop {
+            t.hash = domain_task::random_lowercase_base32(length);
+            match self.repo.save(t, SnapshotSource::Created).await {
+                Ok(()) => return Ok(()),
+                Err(PortError::Conflict(msg)) if msg.contains("tasks.hash") => {
+                    attempts += 1;
+                    if attempts >= K_RETRIES_AT_LENGTH {
+                        attempts = 0;
+                        length += 1;
+                        if length > MAX_LENGTH {
+                            return Err(ServiceError::Port(PortError::Backend(format!(
+                                "could not mint unique task hash at any length up to {MAX_LENGTH}"
+                            ))));
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
