@@ -27,14 +27,16 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 testing-fixtures = { workspace = true }
 domain-workspace = { workspace = true }
 domain-repo = { workspace = true }
-tempfile = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 
-# `src/bin/repo-link-daemon.rs` and `src/bin/rld.rs` are auto-discovered.
-# Both are thin shims around `app_daemon::run_cli()` in `src/lib.rs`.
+# `src/bin/rld.rs` is auto-discovered. Thin shim around `app_daemon::run_cli()`
+# in `src/lib.rs`.

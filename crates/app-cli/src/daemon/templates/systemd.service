@@ -1,0 +1,11 @@
+[Unit]
+Description=repo-link reconciliation daemon
+After=network-online.target
+
+[Service]
+ExecStart={{BINARY_PATH}} --log-format=json
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

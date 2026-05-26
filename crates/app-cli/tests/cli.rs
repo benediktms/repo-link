@@ -1283,3 +1283,206 @@ fn agents_docs_preserves_content_outside_markers_on_update() {
         "second regenerate must be byte-identical (idempotent splice)"
     );
 }
+
+// ---------- daemon --------------------------------------------------------
+
+/// All env state needed to drive `rl daemon …` against a hermetic sandbox.
+/// Construct one per test: HOME is redirected so `default_launch_agent_path`
+/// / `default_systemd_unit_path` write into the tempdir, REPO_LINK_LAUNCHER
+/// picks the FakeLauncher mode, and REPO_LINK_RLD_PATH points the install
+/// flow at a deterministic binary path (we never execute it).
+struct DaemonEnv {
+    home: TempDir,
+    db_dir: TempDir,
+    launcher_log: std::path::PathBuf,
+    rld_path: std::path::PathBuf,
+}
+
+fn daemon_env() -> DaemonEnv {
+    let home = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let launcher_log = db_dir.path().join("launcher.log");
+    let rld_path = db_dir.path().join("rld");
+    // The file's contents are irrelevant — we just need a unique path that
+    // ends up baked into the rendered plist / unit so tests can assert it.
+    std::fs::write(&rld_path, b"# fake rld for tests\n").unwrap();
+    DaemonEnv {
+        home,
+        db_dir,
+        launcher_log,
+        rld_path,
+    }
+}
+
+fn daemon_bin(env: &DaemonEnv, launcher_mode: &str) -> Command {
+    let mut cmd = Command::cargo_bin("rl").expect("rl");
+    cmd.env("HOME", env.home.path());
+    cmd.env("REPO_LINK_DB", env.db_dir.path().join("repo-link.db"));
+    cmd.env("REPO_LINK_LAUNCHER", launcher_mode);
+    cmd.env("REPO_LINK_LAUNCHER_LOG", &env.launcher_log);
+    cmd.env("REPO_LINK_RLD_PATH", &env.rld_path);
+    // Pin XDG_CONFIG_HOME under the tempdir so the Linux systemd unit path
+    // is deterministic regardless of host XDG settings (and so a macOS host
+    // running the test still has a sensible XDG resolution).
+    cmd.env("XDG_CONFIG_HOME", env.home.path().join(".config"));
+    cmd
+}
+
+fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        env.home
+            .path()
+            .join("Library")
+            .join("LaunchAgents")
+            .join("com.benediktms.repo-link.plist")
+    } else {
+        env.home
+            .path()
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("repo-link.service")
+    }
+}
+
+#[test]
+fn daemon_install_writes_manifest_with_correct_paths() {
+    let env = daemon_env();
+    let outcome = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+
+    assert_eq!(outcome["label"], "com.benediktms.repo-link");
+    assert_eq!(outcome["manifest_changed"], true);
+    assert_eq!(outcome["loaded"], true);
+
+    let expected = expected_manifest_path(&env);
+    let reported = std::path::PathBuf::from(outcome["manifest_path"].as_str().unwrap());
+    assert_eq!(reported, expected);
+    assert!(
+        expected.exists(),
+        "manifest file should exist at {}",
+        expected.display()
+    );
+
+    let content = std::fs::read_to_string(&expected).unwrap();
+    assert!(
+        content.contains(env.rld_path.to_str().unwrap()),
+        "manifest should reference the rld path {}: {content}",
+        env.rld_path.display()
+    );
+}
+
+#[test]
+fn daemon_install_is_idempotent() {
+    let env = daemon_env();
+
+    let first = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+    assert_eq!(first["manifest_changed"], true);
+
+    // Second install over identical bytes should be a no-op for the file,
+    // but still re-issue the platform load sequence (bootout/bootstrap on
+    // macOS, daemon-reload/enable on Linux) so we can repair drift after
+    // an external `launchctl bootout`.
+    let second = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+    assert_eq!(second["manifest_changed"], false);
+    assert_eq!(second["loaded"], true);
+
+    // FakeLauncher logs each argv as a JSON line. Two installs ⇒ at least
+    // two recorded calls per platform, and the launcher log should be
+    // non-empty.
+    let log = std::fs::read_to_string(&env.launcher_log).unwrap();
+    let line_count = log.lines().filter(|l| !l.is_empty()).count();
+    assert!(
+        line_count >= 2,
+        "expected at least 2 launcher invocations across 2 installs, got {line_count}:\n{log}"
+    );
+}
+
+#[test]
+fn daemon_install_then_status_is_loaded_no_tick() {
+    let env = daemon_env();
+    let _ = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+
+    let status = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "status"]);
+    assert_eq!(status["unit_loaded"], true);
+    assert!(
+        status["last_tick"].is_null(),
+        "last_tick should be null until the daemon writes its first heartbeat"
+    );
+    assert_eq!(status["wedged"], false);
+    assert_eq!(status["label"], "com.benediktms.repo-link");
+}
+
+#[test]
+fn daemon_status_reads_last_tick_when_present() {
+    let env = daemon_env();
+    let last_tick = serde_json::json!({
+        "tick_at": chrono::Utc::now(),
+        "interval_secs": 60,
+        "report": {
+            "workspaces": 1, "repos_checked": 0, "worktrees_checked": 0,
+            "marked_missing": 0, "pruned": 0, "pushed": 0, "push_failures": []
+        }
+    });
+    std::fs::write(
+        env.db_dir.path().join("last_tick.json"),
+        serde_json::to_string_pretty(&last_tick).unwrap(),
+    )
+    .unwrap();
+
+    // fake_not_found ⇒ probe returns NotFound ⇒ unit_loaded=false. The
+    // heartbeat file should still parse and wedged should be false.
+    let status = run_json(
+        &mut daemon_bin(&env, "fake_not_found"),
+        &["daemon", "status"],
+    );
+    assert_eq!(status["unit_loaded"], false);
+    assert_eq!(status["last_tick"]["interval_secs"], 60);
+    assert_eq!(status["wedged"], false);
+}
+
+#[test]
+fn daemon_status_flags_wedged_when_stale() {
+    let env = daemon_env();
+    let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
+    let last_tick = serde_json::json!({
+        "tick_at": stale,
+        "interval_secs": 60,
+        "report": {
+            "workspaces": 1, "repos_checked": 0, "worktrees_checked": 0,
+            "marked_missing": 0, "pruned": 0, "pushed": 0, "push_failures": []
+        }
+    });
+    std::fs::write(
+        env.db_dir.path().join("last_tick.json"),
+        serde_json::to_string_pretty(&last_tick).unwrap(),
+    )
+    .unwrap();
+
+    // wedged is gated on unit_loaded=true (see is_wedged contract): a
+    // daemon that's offline is "stopped", not "wedged". Use fake mode so
+    // the probe says it's loaded.
+    let status = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "status"]);
+    assert_eq!(status["unit_loaded"], true);
+    assert_eq!(status["wedged"], true);
+}
+
+#[test]
+fn daemon_uninstall_is_idempotent() {
+    let env = daemon_env();
+
+    // First uninstall on a fresh state: nothing to remove, nothing to unload.
+    let first = run_json(
+        &mut daemon_bin(&env, "fake_not_found"),
+        &["daemon", "uninstall"],
+    );
+    assert_eq!(first["manifest_existed"], false);
+    assert_eq!(first["was_loaded"], false);
+
+    // Second uninstall must also succeed.
+    let second = run_json(
+        &mut daemon_bin(&env, "fake_not_found"),
+        &["daemon", "uninstall"],
+    );
+    assert_eq!(second["manifest_existed"], false);
+    assert_eq!(second["was_loaded"], false);
+}
