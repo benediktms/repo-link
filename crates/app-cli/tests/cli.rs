@@ -1250,3 +1250,63 @@ fn agents_docs_updates_block_on_second_run() {
     let after_second = std::fs::read_to_string(&path).unwrap();
     assert_eq!(after_first, after_second);
 }
+
+#[test]
+fn agents_docs_preserves_content_outside_markers_on_update() {
+    // End-to-end guard: a user's hand-written preamble and epilogue, plus
+    // a stale managed block between the markers, should survive an `rl
+    // agents docs` regenerate byte-for-byte outside the markers. Only the
+    // content between `<!-- rl:doc:start -->` and `<!-- rl:doc:end -->`
+    // should change. A second run must be idempotent.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("AGENTS.md");
+
+    let preamble = "# My Repo\n\n\
+                    Custom front matter the user wrote themselves.\n\n\
+                    ## Notes\n\n\
+                    - keep me!\n- and me!\n\n";
+    let stale_block = "<!-- rl:doc:start -->\nstale managed content\n<!-- rl:doc:end -->";
+    let epilogue = "\n\n## Appendix\n\n\
+                    Trailing notes that must not be clobbered.\n";
+
+    std::fs::write(&path, format!("{preamble}{stale_block}{epilogue}")).unwrap();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(dir.path());
+    let outcome = run_json(&mut cmd, &["agents", "docs"]);
+    assert_eq!(outcome["action"], "updated");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    // Surrounding content survives byte-for-byte.
+    assert!(
+        text.starts_with(preamble),
+        "preamble should be preserved verbatim; got: {text:?}"
+    );
+    assert!(
+        text.ends_with(epilogue),
+        "epilogue should be preserved verbatim; got: {text:?}"
+    );
+
+    // The stale managed content is gone and the freshly rendered intro is
+    // in its place.
+    assert!(
+        !text.contains("stale managed content"),
+        "stale managed content should have been replaced; got: {text:?}"
+    );
+    assert!(
+        text.contains("`rl` (repo-link) is a local-first workspace"),
+        "fresh intro should be inside the managed block; got: {text:?}"
+    );
+
+    // A second regenerate must be idempotent: identical bytes in, identical bytes out.
+    let mut cmd2 = bin("repo-link", &dir);
+    cmd2.current_dir(dir.path());
+    let outcome2 = run_json(&mut cmd2, &["agents", "docs"]);
+    assert_eq!(outcome2["action"], "updated");
+    let text2 = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text, text2,
+        "second regenerate must be byte-identical (idempotent splice)"
+    );
+}
