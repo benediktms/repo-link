@@ -688,6 +688,7 @@ dependencies = [
  "domain-core",
  "serde",
  "thiserror 2.0.18",
+ "uuid",
 ]
 
 [[package]]

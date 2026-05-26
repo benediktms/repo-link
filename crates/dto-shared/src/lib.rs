@@ -51,6 +51,10 @@ pub struct RepoBindingDto {
     pub tracked_branch: Option<String>,
     pub name: String,
     pub aliases: Vec<String>,
+    /// Globally-unique short handle used both as the human-typeable
+    /// piece of friendly task IDs (`prefix-hash`) and as a stand-alone
+    /// repo locator anywhere a binding ID is taken.
+    pub prefix: String,
     pub worktrees: Vec<WorktreeLinkDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

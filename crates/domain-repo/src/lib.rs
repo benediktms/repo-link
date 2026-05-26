@@ -39,6 +39,163 @@ pub fn derive_name(canonical_url: &str) -> String {
         .to_string()
 }
 
+/// Words stripped before prefix derivation — they carry no
+/// distinguishing information and would waste a slot in the 3-letter
+/// composite prefix (e.g. `app-packages` becomes `packages` →`pck`,
+/// not `app`). Mirrors brain's noise list so prefix derivation behaves
+/// consistently for engineers used to brain.
+const PREFIX_NOISE_WORDS: &[&str] = &[
+    "app",
+    "application",
+    "service",
+    "svc",
+    "server",
+    "api",
+    "the",
+];
+
+/// Derive a 3-letter lowercase prefix from a repo name.
+///
+/// Algorithm (ported from brain's `generate_prefix`, lowercased to match
+/// the spec's `^[a-z][a-z0-9]{1,7}$` regex):
+/// 1. Split on `-`, `_`, space.
+/// 2. Drop pure-numeric segments (`02`, `v3` stays — only fully numeric
+///    pieces are dropped).
+/// 3. Drop noise words (`app`, `service`, `api`, …).
+/// 4. Multi-word (3+): first letter of the first 3 unique segments.
+/// 5. Two segments: first letter of each + first consonant of the longer.
+/// 6. Single word: first char + next two consonants.
+/// 7. Pad with `x` to exactly 3 alphabetic chars.
+///
+/// Deterministic and pure — collision-breaking lives at the application
+/// layer (the persistence service appends `1`/`2`/… on duplicate insert).
+pub fn derive_prefix(name: &str) -> String {
+    let segments: Vec<&str> = name
+        .split(['-', '_', ' '])
+        .filter(|s| !s.is_empty())
+        .filter(|s| !is_pure_numeric(s))
+        .filter(|s| !PREFIX_NOISE_WORDS.contains(&s.to_ascii_lowercase().as_str()))
+        .collect();
+
+    let raw = match segments.len() {
+        0 => "rlk".to_string(),
+        1 => prefix_from_single_word(segments[0]),
+        2 => prefix_from_two_words(segments[0], segments[1]),
+        _ => prefix_from_multi_words(&segments),
+    };
+
+    let lower = raw.to_ascii_lowercase();
+    let chars: Vec<char> = lower.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    match chars.len() {
+        0 => "rlk".to_string(),
+        1 => format!("{}xx", chars[0]),
+        2 => format!("{}{}x", chars[0], chars[1]),
+        _ => chars[..3].iter().collect(),
+    }
+}
+
+fn is_pure_numeric(s: &str) -> bool {
+    s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_vowel(c: char) -> bool {
+    matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u')
+}
+
+fn consonants_after_first(word: &str) -> Vec<char> {
+    word.chars()
+        .skip(1)
+        .filter(|c| c.is_ascii_alphabetic() && !is_vowel(*c))
+        .collect()
+}
+
+fn prefix_from_single_word(word: &str) -> String {
+    let first = word.chars().next().unwrap_or('x');
+    let mut result = vec![first];
+    for c in consonants_after_first(word) {
+        if result.len() >= 3 {
+            break;
+        }
+        result.push(c);
+    }
+    if result.len() < 3 {
+        for c in word.chars().skip(1).filter(|c| c.is_ascii_alphabetic()) {
+            if !result.iter().any(|r| r.eq_ignore_ascii_case(&c)) || result.len() < 3 {
+                result.push(c);
+            }
+            if result.len() >= 3 {
+                break;
+            }
+        }
+    }
+    result.into_iter().collect()
+}
+
+fn prefix_from_two_words(a: &str, b: &str) -> String {
+    let first_a = a.chars().next().unwrap_or('x');
+    let first_b = b.chars().next().unwrap_or('x');
+    let a_is_longer = a.len() >= b.len();
+    let longer = if a_is_longer { a } else { b };
+    let extra = consonants_after_first(longer)
+        .first()
+        .copied()
+        .unwrap_or_else(|| longer.chars().nth(1).unwrap_or('x'));
+    if a_is_longer {
+        format!("{}{}{}", first_a, extra, first_b)
+    } else {
+        format!("{}{}{}", first_a, first_b, extra)
+    }
+}
+
+/// `^[a-z][a-z0-9]{1,7}$` — 2-8 chars, starts with a letter, lowercase
+/// alnum. Empty strings are rejected; an unset prefix lives as `""` in
+/// storage but never reaches this check.
+pub fn is_valid_prefix(p: &str) -> bool {
+    let len = p.chars().count();
+    if !(2..=8).contains(&len) {
+        return false;
+    }
+    let mut chars = p.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+fn prefix_from_multi_words(segments: &[&str]) -> String {
+    let mut result = Vec::new();
+    let mut seen = Vec::new();
+    for seg in segments {
+        if result.len() >= 3 {
+            break;
+        }
+        if let Some(c) = seg.chars().next() {
+            let lower = c.to_ascii_lowercase();
+            if !seen.contains(&lower) {
+                result.push(c);
+                seen.push(lower);
+            }
+        }
+    }
+    if result.len() < 3 {
+        for seg in segments {
+            if result.len() >= 3 {
+                break;
+            }
+            for c in consonants_after_first(seg) {
+                let lower = c.to_ascii_lowercase();
+                if !seen.contains(&lower) {
+                    result.push(c);
+                    seen.push(lower);
+                    break;
+                }
+            }
+        }
+    }
+    result.into_iter().collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoBinding {
     pub id: RepoId,
@@ -54,6 +211,13 @@ pub struct RepoBinding {
     /// disk; lookups are exact-match (not substring). An alias may not
     /// collide with the current `name`.
     pub aliases: Vec<String>,
+    /// Short globally-unique handle used to assemble friendly task IDs
+    /// (`prefix-hash`, e.g. `rlk-ak7`). Derived from `name` via
+    /// [`derive_prefix`] at attach time, with the persistence layer
+    /// breaking duplicates by appending `1`/`2`/… until unique. Sticky
+    /// once set — renaming the repo does not re-derive the prefix.
+    /// Empty string is the "not yet set" sentinel pre-backfill.
+    pub prefix: String,
     pub worktrees: Vec<WorktreeLink>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -78,6 +242,7 @@ impl RepoBinding {
             ));
         }
         let now = Timestamp::now();
+        let prefix = derive_prefix(&name);
         Ok(Self {
             id: RepoId::new(),
             workspace_id,
@@ -86,10 +251,30 @@ impl RepoBinding {
             tracked_branch: None,
             name,
             aliases: Vec::new(),
+            prefix,
             worktrees: Vec::new(),
             created_at: now,
             updated_at: now,
         })
+    }
+
+    /// Replace the prefix wholesale. Intended for the persistence layer
+    /// to apply collision-breaking suffixes (e.g. `pck` → `pck1`) and
+    /// for the future `rl repo set-prefix` override. Validates against
+    /// the spec regex `^[a-z][a-z0-9]{1,7}$` to keep the composite ID
+    /// human-typeable.
+    pub fn set_prefix(&mut self, new_prefix: String) -> Result<()> {
+        if !is_valid_prefix(&new_prefix) {
+            return Err(DomainError::validation(
+                "prefix must match ^[a-z][a-z0-9]{1,7}$ (2-8 lowercase alnum, must start with a letter)",
+            ));
+        }
+        if self.prefix == new_prefix {
+            return Ok(());
+        }
+        self.prefix = new_prefix;
+        self.touch();
+        Ok(())
     }
 
     /// Set a new short name. Trims whitespace, rejects an empty result,
@@ -372,5 +557,102 @@ mod tests {
             .add_alias("c08c09c5-4ac2-4a43-96ea-d574a580fde5".into())
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ---- Friendly task ID prefix derivation -----------------------------
+
+    #[test]
+    fn new_binding_derives_prefix_from_name() {
+        let b = binding();
+        // Single-word "repo" → first char 'r' + consonant 'p' + fallback
+        // alphabetic 'e' → "rpe". (No 'x' padding needed once the
+        // fallback kicks in.)
+        assert_eq!(b.name, "repo");
+        assert_eq!(b.prefix, "rpe");
+    }
+
+    #[test]
+    fn derive_prefix_repo_link() {
+        // `repo-link` is two segments of equal length; the `a_is_longer`
+        // tie-breaker uses >= so `repo` wins. Format is `first_a + extra
+        // + first_b` where `extra` is the first consonant of the longer:
+        // 'r' + 'p' (from "repo") + 'l' = "rpl". (The spec body wrote
+        // `rlk` as a stylised example; the deterministic algorithm
+        // produces `rpl` — explicit overrides via `set_prefix` or the
+        // upcoming `--prefix` flag let users pick a different value.)
+        assert_eq!(derive_prefix("repo-link"), "rpl");
+    }
+
+    #[test]
+    fn derive_prefix_strips_noise_words() {
+        // `service` is noise; remaining single-word `auth` → a + th = ath.
+        assert_eq!(derive_prefix("auth-service"), "ath");
+        // `app` stripped → single-word `packages` → p + ck = pck.
+        assert_eq!(derive_prefix("app-packages"), "pck");
+    }
+
+    #[test]
+    fn derive_prefix_pads_short_input() {
+        // Single letter pads to 3.
+        assert_eq!(derive_prefix("a"), "axx");
+        // Empty falls back to "rlk".
+        assert_eq!(derive_prefix(""), "rlk");
+        // Pure-numeric segments dropped → empty → fallback.
+        assert_eq!(derive_prefix("123-456"), "rlk");
+    }
+
+    #[test]
+    fn derive_prefix_multi_word_dedup() {
+        // 3 unique first letters.
+        assert_eq!(derive_prefix("my-cool-project"), "mcp");
+        // Underscores work the same as hyphens.
+        assert_eq!(derive_prefix("my_cool_project"), "mcp");
+    }
+
+    #[test]
+    fn is_valid_prefix_accepts_spec_examples() {
+        assert!(is_valid_prefix("rlk"));
+        assert!(is_valid_prefix("ath"));
+        // Up to 8 chars.
+        assert!(is_valid_prefix("abcdefgh"));
+        // Digits allowed after the first char.
+        assert!(is_valid_prefix("rl1"));
+    }
+
+    #[test]
+    fn is_valid_prefix_rejects_bad_shapes() {
+        assert!(!is_valid_prefix("")); // too short
+        assert!(!is_valid_prefix("a")); // too short
+        assert!(!is_valid_prefix("abcdefghi")); // too long
+        assert!(!is_valid_prefix("RLK")); // uppercase
+        assert!(!is_valid_prefix("1rl")); // leading digit
+        assert!(!is_valid_prefix("rl-k")); // hyphen
+    }
+
+    #[test]
+    fn set_prefix_rejects_invalid_and_keeps_old() {
+        let mut b = binding();
+        let before = b.prefix.clone();
+        assert!(b.set_prefix("RLK".into()).is_err());
+        assert_eq!(b.prefix, before);
+    }
+
+    #[test]
+    fn set_prefix_applies_valid_value_and_touches() {
+        let mut b = binding();
+        let before = b.updated_at;
+        // Sleep is not necessary — we only check that the prefix changed.
+        b.set_prefix("xyz".into()).unwrap();
+        assert_eq!(b.prefix, "xyz");
+        assert!(b.updated_at >= before);
+    }
+
+    #[test]
+    fn set_prefix_idempotent_no_op() {
+        let mut b = binding();
+        let current = b.prefix.clone();
+        let before = b.updated_at;
+        b.set_prefix(current).unwrap();
+        assert_eq!(b.updated_at, before);
     }
 }

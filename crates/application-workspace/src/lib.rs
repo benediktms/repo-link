@@ -156,12 +156,45 @@ impl RepoBindingService {
             path
         });
 
-        self.bindings.save(&binding).await?;
+        self.save_with_unique_prefix(&mut binding).await?;
         Ok(RepoAttachOutcomeDto {
             binding: binding_to_dto(&binding),
             merged,
             worktree_added,
         })
+    }
+
+    /// Save a binding, retrying with a numeric suffix on `repos.prefix`
+    /// UNIQUE violations. Two distinct repos with the same `name` would
+    /// otherwise both derive the same prefix and collide globally; the
+    /// suffix breaks the tie deterministically (`rpe` → `rpe1` → `rpe2`).
+    ///
+    /// The retry runs against the database, not a pre-flight cache —
+    /// the spec is explicit that uniqueness is the index's job and a
+    /// pre-check would race.
+    async fn save_with_unique_prefix(&self, binding: &mut RepoBinding) -> Result<()> {
+        const MAX_SUFFIX: u32 = 99;
+        let base = binding.prefix.clone();
+        let mut suffix: u32 = 0;
+        loop {
+            match self.bindings.save(binding).await {
+                Ok(()) => return Ok(()),
+                Err(PortError::Conflict(msg)) if msg.contains("repos.prefix") => {
+                    suffix += 1;
+                    if suffix > MAX_SUFFIX {
+                        return Err(ServiceError::Port(PortError::Backend(format!(
+                            "could not allocate unique repo prefix from base '{base}' after {MAX_SUFFIX} attempts"
+                        ))));
+                    }
+                    let suffix_str = suffix.to_string();
+                    let max_base_chars = 8usize.saturating_sub(suffix_str.len());
+                    let trimmed: String = base.chars().take(max_base_chars).collect();
+                    let candidate = format!("{trimmed}{suffix_str}");
+                    binding.set_prefix(candidate)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub async fn detach(&self, id: &str) -> Result<()> {
@@ -425,6 +458,7 @@ pub fn binding_to_dto(b: &RepoBinding) -> RepoBindingDto {
         tracked_branch: b.tracked_branch.clone(),
         name: b.name.clone(),
         aliases: b.aliases.clone(),
+        prefix: b.prefix.clone(),
         worktrees: b
             .worktrees
             .iter()

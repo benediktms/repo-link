@@ -9,6 +9,34 @@
 use domain_core::{Aggregate, DomainError, RepoId, Result, TaskId, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
+/// Generate a random lowercase RFC 4648 base32 string of the given
+/// length. Backs the friendly task ID minting: the persistence layer
+/// retries with new randomness on `UNIQUE` index collisions and grows
+/// the requested length once the failure rate at a given length climbs.
+///
+/// Uses a fresh UUID's bytes as the entropy source — keeps the
+/// dependency tree small (no extra `rand` crate) and reuses the
+/// randomness primitive that already mints `TaskId`s. One UUID supplies
+/// up to 25 base32 chars of entropy (16 bytes × 8 / 5), which is far
+/// more than the 3–8 chars callers actually consume.
+pub fn random_lowercase_base32(length: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let mut out = String::with_capacity(length);
+    let mut acc: u64 = 0;
+    let mut bits: u32 = 0;
+    for &b in &bytes {
+        acc = (acc << 8) | (b as u64);
+        bits += 8;
+        while bits >= 5 && out.len() < length {
+            bits -= 5;
+            let idx = ((acc >> bits) & 0b11111) as usize;
+            out.push(ALPHABET[idx] as char);
+        }
+    }
+    out
+}
+
 /// Where the task is in the human workflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,6 +181,12 @@ pub struct Task {
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
     pub relations: Vec<TaskRelation>,
+    /// Short globally-unique hash used to assemble the friendly composite
+    /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
+    /// (grown by the persistence layer on collision). Empty string is the
+    /// "not yet minted" sentinel pre-backfill; minted tasks always carry
+    /// a non-empty value.
+    pub hash: String,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     /// The latest baseline-eligible [`TaskSnapshot`] (one of `Promote` /
@@ -187,6 +221,10 @@ impl Task {
             assignees: Vec::new(),
             remote: None,
             relations: Vec::new(),
+            // Empty until the persistence layer mints a unique base32
+            // hash on first save. Domain stays agnostic to randomness
+            // and DB-backed uniqueness retries.
+            hash: String::new(),
             created_at: now,
             updated_at: now,
             synced_baseline: None,
@@ -803,5 +841,35 @@ mod tests {
         let mut t = draft();
         t.archive().unwrap();
         assert!(t.archive().is_err());
+    }
+
+    #[test]
+    fn random_lowercase_base32_length_and_alphabet() {
+        for &length in &[3usize, 4, 5, 7] {
+            let s = random_lowercase_base32(length);
+            assert_eq!(
+                s.chars().count(),
+                length,
+                "expected {length} chars, got {s:?}"
+            );
+            for c in s.chars() {
+                assert!(
+                    matches!(c, 'a'..='z' | '2'..='7'),
+                    "char {c:?} is outside RFC 4648 lowercase base32"
+                );
+            }
+        }
+    }
+
+    /// Smoke test: ten draws at length 3 produce more than one distinct
+    /// value. (3-char base32 has 32^3 = 32 768 possible values; collisions
+    /// across 10 draws would be astronomical bad luck.)
+    #[test]
+    fn random_lowercase_base32_is_actually_random() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..10 {
+            seen.insert(random_lowercase_base32(3));
+        }
+        assert!(seen.len() > 1, "10 length-3 draws produced one value");
     }
 }
