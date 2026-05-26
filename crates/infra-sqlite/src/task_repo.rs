@@ -207,6 +207,24 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(out)
     }
 
+    async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT * FROM tasks WHERE hash = ?")
+            .bind(hash)
+            .fetch_optional(&self.db.reads)
+            .await
+            .map_err(map_sqlx_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut task = row_to_task(&row)?;
+        task.relations = load_relations(&self.db.reads, task.id).await?;
+        task.synced_baseline = load_latest_baseline(&self.db.reads, task.id).await?;
+        Ok(Some(task))
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())

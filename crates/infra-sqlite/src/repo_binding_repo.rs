@@ -136,6 +136,28 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         }
     }
 
+    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>> {
+        // Empty prefix is the unset-sentinel; reject explicitly so a
+        // bug elsewhere doesn't accidentally return "any unbacklfilled
+        // row" via a `WHERE prefix = ''` match.
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT * FROM repos WHERE prefix = ?")
+            .bind(prefix)
+            .fetch_optional(&self.db.reads)
+            .await
+            .map_err(map_sqlx_err)?;
+        match row {
+            Some(row) => {
+                let mut binding = row_to_binding(&row)?;
+                binding.worktrees = load_worktrees(&self.db.reads, binding.id).await?;
+                Ok(Some(binding))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn delete(&self, id: RepoId) -> PortResult<()> {
         sqlx::query("DELETE FROM repos WHERE id = ?")
             .bind(id.to_string())

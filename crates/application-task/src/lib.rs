@@ -8,7 +8,9 @@ use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoteRefDto, TaskDto, TaskRelationDto,
     UpdateTaskCmd,
 };
-use ports::{PortError, TaskFilter, TaskRepository, TaskSnapshotRepository};
+use ports::{
+    PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
+};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -22,6 +24,19 @@ pub enum ServiceError {
     BadId(String),
     #[error("invalid enum value for {field}: {value}")]
     BadEnum { field: &'static str, value: String },
+    /// Composite ID input named one prefix but the task's repo carries
+    /// a different one. The bare hash is unique, so we *could* resolve
+    /// it silently; the spec explicitly rejects that path because the
+    /// mismatch usually indicates a stale copy-paste from another
+    /// repo's context.
+    #[error(
+        "prefix mismatch: input '{input_prefix}-{hash}' but task {hash} lives under prefix '{actual_prefix}'"
+    )]
+    PrefixMismatch {
+        input_prefix: String,
+        actual_prefix: String,
+        hash: String,
+    },
 }
 
 impl From<IdParseError> for ServiceError {
@@ -37,15 +52,75 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 pub struct TaskService {
     repo: Arc<dyn TaskRepository>,
     snapshots: Arc<dyn TaskSnapshotRepository>,
+    /// Used by the friendly-ID resolver to validate the prefix half of
+    /// a composite `prefix-hash` input against the task's repo binding.
+    bindings: Arc<dyn RepoBindingRepository>,
 }
 
 impl TaskService {
-    pub fn new(repo: Arc<dyn TaskRepository>, snapshots: Arc<dyn TaskSnapshotRepository>) -> Self {
-        Self { repo, snapshots }
+    pub fn new(
+        repo: Arc<dyn TaskRepository>,
+        snapshots: Arc<dyn TaskSnapshotRepository>,
+        bindings: Arc<dyn RepoBindingRepository>,
+    ) -> Self {
+        Self {
+            repo,
+            snapshots,
+            bindings,
+        }
     }
 
     pub fn snapshots_repo(&self) -> &Arc<dyn TaskSnapshotRepository> {
         &self.snapshots
+    }
+
+    /// Resolve a task by UUID, bare hash, or `prefix-hash` composite.
+    ///
+    /// Resolution order:
+    /// 1. If the input parses as a UUID, fetch by that ID.
+    /// 2. If the input has no `-`, look up by [`TaskRepository::find_by_hash`].
+    /// 3. Otherwise split on the *last* `-` (the prefix never contains
+    ///    `-`, but hashes are alphanumeric so the right split point is
+    ///    unambiguous), look up by hash, then verify the input prefix
+    ///    matches the task's repo binding's prefix. Mismatch → hard
+    ///    error per the spec.
+    pub async fn resolve_task(&self, query: &str) -> Result<Task> {
+        // UUID short-circuit. Keep this first so existing scripts that
+        // pass UUIDs stay on the cheap path (no hash lookup, no binding
+        // lookup).
+        if let Ok(id) = query.parse::<TaskId>() {
+            return Ok(self.repo.get(id).await?);
+        }
+
+        let (input_prefix, hash) = match query.rsplit_once('-') {
+            Some((p, h)) => (Some(p), h),
+            None => (None, query),
+        };
+
+        let task = self
+            .repo
+            .find_by_hash(hash)
+            .await?
+            .ok_or_else(|| PortError::NotFound(format!("task hash {hash:?}")))?;
+
+        if let Some(input_prefix) = input_prefix {
+            // The bare hash is the source of truth — we found the task.
+            // The prefix half is a sanity check.
+            let actual_prefix = match task.repo_id {
+                Some(repo_id) => self.bindings.get(repo_id).await?.prefix,
+                // Task without a repo binding can't have a prefix; any
+                // input prefix is necessarily a mismatch.
+                None => String::new(),
+            };
+            if actual_prefix != input_prefix {
+                return Err(ServiceError::PrefixMismatch {
+                    input_prefix: input_prefix.to_string(),
+                    actual_prefix,
+                    hash: hash.to_string(),
+                });
+            }
+        }
+        Ok(task)
     }
 
     pub async fn create(&self, cmd: CreateTaskCmd) -> Result<TaskDto> {
@@ -104,13 +179,11 @@ impl TaskService {
     }
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
-        let id: TaskId = id.parse()?;
-        Ok(task_to_dto(&self.repo.get(id).await?))
+        Ok(task_to_dto(&self.resolve_task(id).await?))
     }
 
     pub async fn update(&self, cmd: UpdateTaskCmd) -> Result<TaskDto> {
-        let id: TaskId = cmd.task_id.parse()?;
-        let mut t = self.repo.get(id).await?;
+        let mut t = self.resolve_task(&cmd.task_id).await?;
         if let Some(title) = cmd.title {
             t.set_title(title)?;
         }
@@ -188,19 +261,18 @@ impl TaskService {
     }
 
     pub async fn add_relation(&self, cmd: AddTaskRelationCmd) -> Result<TaskDto> {
-        let id: TaskId = cmd.task_id.parse()?;
-        let other: TaskId = cmd.other.parse()?;
         let kind = parse_enum::<RelationKind>("kind", &cmd.kind)?;
-        let mut t = self.repo.get(id).await?;
-        t.add_relation(kind, other);
+        let mut t = self.resolve_task(&cmd.task_id).await?;
+        // The other side of a relation is a friendly ID too.
+        let other_task = self.resolve_task(&cmd.other).await?;
+        t.add_relation(kind, other_task.id);
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
     }
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
-        let task_id: domain_core::TaskId = id.parse()?;
-        let snapshot = self.snapshots.get(task_id, to_version).await?;
-        let mut task = self.repo.get(task_id).await?;
+        let mut task = self.resolve_task(id).await?;
+        let snapshot = self.snapshots.get(task.id, to_version).await?;
         task.title = snapshot.title;
         task.body = snapshot.body;
         task.status = snapshot.status;
@@ -213,12 +285,11 @@ impl TaskService {
         Ok(task_to_dto(&task))
     }
 
-    async fn transition<F>(&self, id: &str, op: F) -> Result<TaskDto>
+    async fn transition<F>(&self, query: &str, op: F) -> Result<TaskDto>
     where
         F: FnOnce(&mut Task) -> domain_core::Result<()>,
     {
-        let id: TaskId = id.parse()?;
-        let mut t = self.repo.get(id).await?;
+        let mut t = self.resolve_task(query).await?;
         op(&mut t)?;
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         Ok(task_to_dto(&t))
@@ -275,13 +346,17 @@ pub fn task_to_dto(t: &Task) -> TaskDto {
 mod tests {
     use super::*;
     use ports::TaskSnapshotRepository;
-    use testing_fixtures::{InMemoryTaskRepository, InMemoryTaskSnapshotRepository};
+    use testing_fixtures::{
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryTaskSnapshotRepository,
+    };
 
     fn svc() -> TaskService {
         let repo = Arc::new(InMemoryTaskRepository::new());
         let snaps: Arc<dyn TaskSnapshotRepository> =
             Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
-        TaskService::new(repo, snaps)
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        TaskService::new(repo, snaps, bindings)
     }
 
     fn ws_id() -> String {

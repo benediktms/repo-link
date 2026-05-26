@@ -479,7 +479,7 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     Ok(Services {
         workspaces: WorkspaceService::new(workspaces_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
-        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo),
+        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo, bindings_repo.clone()),
         query: QueryService::new(workspaces_repo, bindings_repo.clone(), tasks_repo.clone()),
         tasks_repo,
         bindings_repo,

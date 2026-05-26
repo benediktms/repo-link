@@ -220,8 +220,16 @@ impl RepoBindingService {
         self.resolve_by_handle(query).await
     }
 
-    /// Scan all non-archived workspaces for a binding matching by exact name or alias.
+    /// Resolve `query` to a binding by trying, in order: exact
+    /// `prefix` match (globally-unique, single index lookup); then
+    /// exact `name` or `alias` match across all non-archived
+    /// workspaces. The prefix takes priority because it carries an
+    /// explicit uniqueness guarantee — names and aliases can clash
+    /// across workspaces, so they still produce the ambiguity error.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
+        if let Some(binding) = self.bindings.find_by_prefix(query).await? {
+            return Ok(binding);
+        }
         let workspaces = self.workspaces.list(false).await?;
         let mut matches: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {

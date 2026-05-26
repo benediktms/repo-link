@@ -174,6 +174,19 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
             .cloned())
     }
 
+    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>> {
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .find(|b| b.prefix == prefix)
+            .cloned())
+    }
+
     async fn delete(&self, id: RepoId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())
@@ -283,6 +296,23 @@ impl TaskRepository for InMemoryTaskRepository {
             .collect();
         rows.sort_by_key(|t| t.created_at);
         Ok(rows)
+    }
+
+    async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let g = self.inner.lock().unwrap();
+        let Some(task) = g.values().find(|t| t.hash == hash).cloned() else {
+            return Ok(None);
+        };
+        // Restore the synced_baseline projection the same way `get` does.
+        let snaps = self.snapshots.lock().unwrap();
+        let mut task = task;
+        task.synced_baseline = snaps
+            .get(&task.id)
+            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+        Ok(Some(task))
     }
 
     async fn delete(&self, id: TaskId) -> PortResult<()> {
