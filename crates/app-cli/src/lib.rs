@@ -22,6 +22,7 @@ use infra_sqlite::{
     SqliteWorkspaceRepository, open_from_path,
 };
 
+mod daemon;
 mod docs;
 mod render;
 
@@ -98,6 +99,9 @@ enum Cmd {
     /// Documentation helpers for AI agents picking up this repo.
     #[command(subcommand)]
     Agents(AgentsCmd),
+    /// Manage the background reconciliation daemon (launchd / systemd unit).
+    #[command(subcommand)]
+    Daemon(daemon::DaemonCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -472,6 +476,7 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg),
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
+        Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
     }
 }
 

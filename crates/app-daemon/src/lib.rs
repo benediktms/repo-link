@@ -1,4 +1,4 @@
-//! repo-link-daemon — background reconciliation + sync loop.
+//! rld — repo-link's background reconciliation + sync daemon.
 //!
 //! One periodic tick performs, for each non-archived workspace:
 //! 1. `RepoBindingService::reconcile_worktrees` (mark-only) — fold any
@@ -36,6 +36,7 @@ use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
 };
 use ports::{FilesystemProbe, TaskFilter, TaskRepository};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::signal;
 use tracing::{Instrument, error, info, info_span, warn};
@@ -54,7 +55,7 @@ const STATUS_MISSING_PATH: &str = "missing_path";
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "repo-link-daemon",
+    name = "rld",
     version,
     about = "Background reconciler for repo-link"
 )]
@@ -90,7 +91,7 @@ pub struct Args {
     pub missing_grace_ticks: u32,
 }
 
-/// Library entrypoint shared by both `repo-link-daemon` and `rld` bin shims.
+/// Library entrypoint called from the `rld` bin shim.
 pub async fn run_cli() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut cfg = RepoLinkConfig::from_env()?;
@@ -130,7 +131,11 @@ pub async fn run_cli() -> anyhow::Result<()> {
 
     let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
         .with_prune(args.prune)
-        .with_missing_grace_ticks(args.missing_grace_ticks);
+        .with_missing_grace_ticks(args.missing_grace_ticks)
+        // Co-locate last_tick.json with the db + log so a `--db` override
+        // relocates the whole daemon state consistently.
+        .with_state_dir(log_dir.clone())
+        .with_interval_secs(args.interval_secs);
     // Read the coerced value back from the daemon so a run with
     // `REPO_LINK_MISSING_GRACE_TICKS=0` logs the effective `1` rather
     // than the raw input. Single source of truth lives in
@@ -172,6 +177,13 @@ pub struct Daemon {
     // (entry removed) when the path returns. No persistence — daemon restart
     // forgets all counts, which is the safer direction.
     miss_counts: Mutex<HashMap<(RepoId, PathBuf), u32>>,
+    // Override for the directory that holds heartbeat state (last_tick.json).
+    // `None` resolves via `infra_config::default_last_tick_path()`; tests set
+    // this to a tempdir to keep `cargo test` away from the platform data dir.
+    state_dir: Option<PathBuf>,
+    // Tick cadence in seconds, surfaced in last_tick.json so `daemon status`
+    // can decide whether the daemon is wedged (tick_at older than 2 × this).
+    interval_secs: u64,
 }
 
 impl Daemon {
@@ -191,6 +203,8 @@ impl Daemon {
             prune: false,
             missing_grace_ticks: 3,
             miss_counts: Mutex::new(HashMap::new()),
+            state_dir: None,
+            interval_secs: 60,
         }
     }
 
@@ -199,6 +213,23 @@ impl Daemon {
     /// `missing_grace_ticks` consecutive ticks.
     pub fn with_prune(mut self, prune: bool) -> Self {
         self.prune = prune;
+        self
+    }
+
+    /// Redirect heartbeat state away from the platform data dir. Production
+    /// callers point this at the same parent as the SQLite db (so `--db`
+    /// overrides relocate the whole daemon state consistently); tests point
+    /// it at a `tempfile::TempDir`.
+    pub fn with_state_dir(mut self, dir: PathBuf) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
+    /// Tick cadence in seconds, embedded in `last_tick.json` so `daemon
+    /// status` can flag a wedged daemon. Does not change the actual run-loop
+    /// cadence — pass the duration to [`Self::run`] for that.
+    pub fn with_interval_secs(mut self, n: u64) -> Self {
+        self.interval_secs = n;
         self
     }
 
@@ -319,7 +350,28 @@ impl Daemon {
                 .retain(|k, _| all_valid_keys.contains(k));
         }
 
+        // Heartbeat: observability, not correctness. A failed write must
+        // never abort the tick — the daemon kept its contract; only `daemon
+        // status` loses its "wedged?" signal for one tick.
+        self.write_last_tick(&report);
+
         Ok(report)
+    }
+
+    fn write_last_tick(&self, report: &TickReport) {
+        let path = match &self.state_dir {
+            Some(dir) => dir.join("last_tick.json"),
+            None => match infra_config::default_last_tick_path() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "could not resolve last_tick path");
+                    return;
+                }
+            },
+        };
+        if let Err(e) = write_last_tick_atomic(&path, self.interval_secs, report) {
+            warn!(error = %e, path = %path.display(), "failed to write last_tick.json");
+        }
     }
 
     /// Grace-counter pass for a single workspace. For each binding, re-probe
@@ -442,7 +494,7 @@ impl Daemon {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TickReport {
     pub workspaces: usize,
     pub repos_checked: usize,
@@ -451,6 +503,43 @@ pub struct TickReport {
     pub pruned: usize,
     pub pushed: usize,
     pub push_failures: Vec<String>,
+}
+
+/// Heartbeat artefact written atomically at the end of every `tick_once`.
+/// Consumed by `rl daemon status` to surface "running but wedged" — a
+/// daemon whose unit is loaded but whose `tick_at` is older than expected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastTick {
+    pub tick_at: chrono::DateTime<chrono::Utc>,
+    pub interval_secs: u64,
+    pub report: TickReport,
+}
+
+/// Atomic write: serialise to a temp file in the destination directory,
+/// then `rename` over the target. Same-directory rename is atomic on every
+/// POSIX filesystem, so readers never see a half-written heartbeat.
+fn write_last_tick_atomic(
+    path: &std::path::Path,
+    interval_secs: u64,
+    report: &TickReport,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let last_tick = LastTick {
+        tick_at: chrono::Utc::now(),
+        interval_secs,
+        report: report.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&last_tick)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(&bytes)?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -916,6 +1005,45 @@ mod tests {
         let r4 = daemon.tick_once().await.unwrap();
         assert_eq!(r4.pruned, 1, "WS2 should prune at tick 4");
         assert!(daemon.miss_counts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_once_writes_last_tick_json() {
+        // Heartbeat invariant: every tick_once leaves a parseable
+        // last_tick.json in the configured state_dir, even with no
+        // workspaces to do work over. `daemon status` reads this file to
+        // decide "wedged or not?".
+        let probe = Arc::new(StubFilesystemProbe::new());
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("hb").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo, bind_repo);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None)
+            .with_state_dir(tmp.path().to_path_buf())
+            .with_interval_secs(42);
+
+        let before = chrono::Utc::now();
+        let _ = daemon.tick_once().await.unwrap();
+        let after = chrono::Utc::now();
+
+        let path = tmp.path().join("last_tick.json");
+        assert!(path.exists(), "last_tick.json was not written");
+        let parsed: LastTick =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            parsed.tick_at >= before && parsed.tick_at <= after,
+            "tick_at {} must fall within [{before}, {after}]",
+            parsed.tick_at,
+        );
+        assert_eq!(parsed.interval_secs, 42);
+        assert_eq!(parsed.report.workspaces, 1);
     }
 
     #[tokio::test]
