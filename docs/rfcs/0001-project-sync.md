@@ -112,12 +112,14 @@ When a workspace has a `project_id`, the project is *always* the primary sync ta
 | local `TaskStatus` | auto-derived default option |
 |---|---|
 | `Open` | first option matching `/^(backlog\|todo\|open\|new)$/i`, else first option |
-| `InProgress` | first option matching `/in.progress\|doing\|wip/i` |
-| `Blocked` | first option matching `/blocked\|on.hold\|waiting/i`, else fall back to `InProgress` |
-| `Done` | first option matching `/done\|complete\|closed\|shipped/i`, else last option |
+| `InProgress` | first option matching `/^(in.progress\|doing\|wip)$/i` |
+| `Blocked` | first option matching `/^(blocked\|on.hold\|waiting)$/i`, else fall back to `InProgress` |
+| `Done` | first option matching `/^(done\|complete\|closed\|shipped)$/i`, else last option |
 | `Archived` | no project mutation (REST `close as not_planned` handles this) |
 
-Auto-derivation runs once at `link` time; the resulting map is stored and editable via `rl project map`.
+All patterns are anchored (`^...$`) so they match the option's full name exactly — substring matching would let "Not done" trip the `Done` rule. Auto-derivation runs once at `link` time; the resulting map is stored and editable via `rl project map`.
+
+**Field selection** (briefly — full rationale in [Appendix A](#appendix-a-graphql-shapes-we-care-about)): the live `repo-link` project has multiple single-select fields (`Status`, `Priority`, `Size`). The auto-mapping picks the one *literally named* "Status"; if no such field exists, it falls back to the first single-select field. The chosen field's `id` is stored as the project's `status_field_id`.
 
 ### D2 — Authoritative state ownership: **mirror + outbox**
 
@@ -153,7 +155,7 @@ This is the conceptual cleanup the spike circled to. A *synced* task is a mirror
 - ETag/`If-Modified-Since` is built in via `OctocrabBuilder::cache(InMemoryCache::default())`. Conditional GETs don't decrement the rate-limit counter.
 - Pagination ships as `Page<T>` + `octocrab.get_page()` — replaces a Link-header parser we don't have.
 
-**Typed vs raw GraphQL.** `octocrab.graphql(query)` accepts any string and returns `GraphqlResponse<T>` where `T` is your custom serde struct. The idiomatic add-on is the `graphql_client` crate: `#[derive(GraphQLQuery)]` against checked-in `*.graphql` query files + a `github_schema.graphql` introspection dump. Compile-time validation, refreshable via `gh api graphql -F query=@introspection.graphql > github_schema.graphql`. **We use `graphql_client` for v2 work**; raw strings only as an escape hatch.
+**Typed vs raw GraphQL.** `octocrab.graphql(query)` accepts any string and returns `GraphqlResponse<T>` where `T` is your custom serde struct. The idiomatic add-on is the `graphql_client` crate: `#[derive(GraphQLQuery)]` against checked-in `*.graphql` query files + an introspection dump at `crates/infra-github/schemas/github.graphql`. Compile-time validation, refreshable via `gh api graphql -F query=@introspection.graphql > crates/infra-github/schemas/github.graphql`. **We use `graphql_client` for v2 work**; raw strings only as an escape hatch.
 
 **One honest limitation.** `octocrab::projects` is the *legacy v1* REST projects API (which GitHub is sunsetting). There is no typed v2 surface in octocrab — there can't be in any client, because GitHub made v2 GraphQL-only. All v2 work goes through `octocrab.graphql()`. See [Appendix B](#appendix-b-octocrab-capability-map) for the full feature table.
 
@@ -239,7 +241,7 @@ Eight stages, each independently mergeable and verifiable. Stages within a "lane
 
 ### Stage 1 — Infrastructure foundation (no functional change)
 - 1a. Add `octocrab` to workspace deps. Swap REST internals in `crates/infra-github/src/rest.rs` to `octocrab::issues`. Existing wiremock tests stay green; one fixture grows to match octocrab's richer `Issue` model.
-- 1b. Add `graphql_client` to workspace deps. Check in `infra-github/schemas/github.graphql` (introspection dump). No code uses it yet — sets up the toolchain.
+- 1b. Add `graphql_client` to workspace deps. Check in `crates/infra-github/schemas/github.graphql` (introspection dump). No code uses it yet — sets up the toolchain.
 
 PR shape: one PR (mechanical swap + tooling). Risk: low — port surface unchanged.
 
@@ -443,7 +445,7 @@ CREATE TABLE projects (
   number            INTEGER NOT NULL,
   title             TEXT NOT NULL,
   status_field_id   TEXT NOT NULL,       -- PVTSSF_…
-  archived          INTEGER NOT NULL DEFAULT 0, -- cosmetic flag from GitHub; see §10
+  archived          INTEGER NOT NULL DEFAULT 0, -- mirrored from GitHub; cosmetic only — no cascade
   created_at        TEXT NOT NULL,
   updated_at        TEXT NOT NULL,
   UNIQUE (provider, remote_node_id)
@@ -467,6 +469,10 @@ ALTER TABLE workspaces ADD COLUMN project_id TEXT
   REFERENCES projects(id) ON DELETE SET NULL;
 
 ALTER TABLE tasks ADD COLUMN project_item_id TEXT;  -- PVTI_…
+-- Partial index: the polling loop looks up local tasks by item ID per
+-- polled row. Excluding NULLs keeps the index small for projectless tasks.
+CREATE INDEX idx_tasks_project_item_id ON tasks(project_item_id)
+  WHERE project_item_id IS NOT NULL;
 
 CREATE TABLE outbox_entries (
   id                TEXT PRIMARY KEY,
