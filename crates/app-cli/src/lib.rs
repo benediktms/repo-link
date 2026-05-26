@@ -11,7 +11,7 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::{Args, Parser, Subcommand};
 use dto_shared::{
     AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, LinkWorktreeCmd,
-    ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd,
+    ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd, UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
@@ -272,6 +272,26 @@ enum TaskCmd {
     },
     Show {
         id: String,
+    },
+    /// Edit a task in place. Writes a new snapshot at `version = max + 1`
+    /// with `source = local_edit`; preserves the task's identity (UUID and
+    /// — once friendly IDs land — short prefix). At least one of `--title`,
+    /// `--body`, `--priority`, or `--assignee` must be supplied.
+    Edit {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        /// Replace-set: each `--assignee` flag adds one entry; the full
+        /// list replaces the current assignees. Omitting `--assignee`
+        /// entirely leaves the existing assignees untouched. There is no
+        /// way to clear assignees via `edit` — that's a deliberate gap
+        /// (matches the spec).
+        #[arg(long = "assignee")]
+        assignees: Vec<String>,
     },
     List {
         #[arg(short = 'w', long)]
@@ -1127,6 +1147,37 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
             render::task(&dto);
         }
         TaskCmd::Show { id } => render::task(&svc.tasks.show(&id).await?),
+        TaskCmd::Edit {
+            id,
+            title,
+            body,
+            priority,
+            assignees,
+        } => {
+            // Reject the empty case at the CLI boundary. The service layer
+            // intentionally accepts a no-op UpdateTaskCmd (a future API
+            // binding may want a touch-only refresh) — the `rl task edit`
+            // command's contract is stricter.
+            if title.is_none() && body.is_none() && priority.is_none() && assignees.is_empty() {
+                return Err(anyhow!(
+                    "rl task edit requires at least one of --title, --body, --priority, --assignee"
+                ));
+            }
+            // Collapse clap's accumulated Vec into the DTO's "None = no
+            // change" shape. The trade-off is that "clear all assignees"
+            // is unreachable via `edit`; the spec explicitly accepts this.
+            let dto = svc
+                .tasks
+                .update(UpdateTaskCmd {
+                    task_id: id,
+                    title,
+                    body,
+                    priority,
+                    assignees: (!assignees.is_empty()).then_some(assignees),
+                })
+                .await?;
+            render::task(&dto);
+        }
         TaskCmd::List {
             workspace,
             status,

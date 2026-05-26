@@ -1486,3 +1486,114 @@ fn daemon_uninstall_is_idempotent() {
     assert_eq!(second["manifest_existed"], false);
     assert_eq!(second["was_loaded"], false);
 }
+
+#[test]
+fn task_edit_updates_in_place_and_writes_snapshot_then_rolls_back() {
+    // End-to-end contract for `rl task edit`:
+    //   create v1 → edit (v2 with source=local_edit, title/body changed,
+    //   omitted priority preserved) → snapshots history shows both rows
+    //   → rollback to v1 restores the original values.
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "original title",
+            "--body",
+            "original body",
+            "--priority",
+            "p2",
+        ],
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+    assert_eq!(created["title"], "original title");
+    assert_eq!(created["priority"], "p2");
+
+    let edited = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "edit",
+            &task_id,
+            "--title",
+            "revised title",
+            "--body",
+            "revised body",
+        ],
+    );
+    assert_eq!(edited["id"], task_id);
+    assert_eq!(edited["title"], "revised title");
+    assert_eq!(edited["body"], "revised body");
+    // Priority was not supplied, so it must be untouched.
+    assert_eq!(edited["priority"], "p2");
+    // Local-only task → no remote baseline → reconcile keeps sync_state
+    // at local_only. (DirtyLocal is unreachable here on purpose; that
+    // path is exercised by sync-side tests once a baseline exists.)
+    assert_eq!(edited["sync_state"], "local_only");
+
+    let snaps = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "snapshots", &task_id],
+    );
+    let rows = snaps.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "expected two snapshot rows, got {rows:?}");
+    assert_eq!(rows[0]["version"], 1);
+    assert_eq!(rows[0]["title"], "original title");
+    assert_eq!(rows[1]["version"], 2);
+    assert_eq!(rows[1]["title"], "revised title");
+    assert_eq!(rows[1]["source"], "local_edit");
+
+    let rolled_back = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "rollback", &task_id, "--to-version", "1"],
+    );
+    assert_eq!(rolled_back["title"], "original title");
+    assert_eq!(rolled_back["body"], "original body");
+}
+
+#[test]
+fn task_edit_rejects_empty_flag_set() {
+    // Contract: at least one of --title/--body/--priority/--assignee must
+    // be supplied. The CLI rejects the empty case at the dispatch boundary
+    // even though TaskService::update would otherwise accept it.
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "x",
+        ],
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["task", "edit", &task_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("requires at least one"),
+        "expected 'requires at least one' in stderr, got: {stderr}"
+    );
+}
