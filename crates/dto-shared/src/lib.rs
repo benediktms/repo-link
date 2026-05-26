@@ -96,10 +96,13 @@ pub struct RepoAttachOutcomeDto {
     pub worktree_added: Option<String>,
 }
 
-/// One matching binding for a `repo locate` query.
+/// One workspace-binding pair: this canonical URL is bound under `binding`
+/// inside `workspace`. A repo can be a member of multiple workspaces, so
+/// callers receive a `Vec<RepoMembershipDto>`. Used by `repo locate` and
+/// `agents docs` to report cross-workspace membership.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocateMatchDto {
-    pub workspace_id: String,
+pub struct RepoMembershipDto {
+    pub workspace: WorkspaceDto,
     pub binding: RepoBindingDto,
 }
 
@@ -110,7 +113,7 @@ pub struct LocateMatchDto {
 pub struct LocateResponseDto {
     pub query_path: String,
     pub canonical_url: Option<String>,
-    pub matches: Vec<LocateMatchDto>,
+    pub matches: Vec<RepoMembershipDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

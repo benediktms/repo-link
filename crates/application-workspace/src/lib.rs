@@ -8,8 +8,8 @@ use domain_repo::RepoBinding;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{
     AttachRepoCmd, CreateWorkspaceCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd,
-    ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, UnlinkWorktreeCmd, WorkspaceDto,
-    WorktreeLinkDto,
+    ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
+    WorkspaceDto, WorktreeLinkDto,
 };
 use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
@@ -280,6 +280,34 @@ impl RepoBindingService {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
         let rows = self.bindings.list_by_workspace(workspace_id).await?;
         Ok(rows.iter().map(binding_to_dto).collect())
+    }
+
+    /// Return every (workspace, binding) pair whose binding's
+    /// `canonical_url` is an exact match across all non-archived
+    /// workspaces. Direct key lookup, not a search — callers want the
+    /// full membership set, not a ranked best hit. See [`find`] for the
+    /// ranked / fuzzy variant.
+    ///
+    /// [`find`]: Self::find
+    pub async fn memberships_for_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> Result<Vec<RepoMembershipDto>> {
+        let workspaces = self.workspaces.list(false).await?;
+        let mut out = Vec::new();
+        for ws in &workspaces {
+            if let Some(binding) = self
+                .bindings
+                .find_by_canonical_url(ws.id, canonical_url)
+                .await?
+            {
+                out.push(RepoMembershipDto {
+                    workspace: workspace_to_dto(ws),
+                    binding: binding_to_dto(&binding),
+                });
+            }
+        }
+        Ok(out)
     }
 
     pub async fn link_worktree(&self, cmd: LinkWorktreeCmd) -> Result<RepoBindingDto> {
@@ -854,5 +882,51 @@ mod tests {
         assert!(out.ambiguous);
         assert_eq!(out.matches.len(), 2);
         assert!(out.matches.iter().all(|m| m.matched_by == "alias"));
+    }
+
+    // ---- memberships_for_canonical_url --------------------------------
+
+    #[tokio::test]
+    async fn memberships_for_canonical_url_returns_empty_when_no_match() {
+        let (ws_svc, bsvc) = setup();
+        let _ = seeded(&ws_svc, &bsvc, "ws-mempty", "github.com/o/r").await;
+        let out = bsvc
+            .memberships_for_canonical_url("github.com/o/other")
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memberships_for_canonical_url_returns_single_match() {
+        let (ws_svc, bsvc) = setup();
+        let binding = seeded(&ws_svc, &bsvc, "ws-msingle", "github.com/o/repo").await;
+        let out = bsvc
+            .memberships_for_canonical_url("github.com/o/repo")
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].workspace.name, "ws-msingle");
+        assert_eq!(out[0].binding.id, binding.id);
+        assert_eq!(out[0].binding.canonical_url, "github.com/o/repo");
+    }
+
+    #[tokio::test]
+    async fn memberships_for_canonical_url_returns_all_workspace_matches() {
+        let (ws_svc, bsvc) = setup();
+        let canonical = "github.com/shared/repo";
+        let a = seeded(&ws_svc, &bsvc, "ws-alpha", canonical).await;
+        let b = seeded(&ws_svc, &bsvc, "ws-beta", canonical).await;
+        // Decoy in a third workspace with a different repo.
+        let _ = seeded(&ws_svc, &bsvc, "ws-decoy", "github.com/o/unrelated").await;
+
+        let out = bsvc.memberships_for_canonical_url(canonical).await.unwrap();
+        assert_eq!(out.len(), 2);
+        let workspace_names: Vec<&str> = out.iter().map(|m| m.workspace.name.as_str()).collect();
+        assert!(workspace_names.contains(&"ws-alpha"));
+        assert!(workspace_names.contains(&"ws-beta"));
+        let binding_ids: Vec<&str> = out.iter().map(|m| m.binding.id.as_str()).collect();
+        assert!(binding_ids.contains(&a.id.as_str()));
+        assert!(binding_ids.contains(&b.id.as_str()));
     }
 }

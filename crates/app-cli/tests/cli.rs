@@ -359,6 +359,138 @@ fn worktree_link_unlink_round_trips_with_same_input() {
 }
 
 #[test]
+fn worktree_link_error_suggests_single_repo_hint_when_canonical_matches_one_binding() {
+    // Regression guard: single-match case must keep the existing
+    // "use --repo X instead" message after the multi-match refactor.
+    let dir = TempDir::new().unwrap();
+
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_target = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let b_a = attach_no_link(
+        &dir,
+        &ws_a,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    let b_target = attach_no_link(
+        &dir,
+        &ws_target,
+        "git@github.com:o/other.git",
+        "github.com/o/other",
+    );
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/shared.git");
+    let path = repo_dir.path().display().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &b_target, "--path", &path])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains(&format!("use --repo {b_a} instead")),
+        "single-match path should suggest the lone binding; got: {stderr}"
+    );
+}
+
+#[test]
+fn worktree_link_error_lists_all_candidates_when_canonical_matches_multiple_bindings() {
+    // The bug being fixed: when `discovered` canonical maps to bindings in
+    // multiple workspaces, `.first()` arbitrarily picks one. We want the
+    // error to surface ALL candidates so the user can pick correctly.
+    let dir = TempDir::new().unwrap();
+
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_target = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Same canonical, two different workspaces.
+    let b_a = attach_no_link(
+        &dir,
+        &ws_a,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    let b_b = attach_no_link(
+        &dir,
+        &ws_b,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    // Decoy binding the user is mistakenly passing as --repo.
+    let b_target = attach_no_link(
+        &dir,
+        &ws_target,
+        "git@github.com:o/other.git",
+        "github.com/o/other",
+    );
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/shared.git");
+    let path = repo_dir.path().display().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["worktree", "link", "--repo", &b_target, "--path", &path])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+
+    assert!(
+        stderr.contains(&b_a),
+        "stderr should mention ws-a binding ({b_a}); got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&b_b),
+        "stderr should mention ws-b binding ({b_b}); got: {stderr}"
+    );
+    assert!(
+        stderr.contains("ws-a") && stderr.contains("ws-b"),
+        "stderr should name both workspaces so the user can disambiguate; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("multiple") || stderr.contains("choose --repo"),
+        "stderr should signal that the user must pick; got: {stderr}"
+    );
+}
+
+#[test]
 fn query_overview_reports_counts() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(
@@ -953,6 +1085,72 @@ fn repo_alias_rm_returns_error_when_absent() {
     );
 }
 
+// ---------- repo locate ---------------------------------------------------
+
+#[test]
+fn repo_locate_returns_workspace_and_binding_for_matching_path() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-locate", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/locate.git");
+    let path = repo_dir.path().display().to_string();
+
+    let binding_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/locate.git",
+            "--canonical",
+            "github.com/o/locate",
+            "--path",
+            &path,
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let located = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "locate", "--path", &path],
+    );
+
+    assert_eq!(located["canonical_url"], "github.com/o/locate");
+    let matches = located["matches"].as_array().expect("matches array");
+    assert_eq!(matches.len(), 1);
+    let m = &matches[0];
+    // Workspace is now a nested full DTO (not a bare `workspace_id` string).
+    assert_eq!(m["workspace"]["id"], workspace);
+    assert_eq!(m["workspace"]["name"], "ws-locate");
+    assert_eq!(m["binding"]["id"], binding_id);
+    assert_eq!(m["binding"]["canonical_url"], "github.com/o/locate");
+}
+
+#[test]
+fn repo_locate_returns_empty_matches_for_unbound_repo() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/unbound.git");
+
+    let located = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "locate", "--path", &repo_dir.path().display().to_string()],
+    );
+    assert_eq!(located["canonical_url"], "github.com/o/unbound");
+    assert!(located["matches"].as_array().unwrap().is_empty());
+}
+
 // ---------- agents docs ---------------------------------------------------
 
 #[test]
@@ -976,7 +1174,15 @@ fn agents_docs_creates_file_with_markers() {
     assert!(text.starts_with("# AGENTS\n"));
     assert!(text.contains("<!-- rl:doc:start -->"));
     assert!(text.contains("<!-- rl:doc:end -->"));
-    assert!(text.contains("`rl workspace create`"));
+    // Workflow guidance sections — the curated replacement for the
+    // previous auto-generated command reference.
+    assert!(text.contains("### Finding work"));
+    assert!(text.contains("### Before you start: check drift"));
+    assert!(text.contains("### Before you stop: sync your work"));
+    // Per-repo info block. The tempdir is not a git repo, so we expect
+    // the `unbound` notice.
+    assert!(text.contains("## This repo"));
+    assert!(text.contains("status: unbound"));
     assert_eq!(
         value["bytes_written"].as_u64().unwrap() as usize,
         text.len()
@@ -1016,4 +1222,64 @@ fn agents_docs_updates_block_on_second_run() {
     assert_eq!(second_out["action"], "updated");
     let after_second = std::fs::read_to_string(&path).unwrap();
     assert_eq!(after_first, after_second);
+}
+
+#[test]
+fn agents_docs_preserves_content_outside_markers_on_update() {
+    // End-to-end guard: a user's hand-written preamble and epilogue, plus
+    // a stale managed block between the markers, should survive an `rl
+    // agents docs` regenerate byte-for-byte outside the markers. Only the
+    // content between `<!-- rl:doc:start -->` and `<!-- rl:doc:end -->`
+    // should change. A second run must be idempotent.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("AGENTS.md");
+
+    let preamble = "# My Repo\n\n\
+                    Custom front matter the user wrote themselves.\n\n\
+                    ## Notes\n\n\
+                    - keep me!\n- and me!\n\n";
+    let stale_block = "<!-- rl:doc:start -->\nstale managed content\n<!-- rl:doc:end -->";
+    let epilogue = "\n\n## Appendix\n\n\
+                    Trailing notes that must not be clobbered.\n";
+
+    std::fs::write(&path, format!("{preamble}{stale_block}{epilogue}")).unwrap();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(dir.path());
+    let outcome = run_json(&mut cmd, &["agents", "docs"]);
+    assert_eq!(outcome["action"], "updated");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+
+    // Surrounding content survives byte-for-byte.
+    assert!(
+        text.starts_with(preamble),
+        "preamble should be preserved verbatim; got: {text:?}"
+    );
+    assert!(
+        text.ends_with(epilogue),
+        "epilogue should be preserved verbatim; got: {text:?}"
+    );
+
+    // The stale managed content is gone and the freshly rendered intro is
+    // in its place.
+    assert!(
+        !text.contains("stale managed content"),
+        "stale managed content should have been replaced; got: {text:?}"
+    );
+    assert!(
+        text.contains("`rl` (repo-link) is a local-first workspace"),
+        "fresh intro should be inside the managed block; got: {text:?}"
+    );
+
+    // A second regenerate must be idempotent: identical bytes in, identical bytes out.
+    let mut cmd2 = bin("repo-link", &dir);
+    cmd2.current_dir(dir.path());
+    let outcome2 = run_json(&mut cmd2, &["agents", "docs"]);
+    assert_eq!(outcome2["action"], "updated");
+    let text2 = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text, text2,
+        "second regenerate must be byte-identical (idempotent splice)"
+    );
 }
