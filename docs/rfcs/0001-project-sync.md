@@ -67,7 +67,7 @@ Project ─→ N × Workspace ─→ N × RepoBinding ─→ N × Task
                                   task.project_item_id (lazy, set on first push)
 ```
 
-- A new `Project` aggregate holds `{id, provider, remote_node_id, owner_login, number, title, status_field_id, archived}`. Its options live in a sibling collection (see §6 schema).
+- A new `Project` aggregate holds `{id, provider, owner_login, number, title, status_field_id, archived}` where `id` is the GitHub node ID directly (`PVT_…`) — no separate local UUID. Its options live in a sibling collection (see §6 schema).
 - `Workspace` gains an optional `project_id` (nullable FK). Workspaces without a project remain valid — they're the local-only path. The migration is therefore additive: existing rows get `project_id = NULL` and behave exactly as today.
 - `Task` gains optional `project_item_id` (`PVTI_…`), populated lazily on first push.
 - Project membership for any given task is derived: `task → workspace → project`. There is no `RepoBinding.default_project_id` and no join table.
@@ -113,11 +113,15 @@ When a workspace has a `project_id`, the project is *always* the primary sync ta
 |---|---|
 | `Open` | first option matching `/^(backlog\|todo\|open\|new)$/i`, else first option |
 | `InProgress` | first option matching `/^(in.progress\|doing\|wip)$/i` |
-| `Blocked` | first option matching `/^(blocked\|on.hold\|waiting)$/i`, else fall back to `InProgress` |
+| `Blocked` | first option matching `/^(blocked\|on.hold\|waiting)$/i`, else fall back to `Open` |
 | `Done` | first option matching `/^(done\|complete\|closed\|shipped)$/i`, else last option |
 | `Archived` | no project mutation (REST `close as not_planned` handles this) |
 
 All patterns are anchored (`^...$`) so they match the option's full name exactly — substring matching would let "Not done" trip the `Done` rule. Auto-derivation runs once at `link` time; the resulting map is stored and editable via `rl project map`.
+
+**Fallback semantics — app level, not DB.** Most projects don't have a `Blocked`-like option. When no option matches the Blocked regex, no row in `project_status_options` claims `default_for = 'blocked'`. The application layer reuses the `Open` mapping when a task transitions to Blocked. This is app-level fallback only — the DB column has zero or one row per `default_for` value, never two rows pointing at the same option.
+
+**Project identity is the GitHub node ID.** `ProjectId` is a newtype wrapping a String (validated as a GitHub `PVT_…` node ID), defined in `domain-core` — *not* a `define_id!`-style UUID. Project records are 100% mirrors of the GitHub entity; we don't generate a local identity for them. See §6 for the type sketch.
 
 **Field selection** (briefly — full rationale in [Appendix A](#appendix-a-graphql-shapes-we-care-about)): the live `repo-link` project has multiple single-select fields (`Status`, `Priority`, `Size`). The auto-mapping picks the one *literally named* "Status"; if no such field exists, it falls back to the first single-select field. The chosen field's `id` is stored as the project's `status_field_id`.
 
@@ -129,7 +133,7 @@ This is the conceptual cleanup the spike circled to. A *synced* task is a mirror
 - A task's lifecycle is owned by **whoever the source of truth is**. For `LocalOnly` tasks, that's us. For tasks with a remote ID, it's GitHub.
 - The local SQLite row for a mirror task is a **write-through cache** of GitHub's last-known state.
 - Outbound mutations go through an **outbox**: any `rl task start / complete / block / edit` on a mirror task enqueues a pending mutation and (when online) drains it immediately.
-- The "mirror vs local" distinction is **derived**, not encoded as a new column or status. `task.sync_state != LocalOnly` ⇒ mirror.
+- The "mirror vs local" distinction is **derived**, not encoded as a new column or status. `task.sync_state != LocalOnly` ⇒ mirror. Draft-backed mirrors additionally have `remote_id IS NULL AND project_item_id IS NOT NULL` (drafts have no REST issue number); issue-backed mirrors have `remote_id IS NOT NULL` regardless of project membership.
 
 **This is the rebranding of existing dirty/clean machinery.** `DirtyLocal` today already means "local moved, remote hasn't caught up." Calling that an outbox entry makes the model honest about what it is — and closes one gap: a task created offline, edited offline, then synced should drain N outbox entries in order, not flatten them into one "current state pushed."
 
@@ -213,18 +217,19 @@ The repo is already cleanly layered (domain → ports ← infrastructure / appli
 
 | Crate | Change |
 |---|---|
-| `domain-task` | + `project_item_id: Option<String>` field on `Task`. No status enum changes. |
+| `domain-core` | + `ProjectId` (newtype around `String`, validates as a `PVT_…` node ID — not a `define_id!` UUID). + `OutboxEntryId` (UUID via `define_id!`, pattern-aligns with existing IDs). |
+| `domain-task` | + `project_item_id: Option<String>` field on `Task`. + `node_id: Option<String>` on `RemoteRef` (REST gives us the number; GraphQL gives us the node ID; we keep both). No status enum changes. |
 | `domain-workspace` | + `project_id: Option<ProjectId>` field on `Workspace`. |
 | `domain-sync` | + `OutboxEntry`, `OutboxMutation` (sum type over the supported mutations), `OutboxStatus` (pending/inflight/succeeded/failed). |
 | `ports` | + `ProjectRepository`, + `RemoteProjectProvider`, + `OutboxRepository`, + `RemoteTaskProvider::list_changed_since` (REST delta). |
-| `infra-sqlite` | + migrations for `projects`, `project_status_options`, `outbox_entries`, `tasks.project_item_id`, `workspaces.project_id`. + repository impls. |
-| `infra-github` | + `graphql` submodule implementing `RemoteProjectProvider`. Swap REST internals to `octocrab`. Rename `GithubTaskProvider` → `GithubAdapter` (no longer task-only). |
+| `infra-sqlite` | + migrations for `projects`, `project_status_options`, `outbox_entries`, `tasks.project_item_id`, `tasks.remote_node_id`, `workspaces.project_id`. + repository impls. |
+| `infra-github` | + `graphql` submodule implementing `RemoteProjectProvider`. Swap REST internals to `octocrab`. Capture `issue.node_id` from REST responses into `RemoteRef.node_id`. Rename `GithubTaskProvider` → `GithubAdapter` (no longer task-only). |
 | `application-sync` | + outbox drainer task. + project poller task (calls `RemoteProjectProvider::poll_project_items`, reconciles cache). |
 | `application-task` | Lifecycle verbs enqueue outbox entries when the task is a mirror; no behavior change for `LocalOnly` tasks. |
 | `application-query` | + `rl query drift` includes `project_status` axis. |
-| `app-cli` | + `rl project link/show/unlink/map`. + `rl sync pull --all` (separate follow-up ticket but called out here). |
-| `app-daemon` | + spawn the two new background tasks. |
-| `testing-fixtures` | + in-memory `ProjectRepository`, `RemoteProjectProvider`, `OutboxRepository`. |
+| `app-cli` | + `rl project link/show/unlink/map`. + `rl workspace set-project <workspace> <project-spec>`. + `--project <project-spec>` flag on `rl workspace create`. + `rl sync pull --all` (separate follow-up ticket but called out here). |
+| `app-daemon` | + restructure `Daemon::run` from one ticker to two concurrent background tasks (poller + outbox drainer) with shared cancellation. Cadences hardcoded as constants in v1; see Stage 7. |
+| `testing-fixtures` | + in-memory `ProjectRepository`, `RemoteProjectProvider`, `OutboxRepository`. Follow the existing `Mutex<HashMap<Id, T>>` pattern from `InMemoryWorkspaceRepository`. |
 
 **New crates added:**
 
@@ -240,7 +245,7 @@ Total: 11 crates touched, 2 new. No crate gains an unexpected dependency directi
 Eight stages, each independently mergeable and verifiable. Stages within a "lane" (e.g. domain + ports) can ship as one PR if scope stays small.
 
 ### Stage 1 — Infrastructure foundation (no functional change)
-- 1a. Add `octocrab` to workspace deps. Swap REST internals in `crates/infra-github/src/rest.rs` to `octocrab::issues`. Existing wiremock tests stay green; one fixture grows to match octocrab's richer `Issue` model.
+- 1a. Add `octocrab` to workspace deps. Swap REST internals in `crates/infra-github/src/rest.rs` to `octocrab::issues`. Existing wiremock tests stay structurally the same, but **fixtures expand significantly**: today's `issue_payload()` helper supplies 7 fields; octocrab's typed `Issue` model demands ~30 (`id`, `node_id`, `url`, `user`, `created_at`, `repository_url`, etc.). Plan for a deliberate fixture rewrite rather than a one-line addition.
 - 1b. Add `graphql_client` to workspace deps. Check in `crates/infra-github/schemas/github.graphql` (introspection dump). No code uses it yet — sets up the toolchain.
 
 PR shape: one PR (mechanical swap + tooling). Risk: low — port surface unchanged.
@@ -250,6 +255,8 @@ PR shape: one PR (mechanical swap + tooling). Risk: low — port surface unchang
 - 2b. Extend `domain-sync` with outbox types.
 - 2c. Extend `ports` with `ProjectRepository`, `RemoteProjectProvider`, `OutboxRepository`, and `RemoteTaskProvider::list_changed_since`.
 - 2d. Add `project_item_id` to `Task` (domain-task) + `project_id` to `Workspace` (domain-workspace).
+- 2e. Add `ProjectId` to `domain-core` as a newtype wrapping `String` (validates non-empty + `PVT_` prefix). Add `OutboxEntryId` via the existing `define_id!` macro (it's purely local, no remote analogue).
+- 2f. Extend `RemoteRef` in `domain-task` with `node_id: Option<String>`. Existing constructors default it to `None` — only GitHub paths will populate it. Storage adds `tasks.remote_node_id TEXT` (see §6).
 
 PR shape: one PR. Risk: low — purely additive.
 
@@ -283,8 +290,11 @@ PR shape: one PR. Risk: medium-high — touches every lifecycle verb. Reviewer f
 
 ### Stage 7 — Polling loop
 - 7a. `application-sync` gains the project poller.
-- 7b. `app-daemon` spawns both background tasks (poller + outbox drainer) with shared cancellation.
-- 7c. Polling cadence configurable via `infra-config`.
+- 7b. **Restructure `Daemon::run` from one ticker to two concurrent background tasks.** Today the daemon has a single tick loop; Stage 7 splits it into two `tokio::spawn`'d tasks coordinated by a shared cancellation token. Wrap with `tokio::select!` over their `JoinHandle`s in the run loop so a panic in either still trips shutdown.
+- 7c. **Cadences are hardcoded constants in v1**, with `// TODO(config): expose via infra-config once a user actually asks` comments at the call sites:
+  - `PROJECT_POLLER_INTERVAL: Duration = 30..60s` for the GraphQL `project.items(query:)` polling path.
+  - `OUTBOX_DRAINER_PERIODIC_SWEEP: Duration = 5s` as a safety net; the drainer's primary trigger is just-in-time — `rl task start/edit/complete/...` enqueues then signals the drainer immediately via a `tokio::sync::Notify`. The sweep only catches edges (e.g. enqueues that happened just before the drainer parked).
+- 7d. `infra-config` gains no fields in this stage. Config knobs are deferred until someone actually needs them — see §9 follow-ups.
 
 PR shape: one PR. Risk: medium — first real background work the daemon does beyond heartbeats.
 
@@ -372,7 +382,8 @@ pub trait RemoteProjectProvider: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct RemoteProjectSnapshot {
-    pub node_id: String,           // PVT_…
+    /// PVT_… — also the value stored as `projects.id` locally (no separate UUID).
+    pub node_id: String,
     pub number: u64,
     pub title: String,
     pub owner_login: String,
@@ -430,25 +441,24 @@ pub trait RemoteTaskProvider: Send + Sync {
 }
 ```
 
-Note: issue node IDs (`I_…`) come back from REST today via octocrab's `Issue::node_id`. No new REST surface is required to feed `add_item`.
+Note: issue node IDs (`I_…`) come back from REST via octocrab's typed `Issue::node_id` *after* the Stage 1 swap; today's hand-rolled adapter (`crates/infra-github/src/rest.rs`) throws them away. Stage 1a captures the node ID into `RemoteRef.node_id` (see Stage 2f) so `add_item` has what it needs at Stage 5. No new REST endpoint or extra round-trip is involved.
 
 ### SQLite schema additions
 
 ```sql
 -- Projects are workspace-independent: a project can be the parent of many
--- workspaces. Uniqueness is on the remote identity, not workspace scope.
+-- workspaces. The PK `id` IS the GitHub node ID (PVT_…) — projects are a
+-- 100% mirror of the remote entity, so there's no separate local UUID.
 CREATE TABLE projects (
-  id                TEXT PRIMARY KEY,
+  id                TEXT PRIMARY KEY,    -- PVT_… (the GitHub node ID itself)
   provider          TEXT NOT NULL CHECK (provider IN ('github')),
-  remote_node_id    TEXT NOT NULL,       -- PVT_…
   owner_login       TEXT NOT NULL,
   number            INTEGER NOT NULL,
   title             TEXT NOT NULL,
   status_field_id   TEXT NOT NULL,       -- PVTSSF_…
   archived          INTEGER NOT NULL DEFAULT 0, -- mirrored from GitHub; cosmetic only — no cascade
   created_at        TEXT NOT NULL,
-  updated_at        TEXT NOT NULL,
-  UNIQUE (provider, remote_node_id)
+  updated_at        TEXT NOT NULL
 );
 
 CREATE TABLE project_status_options (
@@ -473,6 +483,12 @@ ALTER TABLE tasks ADD COLUMN project_item_id TEXT;  -- PVTI_…
 -- polled row. Excluding NULLs keeps the index small for projectless tasks.
 CREATE INDEX idx_tasks_project_item_id ON tasks(project_item_id)
   WHERE project_item_id IS NOT NULL;
+
+-- GitHub gives us two coexisting identities for the same issue: REST returns
+-- a per-repo `number` (already stored as `remote_id`); GraphQL needs the
+-- global `node_id` for project mutations. We persist both so we never have
+-- to translate one to the other on the hot path.
+ALTER TABLE tasks ADD COLUMN remote_node_id TEXT;  -- I_… (the GitHub issue node ID)
 
 CREATE TABLE outbox_entries (
   id                TEXT PRIMARY KEY,
