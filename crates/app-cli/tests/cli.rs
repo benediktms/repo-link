@@ -1597,3 +1597,31 @@ fn task_edit_rejects_empty_flag_set() {
         "expected 'requires at least one' in stderr, got: {stderr}"
     );
 }
+
+#[test]
+fn task_edit_unknown_id_exits_nonzero_with_readable_error() {
+    // Contract: editing a task that doesn't exist must fail loudly with a
+    // human-readable message — not swallow the error or panic. The actual
+    // error string today is `not found: task <uuid>` (propagated from
+    // `TaskRepository::get` via `?` and printed by anyhow); this test pins
+    // the substring so a refactor of the error path can't silently regress
+    // into something less informative.
+    let dir = TempDir::new().unwrap();
+    let output = bin("repo-link", &dir)
+        .args([
+            "task",
+            "edit",
+            "00000000-0000-0000-0000-000000000000",
+            "--title",
+            "doesn't matter",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.to_lowercase().contains("not found"),
+        "expected a 'not found' error, got: {stderr}"
+    );
+}

@@ -63,8 +63,10 @@ To change a task's title, body, priority, or assignees in place — without losi
 ```bash
 rl task edit <task-id> --title "new title"
 rl task edit <task-id> --body "new body" --priority p1
-rl task edit <task-id> --assignee alice --assignee bob   # replace-set: full new list
+rl task edit <task-id> --assignee alice --assignee bob   # replace-set; omit --assignee entirely to keep the current list
 ```
+
+At least one of `--title` / `--body` / `--priority` / `--assignee` must be supplied — `rl task edit <task-id>` with no flags is rejected (use `rl task show <task-id>` to inspect current values without changing anything). Clearing all assignees is not expressible via `edit`; that's deliberate.
 
 `task edit` bumps a new row in the task's snapshot history (`source = local_edit`); a subsequent `rl task rollback <task-id> --to-version <N>` can restore any earlier version. **Do not** use `archive + create` to revise a task — that produces a different task (new UUID, lost history) and breaks any shared references to the old ID.
 
