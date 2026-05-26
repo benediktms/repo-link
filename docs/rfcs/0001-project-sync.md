@@ -570,7 +570,7 @@ These don't block Stage 1 (REST → octocrab swap) — they only need to be answ
 4. **Project archival semantics.** A GitHub project can be closed/archived from the UI. **Decision: archival is cosmetic only — no cascade.** We mirror the `archived` flag on the local `projects` row and surface it on `rl project show` / `rl workspace show`, but: child workspaces are unaffected, polling continues (the user may un-archive), and existing outbox entries still drain. The flag is purely a hint for the human reader.
 5. **Unlinking a project with active orphan-drafts.** If a user runs `rl project unlink <p>` while orphan tasks (`repo_id = NULL`, `project_item_id IS NOT NULL`) exist under workspaces attached to that project, the drafts on GitHub aren't affected — but the local task loses its only sync anchor (no repo, no project to track via). Options: (a) refuse the unlink until those tasks are resolved, (b) auto-detach drafts (keep them locally as orphan + projectless, no further sync), (c) prompt per task. Lean: (b), with a `rl project unlink --force` to skip prompting and a summary of affected tasks. Decide before Stage 8.
 
-## Appendix A — GraphQL shapes we care about
+## Appendix A: GraphQL shapes we care about
 
 Confirmed against `api.github.com` on 2026-05-26 via `gh api graphql`.
 
@@ -672,7 +672,7 @@ Project #3 "repo-link" (PVT_kwHOAukuJ84BYZR7) — linked to benediktms/repo-link
     98236657  Done
 ```
 
-## Appendix B — Octocrab capability map
+## Appendix B: Octocrab capability map
 
 | Requirement | Octocrab mechanism | Notes |
 |---|---|---|
@@ -695,7 +695,7 @@ octocrab = { version = "0.x", default-features = false, features = [
 ] }
 ```
 
-## Appendix C — Dependency cost
+## Appendix C: Dependency cost
 
 Adopting `octocrab` adds, transitively (estimated from a probe of its default-features-off graph): `hyper-util`, `tower`, `tower-http`, `hyper-rustls`, `hyper-timeout`, `futures-util`, `bytes`, `http-body-util`, and a handful of micro-crates. Cold-compile budget: ~5–8s on an M-class laptop; incremental rebuild post-swap: negligible.
 
