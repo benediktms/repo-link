@@ -62,7 +62,9 @@ impl TaskService {
         if let Some(p) = cmd.priority {
             t.set_priority(parse_enum::<Priority>("priority", &p)?);
         }
-        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+        // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
+        // `SnapshotSource::Created` for why this distinction matters.
+        self.repo.save(&t, SnapshotSource::Created).await?;
         Ok(task_to_dto(&t))
     }
 
