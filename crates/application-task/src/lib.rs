@@ -74,6 +74,56 @@ impl TaskService {
         &self.snapshots
     }
 
+    /// Resolve a friendly task ID and list its snapshot history.
+    /// Exists so the CLI can stay friendly-ID-aware without having to
+    /// reach into [`snapshots_repo`] and parse a UUID itself.
+    pub async fn list_snapshots(
+        &self,
+        query: &str,
+    ) -> Result<Vec<domain_task::TaskSnapshot>> {
+        let task = self.resolve_task(query).await?;
+        Ok(self.snapshots.list(task.id).await?)
+    }
+
+    /// Look up the repo's prefix for assembling the composite display
+    /// ID. `None` when the task has no repo binding (workspace-scoped
+    /// task or pre-attach state) — the DTO falls back to bare hash.
+    async fn prefix_for(&self, t: &Task) -> Result<Option<String>> {
+        let Some(repo_id) = t.repo_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.bindings.get(repo_id).await?.prefix))
+    }
+
+    /// Convert a single task to its DTO, looking up the composite-ID
+    /// prefix for the task itself and for each related task. The
+    /// relation rewrite keeps JSON output consistent: a task's `id`
+    /// and the `other` end of every relation both follow the same
+    /// composite-or-hash-or-UUID rule. Cost is 1 + N binding lookups
+    /// for a task with N relations; acceptable at current scales.
+    async fn into_dto(&self, t: &Task) -> Result<TaskDto> {
+        let prefix = self.prefix_for(t).await?;
+        let mut dto = task_to_dto(t, prefix.as_deref());
+        // Overlay composite display IDs onto the relation `other`
+        // fields. `task_to_dto` defaults them to UUIDs so the pure
+        // function stays consistent without a binding handle; we
+        // upgrade here because we have one.
+        for (rendered, source) in dto.relations.iter_mut().zip(t.relations.iter()) {
+            rendered.other = self.compose_id_for(source.other).await?;
+        }
+        Ok(dto)
+    }
+
+    /// Look up a task by UUID and return its composite display ID
+    /// (`prefix-hash` / `hash` / UUID fallback). Used to render the
+    /// `other` end of a `TaskRelation` consistently with the task's
+    /// own `id` field.
+    async fn compose_id_for(&self, id: TaskId) -> Result<String> {
+        let related = self.repo.get(id).await?;
+        let prefix = self.prefix_for(&related).await?;
+        Ok(assemble_task_display_id(&related, prefix.as_deref()))
+    }
+
     /// Resolve a task by UUID, bare hash, or `prefix-hash` composite.
     ///
     /// Resolution order:
@@ -140,7 +190,7 @@ impl TaskService {
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
         // `SnapshotSource::Created` for why this distinction matters.
         self.save_with_minted_hash(&mut t).await?;
-        Ok(task_to_dto(&t))
+        self.into_dto(&t).await
     }
 
     /// Save a freshly-created task, retrying the hash on `tasks.hash`
@@ -179,7 +229,8 @@ impl TaskService {
     }
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
-        Ok(task_to_dto(&self.resolve_task(id).await?))
+        let t = self.resolve_task(id).await?;
+        self.into_dto(&t).await
     }
 
     pub async fn update(&self, cmd: UpdateTaskCmd) -> Result<TaskDto> {
@@ -197,7 +248,7 @@ impl TaskService {
             t.set_assignees(assignees);
         }
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.into_dto(&t).await
     }
 
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
@@ -225,7 +276,14 @@ impl TaskService {
             include_archived: query.include_archived,
         };
         let rows = self.repo.list(filter).await?;
-        Ok(rows.iter().map(task_to_dto).collect())
+        // One binding lookup per task — fine at current scales (dozens
+        // of tasks); revisit with a batched prefix-map if list latency
+        // ever shows up in profiles.
+        let mut out = Vec::with_capacity(rows.len());
+        for t in &rows {
+            out.push(self.into_dto(t).await?);
+        }
+        Ok(out)
     }
 
     // ---------- Sync transitions -----------------------------------------
@@ -267,7 +325,7 @@ impl TaskService {
         let other_task = self.resolve_task(&cmd.other).await?;
         t.add_relation(kind, other_task.id);
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.into_dto(&t).await
     }
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
@@ -282,7 +340,7 @@ impl TaskService {
         task.remote = snapshot.remote;
         task.reconcile_dirty_against_baseline();
         self.repo.save(&task, SnapshotSource::Rollback).await?;
-        Ok(task_to_dto(&task))
+        self.into_dto(&task).await
     }
 
     async fn transition<F>(&self, query: &str, op: F) -> Result<TaskDto>
@@ -292,7 +350,7 @@ impl TaskService {
         let mut t = self.resolve_task(query).await?;
         op(&mut t)?;
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.into_dto(&t).await
     }
 }
 
@@ -314,9 +372,28 @@ fn parse_enum<T: DeserializeOwned>(field: &'static str, value: &str) -> Result<T
     })
 }
 
-pub fn task_to_dto(t: &Task) -> TaskDto {
+/// Assemble the user-visible composite `id` for a task DTO.
+///
+/// Rules (in priority order):
+/// 1. Non-empty hash + non-empty prefix → `"{prefix}-{hash}"`.
+/// 2. Non-empty hash + empty/None prefix → bare `"{hash}"`. (Task
+///    has no repo binding, e.g. workspace-scoped or pre-attach.)
+/// 3. Empty hash → UUID (transition fallback for legacy rows the
+///    backfill hasn't reached yet; rare and short-lived in practice).
+fn assemble_task_display_id(t: &Task, prefix: Option<&str>) -> String {
+    if !t.hash.is_empty() {
+        match prefix.filter(|p| !p.is_empty()) {
+            Some(p) => format!("{}-{}", p, t.hash),
+            None => t.hash.clone(),
+        }
+    } else {
+        t.id.to_string()
+    }
+}
+
+pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
     TaskDto {
-        id: t.id.to_string(),
+        id: assemble_task_display_id(t, prefix),
         workspace_id: t.workspace_id.to_string(),
         repo_id: t.repo_id.map(|r| r.to_string()),
         title: t.title.clone(),

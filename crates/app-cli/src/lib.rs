@@ -1233,12 +1233,9 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
             render::task(&dto);
         }
         TaskCmd::Snapshots { id } => {
-            let task_id: domain_core::TaskId =
-                id.parse().map_err(|e| anyhow!("invalid task id: {e}"))?;
             let snaps = svc
                 .tasks
-                .snapshots_repo()
-                .list(task_id)
+                .list_snapshots(&id)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
             render::snapshots(&snaps);
