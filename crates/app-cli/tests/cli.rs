@@ -358,33 +358,6 @@ fn worktree_link_unlink_round_trips_with_same_input() {
     );
 }
 
-/// Helper: attach a binding with explicit canonical, using --no-link so the
-/// test tempdir isn't auto-registered as a worktree.
-fn attach_binding_no_link(
-    dir: &TempDir,
-    workspace: &str,
-    url: &str,
-    canonical: &str,
-) -> String {
-    run_json(
-        &mut bin("repo-link", dir),
-        &[
-            "repo",
-            "attach",
-            "--workspace",
-            workspace,
-            "--url",
-            url,
-            "--canonical",
-            canonical,
-            "--no-link",
-        ],
-    )["binding"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
 #[test]
 fn worktree_link_error_suggests_single_repo_hint_when_canonical_matches_one_binding() {
     // Regression guard: single-match case must keep the existing
@@ -406,13 +379,13 @@ fn worktree_link_error_suggests_single_repo_hint_when_canonical_matches_one_bind
         .unwrap()
         .to_string();
 
-    let b_a = attach_binding_no_link(
+    let b_a = attach_no_link(
         &dir,
         &ws_a,
         "git@github.com:o/shared.git",
         "github.com/o/shared",
     );
-    let b_target = attach_binding_no_link(
+    let b_target = attach_no_link(
         &dir,
         &ws_target,
         "git@github.com:o/other.git",
@@ -467,20 +440,20 @@ fn worktree_link_error_lists_all_candidates_when_canonical_matches_multiple_bind
         .to_string();
 
     // Same canonical, two different workspaces.
-    let b_a = attach_binding_no_link(
+    let b_a = attach_no_link(
         &dir,
         &ws_a,
         "git@github.com:o/shared.git",
         "github.com/o/shared",
     );
-    let b_b = attach_binding_no_link(
+    let b_b = attach_no_link(
         &dir,
         &ws_b,
         "git@github.com:o/shared.git",
         "github.com/o/shared",
     );
     // Decoy binding the user is mistakenly passing as --repo.
-    let b_target = attach_binding_no_link(
+    let b_target = attach_no_link(
         &dir,
         &ws_target,
         "git@github.com:o/other.git",
