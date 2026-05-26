@@ -16,7 +16,7 @@ The "This repo" block below names the workspace(s) this checkout belongs to. Use
 
 If you only know your `cwd` and need to recover workspace context mid-session, run:
 
-```
+```bash
 rl repo locate --path .
 ```
 
@@ -28,7 +28,7 @@ Most hot flags have single-letter short forms (e.g. `-w` for `--workspace`). The
 
 Ask `rl` what's actionable before reading the issue tracker or guessing from git history:
 
-```
+```bash
 rl query ready --workspace <id>     # open tasks, not transitively blocked, sorted by priority
 rl query mine  --workspace <id>     # narrows ready work to tasks assigned to you
 rl query overview --workspace <id>  # counts by status / sync_state — useful sanity check
@@ -40,7 +40,7 @@ rl query overview --workspace <id>  # counts by status / sync_state — useful s
 
 Local task state and remote GitHub Issues can diverge — someone edits an issue on the web, a CI job closes one, etc. Always run drift detection before changing or completing work:
 
-```
+```bash
 rl query drift    --workspace <id>  # tasks whose local snapshot disagrees with the remote
 rl query unsynced --workspace <id>  # local_only / staged / DirtyLocal tasks not yet pushed
 ```
@@ -49,7 +49,7 @@ If drift is non-empty, reconcile with `rl sync pull <task-id>` before editing th
 
 ### Starting work on a task
 
-```
+```bash
 rl task show  <task-id>             # full snapshot, including relations + remote ref
 rl task start <task-id>             # Open|Blocked → InProgress
 ```
@@ -60,7 +60,7 @@ rl task start <task-id>             # Open|Blocked → InProgress
 
 When a session is wrapping up, never leave local work unpushed. The flow is:
 
-```
+```bash
 rl query unsynced --workspace <id>           # see what's pending
 rl sync promote   <task-id>                  # Draft/Staged → create remote issue
 rl sync push      <task-id>                  # DirtyLocal → push local edits to remote
@@ -71,7 +71,7 @@ Then re-run `rl query unsynced --workspace <id>` and confirm it returns an empty
 
 ### Useful filters and views
 
-```
+```bash
 rl query blocked      --workspace <id>   # tasks in Blocked state
 rl query stale        --workspace <id>   # InProgress tasks untouched for a while
 rl query contributors --workspace <id>   # who has touched which tasks
