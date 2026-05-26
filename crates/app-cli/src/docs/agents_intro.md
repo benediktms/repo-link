@@ -5,8 +5,22 @@ Core concepts:
 - **Workspace** — a named container for tasks and attached repos. Lives in a local SQLite database.
 - **Repo binding** — an attachment of a GitHub repo to a workspace, with an optional human-friendly name and aliases.
 - **Worktree link** — a filesystem path linked to a repo binding so `rl` can resolve commands by `cwd`.
-- **Task** — a unit of work owned by a workspace. Tracks `status` and `sync_state` (such as open/closed and local_only/staged/synced respectively; see the CLI `--status` and `--sync-state` flags for the complete set of values).
+- **Task** — a unit of work owned by a workspace. Tracks `status` and `sync_state` (such as open/closed and local_only/staged/synced respectively; see the CLI `--status` and `--sync-state` flags for the complete set of values). Each task carries a friendly composite ID of the form `prefix-hash` (e.g. `rpl-ev6`) in its `id` field — see "Friendly IDs" below.
 - **Snapshot history** — every change to a task is recorded; `sync` operations promote / push / pull against GitHub Issues.
+
+### Friendly IDs
+
+Every task's `id` field renders as a composite `<prefix>-<hash>` (e.g. `rpl-ev6`), where the prefix is the binding's short cosmetic handle and the hash is a globally-unique random base32 string. UUIDs remain the on-disk identity but never appear in JSON.
+
+Anywhere a task ID is accepted, three forms resolve to the same task:
+
+- `rl task show rpl-ev6` — full composite (preferred for humans; carries the repo context visually).
+- `rl task show ev6` — bare hash; works because the hash alone is globally unique.
+- `rl task show <uuid>` — still supported for legacy scripts.
+
+A mismatched prefix is a hard error: `rl task show wrong-ev6` will refuse rather than silently resolving by hash, since the mismatch usually indicates a stale copy-paste from another repo. The bare-hash form (`ev6`) sidesteps this.
+
+The repo's prefix doubles as a globally-unique repo locator — `rl repo show rpl` works the same as `rl repo show <uuid>` or `rl repo show <name>`. The prefix is derived from the repo's name automatically at attach time; override with `rl repo attach --prefix <p>`, change later with `rl repo set-prefix --repo <id> --prefix <p>`.
 
 All commands emit JSON on stdout; pipe through `jq` for human-friendly views. Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference of any command — the workflow snippets below show the common path, not every option.
 

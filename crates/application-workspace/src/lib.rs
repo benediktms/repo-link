@@ -151,12 +151,29 @@ impl RepoBindingService {
             }
         };
 
+        // Explicit `--prefix` always wins over the derived value, even
+        // on merge — interpreted as "set this binding's prefix to X if
+        // it wasn't already". `set_prefix` validates the shape and
+        // bumps `updated_at` only when the value actually changes.
+        let explicit_prefix = cmd.prefix.is_some();
+        if let Some(requested) = cmd.prefix {
+            binding.set_prefix(requested)?;
+        }
+
         let worktree_added = cmd.link_path.map(|path| {
             binding.link_worktree(PathBuf::from(&path), cmd.link_branch);
             path
         });
 
-        self.save_with_unique_prefix(&mut binding).await?;
+        if explicit_prefix {
+            // Explicit prefix → surface conflicts unchanged so the user
+            // picks a different one rather than getting silent
+            // suffix-bumping (`myprefix` → `myprefix1`).
+            self.bindings.save(&binding).await?;
+        } else {
+            // Derived prefix → break collisions automatically.
+            self.save_with_unique_prefix(&mut binding).await?;
+        }
         Ok(RepoAttachOutcomeDto {
             binding: binding_to_dto(&binding),
             merged,
@@ -261,6 +278,24 @@ impl RepoBindingService {
     pub async fn rename(&self, query: &str, new_name: String) -> Result<RepoBindingDto> {
         let mut binding = self.resolve(query).await?;
         binding.set_name(new_name)?;
+        self.bindings.save(&binding).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    /// Replace the binding's prefix with an explicit value. Validates
+    /// against `^[a-z][a-z0-9]{1,7}$`; surfaces `Conflict` if another
+    /// binding already owns the requested prefix (so the user picks a
+    /// different one rather than getting silent suffix-bumping). Every
+    /// composite ID a user has already typed against the *old* prefix
+    /// goes stale — the bare hash still resolves, but `oldprefix-ak7`
+    /// will now error with PrefixMismatch. Document this in CLI help.
+    pub async fn set_prefix(
+        &self,
+        query: &str,
+        new_prefix: String,
+    ) -> Result<RepoBindingDto> {
+        let mut binding = self.resolve(query).await?;
+        binding.set_prefix(new_prefix)?;
         self.bindings.save(&binding).await?;
         Ok(binding_to_dto(&binding))
     }
@@ -568,6 +603,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap_err();
@@ -593,6 +629,7 @@ mod tests {
                 tracked_branch: Some("main".into()),
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -630,6 +667,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -706,6 +744,7 @@ mod tests {
             tracked_branch: None,
             link_path: None,
             link_branch: None,
+            prefix: None,
         };
         let first = bsvc.attach(cmd.clone()).await.unwrap();
         assert!(!first.merged);
@@ -733,6 +772,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -748,6 +788,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: Some("/tmp/second".into()),
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -776,6 +817,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: Some("/tmp/checkout".into()),
                 link_branch: Some("main".into()),
+                prefix: None,
             })
             .await
             .unwrap();
@@ -810,6 +852,7 @@ mod tests {
             tracked_branch: None,
             link_path: None,
             link_branch: None,
+            prefix: None,
         })
         .await
         .unwrap()
