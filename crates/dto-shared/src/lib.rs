@@ -51,6 +51,10 @@ pub struct RepoBindingDto {
     pub tracked_branch: Option<String>,
     pub name: String,
     pub aliases: Vec<String>,
+    /// Globally-unique short handle used both as the human-typeable
+    /// piece of friendly task IDs (`prefix-hash`) and as a stand-alone
+    /// repo locator anywhere a binding ID is taken.
+    pub prefix: String,
     pub worktrees: Vec<WorktreeLinkDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -83,6 +87,14 @@ pub struct AttachRepoCmd {
     /// handed and just records the link.
     pub link_path: Option<String>,
     pub link_branch: Option<String>,
+    /// Explicit prefix override. When `None`, the service derives one
+    /// from the repo name via [`domain_repo::derive_prefix`] and breaks
+    /// collisions with a numeric suffix. When `Some`, the supplied
+    /// value is validated against `^[a-z][a-z0-9]{1,19}$` and used
+    /// verbatim — collisions surface as a `Conflict` error so the
+    /// user is forced to pick a different prefix (rather than getting
+    /// `myprefix1` silently).
+    pub prefix: Option<String>,
 }
 
 /// Returned by `attach`: carries the resulting binding plus whether the

@@ -65,6 +65,11 @@ pub async fn open_db(database_url: &str) -> Result<Db, PoolError> {
     let writes = open_write_pool(database_url).await?;
     crate::migrate(&writes).await?;
     crate::backfill_empty_repo_names(&writes).await?;
+    // The friendly-IDs backfills depend on `repos.name` already being
+    // populated (the prefix derives from it), so they run *after*
+    // `backfill_empty_repo_names`.
+    crate::backfill_empty_repo_prefixes(&writes).await?;
+    crate::backfill_empty_task_hashes(&writes).await?;
     let reads = open_read_pool(database_url).await?;
     Ok(Db { reads, writes })
 }

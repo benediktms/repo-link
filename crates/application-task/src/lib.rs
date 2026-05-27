@@ -8,7 +8,9 @@ use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoteRefDto, TaskDto, TaskRelationDto,
     UpdateTaskCmd,
 };
-use ports::{PortError, TaskFilter, TaskRepository, TaskSnapshotRepository};
+use ports::{
+    PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
+};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -22,6 +24,19 @@ pub enum ServiceError {
     BadId(String),
     #[error("invalid enum value for {field}: {value}")]
     BadEnum { field: &'static str, value: String },
+    /// Composite ID input named one prefix but the task's repo carries
+    /// a different one. The bare hash is unique, so we *could* resolve
+    /// it silently; the spec explicitly rejects that path because the
+    /// mismatch usually indicates a stale copy-paste from another
+    /// repo's context.
+    #[error(
+        "prefix mismatch: input '{input_prefix}-{hash}' but task {hash} lives under prefix '{actual_prefix}'"
+    )]
+    PrefixMismatch {
+        input_prefix: String,
+        actual_prefix: String,
+        hash: String,
+    },
 }
 
 impl From<IdParseError> for ServiceError {
@@ -37,15 +52,142 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 pub struct TaskService {
     repo: Arc<dyn TaskRepository>,
     snapshots: Arc<dyn TaskSnapshotRepository>,
+    /// Used by the friendly-ID resolver to validate the prefix half of
+    /// a composite `prefix-hash` input against the task's repo binding.
+    bindings: Arc<dyn RepoBindingRepository>,
 }
 
 impl TaskService {
-    pub fn new(repo: Arc<dyn TaskRepository>, snapshots: Arc<dyn TaskSnapshotRepository>) -> Self {
-        Self { repo, snapshots }
+    pub fn new(
+        repo: Arc<dyn TaskRepository>,
+        snapshots: Arc<dyn TaskSnapshotRepository>,
+        bindings: Arc<dyn RepoBindingRepository>,
+    ) -> Self {
+        Self {
+            repo,
+            snapshots,
+            bindings,
+        }
     }
 
     pub fn snapshots_repo(&self) -> &Arc<dyn TaskSnapshotRepository> {
         &self.snapshots
+    }
+
+    /// Resolve a friendly task ID and list its snapshot history.
+    /// Exists so the CLI can stay friendly-ID-aware without having to
+    /// reach into [`snapshots_repo`] and parse a UUID itself.
+    pub async fn list_snapshots(
+        &self,
+        query: &str,
+    ) -> Result<Vec<domain_task::TaskSnapshot>> {
+        let task = self.resolve_task(query).await?;
+        Ok(self.snapshots.list(task.id).await?)
+    }
+
+    /// Look up the repo's prefix for assembling the composite display
+    /// ID. `None` when the task has no repo binding (workspace-scoped
+    /// task or pre-attach state) — the DTO falls back to bare hash.
+    async fn prefix_for(&self, t: &Task) -> Result<Option<String>> {
+        let Some(repo_id) = t.repo_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.bindings.get(repo_id).await?.prefix))
+    }
+
+    /// Convert a single task to its DTO, looking up the composite-ID
+    /// prefix for the task itself and for each related task. The
+    /// relation rewrite keeps JSON output consistent: a task's `id`
+    /// and the `other` end of every relation both follow the same
+    /// composite-or-hash-or-UUID rule. Cost is 1 + N binding lookups
+    /// for a task with N relations; acceptable at current scales.
+    async fn task_dto(&self, t: &Task) -> Result<TaskDto> {
+        let prefix = self.prefix_for(t).await?;
+        let mut dto = task_to_dto(t, prefix.as_deref());
+        // Overlay composite display IDs onto the relation `other`
+        // fields. `task_to_dto` defaults them to UUIDs so the pure
+        // function stays consistent without a binding handle; we
+        // upgrade here because we have one.
+        for (rendered, source) in dto.relations.iter_mut().zip(t.relations.iter()) {
+            rendered.other = self.compose_id_for(source.other).await?;
+        }
+        Ok(dto)
+    }
+
+    /// Look up a task by UUID and return its composite display ID
+    /// (`prefix-hash` / `hash` / UUID fallback). Used to render the
+    /// `other` end of a `TaskRelation` consistently with the task's
+    /// own `id` field.
+    async fn compose_id_for(&self, id: TaskId) -> Result<String> {
+        let related = self.repo.get(id).await?;
+        let prefix = self.prefix_for(&related).await?;
+        Ok(assemble_task_display_id(&related, prefix.as_deref()))
+    }
+
+    /// Resolve a task by UUID, bare hash, or `prefix-hash` composite.
+    ///
+    /// Resolution order:
+    /// 1. If the input parses as a UUID, fetch by that ID.
+    /// 2. If the input has no `-`, look up by [`TaskRepository::find_by_hash`].
+    /// 3. Otherwise split on the *last* `-` (the prefix never contains
+    ///    `-`, but hashes are alphanumeric so the right split point is
+    ///    unambiguous), look up by hash, then verify the input prefix
+    ///    matches the task's repo binding's prefix. Mismatch → hard
+    ///    error per the spec.
+    pub async fn resolve_task(&self, query: &str) -> Result<Task> {
+        // UUID short-circuit. Keep this first so existing scripts that
+        // pass UUIDs stay on the cheap path (no hash lookup, no binding
+        // lookup).
+        if let Ok(id) = query.parse::<TaskId>() {
+            return Ok(self.repo.get(id).await?);
+        }
+
+        let (input_prefix, hash) = match query.rsplit_once('-') {
+            Some((p, h)) => (Some(p), h),
+            None => (None, query),
+        };
+
+        // Validate both halves' shapes before the lookup so junk like
+        // `A1-cde`, `ab--cde`, or wrong-case hashes get a clear "bad id"
+        // rather than a misleading PrefixMismatch / "task hash not
+        // found". The bare-hash and composite paths both funnel here.
+        if !domain_task::is_valid_hash(hash) {
+            return Err(ServiceError::BadId(format!(
+                "{query:?} is not a task UUID, bare hash, or prefix-hash composite"
+            )));
+        }
+        if let Some(p) = input_prefix
+            && !domain_repo::is_valid_prefix(p)
+        {
+            return Err(ServiceError::BadId(format!(
+                "{query:?} has a malformed repo prefix {p:?}"
+            )));
+        }
+
+        let task = self
+            .repo
+            .find_by_hash(hash)
+            .await?
+            .ok_or_else(|| PortError::NotFound(format!("task hash {hash:?}")))?;
+
+        if let Some(input_prefix) = input_prefix {
+            // The bare hash is the source of truth — we found the task.
+            // The prefix half is a sanity check.
+            let actual_prefix = match task.repo_id {
+                Some(repo_id) => self.bindings.get(repo_id).await?.prefix,
+                // Task without a repo binding can't have a prefix; any
+                // input prefix is necessarily a mismatch.
+                None => String::new(),
+            };
+            if actual_prefix != input_prefix {
+                return Err(ServiceError::PrefixMismatch {
+                    input_prefix: input_prefix.to_string(),
+                    actual_prefix,
+                    hash: hash.to_string(),
+                });
+            }
+        }
+        Ok(task)
     }
 
     pub async fn create(&self, cmd: CreateTaskCmd) -> Result<TaskDto> {
@@ -64,18 +206,52 @@ impl TaskService {
         }
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
         // `SnapshotSource::Created` for why this distinction matters.
-        self.repo.save(&t, SnapshotSource::Created).await?;
-        Ok(task_to_dto(&t))
+        self.save_with_minted_hash(&mut t).await?;
+        self.task_dto(&t).await
+    }
+
+    /// Save a freshly-created task, retrying the hash on `tasks.hash`
+    /// UNIQUE violations and growing the hash length once collisions
+    /// cluster at a given length. Mirrors the spec's mint algorithm:
+    /// fixed `K_RETRIES_AT_LENGTH = 8` attempts at length 3 before
+    /// stepping to 4, then 5, and so on. Capped at length 8 so the
+    /// hash always fits the prefix-hash composite's 8-char ceiling.
+    ///
+    /// Retry is driven by the DB's UNIQUE index, not a pre-flight
+    /// existence check — pre-checks race with concurrent creates.
+    async fn save_with_minted_hash(&self, t: &mut Task) -> Result<()> {
+        const K_RETRIES_AT_LENGTH: u32 = 8;
+        let mut length = domain_task::MIN_HASH_LEN;
+        let mut attempts: u32 = 0;
+        loop {
+            t.hash = domain_task::random_lowercase_base32(length);
+            match self.repo.save(t, SnapshotSource::Created).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.conflict_target() == Some("tasks.hash") => {
+                    attempts += 1;
+                    if attempts >= K_RETRIES_AT_LENGTH {
+                        attempts = 0;
+                        length += 1;
+                        if length > domain_task::MAX_HASH_LEN {
+                            return Err(ServiceError::Port(PortError::Backend(format!(
+                                "could not mint unique task hash at any length up to {}",
+                                domain_task::MAX_HASH_LEN
+                            ))));
+                        }
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
-        let id: TaskId = id.parse()?;
-        Ok(task_to_dto(&self.repo.get(id).await?))
+        let t = self.resolve_task(id).await?;
+        self.task_dto(&t).await
     }
 
     pub async fn update(&self, cmd: UpdateTaskCmd) -> Result<TaskDto> {
-        let id: TaskId = cmd.task_id.parse()?;
-        let mut t = self.repo.get(id).await?;
+        let mut t = self.resolve_task(&cmd.task_id).await?;
         if let Some(title) = cmd.title {
             t.set_title(title)?;
         }
@@ -89,7 +265,7 @@ impl TaskService {
             t.set_assignees(assignees);
         }
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.task_dto(&t).await
     }
 
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
@@ -117,7 +293,14 @@ impl TaskService {
             include_archived: query.include_archived,
         };
         let rows = self.repo.list(filter).await?;
-        Ok(rows.iter().map(task_to_dto).collect())
+        // One binding lookup per task — fine at current scales (dozens
+        // of tasks); revisit with a batched prefix-map if list latency
+        // ever shows up in profiles.
+        let mut out = Vec::with_capacity(rows.len());
+        for t in &rows {
+            out.push(self.task_dto(t).await?);
+        }
+        Ok(out)
     }
 
     // ---------- Sync transitions -----------------------------------------
@@ -153,19 +336,18 @@ impl TaskService {
     }
 
     pub async fn add_relation(&self, cmd: AddTaskRelationCmd) -> Result<TaskDto> {
-        let id: TaskId = cmd.task_id.parse()?;
-        let other: TaskId = cmd.other.parse()?;
         let kind = parse_enum::<RelationKind>("kind", &cmd.kind)?;
-        let mut t = self.repo.get(id).await?;
-        t.add_relation(kind, other);
+        let mut t = self.resolve_task(&cmd.task_id).await?;
+        // The other side of a relation is a friendly ID too.
+        let other_task = self.resolve_task(&cmd.other).await?;
+        t.add_relation(kind, other_task.id);
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.task_dto(&t).await
     }
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
-        let task_id: domain_core::TaskId = id.parse()?;
-        let snapshot = self.snapshots.get(task_id, to_version).await?;
-        let mut task = self.repo.get(task_id).await?;
+        let mut task = self.resolve_task(id).await?;
+        let snapshot = self.snapshots.get(task.id, to_version).await?;
         task.title = snapshot.title;
         task.body = snapshot.body;
         task.status = snapshot.status;
@@ -175,18 +357,17 @@ impl TaskService {
         task.remote = snapshot.remote;
         task.reconcile_dirty_against_baseline();
         self.repo.save(&task, SnapshotSource::Rollback).await?;
-        Ok(task_to_dto(&task))
+        self.task_dto(&task).await
     }
 
-    async fn transition<F>(&self, id: &str, op: F) -> Result<TaskDto>
+    async fn transition<F>(&self, query: &str, op: F) -> Result<TaskDto>
     where
         F: FnOnce(&mut Task) -> domain_core::Result<()>,
     {
-        let id: TaskId = id.parse()?;
-        let mut t = self.repo.get(id).await?;
+        let mut t = self.resolve_task(query).await?;
         op(&mut t)?;
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        Ok(task_to_dto(&t))
+        self.task_dto(&t).await
     }
 }
 
@@ -208,9 +389,28 @@ fn parse_enum<T: DeserializeOwned>(field: &'static str, value: &str) -> Result<T
     })
 }
 
-pub fn task_to_dto(t: &Task) -> TaskDto {
+/// Assemble the user-visible composite `id` for a task DTO.
+///
+/// Rules (in priority order):
+/// 1. Non-empty hash + non-empty prefix → `"{prefix}-{hash}"`.
+/// 2. Non-empty hash + empty/None prefix → bare `"{hash}"`. (Task
+///    has no repo binding, e.g. workspace-scoped or pre-attach.)
+/// 3. Empty hash → UUID (transition fallback for legacy rows the
+///    backfill hasn't reached yet; rare and short-lived in practice).
+fn assemble_task_display_id(t: &Task, prefix: Option<&str>) -> String {
+    if !t.hash.is_empty() {
+        match prefix.filter(|p| !p.is_empty()) {
+            Some(p) => format!("{}-{}", p, t.hash),
+            None => t.hash.clone(),
+        }
+    } else {
+        t.id.to_string()
+    }
+}
+
+pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
     TaskDto {
-        id: t.id.to_string(),
+        id: assemble_task_display_id(t, prefix),
         workspace_id: t.workspace_id.to_string(),
         repo_id: t.repo_id.map(|r| r.to_string()),
         title: t.title.clone(),
@@ -240,13 +440,17 @@ pub fn task_to_dto(t: &Task) -> TaskDto {
 mod tests {
     use super::*;
     use ports::TaskSnapshotRepository;
-    use testing_fixtures::{InMemoryTaskRepository, InMemoryTaskSnapshotRepository};
+    use testing_fixtures::{
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryTaskSnapshotRepository,
+    };
 
     fn svc() -> TaskService {
         let repo = Arc::new(InMemoryTaskRepository::new());
         let snaps: Arc<dyn TaskSnapshotRepository> =
             Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
-        TaskService::new(repo, snaps)
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        TaskService::new(repo, snaps, bindings)
     }
 
     fn ws_id() -> String {
@@ -435,6 +639,102 @@ mod tests {
         assert_eq!(blocked.status, "blocked");
         let unblocked = svc.unblock(&t.id).await.unwrap();
         assert_eq!(unblocked.status, "open");
+    }
+
+    #[tokio::test]
+    async fn resolve_task_accepts_uuid_and_bare_hash() {
+        // No repo binding → composite collapses to the bare hash, so this
+        // covers the UUID and bare-hash branches. Composite resolution is
+        // covered separately in `resolve_task_round_trips_composite_*`.
+        let svc = svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "resolve me".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        let by_friendly = svc.resolve_task(&dto.id).await.unwrap();
+        // Recover the internal UUID and confirm the UUID branch resolves
+        // to the same task (this is the branch the CLI can't easily test
+        // since the UUID is no longer exposed in JSON output).
+        let uuid = by_friendly.id.to_string();
+        let by_uuid = svc.resolve_task(&uuid).await.unwrap();
+        assert_eq!(by_uuid.id, by_friendly.id);
+        // Bare hash also resolves to the same task.
+        let by_hash = svc.resolve_task(&by_friendly.hash).await.unwrap();
+        assert_eq!(by_hash.id, by_friendly.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_task_round_trips_composite_for_bound_task() {
+        use domain_repo::RepoBinding;
+        use ports::RepoBindingRepository;
+
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+
+        // Seed a binding with a known prefix so the created task's id is a
+        // real `prefix-hash` composite (not the bare-hash fallback).
+        let ws = WorkspaceId::new();
+        let mut binding = RepoBinding::new(
+            ws,
+            "git@github.com:o/widget.git".into(),
+            "github.com/o/widget".into(),
+        )
+        .unwrap();
+        binding.set_prefix("wid".into()).unwrap();
+        let repo_id = binding.id;
+        bindings.save(&binding).await.unwrap();
+
+        let svc = TaskService::new(repo, snaps, bindings);
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws.to_string(),
+                repo_id: Some(repo_id.to_string()),
+                title: "bound task".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+
+        let composite = dto.id.clone();
+        assert!(
+            composite.starts_with("wid-"),
+            "expected a wid- composite, got {composite:?}"
+        );
+        let hash = composite.split_once('-').unwrap().1.to_string();
+
+        // All three input forms resolve to the same task.
+        let by_composite = svc.resolve_task(&composite).await.unwrap();
+        let by_hash = svc.resolve_task(&hash).await.unwrap();
+        let by_uuid = svc
+            .resolve_task(&by_composite.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(by_composite.id, by_hash.id);
+        assert_eq!(by_hash.id, by_uuid.id);
+
+        // A composite naming the wrong prefix is a hard error.
+        let err = svc
+            .resolve_task(&format!("nope-{hash}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::PrefixMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_task_rejects_malformed_input() {
+        let svc = svc();
+        // Uppercase is not valid base32 → BadId, not a doomed lookup.
+        let err = svc.resolve_task("ZZZ").await.unwrap_err();
+        assert!(matches!(err, ServiceError::BadId(_)));
     }
 
     #[tokio::test]

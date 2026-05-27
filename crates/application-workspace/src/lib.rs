@@ -27,6 +27,8 @@ pub enum ServiceError {
     BadId(String),
     #[error("binding not found: no match for '{0}'")]
     BindingNotFound(String),
+    #[error("prefix '{0}' is already taken by another binding — pick a different one")]
+    PrefixTaken(String),
     #[error("ambiguous handle '{query}': matched {count} bindings", count = candidates.len())]
     AmbiguousHandle {
         query: String,
@@ -151,17 +153,75 @@ impl RepoBindingService {
             }
         };
 
+        // Explicit `--prefix` always wins over the derived value, even
+        // on merge — interpreted as "set this binding's prefix to X if
+        // it wasn't already". `set_prefix` validates the shape and
+        // bumps `updated_at` only when the value actually changes.
+        let explicit_prefix = cmd.prefix.is_some();
+        if let Some(requested) = cmd.prefix {
+            binding.set_prefix(requested)?;
+        }
+
         let worktree_added = cmd.link_path.map(|path| {
             binding.link_worktree(PathBuf::from(&path), cmd.link_branch);
             path
         });
 
-        self.bindings.save(&binding).await?;
+        if explicit_prefix {
+            // Explicit prefix → surface conflicts as a human-readable
+            // "pick a different one" rather than silent suffix-bumping
+            // (`myprefix` → `myprefix1`) or a raw SQL error.
+            self.bindings
+                .save(&binding)
+                .await
+                .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
+        } else {
+            // Derived prefix → break collisions automatically.
+            self.save_with_unique_prefix(&mut binding).await?;
+        }
         Ok(RepoAttachOutcomeDto {
             binding: binding_to_dto(&binding),
             merged,
             worktree_added,
         })
+    }
+
+    /// Save a binding, retrying with a numeric suffix on `repos.prefix`
+    /// UNIQUE violations. Two distinct repos with the same `name` would
+    /// otherwise both derive the same prefix and collide globally; the
+    /// suffix breaks the tie deterministically (`rpe` → `rpe1` → `rpe2`).
+    ///
+    /// The retry runs against the database, not a pre-flight cache —
+    /// the spec is explicit that uniqueness is the index's job and a
+    /// pre-check would race.
+    async fn save_with_unique_prefix(&self, binding: &mut RepoBinding) -> Result<()> {
+        // No low ceiling: automatic collision-breaking must scale to any
+        // number of same-named repos (`rpe100` is just as valid as
+        // `rpe1`). The suffix is bounded by the 20-char prefix cap, and
+        // SAFETY_CAP only guards against a logic-bug infinite loop, not
+        // legitimate data.
+        const SAFETY_CAP: u32 = 1_000_000;
+        let base = binding.prefix.clone();
+        let mut suffix: u32 = 0;
+        loop {
+            match self.bindings.save(binding).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.conflict_target() == Some("repos.prefix") => {
+                    suffix += 1;
+                    if suffix > SAFETY_CAP {
+                        return Err(ServiceError::Port(PortError::Backend(format!(
+                            "could not allocate unique repo prefix from base '{base}' after {SAFETY_CAP} attempts"
+                        ))));
+                    }
+                    let suffix_str = suffix.to_string();
+                    let max_base_chars = 20usize.saturating_sub(suffix_str.len());
+                    let trimmed: String = base.chars().take(max_base_chars).collect();
+                    let candidate = format!("{trimmed}{suffix_str}");
+                    binding.set_prefix(candidate)?;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     pub async fn detach(&self, id: &str) -> Result<()> {
@@ -187,8 +247,16 @@ impl RepoBindingService {
         self.resolve_by_handle(query).await
     }
 
-    /// Scan all non-archived workspaces for a binding matching by exact name or alias.
+    /// Resolve `query` to a binding by trying, in order: exact
+    /// `prefix` match (globally-unique, single index lookup); then
+    /// exact `name` or `alias` match across all non-archived
+    /// workspaces. The prefix takes priority because it carries an
+    /// explicit uniqueness guarantee — names and aliases can clash
+    /// across workspaces, so they still produce the ambiguity error.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
+        if let Some(binding) = self.bindings.find_by_prefix(query).await? {
+            return Ok(binding);
+        }
         let workspaces = self.workspaces.list(false).await?;
         let mut matches: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {
@@ -221,6 +289,27 @@ impl RepoBindingService {
         let mut binding = self.resolve(query).await?;
         binding.set_name(new_name)?;
         self.bindings.save(&binding).await?;
+        Ok(binding_to_dto(&binding))
+    }
+
+    /// Replace the binding's prefix with an explicit value. Validates
+    /// against `^[a-z][a-z0-9]{1,19}$`; surfaces `Conflict` if another
+    /// binding already owns the requested prefix (so the user picks a
+    /// different one rather than getting silent suffix-bumping). Every
+    /// composite ID a user has already typed against the *old* prefix
+    /// goes stale — the bare hash still resolves, but `oldprefix-ak7`
+    /// will now error with PrefixMismatch. Document this in CLI help.
+    pub async fn set_prefix(
+        &self,
+        query: &str,
+        new_prefix: String,
+    ) -> Result<RepoBindingDto> {
+        let mut binding = self.resolve(query).await?;
+        binding.set_prefix(new_prefix)?;
+        self.bindings
+            .save(&binding)
+            .await
+            .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
         Ok(binding_to_dto(&binding))
     }
 
@@ -397,6 +486,19 @@ pub struct ReconcileSummary {
 
 // ---------- Mapping (domain → DTO) ---------------------------------------
 
+/// Translate a `repos.prefix` UNIQUE violation into the friendly
+/// [`ServiceError::PrefixTaken`]; pass every other error through
+/// unchanged. Used on the explicit-prefix paths (`attach --prefix`
+/// and `set_prefix`) where we want the user to pick a different value
+/// rather than see a raw SQL message or get silent suffix-bumping.
+fn map_prefix_conflict(e: PortError, prefix: &str) -> ServiceError {
+    if e.conflict_target() == Some("repos.prefix") {
+        ServiceError::PrefixTaken(prefix.to_string())
+    } else {
+        ServiceError::Port(e)
+    }
+}
+
 fn enum_str<T: serde::Serialize>(t: &T) -> String {
     serde_json::to_value(t)
         .ok()
@@ -425,6 +527,7 @@ pub fn binding_to_dto(b: &RepoBinding) -> RepoBindingDto {
         tracked_branch: b.tracked_branch.clone(),
         name: b.name.clone(),
         aliases: b.aliases.clone(),
+        prefix: b.prefix.clone(),
         worktrees: b
             .worktrees
             .iter()
@@ -526,6 +629,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap_err();
@@ -551,6 +655,7 @@ mod tests {
                 tracked_branch: Some("main".into()),
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -588,6 +693,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -664,6 +770,7 @@ mod tests {
             tracked_branch: None,
             link_path: None,
             link_branch: None,
+            prefix: None,
         };
         let first = bsvc.attach(cmd.clone()).await.unwrap();
         assert!(!first.merged);
@@ -691,6 +798,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: None,
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -706,6 +814,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: Some("/tmp/second".into()),
                 link_branch: None,
+                prefix: None,
             })
             .await
             .unwrap();
@@ -734,6 +843,7 @@ mod tests {
                 tracked_branch: None,
                 link_path: Some("/tmp/checkout".into()),
                 link_branch: Some("main".into()),
+                prefix: None,
             })
             .await
             .unwrap();
@@ -768,6 +878,7 @@ mod tests {
             tracked_branch: None,
             link_path: None,
             link_branch: None,
+            prefix: None,
         })
         .await
         .unwrap()

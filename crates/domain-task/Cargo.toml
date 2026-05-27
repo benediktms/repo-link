@@ -9,3 +9,4 @@ publish.workspace = true
 domain-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+uuid = { workspace = true }

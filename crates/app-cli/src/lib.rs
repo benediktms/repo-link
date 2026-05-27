@@ -162,6 +162,14 @@ enum RepoCmd {
         /// `rl worktree link`) to register the intended path instead.
         #[arg(long)]
         no_link: bool,
+        /// Override the auto-derived short prefix for this binding
+        /// (e.g. `--prefix gw` instead of letting the algorithm pick
+        /// `pck` from `app-packages`). Must match
+        /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's
+        /// prefix surface as a hard error — pick a different value.
+        /// Omit to let the system derive and collision-break itself.
+        #[arg(long)]
+        prefix: Option<String>,
     },
     Detach {
         id: String,
@@ -197,6 +205,22 @@ enum RepoCmd {
         repo: String,
         #[arg(short = 'n', long)]
         name: String,
+    },
+    /// Replace the binding's globally-unique short prefix (e.g. swap an
+    /// auto-derived `pck` for a manual `gw`). Must match
+    /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's prefix
+    /// surface as a hard error — pick a different value.
+    ///
+    /// Warning: every composite task ID a user has already typed
+    /// against the *old* prefix (e.g. `oldpfx-ak7`) goes stale and
+    /// errors with `PrefixMismatch`. Bare-hash references (`ak7`) keep
+    /// working because the hash itself is globally unique.
+    SetPrefix {
+        #[arg(long)]
+        repo: String,
+        /// New prefix value. Must match `^[a-z][a-z0-9]{1,19}$`.
+        #[arg(short = 'p', long)]
+        prefix: String,
     },
     /// Manage aliases — alternative short names for a binding.
     #[command(subcommand)]
@@ -479,7 +503,7 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     Ok(Services {
         workspaces: WorkspaceService::new(workspaces_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
-        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo),
+        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo, bindings_repo.clone()),
         query: QueryService::new(workspaces_repo, bindings_repo.clone(), tasks_repo.clone()),
         tasks_repo,
         bindings_repo,
@@ -527,6 +551,7 @@ async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()> {
                         workspace_name: m.workspace.name,
                         binding_name: m.binding.name,
                         aliases: m.binding.aliases,
+                        prefix: m.binding.prefix,
                     })
                     .collect(),
                 None => Vec::new(),
@@ -754,6 +779,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             br: BranchArg { branch },
             path,
             no_link,
+            prefix,
         } => {
             let link_path = resolve_attach_link_path(path.as_deref(), no_link, &canonical)?;
 
@@ -766,6 +792,7 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                     tracked_branch: branch.clone(),
                     link_path,
                     link_branch: branch,
+                    prefix,
                 })
                 .await?;
             render::attach_outcome(&outcome);
@@ -783,6 +810,13 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             Err(e) => return Err(anyhow!("{e}")),
         },
         RepoCmd::Rename { repo, name } => match svc.bindings.rename(&repo, name).await {
+            Ok(dto) => render::repo(&dto),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates);
+            }
+            Err(e) => return Err(anyhow!("{e}")),
+        },
+        RepoCmd::SetPrefix { repo, prefix } => match svc.bindings.set_prefix(&repo, prefix).await {
             Ok(dto) => render::repo(&dto),
             Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
                 handle_ambiguous(query, candidates);
@@ -1233,12 +1267,9 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
             render::task(&dto);
         }
         TaskCmd::Snapshots { id } => {
-            let task_id: domain_core::TaskId =
-                id.parse().map_err(|e| anyhow!("invalid task id: {e}"))?;
             let snaps = svc
                 .tasks
-                .snapshots_repo()
-                .list(task_id)
+                .list_snapshots(&id)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
             render::snapshots(&snaps);

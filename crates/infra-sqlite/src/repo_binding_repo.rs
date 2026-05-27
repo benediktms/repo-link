@@ -35,14 +35,15 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, name, aliases, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, name, aliases, prefix, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 remote_url = excluded.remote_url,
                 canonical_url = excluded.canonical_url,
                 tracked_branch = excluded.tracked_branch,
                 name = excluded.name,
                 aliases = excluded.aliases,
+                prefix = excluded.prefix,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -53,6 +54,7 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         .bind(b.tracked_branch.as_deref())
         .bind(&b.name)
         .bind(serde_json::to_string(&b.aliases).unwrap_or_else(|_| "[]".to_string()))
+        .bind(&b.prefix)
         .bind(b.created_at.into_inner())
         .bind(b.updated_at.into_inner())
         .execute(&mut *tx)
@@ -134,6 +136,28 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         }
     }
 
+    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>> {
+        // Empty prefix is the unset-sentinel; reject explicitly so a
+        // bug elsewhere doesn't accidentally return "any unbacklfilled
+        // row" via a `WHERE prefix = ''` match.
+        if prefix.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT * FROM repos WHERE prefix = ?")
+            .bind(prefix)
+            .fetch_optional(&self.db.reads)
+            .await
+            .map_err(map_sqlx_err)?;
+        match row {
+            Some(row) => {
+                let mut binding = row_to_binding(&row)?;
+                binding.worktrees = load_worktrees(&self.db.reads, binding.id).await?;
+                Ok(Some(binding))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn delete(&self, id: RepoId) -> PortResult<()> {
         sqlx::query("DELETE FROM repos WHERE id = ?")
             .bind(id.to_string())
@@ -156,6 +180,7 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
     } else {
         name_raw
     };
+    let prefix: String = row.try_get("prefix").map_err(map_sqlx_err)?;
     let aliases_json: String = row.try_get("aliases").map_err(map_sqlx_err)?;
     // The CHECK constraint on `repos.aliases` enforces JSON array shape
     // at write time, so this branch should be unreachable through our
@@ -180,6 +205,7 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
         tracked_branch,
         name,
         aliases,
+        prefix,
         worktrees: Vec::new(),
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),

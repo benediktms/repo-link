@@ -50,8 +50,8 @@ impl TaskRepository for SqliteTaskRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, hash, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 repo_id = excluded.repo_id,
@@ -63,6 +63,7 @@ impl TaskRepository for SqliteTaskRepository {
                 assignees_json = excluded.assignees_json,
                 remote_provider = excluded.remote_provider,
                 remote_id = excluded.remote_id,
+                hash = excluded.hash,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -77,6 +78,7 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+        .bind(&t.hash)
         .bind(t.created_at.into_inner())
         .bind(t.updated_at.into_inner())
         .execute(&mut *tx)
@@ -205,6 +207,24 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(out)
     }
 
+    async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>> {
+        if hash.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT * FROM tasks WHERE hash = ?")
+            .bind(hash)
+            .fetch_optional(&self.db.reads)
+            .await
+            .map_err(map_sqlx_err)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut task = row_to_task(&row)?;
+        task.relations = load_relations(&self.db.reads, task.id).await?;
+        task.synced_baseline = load_latest_baseline(&self.db.reads, task.id).await?;
+        Ok(Some(task))
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())
@@ -227,6 +247,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let hash: String = row.try_get("hash").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
 
@@ -255,6 +276,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         relations: Vec::new(),
+        hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),

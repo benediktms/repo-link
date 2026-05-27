@@ -50,6 +50,11 @@ pub struct DocRepoMembership {
     pub workspace_name: String,
     pub binding_name: String,
     pub aliases: Vec<String>,
+    /// Globally-unique short prefix for this binding (`rpl`, `bgt`, …).
+    /// Visible so agents reading the footer can use the prefix as a
+    /// repo locator (`--repo rpl`) or as the prefix half of friendly
+    /// task IDs (`rpl-ev6`) without first running `repo show`.
+    pub prefix: String,
 }
 
 /// Assemble the inner body of the fenced block: the curated intro
@@ -223,6 +228,7 @@ mod tests {
             workspace_name: "repo-link-dev".to_string(),
             binding_name: "repo-link".to_string(),
             aliases: vec!["rl".to_string()],
+            prefix: "tst".to_string(),
         }];
         let out = render_repo_info(&memberships, Some("github.com/foo/bar"));
         assert!(out.starts_with("## This repo\n\n```json\n"));
@@ -241,12 +247,14 @@ mod tests {
                 workspace_name: "alpha".to_string(),
                 binding_name: "shared-repo".to_string(),
                 aliases: vec![],
+                prefix: "tst".to_string(),
             },
             DocRepoMembership {
                 workspace_id: "ws-2".to_string(),
                 workspace_name: "beta".to_string(),
                 binding_name: "shared-repo".to_string(),
                 aliases: vec!["sr".to_string()],
+                prefix: "tst".to_string(),
             },
         ];
         let out = render_repo_info(&memberships, None);

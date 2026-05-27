@@ -14,14 +14,38 @@ pub enum PortError {
     #[error("not found: {0}")]
     NotFound(String),
 
-    #[error("conflict: {0}")]
-    Conflict(String),
+    /// A uniqueness violation. `target` names the logical constraint the
+    /// backend reported (e.g. `"tasks.hash"`, `"repos.prefix"`) when it
+    /// can — adapters translate their native error into this structured
+    /// form so the application layer can drive retry logic off the
+    /// target instead of substring-matching backend-specific message
+    /// text. `None` when the backend gives no usable target.
+    #[error("conflict{}: {message}", .target.as_deref().map(|t| format!(" on {t}")).unwrap_or_default())]
+    Conflict {
+        target: Option<String>,
+        message: String,
+    },
 
     #[error("backend failure: {0}")]
     Backend(String),
 
     #[error("network failure: {0}")]
     Network(String),
+}
+
+impl PortError {
+    /// The logical target of a uniqueness [`PortError::Conflict`]
+    /// (e.g. `"tasks.hash"`, `"repos.prefix"`), if the backend reported
+    /// one. Returns `None` for non-conflict errors or conflicts without
+    /// a target.
+    pub fn conflict_target(&self) -> Option<&str> {
+        match self {
+            PortError::Conflict {
+                target: Some(t), ..
+            } => Some(t.as_str()),
+            _ => None,
+        }
+    }
 }
 
 pub type PortResult<T> = std::result::Result<T, PortError>;
@@ -49,6 +73,11 @@ pub trait RepoBindingRepository: Send + Sync {
         workspace_id: WorkspaceId,
         canonical_url: &str,
     ) -> PortResult<Option<RepoBinding>>;
+    /// Look up a binding by its globally-unique `prefix`. Used by the
+    /// repo locator path so callers can pass `--repo rpl` (or use
+    /// `rpl-ak7` for tasks and reuse the prefix half here) instead of a
+    /// UUID.
+    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>>;
     async fn delete(&self, id: RepoId) -> PortResult<()>;
 }
 
@@ -76,6 +105,10 @@ pub trait TaskRepository: Send + Sync {
     async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()>;
     async fn get(&self, id: TaskId) -> PortResult<Task>;
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>>;
+    /// Look up a task by its globally-unique `hash`. Used by the
+    /// friendly-ID resolver so callers can pass a bare hash (`ak7`) or
+    /// the prefix half of a composite (`rlk-ak7`) instead of a UUID.
+    async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
