@@ -16,7 +16,7 @@ Anywhere a task ID is accepted, three forms resolve to the same task:
 
 - `rl task show rpl-ev6` — full composite (preferred for humans; carries the repo context visually).
 - `rl task show ev6` — bare hash; works because the hash alone is globally unique.
-- `rl task show <uuid>` — still supported for legacy scripts.
+- `rl task show <uuid>` — the underlying UUID also resolves.
 
 A mismatched prefix is a hard error: `rl task show wrong-ev6` will refuse rather than silently resolving by hash, since the mismatch usually indicates a stale copy-paste from another repo. The bare-hash form (`ev6`) sidesteps this.
 

@@ -165,7 +165,7 @@ enum RepoCmd {
         /// Override the auto-derived short prefix for this binding
         /// (e.g. `--prefix gw` instead of letting the algorithm pick
         /// `pck` from `app-packages`). Must match
-        /// `^[a-z][a-z0-9]{1,7}$`. Conflicts with another binding's
+        /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's
         /// prefix surface as a hard error — pick a different value.
         /// Omit to let the system derive and collision-break itself.
         #[arg(long)]
@@ -208,7 +208,7 @@ enum RepoCmd {
     },
     /// Replace the binding's globally-unique short prefix (e.g. swap an
     /// auto-derived `pck` for a manual `gw`). Must match
-    /// `^[a-z][a-z0-9]{1,7}$`. Conflicts with another binding's prefix
+    /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's prefix
     /// surface as a hard error — pick a different value.
     ///
     /// Warning: every composite task ID a user has already typed
@@ -218,7 +218,7 @@ enum RepoCmd {
     SetPrefix {
         #[arg(long)]
         repo: String,
-        /// New prefix value. Must match `^[a-z][a-z0-9]{1,7}$`.
+        /// New prefix value. Must match `^[a-z][a-z0-9]{1,19}$`.
         #[arg(short = 'p', long)]
         prefix: String,
     },

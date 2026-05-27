@@ -90,7 +90,7 @@ pub struct AttachRepoCmd {
     /// Explicit prefix override. When `None`, the service derives one
     /// from the repo name via [`domain_repo::derive_prefix`] and breaks
     /// collisions with a numeric suffix. When `Some`, the supplied
-    /// value is validated against `^[a-z][a-z0-9]{1,7}$` and used
+    /// value is validated against `^[a-z][a-z0-9]{1,19}$` and used
     /// verbatim — collisions surface as a `Conflict` error so the
     /// user is forced to pick a different prefix (rather than getting
     /// `myprefix1` silently).

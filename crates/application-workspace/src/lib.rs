@@ -209,7 +209,7 @@ impl RepoBindingService {
                         ))));
                     }
                     let suffix_str = suffix.to_string();
-                    let max_base_chars = 8usize.saturating_sub(suffix_str.len());
+                    let max_base_chars = 20usize.saturating_sub(suffix_str.len());
                     let trimmed: String = base.chars().take(max_base_chars).collect();
                     let candidate = format!("{trimmed}{suffix_str}");
                     binding.set_prefix(candidate)?;

@@ -2090,6 +2090,30 @@ fn task_show_rejects_malformed_id_with_clear_error() {
 }
 
 #[test]
+fn repo_attach_accepts_long_manual_prefix() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap();
+    // A manual prefix longer than the 3-char derived default is allowed
+    // (up to the 20-char cap).
+    let outcome = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", workspace,
+            "--url", "git@github.com:o/thing.git", "--canonical", "github.com/o/thing",
+            "--no-link", "--prefix", "mylongprefix",
+        ],
+    );
+    assert_eq!(outcome["binding"]["prefix"], "mylongprefix");
+    // And resolvable by that handle.
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", "mylongprefix"]);
+    assert_eq!(shown["prefix"], "mylongprefix");
+}
+
+#[test]
 fn repo_set_prefix_conflict_is_friendly() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(

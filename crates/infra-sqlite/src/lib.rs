@@ -73,7 +73,7 @@ pub async fn backfill_empty_repo_prefixes(pool: &SqlitePool) -> Result<(), sqlx:
                 base.clone()
             } else {
                 let s = suffix.to_string();
-                let n = 8usize.saturating_sub(s.len());
+                let n = 20usize.saturating_sub(s.len());
                 let trimmed: String = base.chars().take(n).collect();
                 format!("{trimmed}{s}")
             };

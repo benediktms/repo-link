@@ -150,12 +150,17 @@ fn prefix_from_two_words(a: &str, b: &str) -> String {
     }
 }
 
-/// `^[a-z][a-z0-9]{1,7}$` — 2-8 chars, starts with a letter, lowercase
-/// alnum. Empty strings are rejected; an unset prefix lives as `""` in
-/// storage but never reaches this check.
+/// `^[a-z][a-z0-9]{1,19}$` — 2-20 chars, starts with a letter,
+/// lowercase alnum. Auto-derived prefixes are always 3 chars (see
+/// [`derive_prefix`]); the wider ceiling exists only for manual
+/// overrides via `set_prefix` / `repo attach --prefix`, where a user
+/// may legitimately want a longer, more descriptive handle. The 20-char
+/// cap is an arbitrary safety bound to keep composite IDs typeable.
+/// Empty strings are rejected; an unset prefix lives as `""` in storage
+/// but never reaches this check.
 pub fn is_valid_prefix(p: &str) -> bool {
     let len = p.chars().count();
-    if !(2..=8).contains(&len) {
+    if !(2..=20).contains(&len) {
         return false;
     }
     let mut chars = p.chars();
@@ -263,13 +268,13 @@ impl RepoBinding {
 
     /// Replace the prefix wholesale. Intended for the persistence layer
     /// to apply collision-breaking suffixes (e.g. `pck` → `pck1`) and
-    /// for the future `rl repo set-prefix` override. Validates against
-    /// the spec regex `^[a-z][a-z0-9]{1,7}$` to keep the composite ID
-    /// human-typeable.
+    /// for the `rl repo set-prefix` / `repo attach --prefix` override.
+    /// Validates against `^[a-z][a-z0-9]{1,19}$` to keep the composite
+    /// ID human-typeable.
     pub fn set_prefix(&mut self, new_prefix: String) -> Result<()> {
         if !is_valid_prefix(&new_prefix) {
             return Err(DomainError::validation(
-                "prefix must match ^[a-z][a-z0-9]{1,7}$ (2-8 lowercase alnum, must start with a letter)",
+                "prefix must match ^[a-z][a-z0-9]{1,19}$ (2-20 lowercase alnum, must start with a letter)",
             ));
         }
         if self.prefix == new_prefix {
@@ -616,8 +621,10 @@ mod tests {
     fn is_valid_prefix_accepts_spec_examples() {
         assert!(is_valid_prefix("rlk"));
         assert!(is_valid_prefix("ath"));
-        // Up to 8 chars.
+        // Longer manual prefixes are allowed (derived ones are always 3).
         assert!(is_valid_prefix("abcdefgh"));
+        assert!(is_valid_prefix("mylongprefix")); // 12 chars
+        assert!(is_valid_prefix("abcdefghijklmnopqrst")); // exactly 20
         // Digits allowed after the first char.
         assert!(is_valid_prefix("rl1"));
     }
@@ -626,7 +633,7 @@ mod tests {
     fn is_valid_prefix_rejects_bad_shapes() {
         assert!(!is_valid_prefix("")); // too short
         assert!(!is_valid_prefix("a")); // too short
-        assert!(!is_valid_prefix("abcdefghi")); // too long
+        assert!(!is_valid_prefix("abcdefghijklmnopqrstu")); // 21 chars, over cap
         assert!(!is_valid_prefix("RLK")); // uppercase
         assert!(!is_valid_prefix("1rl")); // leading digit
         assert!(!is_valid_prefix("rl-k")); // hyphen
