@@ -118,6 +118,7 @@ impl RestClient {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: u32 = 50;
         let mut issues: Vec<Issue> = Vec::new();
+        let mut truncated = false;
         for page in 1..=MAX_PAGES {
             let route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
@@ -128,6 +129,18 @@ impl RestClient {
             if !full {
                 break;
             }
+            if page == MAX_PAGES {
+                // Still a full page at the cap — more remain. Refuse rather
+                // than silently returning a truncated tree with no signal.
+                truncated = true;
+            }
+        }
+        if truncated {
+            return Err(PortError::Backend(format!(
+                "issue {number} in {canonical_repo} has more than {} sub-issues; \
+                 refusing to import a truncated tree",
+                MAX_PAGES as usize * PER_PAGE
+            )));
         }
         Ok(issues
             .into_iter()
