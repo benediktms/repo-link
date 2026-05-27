@@ -9,6 +9,30 @@
 use domain_core::{Aggregate, DomainError, RepoId, Result, TaskId, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
+/// Minimum minted hash length. Minting always starts here and only
+/// grows on repeated collisions.
+pub const MIN_HASH_LEN: usize = 3;
+
+/// Maximum minted hash length. Both mint paths (runtime `task create`
+/// and the `open_db` backfill) cap growth here, and [`is_valid_hash`]
+/// accepts up to this length — keeping the validator and the minters
+/// in lockstep so a grown hash can never become unresolvable. 16 chars
+/// of base32 is 32^16 ≈ 10^24 values; reaching this length is
+/// effectively impossible in practice. A single UUID yields up to 25
+/// base32 chars of entropy, so one draw covers it.
+pub const MAX_HASH_LEN: usize = 16;
+
+/// `^[a-z2-7]{MIN..=MAX}$` — the shape of a minted hash. Used by the
+/// resolver to reject obviously-malformed input (wrong case, illegal
+/// chars, a truncated UUID's trailing group) with a clear "bad id"
+/// error rather than a misleading "task hash not found". The bounds
+/// match the minters so any hash the system can persist also resolves.
+pub fn is_valid_hash(s: &str) -> bool {
+    let len = s.chars().count();
+    (MIN_HASH_LEN..=MAX_HASH_LEN).contains(&len)
+        && s.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
+}
+
 /// Generate a random lowercase RFC 4648 base32 string of the given
 /// length. Backs the friendly task ID minting: the persistence layer
 /// retries with new randomness on `UNIQUE` index collisions and grows
@@ -17,17 +41,8 @@ use serde::{Deserialize, Serialize};
 /// Uses a fresh UUID's bytes as the entropy source — keeps the
 /// dependency tree small (no extra `rand` crate) and reuses the
 /// randomness primitive that already mints `TaskId`s. One UUID supplies
-/// up to 25 base32 chars of entropy (16 bytes × 8 / 5), which is far
-/// more than the 3–8 chars callers actually consume.
-/// `^[a-z2-7]{3,8}$` — the shape of a minted hash. Used by the
-/// resolver to reject obviously-malformed input (wrong case, illegal
-/// chars, a truncated UUID's trailing group) with a clear "bad id"
-/// error rather than a misleading "task hash not found".
-pub fn is_valid_hash(s: &str) -> bool {
-    let len = s.chars().count();
-    (3..=8).contains(&len) && s.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7'))
-}
-
+/// up to 25 base32 chars of entropy (16 bytes × 8 / 5), which covers
+/// the full `MIN_HASH_LEN..=MAX_HASH_LEN` range callers consume.
 pub fn random_lowercase_base32(length: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let bytes = uuid::Uuid::new_v4().into_bytes();
@@ -856,11 +871,14 @@ mod tests {
     fn is_valid_hash_accepts_minted_shapes_rejects_junk() {
         assert!(is_valid_hash("ev6"));
         assert!(is_valid_hash("ak7"));
-        assert!(is_valid_hash("abcdefgh")); // max length 8
+        // Grown hashes (up to MAX_HASH_LEN) must still validate, or a
+        // collision-grown hash would become unresolvable.
+        assert!(is_valid_hash("abcdefgh")); // 8
+        assert!(is_valid_hash("abcdefghijklmnop")); // exactly MAX_HASH_LEN (16)
         // Wrong case, illegal base32 digits (0/1/8/9), wrong length.
         assert!(!is_valid_hash("EV6"));
-        assert!(!is_valid_hash("ab"));
-        assert!(!is_valid_hash("abcdefghi"));
+        assert!(!is_valid_hash("ab")); // below MIN_HASH_LEN
+        assert!(!is_valid_hash("abcdefghijklmnopq")); // 17, over MAX_HASH_LEN
         assert!(!is_valid_hash("ev0")); // 0 not in RFC 4648 base32
         assert!(!is_valid_hash("ev1")); // 1 not in RFC 4648 base32
         assert!(!is_valid_hash("ev-")); // hyphen

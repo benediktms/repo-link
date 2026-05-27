@@ -10,7 +10,7 @@ Core concepts:
 
 ### Friendly IDs
 
-Every task's `id` field renders as a composite `<prefix>-<hash>` (e.g. `rpl-ev6`), where the prefix is the binding's short cosmetic handle and the hash is a globally-unique random base32 string. UUIDs remain the on-disk identity but never appear in JSON.
+Every task's `id` field normally renders as a composite `<prefix>-<hash>` (e.g. `rpl-ev6`), where the prefix is the binding's short cosmetic handle and the hash is a globally-unique random base32 string. UUIDs remain the on-disk identity; a task with no repo binding shows just the bare `<hash>`.
 
 Anywhere a task ID is accepted, three forms resolve to the same task:
 

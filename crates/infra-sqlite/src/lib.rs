@@ -88,12 +88,18 @@ pub async fn backfill_empty_repo_prefixes(pool: &SqlitePool) -> Result<(), sqlx:
                 // and UPDATE. Move on to the next row.
                 Ok(_) => break,
                 Err(e) if is_unique_violation(&e) => {
+                    // Keep growing the suffix until the row lands. A
+                    // startup backfill must not hard-fail on otherwise
+                    // valid data (e.g. many repos sharing a derived
+                    // base), so there's no low artificial cap here. The
+                    // suffix is bounded by `u32` and the trim keeps the
+                    // candidate within the 20-char prefix ceiling; the
+                    // `SAFETY_CAP` guard exists only to turn a genuine
+                    // logic bug into a clear error instead of an
+                    // infinite loop.
+                    const SAFETY_CAP: u32 = 1_000_000;
                     suffix += 1;
-                    if suffix > 99 {
-                        // Pathological: 100 repos sharing the same
-                        // derived prefix. Surface as a backend error so
-                        // the operator notices instead of silently
-                        // skipping the row.
+                    if suffix > SAFETY_CAP {
                         return Err(e);
                     }
                 }
@@ -113,9 +119,13 @@ pub async fn backfill_empty_task_hashes(pool: &SqlitePool) -> Result<(), sqlx::E
     let rows = sqlx::query("SELECT id FROM tasks WHERE hash = ''")
         .fetch_all(pool)
         .await?;
-    let mut length = 3usize;
     for row in rows {
         let id: String = row.try_get("id")?;
+        // Each task starts minting at the minimum length and only grows
+        // for *its own* collisions — `length` must reset per row, or one
+        // unlucky task would permanently inflate every subsequent task's
+        // hash. Matches the runtime `task create` mint behaviour.
+        let mut length = domain_task::MIN_HASH_LEN;
         let mut attempts_at_length: u32 = 0;
         loop {
             attempts_at_length += 1;
@@ -132,6 +142,12 @@ pub async fn backfill_empty_task_hashes(pool: &SqlitePool) -> Result<(), sqlx::E
                     if attempts_at_length >= 8 {
                         attempts_at_length = 0;
                         length += 1;
+                        if length > domain_task::MAX_HASH_LEN {
+                            // Astronomically unreachable (would need
+                            // ~10^24 tasks). Surface rather than loop
+                            // forever on a logic bug.
+                            return Err(e);
+                        }
                     }
                 }
                 Err(e) => return Err(e),

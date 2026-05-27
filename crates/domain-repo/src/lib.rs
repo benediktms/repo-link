@@ -57,7 +57,9 @@ const PREFIX_NOISE_WORDS: &[&str] = &[
 /// Derive a 3-letter lowercase prefix from a repo name.
 ///
 /// Algorithm (ported from brain's `generate_prefix`, lowercased to match
-/// the spec's `^[a-z][a-z0-9]{1,7}$` regex):
+/// the spec's `^[a-z][a-z0-9]{1,19}$` regex — the derived value is
+/// always exactly 3 chars; the wider bound only applies to manual
+/// overrides):
 /// 1. Split on `-`, `_`, space.
 /// 2. Drop pure-numeric segments (`02`, `v3` stays — only fully numeric
 ///    pieces are dropped).

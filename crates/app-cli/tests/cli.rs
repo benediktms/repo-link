@@ -1934,7 +1934,7 @@ fn task_without_repo_falls_back_to_bare_hash() {
 }
 
 #[test]
-fn task_resolves_by_composite_bare_hash_and_uuid() {
+fn task_resolves_by_composite_and_bare_hash() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(
         &mut bin("repo-link", &dir),

@@ -288,7 +288,7 @@ impl RepoBindingService {
     }
 
     /// Replace the binding's prefix with an explicit value. Validates
-    /// against `^[a-z][a-z0-9]{1,7}$`; surfaces `Conflict` if another
+    /// against `^[a-z][a-z0-9]{1,19}$`; surfaces `Conflict` if another
     /// binding already owns the requested prefix (so the user picks a
     /// different one rather than getting silent suffix-bumping). Every
     /// composite ID a user has already typed against the *old* prefix

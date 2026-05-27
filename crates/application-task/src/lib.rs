@@ -214,8 +214,7 @@ impl TaskService {
     /// existence check — pre-checks race with concurrent creates.
     async fn save_with_minted_hash(&self, t: &mut Task) -> Result<()> {
         const K_RETRIES_AT_LENGTH: u32 = 8;
-        const MAX_LENGTH: usize = 8;
-        let mut length: usize = 3;
+        let mut length = domain_task::MIN_HASH_LEN;
         let mut attempts: u32 = 0;
         loop {
             t.hash = domain_task::random_lowercase_base32(length);
@@ -226,9 +225,10 @@ impl TaskService {
                     if attempts >= K_RETRIES_AT_LENGTH {
                         attempts = 0;
                         length += 1;
-                        if length > MAX_LENGTH {
+                        if length > domain_task::MAX_HASH_LEN {
                             return Err(ServiceError::Port(PortError::Backend(format!(
-                                "could not mint unique task hash at any length up to {MAX_LENGTH}"
+                                "could not mint unique task hash at any length up to {}",
+                                domain_task::MAX_HASH_LEN
                             ))));
                         }
                     }
@@ -632,6 +632,40 @@ mod tests {
         assert_eq!(blocked.status, "blocked");
         let unblocked = svc.unblock(&t.id).await.unwrap();
         assert_eq!(unblocked.status, "open");
+    }
+
+    #[tokio::test]
+    async fn resolve_task_accepts_uuid_hash_and_composite() {
+        let svc = svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "resolve me".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        // No repo binding → composite collapses to the bare hash.
+        let by_friendly = svc.resolve_task(&dto.id).await.unwrap();
+        // Recover the internal UUID and confirm the UUID branch resolves
+        // to the same task (this is the branch the CLI can't easily test
+        // since the UUID is no longer exposed in JSON output).
+        let uuid = by_friendly.id.to_string();
+        let by_uuid = svc.resolve_task(&uuid).await.unwrap();
+        assert_eq!(by_uuid.id, by_friendly.id);
+        // Bare hash also resolves to the same task.
+        let by_hash = svc.resolve_task(&by_friendly.hash).await.unwrap();
+        assert_eq!(by_hash.id, by_friendly.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_task_rejects_malformed_input() {
+        let svc = svc();
+        // Uppercase is not valid base32 → BadId, not a doomed lookup.
+        let err = svc.resolve_task("ZZZ").await.unwrap_err();
+        assert!(matches!(err, ServiceError::BadId(_)));
     }
 
     #[tokio::test]
