@@ -695,7 +695,8 @@ async fn sync_import(
                  attach it first with `rl repo attach`"
             )
         })?;
-    let repo_id = root_binding.id.to_string();
+    let repo_id = root_binding.id; // RepoId — all imported tasks land under it
+    let repo_id_str = repo_id.to_string();
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -713,7 +714,7 @@ async fn sync_import(
         // or a freshly imported mirror. Used to parent its children.
         let node_task_id = if let Some(existing) = svc
             .tasks_repo
-            .find_by_remote(PROVIDER, &number)
+            .find_by_remote(repo_id, PROVIDER, &number)
             .await
             .map_err(|e| anyhow!("{e}"))?
         {
@@ -727,34 +728,60 @@ async fn sync_import(
                 .fetch_remote(&canonical, &number)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
-            let dto = svc
-                .tasks
-                .import_mirror(ImportMirrorCmd {
-                    workspace_id: workspace.to_string(),
-                    repo_id: Some(repo_id.clone()),
-                    provider: PROVIDER.to_string(),
-                    remote_id: number.clone(),
-                    title: snap.title,
-                    body: snap.body,
-                    assignees: snap.assignees,
-                    closed: snap.closed,
-                })
-                .await
-                .map_err(|e| anyhow!("{e}"))?;
-            if let Some(parent) = &parent_id {
-                svc.tasks
-                    .add_relation(AddTaskRelationCmd {
-                        task_id: dto.id.clone(),
-                        kind: "child_of".to_string(),
-                        other: parent.clone(),
-                    })
-                    .await
-                    .map_err(|e| anyhow!("{e}"))?;
+            let cmd = ImportMirrorCmd {
+                workspace_id: workspace.to_string(),
+                repo_id: Some(repo_id_str.clone()),
+                provider: PROVIDER.to_string(),
+                remote_id: number.clone(),
+                title: snap.title,
+                body: snap.body,
+                assignees: snap.assignees,
+                closed: snap.closed,
+            };
+            match svc.tasks.import_mirror(cmd).await {
+                Ok(dto) => {
+                    if let Some(parent) = &parent_id {
+                        svc.tasks
+                            .add_relation(AddTaskRelationCmd {
+                                task_id: dto.id.clone(),
+                                kind: "child_of".to_string(),
+                                other: parent.clone(),
+                            })
+                            .await
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
+                    results.push(serde_json::json!({
+                        "remote_id": number, "ok": true, "task_id": dto.id, "title": dto.title,
+                    }));
+                    dto.id
+                }
+                // Race: another writer inserted this remote between our
+                // find_by_remote check and the save. The repo-scoped UNIQUE
+                // means the conflict is genuinely the same remote object, so
+                // treat it as an idempotent already-tracked rather than erroring.
+                Err(application_task::ServiceError::Port(ports::PortError::Conflict { .. })) => {
+                    match svc
+                        .tasks_repo
+                        .find_by_remote(repo_id, PROVIDER, &number)
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        Some(existing) => {
+                            results.push(serde_json::json!({
+                                "remote_id": number, "ok": false, "reason": "already_tracked",
+                                "task_id": existing.id.to_string(),
+                            }));
+                            existing.id.to_string()
+                        }
+                        None => {
+                            return Err(anyhow!(
+                                "remote {number} conflicted on save but no local task found"
+                            ));
+                        }
+                    }
+                }
+                Err(e) => return Err(anyhow!("{e}")),
             }
-            results.push(serde_json::json!({
-                "remote_id": number, "ok": true, "task_id": dto.id, "title": dto.title,
-            }));
-            dto.id
         };
 
         if cascade && depth < MAX_DEPTH {

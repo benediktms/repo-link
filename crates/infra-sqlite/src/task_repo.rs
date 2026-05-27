@@ -232,13 +232,21 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(Some(task))
     }
 
-    async fn find_by_remote(&self, provider: &str, remote_id: &str) -> PortResult<Option<Task>> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE remote_provider = ? AND remote_id = ?")
-            .bind(provider)
-            .bind(remote_id)
-            .fetch_optional(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?;
+    async fn find_by_remote(
+        &self,
+        repo_id: RepoId,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<Task>> {
+        let row = sqlx::query(
+            "SELECT * FROM tasks WHERE repo_id = ? AND remote_provider = ? AND remote_id = ?",
+        )
+        .bind(repo_id.to_string())
+        .bind(provider)
+        .bind(remote_id)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
         let Some(row) = row else {
             return Ok(None);
         };

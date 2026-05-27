@@ -109,10 +109,16 @@ pub trait TaskRepository: Send + Sync {
     /// friendly-ID resolver so callers can pass a bare hash (`ak7`) or
     /// the prefix half of a composite (`rlk-ak7`) instead of a UUID.
     async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>>;
-    /// Look up the task mirroring a given remote issue (`provider` +
-    /// `remote_id`). Used by `sync import` to skip issues already tracked
-    /// locally. Backed by the `remote_mappings` UNIQUE(provider, remote_id).
-    async fn find_by_remote(&self, provider: &str, remote_id: &str) -> PortResult<Option<Task>>;
+    /// Look up the task mirroring a given remote issue within a repo
+    /// (`repo_id` + `provider` + `remote_id`). Scoped by repo because remote
+    /// issue numbers are only unique per repo (GitHub `repoA#123` ≠
+    /// `repoB#123`). Used by `sync import` to skip already-tracked issues.
+    async fn find_by_remote(
+        &self,
+        repo_id: RepoId,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<Task>>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 

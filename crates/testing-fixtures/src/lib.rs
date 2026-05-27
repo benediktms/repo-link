@@ -315,14 +315,20 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(Some(task))
     }
 
-    async fn find_by_remote(&self, provider: &str, remote_id: &str) -> PortResult<Option<Task>> {
+    async fn find_by_remote(
+        &self,
+        repo_id: RepoId,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<Task>> {
         let g = self.inner.lock().unwrap();
         let Some(task) = g
             .values()
             .find(|t| {
-                t.remote
-                    .as_ref()
-                    .is_some_and(|r| r.provider == provider && r.remote_id == remote_id)
+                t.repo_id == Some(repo_id)
+                    && t.remote
+                        .as_ref()
+                        .is_some_and(|r| r.provider == provider && r.remote_id == remote_id)
             })
             .cloned()
         else {
