@@ -198,6 +198,23 @@ pub struct UpdateTaskCmd {
     pub repo_id: Option<String>,
 }
 
+/// Materialise a remote issue as a local mirror task (`sync import`). The
+/// CLI fetches the issue + resolves the binding, then hands the application
+/// layer everything needed to construct a `Synced` task with a `Pull`
+/// baseline. `repo_id` is the resolved binding UUID; `closed` maps to the
+/// initial lifecycle status (open→Open, closed→Done).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportMirrorCmd {
+    pub workspace_id: String,
+    pub repo_id: Option<String>,
+    pub provider: String,
+    pub remote_id: String,
+    pub title: String,
+    pub body: String,
+    pub assignees: Vec<String>,
+    pub closed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddTaskRelationCmd {
     pub task_id: String,

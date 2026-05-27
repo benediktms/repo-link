@@ -18,7 +18,8 @@
 
 use async_trait::async_trait;
 use ports::{
-    PortResult, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot, RemoteTaskUpdate,
+    PortResult, RemoteChildIssue, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
+    RemoteTaskUpdate,
 };
 
 mod rest;
@@ -67,6 +68,14 @@ impl RemoteTaskProvider for GithubTaskProvider {
     ) -> PortResult<RemoteTaskSnapshot> {
         self.rest.fetch_issue(canonical_repo, remote_id).await
     }
+
+    async fn fetch_sub_issues(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        self.rest.fetch_sub_issues(canonical_repo, remote_id).await
+    }
 }
 
 #[cfg(test)]
@@ -78,7 +87,7 @@ mod tests {
 
     use super::*;
     use ports::RemoteStateReason;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A full GitHub `Author` object. octocrab's typed `Author` model has 18
@@ -230,6 +239,65 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_sub_issues_maps_children_with_canonical_repo() {
+        let server = MockServer::start().await;
+        // GitHub returns a flat array of full issue objects (one level).
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/sub_issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                issue_payload(2, "child a", "body a", "open"),
+                issue_payload(3, "child b", "body b", "closed"),
+            ])))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let children = provider
+            .fetch_sub_issues("github.com/o/r", "1")
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].snapshot.remote_id, "2");
+        assert_eq!(children[0].snapshot.title, "child a");
+        assert!(!children[0].snapshot.closed);
+        // issue_payload sets repository_url to .../repos/o/r → canonical github.com/o/r.
+        assert_eq!(children[0].canonical_repo, "github.com/o/r");
+        assert_eq!(children[1].snapshot.remote_id, "3");
+        assert!(children[1].snapshot.closed);
+    }
+
+    #[tokio::test]
+    async fn fetch_sub_issues_paginates_past_one_page() {
+        let server = MockServer::start().await;
+        // Page 1: a full page of 100 → the client must request page 2.
+        let page1: Vec<serde_json::Value> = (0..100)
+            .map(|i| issue_payload(1000 + i, "child", "b", "open"))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/sub_issues"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page1))
+            .mount(&server)
+            .await;
+        // Page 2: a short page → stop.
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/sub_issues"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue_payload(
+                2000, "last", "b", "open",
+            )]))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let children = provider
+            .fetch_sub_issues("github.com/o/r", "1")
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 101); // 100 + 1 across two pages
     }
 
     #[tokio::test]

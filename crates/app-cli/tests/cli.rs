@@ -820,6 +820,63 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     );
 }
 
+// `sync import` validates the URL and resolves the repo binding *before* any
+// network call, so these paths are testable with a dummy token and no mock.
+
+#[test]
+fn sync_import_rejects_non_issue_url() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let ws_id = ws["id"].as_str().unwrap();
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "dummy");
+    let output = cmd
+        .args(["sync", "import", "not-a-url", "--workspace", ws_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not a github issue url"),
+        "expected url-parse error; got: {stderr}"
+    );
+}
+
+#[test]
+fn sync_import_errors_when_repo_unbound() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let ws_id = ws["id"].as_str().unwrap();
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "dummy");
+    let output = cmd
+        .args([
+            "sync",
+            "import",
+            "https://github.com/o/r/issues/1",
+            "--workspace",
+            ws_id,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("no repo binding for github.com/o/r"),
+        "expected unbound-repo error; got: {stderr}"
+    );
+}
+
 #[test]
 fn invalid_priority_exits_nonzero_with_readable_error() {
     let dir = TempDir::new().unwrap();

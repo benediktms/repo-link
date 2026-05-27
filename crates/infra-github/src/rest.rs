@@ -11,8 +11,8 @@ use octocrab::Octocrab;
 use octocrab::models::IssueState;
 use octocrab::models::issues::{Issue, IssueStateReason};
 use ports::{
-    PortError, PortResult, RemoteStateReason, RemoteTaskCreate, RemoteTaskSnapshot,
-    RemoteTaskUpdate,
+    PortError, PortResult, RemoteChildIssue, RemoteStateReason, RemoteTaskCreate,
+    RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.github.com";
@@ -100,6 +100,60 @@ impl RestClient {
             .map_err(map_err)?;
         Ok(map_issue(issue))
     }
+
+    /// List the direct sub-issues of an issue. octocrab has no typed handler
+    /// for `/sub_issues`, so we hit it via the generic `get` and decode into
+    /// the typed `Issue` model. Each child carries its own canonical repo
+    /// (derived from `repository_url`) since sub-issues can live in another
+    /// repo. One level only — the caller recurses.
+    pub(crate) async fn fetch_sub_issues(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        // Page through until a short page (or the safety cap), so issues with
+        // more than one page of direct sub-issues aren't silently truncated.
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut issues: Vec<Issue> = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
+            );
+            let batch: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+            let full = batch.len() == PER_PAGE;
+            issues.extend(batch);
+            if !full {
+                break;
+            }
+            if page == MAX_PAGES {
+                // Still a full page at the cap — more remain. Refuse rather
+                // than silently returning a truncated tree with no signal.
+                truncated = true;
+            }
+        }
+        if truncated {
+            return Err(PortError::Backend(format!(
+                "issue {number} in {canonical_repo} has more than {} sub-issues; \
+                 refusing to import a truncated tree",
+                MAX_PAGES as usize * PER_PAGE
+            )));
+        }
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                let child_canonical = canonical_from_repository_url(issue.repository_url.as_str())
+                    .unwrap_or_else(|| canonical_repo.to_string());
+                RemoteChildIssue {
+                    canonical_repo: child_canonical,
+                    snapshot: map_issue(issue),
+                }
+            })
+            .collect())
+    }
 }
 
 // ---------- Mapping (octocrab models ↔ port types) ----------------------
@@ -139,6 +193,17 @@ pub(crate) fn split_owner_repo(canonical: &str) -> PortResult<(String, String)> 
         )));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Derive the canonical `github.com/<owner>/<repo>` form from a GitHub API
+/// `repository_url` (e.g. `https://api.github.com/repos/o/r`). Returns `None`
+/// for shapes that don't contain a `/repos/<owner>/<repo>` segment.
+fn canonical_from_repository_url(url: &str) -> Option<String> {
+    let rest = url.split("/repos/").nth(1)?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("github.com/{owner}/{repo}"))
 }
 
 fn parse_issue_number(remote_id: &str) -> PortResult<u64> {
@@ -182,6 +247,19 @@ mod tests {
             split_owner_repo("github.com/o/r").unwrap(),
             ("o".into(), "r".into())
         );
+    }
+
+    #[test]
+    fn canonical_from_repository_url_extracts_owner_repo() {
+        assert_eq!(
+            canonical_from_repository_url("https://api.github.com/repos/o/r").as_deref(),
+            Some("github.com/o/r")
+        );
+        assert_eq!(
+            canonical_from_repository_url("https://api.github.com/repos/acme/backend").as_deref(),
+            Some("github.com/acme/backend")
+        );
+        assert_eq!(canonical_from_repository_url("https://example.com/x"), None);
     }
 
     #[test]

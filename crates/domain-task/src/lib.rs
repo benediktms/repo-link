@@ -263,6 +263,52 @@ impl Task {
         })
     }
 
+    /// Construct a task that is already a mirror of an existing remote issue
+    /// — the one-step factory `sync import` needs. Unlike the
+    /// `new_draft → stage → promote` path (which *creates* the remote), this
+    /// records a remote that already exists: `sync = Synced`, `remote` set,
+    /// and the diff baseline captured from a `Pull` view (the remote is the
+    /// source of truth from the first version). `status` mirrors the remote's
+    /// open/closed bit; lifecycle and sync stay orthogonal thereafter. `hash`
+    /// is left empty for the persistence layer to mint, as with `new_draft`.
+    pub fn import_mirror(
+        workspace_id: WorkspaceId,
+        repo_id: Option<RepoId>,
+        remote: RemoteRef,
+        title: String,
+        body: String,
+        assignees: Vec<String>,
+        closed: bool,
+    ) -> Result<Self> {
+        if title.trim().is_empty() {
+            return Err(DomainError::validation("task title is empty"));
+        }
+        let now = Timestamp::now();
+        let mut task = Self {
+            id: TaskId::new(),
+            workspace_id,
+            repo_id,
+            title,
+            body,
+            status: if closed {
+                TaskStatus::Done
+            } else {
+                TaskStatus::Open
+            },
+            sync: SyncState::Synced,
+            priority: Priority::P3,
+            assignees,
+            remote: Some(remote),
+            relations: Vec::new(),
+            hash: String::new(),
+            created_at: now,
+            updated_at: now,
+            synced_baseline: None,
+        };
+        task.synced_baseline = Some(task.snapshot_view(SnapshotSource::Pull));
+        Ok(task)
+    }
+
     /// Refresh the diff baseline after a successful remote-aligning sync
     /// event (promote / push / pull / conflict resolve). The snapshot's
     /// `version` is assigned by the repository; the application layer
@@ -673,6 +719,59 @@ mod tests {
     fn promote_requires_staged() {
         let mut t = draft();
         assert!(t.promote_to_remote(remote_ref()).is_err());
+    }
+
+    #[test]
+    fn import_mirror_lands_synced_with_pull_baseline() {
+        let t = Task::import_mirror(
+            WorkspaceId::new(),
+            None,
+            remote_ref(),
+            "imported".into(),
+            "from remote".into(),
+            vec!["alice".into()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert_eq!(t.status, TaskStatus::Done); // closed → Done
+        assert!(t.is_remote_backed());
+        assert_eq!(t.assignees, vec!["alice".to_string()]);
+        // Baseline captured from the remote, so a fresh import is NOT dirty.
+        let baseline = t.synced_baseline.as_ref().expect("baseline set");
+        assert_eq!(baseline.source, SnapshotSource::Pull);
+    }
+
+    #[test]
+    fn import_mirror_open_issue_maps_to_open() {
+        let t = Task::import_mirror(
+            WorkspaceId::new(),
+            None,
+            remote_ref(),
+            "open one".into(),
+            String::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(t.status, TaskStatus::Open);
+        assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn import_mirror_rejects_empty_title() {
+        assert!(
+            Task::import_mirror(
+                WorkspaceId::new(),
+                None,
+                remote_ref(),
+                "   ".into(),
+                String::new(),
+                vec![],
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]
