@@ -156,6 +156,15 @@ pub struct TaskRelationDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCommentDto {
+    /// GitHub comment id; `None` for a pending local comment not yet pushed.
+    pub remote_id: Option<String>,
+    pub author: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskDto {
     pub id: String,
     pub workspace_id: String,
@@ -170,6 +179,9 @@ pub struct TaskDto {
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRefDto>,
     pub relations: Vec<TaskRelationDto>,
+    /// Mirrored issue comments (oldest first). Populated for `task show`;
+    /// empty in list views to avoid a per-row fetch.
+    pub comments: Vec<TaskCommentDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

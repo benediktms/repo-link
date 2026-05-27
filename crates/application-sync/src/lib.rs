@@ -175,6 +175,9 @@ impl SyncService {
         let remote_changed = snap.updated_at.into_inner() > task.updated_at.into_inner();
         let decision = decide(task.sync, remote_changed, self.policy);
 
+        // A conflict still records the conflicted state below, but we defer the
+        // error so comment mirroring (orthogonal to title/body drift) still runs.
+        let mut manual_merge: Option<String> = None;
         match decision {
             SyncDecision::Noop => {}
             SyncDecision::PullRemote => {
@@ -203,8 +206,22 @@ impl SyncService {
             SyncDecision::RequireManualMerge => {
                 task.mark_conflicted()?;
                 self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
-                return Err(SyncError::ManualMerge(task_id.to_string()));
+                manual_merge = Some(task_id.to_string());
             }
+        }
+
+        // Mirror comments regardless of the snapshot decision (even on Noop or a
+        // manual-merge conflict): comment activity is orthogonal to title/body
+        // drift, and `replace_comments` writes no snapshot, so this can't cause
+        // the cosmetic-refresh churn the field-level pull guards against.
+        let comments = self
+            .provider
+            .fetch_comments(&canonical, &remote.remote_id)
+            .await?;
+        self.tasks.replace_comments(id, &comments).await?;
+
+        if let Some(tid) = manual_merge {
+            return Err(SyncError::ManualMerge(tid));
         }
 
         Ok(summary(&task, prev, decision))
@@ -261,7 +278,7 @@ mod tests {
     use domain_core::{Timestamp, WorkspaceId};
     use domain_repo::RepoBinding;
     use domain_task::Task;
-    use ports::{PortResult, RemoteTaskSnapshot};
+    use ports::{PortResult, RemoteComment, RemoteTaskSnapshot};
     use std::sync::Mutex;
     use testing_fixtures::{InMemoryRepoBindingRepository, InMemoryTaskRepository};
 
@@ -278,11 +295,16 @@ mod tests {
         last_create: Mutex<Option<String>>,
         last_update: Mutex<Option<RecordedUpdate>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
+        comments: Mutex<Vec<RemoteComment>>,
     }
 
     impl FakeProvider {
         fn set_fetch(&self, snap: RemoteTaskSnapshot) {
             *self.fetch_returns.lock().unwrap() = Some(snap);
+        }
+
+        fn set_comments(&self, comments: Vec<RemoteComment>) {
+            *self.comments.lock().unwrap() = comments;
         }
     }
 
@@ -325,6 +347,10 @@ mod tests {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| PortError::NotFound("no fetch fixture".into()))
+        }
+
+        async fn fetch_comments(&self, _: &str, _: &str) -> PortResult<Vec<RemoteComment>> {
+            Ok(self.comments.lock().unwrap().clone())
         }
     }
 
@@ -465,5 +491,44 @@ mod tests {
         });
         let s = svc.pull(&task.id.to_string()).await.unwrap();
         assert_eq!(s.decision, "noop");
+    }
+
+    #[tokio::test]
+    async fn pull_mirrors_comments_even_on_manual_merge_conflict() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Local edit → DirtyLocal, and a newer remote → remote_dirty. Under the
+        // default ManualMerge policy this resolves to RequireManualMerge.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_body("local edit".into());
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let later = Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60));
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            title: "remote title".into(),
+            body: "remote body".into(),
+            closed: false,
+            updated_at: later,
+            assignees: vec![],
+            labels: vec![],
+        });
+        provider.set_comments(vec![RemoteComment {
+            remote_id: "7".into(),
+            author: "octocat".into(),
+            body: "ping".into(),
+            created_at: Timestamp::from_utc(Utc::now()),
+        }]);
+
+        let err = svc.pull(&task.id.to_string()).await.unwrap_err();
+        assert!(matches!(err, SyncError::ManualMerge(_)));
+
+        // The conflict still surfaces an error, but comments are mirrored anyway.
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Conflict);
+        assert_eq!(after.comments.len(), 1);
+        assert_eq!(after.comments[0].body, "ping");
     }
 }

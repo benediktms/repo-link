@@ -137,6 +137,20 @@ pub struct RemoteRef {
     pub remote_id: String,
 }
 
+/// A comment mirrored from (or destined for) the remote issue. `remote_id`
+/// is `None` for a comment authored locally that hasn't been pushed yet —
+/// the outbound path (a follow-up) sets it once the remote create succeeds.
+/// Comments are append-only and orthogonal to the snapshot/dirty machinery:
+/// they're never part of [`TaskSnapshot`], so remote-side comment activity
+/// doesn't perturb dirty detection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskComment {
+    pub remote_id: Option<String>,
+    pub author: String,
+    pub body: String,
+    pub created_at: Timestamp,
+}
+
 /// Why a snapshot was captured. Only events that confirm remote alignment
 /// (`Promote` / `Push` / `Pull` / `ConflictResolve`) count toward the diff
 /// baseline used by dirty detection. `LocalEdit`, `PrePull`, and
@@ -213,6 +227,11 @@ pub struct Task {
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
     pub relations: Vec<TaskRelation>,
+    /// Comments mirrored from the remote issue (and, in a follow-up, pending
+    /// outbound ones). Append-only; populated by the repository on load and
+    /// reconciled by `sync pull`. Deliberately excluded from `snapshot_view`
+    /// so comment activity never marks the task dirty.
+    pub comments: Vec<TaskComment>,
     /// Short globally-unique hash used to assemble the friendly composite
     /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
     /// (grown by the persistence layer on collision). Empty string is the
@@ -253,6 +272,7 @@ impl Task {
             assignees: Vec::new(),
             remote: None,
             relations: Vec::new(),
+            comments: Vec::new(),
             // Empty until the persistence layer mints a unique base32
             // hash on first save. Domain stays agnostic to randomness
             // and DB-backed uniqueness retries.
@@ -300,6 +320,7 @@ impl Task {
             assignees,
             remote: Some(remote),
             relations: Vec::new(),
+            comments: Vec::new(),
             hash: String::new(),
             created_at: now,
             updated_at: now,
@@ -740,6 +761,33 @@ mod tests {
         // Baseline captured from the remote, so a fresh import is NOT dirty.
         let baseline = t.synced_baseline.as_ref().expect("baseline set");
         assert_eq!(baseline.source, SnapshotSource::Pull);
+    }
+
+    #[test]
+    fn comments_do_not_dirty_a_synced_task() {
+        let mut t = draft();
+        assert!(t.comments.is_empty());
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        // Mirroring a comment must not perturb sync state: comments are
+        // excluded from the snapshot baseline, so a subsequent reconcile
+        // (here via a no-op body set) leaves the task Synced, not DirtyLocal.
+        t.comments.push(TaskComment {
+            remote_id: Some("7".into()),
+            author: "octocat".into(),
+            body: "looks good".into(),
+            created_at: Timestamp::now(),
+        });
+        let body = t.body.clone();
+        t.set_body(body);
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "comment activity must not dirty a synced task"
+        );
+        assert_eq!(t.comments.len(), 1);
     }
 
     #[test]

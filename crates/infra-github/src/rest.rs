@@ -11,7 +11,7 @@ use octocrab::Octocrab;
 use octocrab::models::IssueState;
 use octocrab::models::issues::{Issue, IssueStateReason};
 use ports::{
-    PortError, PortResult, RemoteChildIssue, RemoteStateReason, RemoteTaskCreate,
+    PortError, PortResult, RemoteChildIssue, RemoteComment, RemoteStateReason, RemoteTaskCreate,
     RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
@@ -118,7 +118,7 @@ impl RestClient {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: u32 = 50;
         let mut issues: Vec<Issue> = Vec::new();
-        let mut truncated = false;
+        let mut cap_page_full = false;
         for page in 1..=MAX_PAGES {
             let route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
@@ -130,17 +130,27 @@ impl RestClient {
                 break;
             }
             if page == MAX_PAGES {
-                // Still a full page at the cap — more remain. Refuse rather
-                // than silently returning a truncated tree with no signal.
-                truncated = true;
+                cap_page_full = true;
             }
         }
-        if truncated {
-            return Err(PortError::Backend(format!(
-                "issue {number} in {canonical_repo} has more than {} sub-issues; \
-                 refusing to import a truncated tree",
-                MAX_PAGES as usize * PER_PAGE
-            )));
+        // A full final page isn't proof of overflow (could be exactly
+        // MAX_PAGES * PER_PAGE). Probe one more lightweight page to tell an
+        // exact boundary from genuine truncation.
+        if cap_page_full {
+            // With per_page=1 a page number indexes a single item, so the first
+            // item past the capped window is page MAX_PAGES * PER_PAGE + 1.
+            let probe_page = MAX_PAGES as usize * PER_PAGE + 1;
+            let probe_route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=1&page={probe_page}"
+            );
+            let probe: Vec<Issue> = self.http.get(probe_route, None::<&()>).await.map_err(map_err)?;
+            if !probe.is_empty() {
+                return Err(PortError::Backend(format!(
+                    "issue {number} in {canonical_repo} has more than {} sub-issues; \
+                     refusing to import a truncated tree",
+                    MAX_PAGES as usize * PER_PAGE
+                )));
+            }
         }
         Ok(issues
             .into_iter()
@@ -153,6 +163,73 @@ impl RestClient {
                 }
             })
             .collect())
+    }
+
+    /// List an issue's comments, oldest first, paging through the typed
+    /// `list_comments` handler. Caps pages like `fetch_sub_issues` and
+    /// surfaces a cap-hit rather than silently truncating.
+    pub(crate) async fn fetch_comments(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteComment>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        const PER_PAGE: u8 = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut out: Vec<RemoteComment> = Vec::new();
+        let mut cap_page_full = false;
+        for page in 1..=MAX_PAGES {
+            let batch = self
+                .http
+                .issues(owner.as_str(), repo.as_str())
+                .list_comments(number)
+                .per_page(PER_PAGE)
+                .page(page)
+                .send()
+                .await
+                .map_err(map_err)?;
+            let full = batch.items.len() == PER_PAGE as usize;
+            for c in batch.items {
+                out.push(RemoteComment {
+                    remote_id: c.id.to_string(),
+                    author: c.user.login,
+                    body: c.body.unwrap_or_default(),
+                    created_at: Timestamp::from_utc(c.created_at),
+                });
+            }
+            if !full {
+                break;
+            }
+            if page == MAX_PAGES {
+                cap_page_full = true;
+            }
+        }
+        // A full final page isn't proof of overflow (it could be exactly
+        // MAX_PAGES * PER_PAGE). Probe one more lightweight page to tell an
+        // exact boundary from genuine truncation.
+        if cap_page_full
+            && !self
+                .http
+                .issues(owner.as_str(), repo.as_str())
+                .list_comments(number)
+                .per_page(1)
+                // per_page=1 indexes a single item per page, so the first item
+                // past the capped window is page MAX_PAGES * PER_PAGE + 1.
+                .page(MAX_PAGES * PER_PAGE as u32 + 1)
+                .send()
+                .await
+                .map_err(map_err)?
+                .items
+                .is_empty()
+        {
+            return Err(PortError::Backend(format!(
+                "issue {number} in {canonical_repo} has more than {} comments; \
+                 refusing to mirror a truncated set",
+                MAX_PAGES as usize * PER_PAGE as usize
+            )));
+        }
+        Ok(out)
     }
 }
 

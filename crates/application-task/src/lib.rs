@@ -7,8 +7,8 @@ use domain_task::{
     Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus,
 };
 use dto_shared::{
-    AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto, TaskDto,
-    TaskRelationDto, UpdateTaskCmd,
+    AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto,
+    TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,
 };
 use ports::{
     PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
@@ -472,6 +472,16 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
             .map(|r| TaskRelationDto {
                 kind: enum_str(&r.kind),
                 other: r.other.to_string(),
+            })
+            .collect(),
+        comments: t
+            .comments
+            .iter()
+            .map(|c| TaskCommentDto {
+                remote_id: c.remote_id.clone(),
+                author: c.author.clone(),
+                body: c.body.clone(),
+                created_at: c.created_at.into(),
             })
             .collect(),
         created_at: t.created_at.into(),

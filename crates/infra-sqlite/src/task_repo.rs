@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_task::{
-    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskRelation, TaskSnapshot,
-    TaskStatus,
+    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment, TaskRelation,
+    TaskSnapshot, TaskStatus,
 };
-use ports::{PortError, PortResult, TaskFilter, TaskRepository};
+use ports::{PortError, PortResult, RemoteComment, TaskFilter, TaskRepository};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::Db;
@@ -175,6 +175,7 @@ impl TaskRepository for SqliteTaskRepository {
         let mut task = row_to_task(&row)?;
         task.relations = load_relations(&self.db.reads, id).await?;
         task.synced_baseline = load_latest_baseline(&self.db.reads, id).await?;
+        task.comments = load_comments(&self.db.reads, id).await?;
         Ok(task)
     }
 
@@ -229,6 +230,7 @@ impl TaskRepository for SqliteTaskRepository {
         let mut task = row_to_task(&row)?;
         task.relations = load_relations(&self.db.reads, task.id).await?;
         task.synced_baseline = load_latest_baseline(&self.db.reads, task.id).await?;
+        task.comments = load_comments(&self.db.reads, task.id).await?;
         Ok(Some(task))
     }
 
@@ -253,7 +255,45 @@ impl TaskRepository for SqliteTaskRepository {
         let mut task = row_to_task(&row)?;
         task.relations = load_relations(&self.db.reads, task.id).await?;
         task.synced_baseline = load_latest_baseline(&self.db.reads, task.id).await?;
+        task.comments = load_comments(&self.db.reads, task.id).await?;
         Ok(Some(task))
+    }
+
+    async fn replace_comments(
+        &self,
+        task_id: TaskId,
+        comments: &[RemoteComment],
+    ) -> PortResult<()> {
+        let mut tx = self
+            .db
+            .writes
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_err)?;
+        // Replace only the synced (remote-backed) comments; pending local
+        // comments (remote_comment_id = '') are left intact.
+        sqlx::query("DELETE FROM task_comments WHERE task_id = ? AND remote_comment_id != ''")
+            .bind(task_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        for c in comments {
+            sqlx::query(
+                "INSERT INTO task_comments (id, task_id, remote_comment_id, author, body, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(task_id.to_string())
+            .bind(&c.remote_id)
+            .bind(&c.author)
+            .bind(&c.body)
+            .bind(c.created_at.into_inner())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(())
     }
 
     async fn delete(&self, id: TaskId) -> PortResult<()> {
@@ -307,6 +347,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         relations: Vec::new(),
+        comments: Vec::new(),
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
@@ -330,6 +371,33 @@ async fn load_relations(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<Ta
             Ok(TaskRelation {
                 kind: enum_from_str::<RelationKind>("relation kind", &kind)?,
                 other: parse_uuid::<TaskId>("task_id", &other)?,
+            })
+        })
+        .collect()
+}
+
+async fn load_comments(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<TaskComment>> {
+    let rows = sqlx::query(
+        "SELECT remote_comment_id, author, body, created_at FROM task_comments \
+         WHERE task_id = ? ORDER BY created_at, id",
+    )
+    .bind(task_id.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    rows.iter()
+        .map(|row| {
+            let remote_comment_id: String = row.try_get("remote_comment_id").map_err(map_sqlx_err)?;
+            let author: String = row.try_get("author").map_err(map_sqlx_err)?;
+            let body: String = row.try_get("body").map_err(map_sqlx_err)?;
+            let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
+            Ok(TaskComment {
+                // '' sentinel ⇒ a pending local comment with no remote id yet.
+                remote_id: (!remote_comment_id.is_empty()).then_some(remote_comment_id),
+                author,
+                body,
+                created_at: Timestamp::from_utc(created_at),
             })
         })
         .collect()
