@@ -740,16 +740,6 @@ async fn sync_import(
             };
             match svc.tasks.import_mirror(cmd).await {
                 Ok(dto) => {
-                    if let Some(parent) = &parent_id {
-                        svc.tasks
-                            .add_relation(AddTaskRelationCmd {
-                                task_id: dto.id.clone(),
-                                kind: "child_of".to_string(),
-                                other: parent.clone(),
-                            })
-                            .await
-                            .map_err(|e| anyhow!("{e}"))?;
-                    }
                     results.push(serde_json::json!({
                         "remote_id": number, "ok": true, "task_id": dto.id, "title": dto.title,
                     }));
@@ -783,6 +773,21 @@ async fn sync_import(
                 Err(e) => return Err(anyhow!("{e}")),
             }
         };
+
+        // Wire the parent link regardless of how the node was resolved (fresh
+        // import, already-tracked, or conflict recovery), so re-running
+        // `--cascade` can't leave a previously-imported child disconnected
+        // from its parent. `add_relation` dedups, so this is idempotent.
+        if let Some(parent) = &parent_id {
+            svc.tasks
+                .add_relation(AddTaskRelationCmd {
+                    task_id: node_task_id.clone(),
+                    kind: "child_of".to_string(),
+                    other: parent.clone(),
+                })
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+        }
 
         if cascade && depth < MAX_DEPTH {
             let children = provider
