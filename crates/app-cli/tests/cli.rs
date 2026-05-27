@@ -2194,3 +2194,69 @@ fn repo_attach_collision_breaks_with_numeric_suffix() {
     // suffix kicks in.
     assert_eq!(b["binding"]["prefix"], "ath1");
 }
+
+#[test]
+fn task_edit_repo_attaches_repo_and_makes_id_composite() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let binding = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/widget.git", "--canonical", "github.com/o/widget",
+            "--no-link", "--prefix", "wid",
+        ],
+    );
+    let repo_id = binding["binding"]["id"].as_str().unwrap().to_string();
+
+    // Create a task with NO repo → bare-hash id, repo_id null.
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "orphan task"],
+    );
+    let original_id = task["id"].as_str().unwrap().to_string();
+    assert!(!original_id.contains('-'), "expected bare hash, got {original_id}");
+    assert!(task["repo_id"].is_null());
+
+    // Attach the repo via edit (using the -r short flag) → id becomes a
+    // `wid-<hash>` composite.
+    let edited = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "edit", &original_id, "-r", &repo_id],
+    );
+    assert_eq!(edited["repo_id"], repo_id);
+    let new_id = edited["id"].as_str().unwrap();
+    assert_eq!(new_id, format!("wid-{original_id}"), "id should gain the wid- prefix");
+
+    // The task now resolves by its composite id too.
+    let shown = run_json(&mut bin("repo-link", &dir), &["task", "show", new_id]);
+    assert_eq!(shown["title"], "orphan task");
+}
+
+#[test]
+fn task_edit_with_no_flags_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap();
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", workspace, "--title", "t"],
+    );
+    let id = task["id"].as_str().unwrap();
+    let assert = bin("repo-link", &dir)
+        .args(["task", "edit", id])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("--repo"),
+        "the at-least-one-flag error should now mention --repo: {stderr}"
+    );
+}
