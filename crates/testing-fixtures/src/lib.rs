@@ -315,6 +315,27 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(Some(task))
     }
 
+    async fn find_by_remote(&self, provider: &str, remote_id: &str) -> PortResult<Option<Task>> {
+        let g = self.inner.lock().unwrap();
+        let Some(task) = g
+            .values()
+            .find(|t| {
+                t.remote
+                    .as_ref()
+                    .is_some_and(|r| r.provider == provider && r.remote_id == remote_id)
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let snaps = self.snapshots.lock().unwrap();
+        let mut task = task;
+        task.synced_baseline = snaps
+            .get(&task.id)
+            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+        Ok(Some(task))
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())

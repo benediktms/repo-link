@@ -3,10 +3,12 @@
 use std::sync::Arc;
 
 use domain_core::{IdParseError, RepoId, TaskId, WorkspaceId};
-use domain_task::{Priority, RelationKind, SnapshotSource, SyncState, Task, TaskStatus};
+use domain_task::{
+    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus,
+};
 use dto_shared::{
-    AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoteRefDto, TaskDto, TaskRelationDto,
-    UpdateTaskCmd,
+    AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto, TaskDto,
+    TaskRelationDto, UpdateTaskCmd,
 };
 use ports::{
     PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
@@ -214,7 +216,37 @@ impl TaskService {
         }
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
         // `SnapshotSource::Created` for why this distinction matters.
-        self.save_with_minted_hash(&mut t).await?;
+        self.save_with_minted_hash(&mut t, SnapshotSource::Created)
+            .await?;
+        self.task_dto(&t).await
+    }
+
+    /// Materialise a remote issue as a local mirror task. Unlike `create`,
+    /// the first snapshot is a `Pull` baseline — the task starts life
+    /// `Synced` against the remote it mirrors. Hash minting + the UNIQUE
+    /// retry are shared with `create`; idempotency (skip already-tracked
+    /// remotes) is the caller's job via `TaskRepository::find_by_remote`.
+    pub async fn import_mirror(&self, cmd: ImportMirrorCmd) -> Result<TaskDto> {
+        let workspace_id: WorkspaceId = cmd.workspace_id.parse()?;
+        let repo_id = cmd
+            .repo_id
+            .as_deref()
+            .map(|s| s.parse::<RepoId>())
+            .transpose()?;
+        let mut t = Task::import_mirror(
+            workspace_id,
+            repo_id,
+            RemoteRef {
+                provider: cmd.provider,
+                remote_id: cmd.remote_id,
+            },
+            cmd.title,
+            cmd.body,
+            cmd.assignees,
+            cmd.closed,
+        )?;
+        self.save_with_minted_hash(&mut t, SnapshotSource::Pull)
+            .await?;
         self.task_dto(&t).await
     }
 
@@ -227,13 +259,13 @@ impl TaskService {
     ///
     /// Retry is driven by the DB's UNIQUE index, not a pre-flight
     /// existence check — pre-checks race with concurrent creates.
-    async fn save_with_minted_hash(&self, t: &mut Task) -> Result<()> {
+    async fn save_with_minted_hash(&self, t: &mut Task, source: SnapshotSource) -> Result<()> {
         const K_RETRIES_AT_LENGTH: u32 = 8;
         let mut length = domain_task::MIN_HASH_LEN;
         let mut attempts: u32 = 0;
         loop {
             t.hash = domain_task::random_lowercase_base32(length);
-            match self.repo.save(t, SnapshotSource::Created).await {
+            match self.repo.save(t, source).await {
                 Ok(()) => return Ok(()),
                 Err(e) if e.conflict_target() == Some("tasks.hash") => {
                     attempts += 1;
@@ -466,6 +498,33 @@ mod tests {
 
     fn ws_id() -> String {
         WorkspaceId::new().to_string()
+    }
+
+    #[tokio::test]
+    async fn import_mirror_persists_synced_task_with_minted_hash() {
+        let svc = svc();
+        let dto = svc
+            .import_mirror(ImportMirrorCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                provider: "github".into(),
+                remote_id: "123".into(),
+                title: "imported issue".into(),
+                body: "from gh".into(),
+                assignees: vec!["alice".into()],
+                closed: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(dto.sync_state, "synced");
+        assert_eq!(dto.status, "open");
+        assert_eq!(dto.remote.as_ref().unwrap().remote_id, "123");
+        assert_eq!(dto.assignees, vec!["alice".to_string()]);
+        // Hash was minted on save, so the friendly id is a non-empty bare hash.
+        assert!(!dto.id.is_empty());
+        // And it's findable by its remote ref (idempotency backstop).
+        let found = svc.show(&dto.id).await.unwrap();
+        assert_eq!(found.remote.unwrap().remote_id, "123");
     }
 
     #[tokio::test]

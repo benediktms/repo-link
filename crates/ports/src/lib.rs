@@ -109,6 +109,10 @@ pub trait TaskRepository: Send + Sync {
     /// friendly-ID resolver so callers can pass a bare hash (`ak7`) or
     /// the prefix half of a composite (`rlk-ak7`) instead of a UUID.
     async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>>;
+    /// Look up the task mirroring a given remote issue (`provider` +
+    /// `remote_id`). Used by `sync import` to skip issues already tracked
+    /// locally. Backed by the `remote_mappings` UNIQUE(provider, remote_id).
+    async fn find_by_remote(&self, provider: &str, remote_id: &str) -> PortResult<Option<Task>>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
@@ -178,6 +182,17 @@ pub struct RemoteTaskSnapshot {
     pub labels: Vec<String>,
 }
 
+/// One sub-issue returned by [`RemoteTaskProvider::fetch_sub_issues`], paired
+/// with the canonical repo it actually lives in. A sub-issue can belong to a
+/// different repo than its parent, so the canonical is carried here (rather
+/// than widening [`RemoteTaskSnapshot`]) to let the import orchestrator detect
+/// and skip cross-repo children.
+#[derive(Clone, Debug)]
+pub struct RemoteChildIssue {
+    pub canonical_repo: String,
+    pub snapshot: RemoteTaskSnapshot,
+}
+
 #[async_trait]
 pub trait RemoteTaskProvider: Send + Sync {
     async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot>;
@@ -187,6 +202,18 @@ pub trait RemoteTaskProvider: Send + Sync {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<RemoteTaskSnapshot>;
+
+    /// List the direct (one level) sub-issues of a remote task. Providers
+    /// without a sub-issue concept inherit the default empty result, so only
+    /// adapters that support it (GitHub) need to override. Recursion into
+    /// grandchildren is the caller's job.
+    async fn fetch_sub_issues(
+        &self,
+        _canonical_repo: &str,
+        _remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------- Filesystem probe ---------------------------------------------

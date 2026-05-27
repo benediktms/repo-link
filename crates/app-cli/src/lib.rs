@@ -10,8 +10,9 @@ use application_task::TaskService;
 use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::{Args, Parser, Subcommand};
 use dto_shared::{
-    AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, LinkWorktreeCmd,
-    ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd, UpdateTaskCmd,
+    AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, ImportMirrorCmd,
+    LinkWorktreeCmd, ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd,
+    UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
@@ -450,6 +451,18 @@ enum SyncCmd {
         #[command(flatten)]
         t: TaskArg,
     },
+    /// Import a GitHub issue by URL as a local task, optionally cascading
+    /// into its sub-issues.
+    Import {
+        /// GitHub issue URL, e.g. https://github.com/owner/repo/issues/123.
+        url: String,
+        /// Also import the issue's sub-issue tree (recursively), wiring
+        /// `child_of` relations. Cross-repo sub-issues are skipped.
+        #[arg(long)]
+        cascade: bool,
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -590,6 +603,18 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
         })?;
     let provider: Arc<dyn ports::RemoteTaskProvider> =
         Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
+
+    // `import` has its own orchestration (fetch + materialise), not the
+    // promote/push/pull reconciliation `SyncService` handles.
+    if let SyncCmd::Import {
+        url,
+        cascade,
+        ws: WorkspaceArg { workspace },
+    } = cmd
+    {
+        return sync_import(provider.as_ref(), svc, &workspace, &url, cascade).await;
+    }
+
     let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
     // Resolve the friendly task reference (UUID / bare hash / prefix-hash)
     // to a UUID here, at the CLI boundary, so `sync` accepts the same id
@@ -604,8 +629,163 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
         SyncCmd::Pull { t: TaskArg { task } } => {
             sync.pull(&svc.tasks.resolve_id(&task).await?).await?
         }
+        SyncCmd::Import { .. } => unreachable!("handled above"),
     };
     render::sync(&summary);
+    Ok(())
+}
+
+/// Parse a GitHub issue URL into `(canonical "github.com/owner/repo", number)`.
+/// Returns `None` for anything that isn't a `github.com/.../issues/<n>` URL.
+fn parse_issue_url(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let mut parts = rest.split('/');
+    if parts.next()? != "github.com" {
+        return None;
+    }
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next()? != "issues" {
+        return None;
+    }
+    let number = parts.next()?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Reject trailing segments (e.g. .../issues/1/foo) so we don't silently
+    // accept a malformed URL.
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((format!("github.com/{owner}/{repo}"), number.to_string()))
+}
+
+/// Import a GitHub issue (and optionally its sub-issue tree) into local mirror
+/// tasks. The whole tree lands under the root issue's repo binding; sub-issues
+/// in a different repo are skipped. Idempotent: issues already tracked locally
+/// are reported, not re-created. Emits a `batch_task_op`-style JSON array.
+async fn sync_import(
+    provider: &dyn ports::RemoteTaskProvider,
+    svc: &Services,
+    workspace: &str,
+    url: &str,
+    cascade: bool,
+) -> Result<()> {
+    const PROVIDER: &str = "github";
+    const MAX_DEPTH: usize = 25;
+
+    let workspace_id: domain_core::WorkspaceId = workspace
+        .parse()
+        .map_err(|e| anyhow!("invalid workspace id: {e}"))?;
+    let (root_canonical, root_number) =
+        parse_issue_url(url).ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
+
+    let root_binding = svc
+        .bindings_repo
+        .find_by_canonical_url(workspace_id, &root_canonical)
+        .await
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "no repo binding for {root_canonical} in this workspace; \
+                 attach it first with `rl repo attach`"
+            )
+        })?;
+    let repo_id = root_binding.id.to_string();
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // DFS: (canonical, number, parent_task_id, depth). Parent imported before
+    // its children, so the `child_of` target always exists when wired.
+    let mut stack: Vec<(String, String, Option<String>, usize)> =
+        vec![(root_canonical.clone(), root_number, None, 0)];
+
+    while let Some((canonical, number, parent_id, depth)) = stack.pop() {
+        if !visited.insert(number.clone()) {
+            continue; // cycle guard
+        }
+
+        // Resolve the task id for this node: either the already-tracked one,
+        // or a freshly imported mirror. Used to parent its children.
+        let node_task_id = if let Some(existing) = svc
+            .tasks_repo
+            .find_by_remote(PROVIDER, &number)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+        {
+            results.push(serde_json::json!({
+                "remote_id": number, "ok": false, "reason": "already_tracked",
+                "task_id": existing.id.to_string(),
+            }));
+            existing.id.to_string()
+        } else {
+            let snap = provider
+                .fetch_remote(&canonical, &number)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            let dto = svc
+                .tasks
+                .import_mirror(ImportMirrorCmd {
+                    workspace_id: workspace.to_string(),
+                    repo_id: Some(repo_id.clone()),
+                    provider: PROVIDER.to_string(),
+                    remote_id: number.clone(),
+                    title: snap.title,
+                    body: snap.body,
+                    assignees: snap.assignees,
+                    closed: snap.closed,
+                })
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            if let Some(parent) = &parent_id {
+                svc.tasks
+                    .add_relation(AddTaskRelationCmd {
+                        task_id: dto.id.clone(),
+                        kind: "child_of".to_string(),
+                        other: parent.clone(),
+                    })
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            results.push(serde_json::json!({
+                "remote_id": number, "ok": true, "task_id": dto.id, "title": dto.title,
+            }));
+            dto.id
+        };
+
+        if cascade && depth < MAX_DEPTH {
+            let children = provider
+                .fetch_sub_issues(&canonical, &number)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            for child in children {
+                // The whole tree lives under the root binding; a child in a
+                // different repo can't be filed here, so skip + report it.
+                if child.canonical_repo != root_canonical {
+                    results.push(serde_json::json!({
+                        "remote_id": child.snapshot.remote_id, "ok": false,
+                        "reason": "skipped_cross_repo", "repo": child.canonical_repo,
+                    }));
+                    continue;
+                }
+                stack.push((
+                    root_canonical.clone(),
+                    child.snapshot.remote_id,
+                    Some(node_task_id.clone()),
+                    depth + 1,
+                ));
+            }
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".into())
+    );
     Ok(())
 }
 
@@ -1383,4 +1563,35 @@ async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_issue_url;
+
+    #[test]
+    fn parses_standard_issue_url() {
+        assert_eq!(
+            parse_issue_url("https://github.com/owner/repo/issues/123"),
+            Some(("github.com/owner/repo".to_string(), "123".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_with_trailing_slash_and_http() {
+        assert_eq!(
+            parse_issue_url("http://github.com/o/r/issues/7/"),
+            Some(("github.com/o/r".to_string(), "7".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_issue_and_malformed_urls() {
+        assert_eq!(parse_issue_url("not a url"), None);
+        assert_eq!(parse_issue_url("https://github.com/o/r"), None); // no /issues/N
+        assert_eq!(parse_issue_url("https://github.com/o/r/pull/1"), None); // PR, not issue
+        assert_eq!(parse_issue_url("https://gitlab.com/o/r/issues/1"), None); // wrong host
+        assert_eq!(parse_issue_url("https://github.com/o/r/issues/abc"), None); // non-numeric
+        assert_eq!(parse_issue_url("https://github.com/o/r/issues/1/extra"), None); // trailing
+    }
 }

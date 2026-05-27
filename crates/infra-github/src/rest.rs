@@ -11,8 +11,8 @@ use octocrab::Octocrab;
 use octocrab::models::IssueState;
 use octocrab::models::issues::{Issue, IssueStateReason};
 use ports::{
-    PortError, PortResult, RemoteStateReason, RemoteTaskCreate, RemoteTaskSnapshot,
-    RemoteTaskUpdate,
+    PortError, PortResult, RemoteChildIssue, RemoteStateReason, RemoteTaskCreate,
+    RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.github.com";
@@ -100,6 +100,33 @@ impl RestClient {
             .map_err(map_err)?;
         Ok(map_issue(issue))
     }
+
+    /// List the direct sub-issues of an issue. octocrab has no typed handler
+    /// for `/sub_issues`, so we hit it via the generic `get` and decode into
+    /// the typed `Issue` model. Each child carries its own canonical repo
+    /// (derived from `repository_url`) since sub-issues can live in another
+    /// repo. One level only — the caller recurses.
+    pub(crate) async fn fetch_sub_issues(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        let route = format!("/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=100");
+        let issues: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                let child_canonical = canonical_from_repository_url(issue.repository_url.as_str())
+                    .unwrap_or_else(|| canonical_repo.to_string());
+                RemoteChildIssue {
+                    canonical_repo: child_canonical,
+                    snapshot: map_issue(issue),
+                }
+            })
+            .collect())
+    }
 }
 
 // ---------- Mapping (octocrab models ↔ port types) ----------------------
@@ -139,6 +166,17 @@ pub(crate) fn split_owner_repo(canonical: &str) -> PortResult<(String, String)> 
         )));
     }
     Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Derive the canonical `github.com/<owner>/<repo>` form from a GitHub API
+/// `repository_url` (e.g. `https://api.github.com/repos/o/r`). Returns `None`
+/// for shapes that don't contain a `/repos/<owner>/<repo>` segment.
+fn canonical_from_repository_url(url: &str) -> Option<String> {
+    let rest = url.split("/repos/").nth(1)?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    Some(format!("github.com/{owner}/{repo}"))
 }
 
 fn parse_issue_number(remote_id: &str) -> PortResult<u64> {
@@ -182,6 +220,19 @@ mod tests {
             split_owner_repo("github.com/o/r").unwrap(),
             ("o".into(), "r".into())
         );
+    }
+
+    #[test]
+    fn canonical_from_repository_url_extracts_owner_repo() {
+        assert_eq!(
+            canonical_from_repository_url("https://api.github.com/repos/o/r").as_deref(),
+            Some("github.com/o/r")
+        );
+        assert_eq!(
+            canonical_from_repository_url("https://api.github.com/repos/acme/backend").as_deref(),
+            Some("github.com/acme/backend")
+        );
+        assert_eq!(canonical_from_repository_url("https://example.com/x"), None);
     }
 
     #[test]
