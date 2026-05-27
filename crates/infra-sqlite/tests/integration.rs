@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use domain_repo::RepoBinding;
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task, TaskComment};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
@@ -70,6 +70,47 @@ async fn unique_workspace_name_enforced_by_db() {
         msg.contains("unique") || msg.contains("conflict"),
         "got: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn task_comments_roundtrip_and_replace() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+    let t = Task::new_draft(w.id, None, "commented task".into()).unwrap();
+    ts.save(&t, SnapshotSource::Created).await.unwrap();
+
+    // Distinct created_at per comment so load order (chronological, like
+    // GitHub) is deterministic — `Timestamp::now()` for all three would
+    // collide at storage precision and fall back to the random surrogate id.
+    let base = chrono::Utc::now();
+    let mk = |id: &str, body: &str, secs: i64| TaskComment {
+        remote_id: Some(id.into()),
+        author: "octocat".into(),
+        body: body.into(),
+        created_at: domain_core::Timestamp::from_utc(base + chrono::Duration::seconds(secs)),
+    };
+
+    // First sync of two comments.
+    ts.replace_comments(t.id, &[mk("1", "first", 0), mk("2", "second", 1)])
+        .await
+        .unwrap();
+    let loaded = ts.get(t.id).await.unwrap();
+    assert_eq!(loaded.comments.len(), 2);
+    assert_eq!(loaded.comments[0].body, "first");
+    assert_eq!(loaded.comments[0].remote_id.as_deref(), Some("1"));
+
+    // Replacing the synced set with the latest remote view (now 3) reflects it
+    // without duplicating the originals.
+    ts.replace_comments(
+        t.id,
+        &[mk("1", "first", 0), mk("2", "second", 1), mk("3", "third", 2)],
+    )
+    .await
+    .unwrap();
+    let loaded = ts.get(t.id).await.unwrap();
+    assert_eq!(loaded.comments.len(), 3);
+    assert_eq!(loaded.comments[2].remote_id.as_deref(), Some("3"));
 }
 
 #[tokio::test]

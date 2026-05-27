@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
-use domain_task::{SnapshotSource, Task, TaskSnapshot};
+use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use domain_workspace::Workspace;
 use dto_events::EventEnvelope;
 use ports::{
@@ -198,6 +198,9 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
 pub struct InMemoryTaskRepository {
     inner: Mutex<HashMap<TaskId, Task>>,
     snapshots: Arc<Mutex<HashMap<TaskId, Vec<TaskSnapshot>>>>,
+    // Comments live in their own store (like the `task_comments` table), so
+    // `save` never clobbers them and reads overlay the current set.
+    comments: Mutex<HashMap<TaskId, Vec<TaskComment>>>,
 }
 
 impl InMemoryTaskRepository {
@@ -205,6 +208,7 @@ impl InMemoryTaskRepository {
         Self {
             inner: Mutex::new(HashMap::new()),
             snapshots: Arc::new(Mutex::new(HashMap::new())),
+            comments: Mutex::new(HashMap::new()),
         }
     }
 
@@ -255,6 +259,13 @@ impl TaskRepository for InMemoryTaskRepository {
         task.synced_baseline = snaps
             .get(&id)
             .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+        task.comments = self
+            .comments
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
         Ok(task)
     }
 
@@ -312,6 +323,13 @@ impl TaskRepository for InMemoryTaskRepository {
         task.synced_baseline = snaps
             .get(&task.id)
             .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+        task.comments = self
+            .comments
+            .lock()
+            .unwrap()
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(Some(task))
     }
 
@@ -339,7 +357,29 @@ impl TaskRepository for InMemoryTaskRepository {
         task.synced_baseline = snaps
             .get(&task.id)
             .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+        task.comments = self
+            .comments
+            .lock()
+            .unwrap()
+            .get(&task.id)
+            .cloned()
+            .unwrap_or_default();
         Ok(Some(task))
+    }
+
+    async fn replace_comments(
+        &self,
+        task_id: TaskId,
+        comments: &[TaskComment],
+    ) -> PortResult<()> {
+        let mut store = self.comments.lock().unwrap();
+        let entry = store.entry(task_id).or_default();
+        // Keep pending (local-only) comments; replace the synced set.
+        let mut next: Vec<TaskComment> =
+            entry.iter().filter(|c| c.remote_id.is_none()).cloned().collect();
+        next.extend(comments.iter().cloned());
+        *entry = next;
+        Ok(())
     }
 
     async fn delete(&self, id: TaskId) -> PortResult<()> {

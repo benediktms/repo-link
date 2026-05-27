@@ -11,7 +11,7 @@ use octocrab::Octocrab;
 use octocrab::models::IssueState;
 use octocrab::models::issues::{Issue, IssueStateReason};
 use ports::{
-    PortError, PortResult, RemoteChildIssue, RemoteStateReason, RemoteTaskCreate,
+    PortError, PortResult, RemoteChildIssue, RemoteComment, RemoteStateReason, RemoteTaskCreate,
     RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
@@ -153,6 +153,56 @@ impl RestClient {
                 }
             })
             .collect())
+    }
+
+    /// List an issue's comments, oldest first, paging through the typed
+    /// `list_comments` handler. Caps pages like `fetch_sub_issues` and
+    /// surfaces a cap-hit rather than silently truncating.
+    pub(crate) async fn fetch_comments(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteComment>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        const PER_PAGE: u8 = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut out: Vec<RemoteComment> = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let batch = self
+                .http
+                .issues(owner.as_str(), repo.as_str())
+                .list_comments(number)
+                .per_page(PER_PAGE)
+                .page(page)
+                .send()
+                .await
+                .map_err(map_err)?;
+            let full = batch.items.len() == PER_PAGE as usize;
+            for c in batch.items {
+                out.push(RemoteComment {
+                    remote_id: c.id.to_string(),
+                    author: c.user.login,
+                    body: c.body.unwrap_or_default(),
+                    created_at: Timestamp::from_utc(c.created_at),
+                });
+            }
+            if !full {
+                break;
+            }
+            if page == MAX_PAGES {
+                truncated = true;
+            }
+        }
+        if truncated {
+            return Err(PortError::Backend(format!(
+                "issue {number} in {canonical_repo} has more than {} comments; \
+                 refusing to mirror a truncated set",
+                MAX_PAGES as usize * PER_PAGE as usize
+            )));
+        }
+        Ok(out)
     }
 }
 

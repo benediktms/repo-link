@@ -18,8 +18,8 @@
 
 use async_trait::async_trait;
 use ports::{
-    PortResult, RemoteChildIssue, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
-    RemoteTaskUpdate,
+    PortResult, RemoteChildIssue, RemoteComment, RemoteTaskCreate, RemoteTaskProvider,
+    RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
 mod rest;
@@ -75,6 +75,14 @@ impl RemoteTaskProvider for GithubTaskProvider {
         remote_id: &str,
     ) -> PortResult<Vec<RemoteChildIssue>> {
         self.rest.fetch_sub_issues(canonical_repo, remote_id).await
+    }
+
+    async fn fetch_comments(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteComment>> {
+        self.rest.fetch_comments(canonical_repo, remote_id).await
     }
 }
 
@@ -239,6 +247,41 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    fn comment_payload(id: u64, login: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "node_id": "IC_kwDOAAAAAA",
+            "url": format!("https://api.github.com/repos/o/r/issues/comments/{id}"),
+            "html_url": format!("https://github.com/o/r/issues/1#issuecomment-{id}"),
+            "body": body,
+            "user": user(login),
+            "created_at": "2026-05-21T09:00:00Z",
+            "updated_at": "2026-05-21T09:00:00Z",
+            "author_association": "OWNER"
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_comments_maps_and_paginates() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                comment_payload(10, "alice", "first"),
+                comment_payload(11, "bob", "second"),
+            ]))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let comments = provider.fetch_comments("github.com/o/r", "1").await.unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].remote_id, "10");
+        assert_eq!(comments[0].author, "alice");
+        assert_eq!(comments[0].body, "first");
+        assert_eq!(comments[1].author, "bob");
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
-use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
+use domain_task::{SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot, TaskStatus};
 use domain_workspace::Workspace;
 use thiserror::Error;
 
@@ -119,6 +119,12 @@ pub trait TaskRepository: Send + Sync {
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>>;
+    /// Replace the task's *synced* comments (those with a remote id) with
+    /// `comments`, leaving any pending local-only comments untouched. Writes
+    /// only the `task_comments` table — never a snapshot — so mirroring
+    /// remote comments doesn't perturb the task's sync state.
+    async fn replace_comments(&self, task_id: TaskId, comments: &[TaskComment])
+    -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
@@ -199,6 +205,17 @@ pub struct RemoteChildIssue {
     pub snapshot: RemoteTaskSnapshot,
 }
 
+/// A comment fetched from a remote issue. Always carries a remote id (the
+/// provider assigns one on create); the local-only / pending case is
+/// represented by [`domain_task::TaskComment::remote_id`] being `None`.
+#[derive(Clone, Debug)]
+pub struct RemoteComment {
+    pub remote_id: String,
+    pub author: String,
+    pub body: String,
+    pub created_at: Timestamp,
+}
+
 #[async_trait]
 pub trait RemoteTaskProvider: Send + Sync {
     async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot>;
@@ -218,6 +235,16 @@ pub trait RemoteTaskProvider: Send + Sync {
         _canonical_repo: &str,
         _remote_id: &str,
     ) -> PortResult<Vec<RemoteChildIssue>> {
+        Ok(Vec::new())
+    }
+
+    /// List the comments on a remote task, oldest first. Providers without a
+    /// comment concept inherit the default empty result; GitHub overrides.
+    async fn fetch_comments(
+        &self,
+        _canonical_repo: &str,
+        _remote_id: &str,
+    ) -> PortResult<Vec<RemoteComment>> {
         Ok(Vec::new())
     }
 }
