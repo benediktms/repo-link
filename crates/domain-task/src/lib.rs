@@ -513,6 +513,28 @@ impl Task {
         }
     }
 
+    /// Reassign the owning repo binding. Permitted only while the task is
+    /// not yet remote-backed: once promoted, the remote issue lives in a
+    /// specific GitHub repo, so moving the local task to a different
+    /// binding would orphan that issue. Repo ownership is local metadata
+    /// (it selects the promote target), so — like `priority` — changing
+    /// it does NOT flip sync state.
+    pub fn set_repo_id(&mut self, repo_id: Option<RepoId>) -> Result<()> {
+        // Idempotent no-op: setting the same value is always fine, even on
+        // a remote-backed task — only an actual *change* is rejected.
+        if self.repo_id == repo_id {
+            return Ok(());
+        }
+        if self.remote.is_some() {
+            return Err(DomainError::validation(
+                "cannot reassign the repo of a task already synced to a remote issue",
+            ));
+        }
+        self.repo_id = repo_id;
+        self.touch();
+        Ok(())
+    }
+
     /// Body is mirrored to the remote issue, so editing it marks the task
     /// `DirtyLocal` (when remote-backed and currently `Synced`).
     pub fn set_body(&mut self, body: String) {
@@ -792,6 +814,53 @@ mod tests {
         t.set_priority(Priority::P0);
         // Priority isn't a remote field — no spurious DirtyLocal flip.
         assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn set_repo_id_assigns_when_not_remote_backed() {
+        let mut t = draft();
+        assert_eq!(t.repo_id, None);
+        let repo = RepoId::new();
+        t.set_repo_id(Some(repo)).unwrap();
+        assert_eq!(t.repo_id, Some(repo));
+        // Repo ownership selects the promote target; it's local metadata,
+        // so assigning it on a local-only task doesn't flip sync state.
+        assert_eq!(t.sync, SyncState::LocalOnly);
+    }
+
+    #[test]
+    fn set_repo_id_rejected_once_remote_backed() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        // The remote issue lives in a specific repo; reassigning would
+        // orphan it.
+        let err = t.set_repo_id(Some(RepoId::new())).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn set_repo_id_idempotent_no_op() {
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_repo_id(Some(repo)).unwrap();
+        let before = t.updated_at;
+        t.set_repo_id(Some(repo)).unwrap();
+        assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn set_repo_id_noop_allowed_even_when_remote_backed() {
+        // A no-op (same value) must succeed even after promotion — only an
+        // actual *change* of repo on a remote-backed task is rejected.
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_repo_id(Some(repo)).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        let before = t.updated_at;
+        t.set_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
+        assert_eq!(t.updated_at, before);
     }
 
     /// Mutating a `DirtyRemote` task is the textbook conflict case: remote

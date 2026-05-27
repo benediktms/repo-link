@@ -190,6 +190,12 @@ pub struct UpdateTaskCmd {
     pub body: Option<String>,
     pub priority: Option<String>,
     pub assignees: Option<Vec<String>>,
+    /// Reassign the owning repo binding (a repo UUID). `None` leaves the
+    /// current repo untouched. Only valid while the task is not yet
+    /// remote-backed — the service rejects reassigning a synced task.
+    /// There is no way to *clear* the repo via update (matches the
+    /// assignees gap).
+    pub repo_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

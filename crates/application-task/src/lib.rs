@@ -264,6 +264,9 @@ impl TaskService {
         if let Some(assignees) = cmd.assignees {
             t.set_assignees(assignees);
         }
+        if let Some(repo_id) = cmd.repo_id {
+            t.set_repo_id(Some(repo_id.parse::<RepoId>()?))?;
+        }
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         self.task_dto(&t).await
     }
@@ -480,6 +483,7 @@ mod tests {
                 body: None,
                 priority: Some("p0".into()),
                 assignees: Some(vec!["alice".into()]),
+                repo_id: None,
             })
             .await
             .unwrap();
@@ -758,6 +762,7 @@ mod tests {
             body: None,
             priority: None,
             assignees: None,
+            repo_id: None,
         })
         .await
         .unwrap();

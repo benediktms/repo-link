@@ -299,8 +299,8 @@ enum TaskCmd {
     },
     /// Edit a task in place. Writes a new snapshot at `version = max + 1`
     /// with `source = local_edit`; preserves the task's identity (UUID and
-    /// — once friendly IDs land — short prefix). At least one of `--title`,
-    /// `--body`, `--priority`, or `--assignee` must be supplied.
+    /// short prefix). At least one of `--title`, `--body`, `--priority`,
+    /// `--assignee`, or `--repo` must be supplied.
     Edit {
         id: String,
         #[arg(long)]
@@ -316,6 +316,13 @@ enum TaskCmd {
         /// (matches the spec).
         #[arg(long = "assignee")]
         assignees: Vec<String>,
+        /// Reassign the task's owning repo binding (a repo UUID). Use this
+        /// to attach a repo to a task created without one — required
+        /// before `sync promote`, which needs a repo to know which GitHub
+        /// repo to open the issue in. Only valid while the task is not yet
+        /// synced to a remote issue; reassigning a synced task is rejected.
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
     },
     List {
         #[arg(short = 'w', long)]
@@ -1187,14 +1194,20 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
             body,
             priority,
             assignees,
+            repo,
         } => {
             // Reject the empty case at the CLI boundary. The service layer
             // intentionally accepts a no-op UpdateTaskCmd (a future API
             // binding may want a touch-only refresh) — the `rl task edit`
             // command's contract is stricter.
-            if title.is_none() && body.is_none() && priority.is_none() && assignees.is_empty() {
+            if title.is_none()
+                && body.is_none()
+                && priority.is_none()
+                && assignees.is_empty()
+                && repo.is_none()
+            {
                 return Err(anyhow!(
-                    "rl task edit requires at least one of --title, --body, --priority, --assignee"
+                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo"
                 ));
             }
             // Collapse clap's accumulated Vec into the DTO's "None = no
@@ -1208,6 +1221,7 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
                     body,
                     priority,
                     assignees: (!assignees.is_empty()).then_some(assignees),
+                    repo_id: repo,
                 })
                 .await?;
             render::task(&dto);
