@@ -642,7 +642,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_task_accepts_uuid_hash_and_composite() {
+    async fn resolve_task_accepts_uuid_and_bare_hash() {
+        // No repo binding → composite collapses to the bare hash, so this
+        // covers the UUID and bare-hash branches. Composite resolution is
+        // covered separately in `resolve_task_round_trips_composite_*`.
         let svc = svc();
         let dto = svc
             .create(CreateTaskCmd {
@@ -654,7 +657,6 @@ mod tests {
             })
             .await
             .unwrap();
-        // No repo binding → composite collapses to the bare hash.
         let by_friendly = svc.resolve_task(&dto.id).await.unwrap();
         // Recover the internal UUID and confirm the UUID branch resolves
         // to the same task (this is the branch the CLI can't easily test
@@ -665,6 +667,66 @@ mod tests {
         // Bare hash also resolves to the same task.
         let by_hash = svc.resolve_task(&by_friendly.hash).await.unwrap();
         assert_eq!(by_hash.id, by_friendly.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_task_round_trips_composite_for_bound_task() {
+        use domain_repo::RepoBinding;
+        use ports::RepoBindingRepository;
+
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+
+        // Seed a binding with a known prefix so the created task's id is a
+        // real `prefix-hash` composite (not the bare-hash fallback).
+        let ws = WorkspaceId::new();
+        let mut binding = RepoBinding::new(
+            ws,
+            "git@github.com:o/widget.git".into(),
+            "github.com/o/widget".into(),
+        )
+        .unwrap();
+        binding.set_prefix("wid".into()).unwrap();
+        let repo_id = binding.id;
+        bindings.save(&binding).await.unwrap();
+
+        let svc = TaskService::new(repo, snaps, bindings);
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws.to_string(),
+                repo_id: Some(repo_id.to_string()),
+                title: "bound task".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+
+        let composite = dto.id.clone();
+        assert!(
+            composite.starts_with("wid-"),
+            "expected a wid- composite, got {composite:?}"
+        );
+        let hash = composite.split_once('-').unwrap().1.to_string();
+
+        // All three input forms resolve to the same task.
+        let by_composite = svc.resolve_task(&composite).await.unwrap();
+        let by_hash = svc.resolve_task(&hash).await.unwrap();
+        let by_uuid = svc
+            .resolve_task(&by_composite.id.to_string())
+            .await
+            .unwrap();
+        assert_eq!(by_composite.id, by_hash.id);
+        assert_eq!(by_hash.id, by_uuid.id);
+
+        // A composite naming the wrong prefix is a hard error.
+        let err = svc
+            .resolve_task(&format!("nope-{hash}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::PrefixMismatch { .. }));
     }
 
     #[tokio::test]
