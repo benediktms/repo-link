@@ -147,6 +147,16 @@ impl TaskService {
             None => (None, query),
         };
 
+        // Validate the hash shape before the lookup so a typo'd UUID,
+        // wrong-case input, or junk gets a clear "bad id" rather than a
+        // misleading "task hash not found". The bare-hash and composite
+        // paths both funnel through here.
+        if !domain_task::is_valid_hash(hash) {
+            return Err(ServiceError::BadId(format!(
+                "{query:?} is not a task UUID, bare hash, or prefix-hash composite"
+            )));
+        }
+
         let task = self
             .repo
             .find_by_hash(hash)

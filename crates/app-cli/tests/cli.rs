@@ -2070,6 +2070,64 @@ fn repo_set_prefix_changes_the_prefix_in_place() {
 }
 
 #[test]
+fn task_show_rejects_malformed_id_with_clear_error() {
+    let dir = TempDir::new().unwrap();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    // Uppercase is not valid base32 → should be a "bad id" style error,
+    // not a confusing "task hash not found".
+    let assert = bin("repo-link", &dir)
+        .args(["task", "show", "ZZZ"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("not a task UUID, bare hash, or prefix-hash composite"),
+        "expected bad-id message, got: {stderr}"
+    );
+}
+
+#[test]
+fn repo_set_prefix_conflict_is_friendly() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    // Attach two repos with explicit, distinct prefixes.
+    let a = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/a.git", "--canonical", "github.com/o/a",
+            "--no-link", "--prefix", "aaa",
+        ],
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo", "attach", "--workspace", &workspace,
+            "--url", "git@github.com:o/b.git", "--canonical", "github.com/o/b",
+            "--no-link", "--prefix", "bbb",
+        ],
+    );
+    let a_id = a["binding"]["id"].as_str().unwrap();
+    // Try to rename repo A's prefix to one already owned by repo B.
+    let assert = bin("repo-link", &dir)
+        .args(["repo", "set-prefix", "--repo", a_id, "--prefix", "bbb"])
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("already taken") && stderr.contains("bbb"),
+        "expected friendly prefix-taken error, got: {stderr}"
+    );
+}
+
+#[test]
 fn repo_attach_collision_breaks_with_numeric_suffix() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(

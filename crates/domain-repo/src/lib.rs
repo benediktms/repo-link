@@ -119,10 +119,13 @@ fn prefix_from_single_word(word: &str) -> String {
         result.push(c);
     }
     if result.len() < 3 {
+        // Pad from the remaining alphabetic chars (vowels included).
+        // Duplicates are acceptable here — a 3-char prefix from a short
+        // single word (e.g. "aa" → "aax") just needs to reach length 3;
+        // global uniqueness is enforced separately by the suffix-on-
+        // collision retry at the persistence layer.
         for c in word.chars().skip(1).filter(|c| c.is_ascii_alphabetic()) {
-            if !result.iter().any(|r| r.eq_ignore_ascii_case(&c)) || result.len() < 3 {
-                result.push(c);
-            }
+            result.push(c);
             if result.len() >= 3 {
                 break;
             }

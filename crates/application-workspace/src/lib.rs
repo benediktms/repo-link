@@ -27,6 +27,8 @@ pub enum ServiceError {
     BadId(String),
     #[error("binding not found: no match for '{0}'")]
     BindingNotFound(String),
+    #[error("prefix '{0}' is already taken by another binding — pick a different one")]
+    PrefixTaken(String),
     #[error("ambiguous handle '{query}': matched {count} bindings", count = candidates.len())]
     AmbiguousHandle {
         query: String,
@@ -166,10 +168,13 @@ impl RepoBindingService {
         });
 
         if explicit_prefix {
-            // Explicit prefix → surface conflicts unchanged so the user
-            // picks a different one rather than getting silent
-            // suffix-bumping (`myprefix` → `myprefix1`).
-            self.bindings.save(&binding).await?;
+            // Explicit prefix → surface conflicts as a human-readable
+            // "pick a different one" rather than silent suffix-bumping
+            // (`myprefix` → `myprefix1`) or a raw SQL error.
+            self.bindings
+                .save(&binding)
+                .await
+                .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
         } else {
             // Derived prefix → break collisions automatically.
             self.save_with_unique_prefix(&mut binding).await?;
@@ -296,7 +301,10 @@ impl RepoBindingService {
     ) -> Result<RepoBindingDto> {
         let mut binding = self.resolve(query).await?;
         binding.set_prefix(new_prefix)?;
-        self.bindings.save(&binding).await?;
+        self.bindings
+            .save(&binding)
+            .await
+            .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
         Ok(binding_to_dto(&binding))
     }
 
@@ -472,6 +480,20 @@ pub struct ReconcileSummary {
 }
 
 // ---------- Mapping (domain → DTO) ---------------------------------------
+
+/// Translate a `repos.prefix` UNIQUE violation into the friendly
+/// [`ServiceError::PrefixTaken`]; pass every other error through
+/// unchanged. Used on the explicit-prefix paths (`attach --prefix`
+/// and `set_prefix`) where we want the user to pick a different value
+/// rather than see a raw SQL message or get silent suffix-bumping.
+fn map_prefix_conflict(e: PortError, prefix: &str) -> ServiceError {
+    match e {
+        PortError::Conflict(msg) if msg.contains("repos.prefix") => {
+            ServiceError::PrefixTaken(prefix.to_string())
+        }
+        other => ServiceError::Port(other),
+    }
+}
 
 fn enum_str<T: serde::Serialize>(t: &T) -> String {
     serde_json::to_value(t)
