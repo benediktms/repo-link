@@ -137,8 +137,12 @@ impl RestClient {
         // MAX_PAGES * PER_PAGE). Probe one more lightweight page to tell an
         // exact boundary from genuine truncation.
         if cap_page_full {
-            let probe_route =
-                format!("/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=1&page={}", MAX_PAGES + 1);
+            // With per_page=1 a page number indexes a single item, so the first
+            // item past the capped window is page MAX_PAGES * PER_PAGE + 1.
+            let probe_page = MAX_PAGES as usize * PER_PAGE + 1;
+            let probe_route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=1&page={probe_page}"
+            );
             let probe: Vec<Issue> = self.http.get(probe_route, None::<&()>).await.map_err(map_err)?;
             if !probe.is_empty() {
                 return Err(PortError::Backend(format!(
@@ -210,7 +214,9 @@ impl RestClient {
                 .issues(owner.as_str(), repo.as_str())
                 .list_comments(number)
                 .per_page(1)
-                .page(MAX_PAGES + 1)
+                // per_page=1 indexes a single item per page, so the first item
+                // past the capped window is page MAX_PAGES * PER_PAGE + 1.
+                .page(MAX_PAGES * PER_PAGE as u32 + 1)
                 .send()
                 .await
                 .map_err(map_err)?
