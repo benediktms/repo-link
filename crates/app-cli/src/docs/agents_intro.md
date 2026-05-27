@@ -26,6 +26,8 @@ All commands emit JSON on stdout; pipe through `jq` for human-friendly views. Ru
 
 ## Working with `rl` as an agent
 
+**Before doing anything else in a session** — before reading the issue tracker, running `gh issue list`, scanning open PRs, or guessing from git history — run `rl query ready --workspace <id>` (or `rl query mine --workspace <id>`). The first entry is the next task. `rl` accounts for transitive blockers and local-only tasks the issue tracker cannot see, so it is **strictly more informative** than the GitHub view. This is a rule, not a suggestion. (Get `<id>` from the "This repo" block below; the detailed reference is under "Finding work".)
+
 The "This repo" block below names the workspace(s) this checkout belongs to. Use the `workspace_id` from there as `--workspace <id>` in every command. If the block says `status: unbound`, follow its hint to attach the repo before doing anything else.
 
 If you only know your `cwd` and need to recover workspace context mid-session, run:
@@ -96,6 +98,16 @@ rl task complete  <task-id>                  # mark done locally (then push if n
 ```
 
 Then re-run `rl query unsynced --workspace <id>` and confirm it returns an empty list. If it doesn't, the session isn't done — either push the remaining tasks or note them as deliberate carry-over for the next session.
+
+### Referencing tasks in pull requests
+
+When opening a pull request, the PR title, body, commit messages, and branch name may reference issues **only** by their GitHub URL or `#NNN` number.
+
+Do **not** paste an `rl` task UUID, the task's short prefix / friendly ID (`rpl-ev6`), a `task-id` of any form, a workspace UUID, or any other local-only identifier into a PR description, commit message, or branch name. Those identifiers are invisible to anyone reading the PR on GitHub and rot the moment the local DB is reset or the workspace is recreated.
+
+If a local-only task needs to be referenced from a PR, the correct flow is: `rl sync promote <task-id>` first (which creates the remote GitHub issue), then reference *that* issue (`#NNN`) in the PR. Never the reverse.
+
+The same rule applies to commit trailers, changelog entries, and any other artifact that lives in the git history.
 
 ### Useful filters and views
 
