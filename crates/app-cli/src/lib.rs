@@ -54,7 +54,7 @@ struct WorkspaceArg {
 
 #[derive(Args, Debug)]
 struct TaskArg {
-    /// Task UUID.
+    /// Task reference: UUID, bare hash, or `prefix-hash`.
     #[arg(short = 't', long)]
     task: String,
 }
@@ -1185,7 +1185,15 @@ where
 /// command instead of demanding a raw UUID.
 async fn resolve_repo_handle(svc: &Services, repo: Option<String>) -> Result<Option<String>> {
     match repo {
-        Some(handle) => Ok(Some(svc.bindings.show(&handle).await.map_err(|e| anyhow!("{e}"))?.id)),
+        // Mirror `repo show`: an ambiguous name/alias prints the candidate
+        // list and exits 2 rather than collapsing into a generic error.
+        Some(handle) => match svc.bindings.show(&handle).await {
+            Ok(dto) => Ok(Some(dto.id)),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates)
+            }
+            Err(e) => Err(anyhow!("{e}")),
+        },
         None => Ok(None),
     }
 }

@@ -75,9 +75,11 @@ impl RestClient {
             } else {
                 IssueState::Open
             });
-        }
-        if let Some(reason) = cmd.state_reason {
-            builder = builder.state_reason(map_state_reason(reason));
+            // `state_reason` only annotates a state transition, so it rides
+            // along with `state` — never on a title/body-only patch.
+            if let Some(reason) = cmd.state_reason {
+                builder = builder.state_reason(map_state_reason(reason));
+            }
         }
         let issue = builder.send().await.map_err(map_err)?;
         Ok(map_issue(issue))
