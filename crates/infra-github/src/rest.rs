@@ -113,8 +113,22 @@ impl RestClient {
     ) -> PortResult<Vec<RemoteChildIssue>> {
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
-        let route = format!("/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=100");
-        let issues: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+        // Page through until a short page (or the safety cap), so issues with
+        // more than one page of direct sub-issues aren't silently truncated.
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut issues: Vec<Issue> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
+            );
+            let batch: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+            let full = batch.len() == PER_PAGE;
+            issues.extend(batch);
+            if !full {
+                break;
+            }
+        }
         Ok(issues
             .into_iter()
             .map(|issue| {
