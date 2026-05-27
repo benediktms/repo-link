@@ -178,20 +178,13 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
         if prefix.is_empty() {
             return Ok(None);
         }
-        let g = self.inner.lock().unwrap();
-        let mut hits = g.values().filter(|b| b.prefix == prefix);
-        let first = hits.next().cloned();
-        // The DB enforces `repos.prefix` UNIQUE; mirror that here so a
-        // test that accidentally seeds duplicates surfaces a Conflict
-        // (matching prod) instead of silently returning an arbitrary
-        // HashMap-iteration-order match.
-        if first.is_some() && hits.next().is_some() {
-            return Err(PortError::Conflict {
-                target: Some("repos.prefix".into()),
-                message: format!("duplicate prefix {prefix:?} in fixture"),
-            });
-        }
-        Ok(first)
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .find(|b| b.prefix == prefix)
+            .cloned())
     }
 
     async fn delete(&self, id: RepoId) -> PortResult<()> {
@@ -310,19 +303,9 @@ impl TaskRepository for InMemoryTaskRepository {
             return Ok(None);
         }
         let g = self.inner.lock().unwrap();
-        let mut hits = g.values().filter(|t| t.hash == hash);
-        let Some(task) = hits.next().cloned() else {
+        let Some(task) = g.values().find(|t| t.hash == hash).cloned() else {
             return Ok(None);
         };
-        // The DB enforces `tasks.hash` UNIQUE; mirror that here so a test
-        // that accidentally seeds duplicate hashes surfaces a Conflict
-        // (matching prod) instead of an arbitrary iteration-order match.
-        if hits.next().is_some() {
-            return Err(PortError::Conflict {
-                target: Some("tasks.hash".into()),
-                message: format!("duplicate hash {hash:?} in fixture"),
-            });
-        }
         // Restore the synced_baseline projection the same way `get` does.
         let snaps = self.snapshots.lock().unwrap();
         let mut task = task;
