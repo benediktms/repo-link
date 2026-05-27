@@ -143,7 +143,10 @@ impl TaskRepository for SqliteTaskRepository {
                 "#,
             )
             .bind(t.id.to_string())
-            .bind(t.repo_id.map(|r| r.to_string()))
+            // Empty-string sentinel for a repo-less remote task — keeps the
+            // (repo_id, provider, remote_id) UNIQUE key well-defined (NULLs
+            // would dedupe as distinct).
+            .bind(t.repo_id.map(|r| r.to_string()).unwrap_or_default())
             .bind(&remote.provider)
             .bind(&remote.remote_id)
             .bind(t.updated_at.into_inner())
