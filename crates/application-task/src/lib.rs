@@ -101,7 +101,7 @@ impl TaskService {
     /// and the `other` end of every relation both follow the same
     /// composite-or-hash-or-UUID rule. Cost is 1 + N binding lookups
     /// for a task with N relations; acceptable at current scales.
-    async fn into_dto(&self, t: &Task) -> Result<TaskDto> {
+    async fn task_dto(&self, t: &Task) -> Result<TaskDto> {
         let prefix = self.prefix_for(t).await?;
         let mut dto = task_to_dto(t, prefix.as_deref());
         // Overlay composite display IDs onto the relation `other`
@@ -156,12 +156,12 @@ impl TaskService {
                 "{query:?} is not a task UUID, bare hash, or prefix-hash composite"
             )));
         }
-        if let Some(p) = input_prefix {
-            if !domain_repo::is_valid_prefix(p) {
-                return Err(ServiceError::BadId(format!(
-                    "{query:?} has a malformed repo prefix {p:?}"
-                )));
-            }
+        if let Some(p) = input_prefix
+            && !domain_repo::is_valid_prefix(p)
+        {
+            return Err(ServiceError::BadId(format!(
+                "{query:?} has a malformed repo prefix {p:?}"
+            )));
         }
 
         let task = self
@@ -207,7 +207,7 @@ impl TaskService {
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
         // `SnapshotSource::Created` for why this distinction matters.
         self.save_with_minted_hash(&mut t).await?;
-        self.into_dto(&t).await
+        self.task_dto(&t).await
     }
 
     /// Save a freshly-created task, retrying the hash on `tasks.hash`
@@ -247,7 +247,7 @@ impl TaskService {
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
         let t = self.resolve_task(id).await?;
-        self.into_dto(&t).await
+        self.task_dto(&t).await
     }
 
     pub async fn update(&self, cmd: UpdateTaskCmd) -> Result<TaskDto> {
@@ -265,7 +265,7 @@ impl TaskService {
             t.set_assignees(assignees);
         }
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        self.into_dto(&t).await
+        self.task_dto(&t).await
     }
 
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
@@ -298,7 +298,7 @@ impl TaskService {
         // ever shows up in profiles.
         let mut out = Vec::with_capacity(rows.len());
         for t in &rows {
-            out.push(self.into_dto(t).await?);
+            out.push(self.task_dto(t).await?);
         }
         Ok(out)
     }
@@ -342,7 +342,7 @@ impl TaskService {
         let other_task = self.resolve_task(&cmd.other).await?;
         t.add_relation(kind, other_task.id);
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        self.into_dto(&t).await
+        self.task_dto(&t).await
     }
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
@@ -357,7 +357,7 @@ impl TaskService {
         task.remote = snapshot.remote;
         task.reconcile_dirty_against_baseline();
         self.repo.save(&task, SnapshotSource::Rollback).await?;
-        self.into_dto(&task).await
+        self.task_dto(&task).await
     }
 
     async fn transition<F>(&self, query: &str, op: F) -> Result<TaskDto>
@@ -367,7 +367,7 @@ impl TaskService {
         let mut t = self.resolve_task(query).await?;
         op(&mut t)?;
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-        self.into_dto(&t).await
+        self.task_dto(&t).await
     }
 }
 
