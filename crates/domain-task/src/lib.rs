@@ -520,15 +520,18 @@ impl Task {
     /// (it selects the promote target), so — like `priority` — changing
     /// it does NOT flip sync state.
     pub fn set_repo_id(&mut self, repo_id: Option<RepoId>) -> Result<()> {
+        // Idempotent no-op: setting the same value is always fine, even on
+        // a remote-backed task — only an actual *change* is rejected.
+        if self.repo_id == repo_id {
+            return Ok(());
+        }
         if self.remote.is_some() {
             return Err(DomainError::validation(
                 "cannot reassign the repo of a task already synced to a remote issue",
             ));
         }
-        if self.repo_id != repo_id {
-            self.repo_id = repo_id;
-            self.touch();
-        }
+        self.repo_id = repo_id;
+        self.touch();
         Ok(())
     }
 
@@ -843,6 +846,20 @@ mod tests {
         t.set_repo_id(Some(repo)).unwrap();
         let before = t.updated_at;
         t.set_repo_id(Some(repo)).unwrap();
+        assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn set_repo_id_noop_allowed_even_when_remote_backed() {
+        // A no-op (same value) must succeed even after promotion — only an
+        // actual *change* of repo on a remote-backed task is rejected.
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_repo_id(Some(repo)).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        let before = t.updated_at;
+        t.set_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
         assert_eq!(t.updated_at, before);
     }
 
