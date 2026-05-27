@@ -1,39 +1,38 @@
 //! GitHub REST adapter internals.
 //!
-//! Everything in this module is REST-specific: the HTTP client, the JSON
-//! wire types, the URL parsing, the `state_reason` mapping. A future
+//! Everything in this module is REST-specific: the `octocrab` client, the
+//! issue-model mapping, the URL parsing, the `state_reason` mapping. A future
 //! `graphql` sibling will live next to this one (for Projects v2 mutations
 //! and other capabilities not on the REST surface); the top-level
 //! `GithubTaskProvider` in `lib.rs` will compose both.
 
-use chrono::{DateTime, Utc};
 use domain_core::Timestamp;
+use octocrab::Octocrab;
+use octocrab::models::IssueState;
+use octocrab::models::issues::{Issue, IssueStateReason};
 use ports::{
     PortError, PortResult, RemoteStateReason, RemoteTaskCreate, RemoteTaskSnapshot,
     RemoteTaskUpdate,
 };
-use reqwest::Client as HttpClient;
-use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.github.com";
-const USER_AGENT: &str = "repo-link";
 
-/// REST client. Stateless beyond the HTTP client + auth token; the actual
-/// `GithubTaskProvider` wraps this and dispatches the [`ports::RemoteTaskProvider`]
-/// methods through it.
+/// REST client. A thin wrapper around an `octocrab` instance bound to one
+/// token; the actual `GithubTaskProvider` wraps this and dispatches the
+/// [`ports::RemoteTaskProvider`] methods through it.
 pub(crate) struct RestClient {
-    http: HttpClient,
-    base_url: String,
-    token: String,
+    http: Octocrab,
 }
 
 impl RestClient {
-    pub(crate) fn new(token: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self {
-            http: HttpClient::new(),
-            base_url: base_url.into(),
-            token: token.into(),
-        }
+    pub(crate) fn new(token: impl Into<String>, base_url: impl Into<String>) -> PortResult<Self> {
+        let http = Octocrab::builder()
+            .personal_token(token.into())
+            .base_uri(base_url.into())
+            .map_err(|e| PortError::Backend(format!("github base_uri: {e}")))?
+            .build()
+            .map_err(|e| PortError::Backend(format!("github client build: {e}")))?;
+        Ok(Self { http })
     }
 
     pub(crate) async fn create_issue(
@@ -41,22 +40,17 @@ impl RestClient {
         cmd: RemoteTaskCreate<'_>,
     ) -> PortResult<RemoteTaskSnapshot> {
         let (owner, repo) = split_owner_repo(cmd.canonical_repo)?;
-        let body = CreateIssueBody {
-            title: cmd.title,
-            body: cmd.body,
-            assignees: cmd.assignees,
-            labels: cmd.labels,
-        };
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/repos/{owner}/{repo}/issues"),
-            )
-            .json(&body)
+        let issue = self
+            .http
+            .issues(owner, repo)
+            .create(cmd.title)
+            .body(cmd.body)
+            .assignees(cmd.assignees.to_vec())
+            .labels(cmd.labels.to_vec())
             .send()
             .await
-            .map_err(net)?;
-        decode_issue(resp).await
+            .map_err(map_err)?;
+        Ok(map_issue(issue))
     }
 
     pub(crate) async fn update_issue(
@@ -64,22 +58,31 @@ impl RestClient {
         cmd: RemoteTaskUpdate<'_>,
     ) -> PortResult<RemoteTaskSnapshot> {
         let (owner, repo) = split_owner_repo(cmd.canonical_repo)?;
-        let body = UpdateIssueBody {
-            title: cmd.title,
-            body: cmd.body,
-            state: cmd.closed.map(|c| if c { "closed" } else { "open" }),
-            state_reason: cmd.state_reason.map(state_reason_str),
-        };
-        let resp = self
-            .request(
-                reqwest::Method::PATCH,
-                &format!("/repos/{owner}/{repo}/issues/{}", cmd.remote_id),
-            )
-            .json(&body)
-            .send()
-            .await
-            .map_err(net)?;
-        decode_issue(resp).await
+        let number = parse_issue_number(cmd.remote_id)?;
+        let handler = self.http.issues(owner, repo);
+        // Builders consume `self`, so partial updates reassign as we go —
+        // each field is only set when the caller supplied it.
+        let mut builder = handler.update(number);
+        if let Some(title) = cmd.title {
+            builder = builder.title(title);
+        }
+        if let Some(body) = cmd.body {
+            builder = builder.body(body);
+        }
+        if let Some(closed) = cmd.closed {
+            builder = builder.state(if closed {
+                IssueState::Closed
+            } else {
+                IssueState::Open
+            });
+            // `state_reason` only annotates a state transition, so it rides
+            // along with `state` — never on a title/body-only patch.
+            if let Some(reason) = cmd.state_reason {
+                builder = builder.state_reason(map_state_reason(reason));
+            }
+        }
+        let issue = builder.send().await.map_err(map_err)?;
+        Ok(map_issue(issue))
     }
 
     pub(crate) async fn fetch_issue(
@@ -88,86 +91,40 @@ impl RestClient {
         remote_id: &str,
     ) -> PortResult<RemoteTaskSnapshot> {
         let (owner, repo) = split_owner_repo(canonical_repo)?;
-        let resp = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/repos/{owner}/{repo}/issues/{remote_id}"),
-            )
-            .send()
+        let number = parse_issue_number(remote_id)?;
+        let issue = self
+            .http
+            .issues(owner, repo)
+            .get(number)
             .await
-            .map_err(net)?;
-        decode_issue(resp).await
-    }
-
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http
-            .request(method, format!("{}{}", self.base_url, path))
-            .bearer_auth(&self.token)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
+            .map_err(map_err)?;
+        Ok(map_issue(issue))
     }
 }
 
-// ---------- Wire types (REST JSON shapes) --------------------------------
+// ---------- Mapping (octocrab models ↔ port types) ----------------------
 
-#[derive(Serialize)]
-struct CreateIssueBody<'a> {
-    title: &'a str,
-    body: &'a str,
-    assignees: &'a [String],
-    labels: &'a [String],
+fn map_issue(issue: Issue) -> RemoteTaskSnapshot {
+    RemoteTaskSnapshot {
+        remote_id: issue.number.to_string(),
+        title: issue.title,
+        body: issue.body.unwrap_or_default(),
+        closed: matches!(issue.state, IssueState::Closed),
+        updated_at: Timestamp::from_utc(issue.updated_at),
+        assignees: issue.assignees.into_iter().map(|u| u.login).collect(),
+        labels: issue.labels.into_iter().map(|l| l.name).collect(),
+    }
 }
 
-#[derive(Serialize)]
-struct UpdateIssueBody<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    body: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    state_reason: Option<&'static str>,
-}
-
-#[derive(Deserialize)]
-struct IssueResponse {
-    number: u64,
-    title: String,
-    #[serde(default)]
-    body: Option<String>,
-    state: String,
-    updated_at: DateTime<Utc>,
-    #[serde(default)]
-    assignees: Vec<UserRef>,
-    #[serde(default)]
-    labels: Vec<LabelRef>,
-}
-
-#[derive(Deserialize)]
-struct UserRef {
-    login: String,
-}
-
-#[derive(Deserialize)]
-struct LabelRef {
-    name: String,
-}
-
-// ---------- Mapping (provider-agnostic enums → REST strings) -------------
-
-/// REST-specific mapping from the typed [`RemoteStateReason`] to GitHub's
-/// `state_reason` wire format. Lives in this module because the strings
-/// (`"completed"`, `"not_planned"`, …) are REST-API-shaped; GraphQL uses a
-/// different enum vocabulary (`StateReason::COMPLETED` etc.) and will have
-/// its own mapping when that adapter lands.
-pub(crate) fn state_reason_str(reason: RemoteStateReason) -> &'static str {
+/// Map the provider-agnostic [`RemoteStateReason`] to octocrab's typed
+/// `IssueStateReason`. Lives here because it's REST-API-shaped; the GraphQL
+/// adapter uses a different enum vocabulary and will have its own mapping.
+fn map_state_reason(reason: RemoteStateReason) -> IssueStateReason {
     match reason {
-        RemoteStateReason::Completed => "completed",
-        RemoteStateReason::NotPlanned => "not_planned",
-        RemoteStateReason::Duplicate => "duplicate",
-        RemoteStateReason::Reopened => "reopened",
+        RemoteStateReason::Completed => IssueStateReason::Completed,
+        RemoteStateReason::NotPlanned => IssueStateReason::NotPlanned,
+        RemoteStateReason::Duplicate => IssueStateReason::Duplicate,
+        RemoteStateReason::Reopened => IssueStateReason::Reopened,
     }
 }
 
@@ -184,33 +141,31 @@ pub(crate) fn split_owner_repo(canonical: &str) -> PortResult<(String, String)> 
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-async fn decode_issue(resp: reqwest::Response) -> PortResult<RemoteTaskSnapshot> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(match status.as_u16() {
-            404 => PortError::NotFound(body),
-            409 | 422 => PortError::Conflict {
-                target: None,
-                message: body,
-            },
-            _ => PortError::Network(format!("github {status}: {body}")),
-        });
-    }
-    let issue: IssueResponse = resp.json().await.map_err(net)?;
-    Ok(RemoteTaskSnapshot {
-        remote_id: issue.number.to_string(),
-        title: issue.title,
-        body: issue.body.unwrap_or_default(),
-        closed: issue.state == "closed",
-        updated_at: Timestamp::from_utc(issue.updated_at),
-        assignees: issue.assignees.into_iter().map(|u| u.login).collect(),
-        labels: issue.labels.into_iter().map(|l| l.name).collect(),
-    })
+fn parse_issue_number(remote_id: &str) -> PortResult<u64> {
+    remote_id
+        .parse::<u64>()
+        .map_err(|_| PortError::Backend(format!("invalid github issue number: {remote_id}")))
 }
 
-fn net(e: reqwest::Error) -> PortError {
-    PortError::Network(e.to_string())
+/// Translate an `octocrab::Error` into a [`PortError`], preserving the
+/// status-code → variant mapping the application layer relies on. A GitHub
+/// API error carries an HTTP status; everything else (transport, decode) is
+/// a network-class failure.
+fn map_err(e: octocrab::Error) -> PortError {
+    match e {
+        octocrab::Error::GitHub { source, .. } => {
+            let message = source.message.clone();
+            match source.status_code.as_u16() {
+                404 => PortError::NotFound(message),
+                409 | 422 => PortError::Conflict {
+                    target: None,
+                    message,
+                },
+                code => PortError::Network(format!("github {code}: {message}")),
+            }
+        }
+        other => PortError::Network(other.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -230,13 +185,22 @@ mod tests {
     }
 
     #[test]
-    fn state_reason_strings_match_github_wire_format() {
-        assert_eq!(state_reason_str(RemoteStateReason::Completed), "completed");
-        assert_eq!(
-            state_reason_str(RemoteStateReason::NotPlanned),
-            "not_planned"
-        );
-        assert_eq!(state_reason_str(RemoteStateReason::Duplicate), "duplicate");
-        assert_eq!(state_reason_str(RemoteStateReason::Reopened), "reopened");
+    fn maps_state_reason_to_octocrab_enum() {
+        assert!(matches!(
+            map_state_reason(RemoteStateReason::Completed),
+            IssueStateReason::Completed
+        ));
+        assert!(matches!(
+            map_state_reason(RemoteStateReason::NotPlanned),
+            IssueStateReason::NotPlanned
+        ));
+        assert!(matches!(
+            map_state_reason(RemoteStateReason::Duplicate),
+            IssueStateReason::Duplicate
+        ));
+        assert!(matches!(
+            map_state_reason(RemoteStateReason::Reopened),
+            IssueStateReason::Reopened
+        ));
     }
 }

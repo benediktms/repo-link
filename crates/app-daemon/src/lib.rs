@@ -124,10 +124,14 @@ pub async fn run_cli() -> anyhow::Result<()> {
 
     let probe: Arc<dyn ports::FilesystemProbe> = Arc::new(TokioFilesystemProbe::new());
 
-    let sync = cfg.github_token.clone().map(|token| {
-        let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubTaskProvider::new(token));
-        SyncService::new(tasks_repo.clone(), bindings_repo, provider)
-    });
+    let sync = match cfg.github_token.clone() {
+        Some(token) => {
+            let provider: Arc<dyn ports::RemoteTaskProvider> =
+                Arc::new(GithubTaskProvider::new(token)?);
+            Some(SyncService::new(tasks_repo.clone(), bindings_repo, provider))
+        }
+        None => None,
+    };
 
     let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
         .with_prune(args.prune)
