@@ -127,19 +127,23 @@ impl TaskRepository for SqliteTaskRepository {
             .map_err(map_sqlx_err)?;
         }
 
-        // Mirror remote ref into the remote_mappings table for unique-index protection.
+        // Mirror remote ref into the remote_mappings table for unique-index
+        // protection. The unique key is (repo_id, provider, remote_id) since
+        // remote issue numbers are only unique within a repo.
         if let Some(remote) = &t.remote {
             sqlx::query(
                 r#"
-                INSERT INTO remote_mappings (task_id, provider, remote_id, last_synced_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id, last_synced_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
+                    repo_id = excluded.repo_id,
                     provider = excluded.provider,
                     remote_id = excluded.remote_id,
                     last_synced_at = excluded.last_synced_at
                 "#,
             )
             .bind(t.id.to_string())
+            .bind(t.repo_id.map(|r| r.to_string()))
             .bind(&remote.provider)
             .bind(&remote.remote_id)
             .bind(t.updated_at.into_inner())
