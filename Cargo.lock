@@ -198,6 +198,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "domain-core",
+ "domain-repo",
  "domain-task",
  "dto-shared",
  "ports",

@@ -43,7 +43,16 @@ pub fn map_sqlx_err(e: sqlx::Error) -> PortError {
     match &e {
         sqlx::Error::RowNotFound => PortError::NotFound("row not found".into()),
         sqlx::Error::Database(db) if db.is_unique_violation() => {
-            PortError::Conflict(db.message().to_string())
+            let message = db.message().to_string();
+            // SQLite reports unique violations as
+            // "UNIQUE constraint failed: <table>.<col>[, <table>.<col>…]".
+            // Lift the column list into a structured target so the
+            // application layer can match on it without re-parsing this
+            // adapter-specific wording.
+            let target = message
+                .split_once("UNIQUE constraint failed: ")
+                .map(|(_, cols)| cols.trim().to_string());
+            PortError::Conflict { target, message }
         }
         _ => PortError::Backend(e.to_string()),
     }

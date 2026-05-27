@@ -195,17 +195,22 @@ impl RepoBindingService {
     /// the spec is explicit that uniqueness is the index's job and a
     /// pre-check would race.
     async fn save_with_unique_prefix(&self, binding: &mut RepoBinding) -> Result<()> {
-        const MAX_SUFFIX: u32 = 99;
+        // No low ceiling: automatic collision-breaking must scale to any
+        // number of same-named repos (`rpe100` is just as valid as
+        // `rpe1`). The suffix is bounded by the 20-char prefix cap, and
+        // SAFETY_CAP only guards against a logic-bug infinite loop, not
+        // legitimate data.
+        const SAFETY_CAP: u32 = 1_000_000;
         let base = binding.prefix.clone();
         let mut suffix: u32 = 0;
         loop {
             match self.bindings.save(binding).await {
                 Ok(()) => return Ok(()),
-                Err(PortError::Conflict(msg)) if msg.contains("repos.prefix") => {
+                Err(e) if e.conflict_target() == Some("repos.prefix") => {
                     suffix += 1;
-                    if suffix > MAX_SUFFIX {
+                    if suffix > SAFETY_CAP {
                         return Err(ServiceError::Port(PortError::Backend(format!(
-                            "could not allocate unique repo prefix from base '{base}' after {MAX_SUFFIX} attempts"
+                            "could not allocate unique repo prefix from base '{base}' after {SAFETY_CAP} attempts"
                         ))));
                     }
                     let suffix_str = suffix.to_string();
@@ -487,11 +492,10 @@ pub struct ReconcileSummary {
 /// and `set_prefix`) where we want the user to pick a different value
 /// rather than see a raw SQL message or get silent suffix-bumping.
 fn map_prefix_conflict(e: PortError, prefix: &str) -> ServiceError {
-    match e {
-        PortError::Conflict(msg) if msg.contains("repos.prefix") => {
-            ServiceError::PrefixTaken(prefix.to_string())
-        }
-        other => ServiceError::Port(other),
+    if e.conflict_target() == Some("repos.prefix") {
+        ServiceError::PrefixTaken(prefix.to_string())
+    } else {
+        ServiceError::Port(e)
     }
 }
 

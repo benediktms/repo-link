@@ -147,14 +147,21 @@ impl TaskService {
             None => (None, query),
         };
 
-        // Validate the hash shape before the lookup so a typo'd UUID,
-        // wrong-case input, or junk gets a clear "bad id" rather than a
-        // misleading "task hash not found". The bare-hash and composite
-        // paths both funnel through here.
+        // Validate both halves' shapes before the lookup so junk like
+        // `A1-cde`, `ab--cde`, or wrong-case hashes get a clear "bad id"
+        // rather than a misleading PrefixMismatch / "task hash not
+        // found". The bare-hash and composite paths both funnel here.
         if !domain_task::is_valid_hash(hash) {
             return Err(ServiceError::BadId(format!(
                 "{query:?} is not a task UUID, bare hash, or prefix-hash composite"
             )));
+        }
+        if let Some(p) = input_prefix {
+            if !domain_repo::is_valid_prefix(p) {
+                return Err(ServiceError::BadId(format!(
+                    "{query:?} has a malformed repo prefix {p:?}"
+                )));
+            }
         }
 
         let task = self
@@ -220,7 +227,7 @@ impl TaskService {
             t.hash = domain_task::random_lowercase_base32(length);
             match self.repo.save(t, SnapshotSource::Created).await {
                 Ok(()) => return Ok(()),
-                Err(PortError::Conflict(msg)) if msg.contains("tasks.hash") => {
+                Err(e) if e.conflict_target() == Some("tasks.hash") => {
                     attempts += 1;
                     if attempts >= K_RETRIES_AT_LENGTH {
                         attempts = 0;

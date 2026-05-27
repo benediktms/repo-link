@@ -190,7 +190,10 @@ async fn decode_issue(resp: reqwest::Response) -> PortResult<RemoteTaskSnapshot>
         let body = resp.text().await.unwrap_or_default();
         return Err(match status.as_u16() {
             404 => PortError::NotFound(body),
-            409 | 422 => PortError::Conflict(body),
+            409 | 422 => PortError::Conflict {
+                target: None,
+                message: body,
+            },
             _ => PortError::Network(format!("github {status}: {body}")),
         });
     }

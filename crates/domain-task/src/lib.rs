@@ -45,17 +45,25 @@ pub fn is_valid_hash(s: &str) -> bool {
 /// the full `MIN_HASH_LEN..=MAX_HASH_LEN` range callers consume.
 pub fn random_lowercase_base32(length: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let bytes = uuid::Uuid::new_v4().into_bytes();
     let mut out = String::with_capacity(length);
     let mut acc: u64 = 0;
     let mut bits: u32 = 0;
-    for &b in &bytes {
-        acc = (acc << 8) | (b as u64);
-        bits += 8;
-        while bits >= 5 && out.len() < length {
-            bits -= 5;
-            let idx = ((acc >> bits) & 0b11111) as usize;
-            out.push(ALPHABET[idx] as char);
+    // One UUID yields 128 bits ≈ 25 base32 chars. Draw additional UUIDs
+    // as needed so the function always returns exactly `length` chars,
+    // even past 25 — otherwise it would silently underfill and break
+    // the length-growth collision strategy.
+    while out.len() < length {
+        for &b in uuid::Uuid::new_v4().as_bytes() {
+            acc = (acc << 8) | (b as u64);
+            bits += 8;
+            while bits >= 5 && out.len() < length {
+                bits -= 5;
+                let idx = ((acc >> bits) & 0b11111) as usize;
+                out.push(ALPHABET[idx] as char);
+            }
+            if out.len() >= length {
+                break;
+            }
         }
     }
     out
@@ -891,6 +899,15 @@ mod tests {
             let s = random_lowercase_base32(length);
             assert!(is_valid_hash(&s), "minted {s:?} failed is_valid_hash");
         }
+    }
+
+    #[test]
+    fn random_lowercase_base32_fills_past_single_uuid_entropy() {
+        // 30 > the ~25 chars a single UUID supplies — the function must
+        // draw more entropy rather than underfilling.
+        let s = random_lowercase_base32(30);
+        assert_eq!(s.chars().count(), 30);
+        assert!(s.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')));
     }
 
     #[test]
