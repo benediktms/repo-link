@@ -84,6 +84,17 @@ impl RemoteTaskProvider for GithubTaskProvider {
     ) -> PortResult<Vec<RemoteComment>> {
         self.rest.fetch_comments(canonical_repo, remote_id).await
     }
+
+    async fn create_comment(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+        body: &str,
+    ) -> PortResult<RemoteComment> {
+        self.rest
+            .create_comment(canonical_repo, remote_id, body)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +320,30 @@ mod tests {
         let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
         let comments = provider.fetch_comments("github.com/o/r", "1").await.unwrap();
         assert_eq!(comments.len(), 101); // 100 + 1 across two pages
+    }
+
+    #[tokio::test]
+    async fn create_comment_posts_and_maps_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .and(header("authorization", "Bearer t0k"))
+            .and(body_partial_json(serde_json::json!({"body": "looks good"})))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(comment_payload(42, "alice", "looks good")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let c = provider
+            .create_comment("github.com/o/r", "1", "looks good")
+            .await
+            .unwrap();
+        assert_eq!(c.remote_id, "42");
+        assert_eq!(c.author, "alice");
+        assert_eq!(c.body, "looks good");
     }
 
     #[tokio::test]

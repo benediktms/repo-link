@@ -73,6 +73,10 @@ pub struct UnsyncedTaskRow {
     pub task_id: String,
     pub title: String,
     pub sync_state: String,
+    /// Pending (local-only) outbound comments awaiting `sync push`. A task can
+    /// be `Synced` on the snapshot axis yet still appear here with a non-zero
+    /// count — comments are a separate outbound axis.
+    pub pending_comments: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,13 +415,22 @@ impl QueryService {
                 ..TaskFilter::default()
             })
             .await?;
+        // `list` skips comments, so fetch pending counts separately. A task is
+        // unsynced if its snapshot axis is dirty OR it owes outbound comments.
+        let pending = self.tasks.pending_comment_counts(id).await?;
         Ok(tasks
             .iter()
-            .filter(|t| is_unsynced(t.sync))
-            .map(|t| UnsyncedTaskRow {
-                task_id: t.id.to_string(),
-                title: t.title.clone(),
-                sync_state: enum_str(&t.sync),
+            .filter_map(|t| {
+                let pending_comments = pending.get(&t.id).copied().unwrap_or(0);
+                if !is_unsynced(t.sync) && pending_comments == 0 {
+                    return None;
+                }
+                Some(UnsyncedTaskRow {
+                    task_id: t.id.to_string(),
+                    title: t.title.clone(),
+                    sync_state: enum_str(&t.sync),
+                    pending_comments,
+                })
             })
             .collect())
     }
@@ -444,7 +457,7 @@ fn is_done_or_archived(status: TaskStatus) -> bool {
 mod tests {
     use super::*;
     use domain_repo::RepoBinding;
-    use domain_task::{SnapshotSource, Task};
+    use domain_task::{RemoteRef, SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use std::path::PathBuf;
     use testing_fixtures::{
@@ -500,6 +513,42 @@ mod tests {
         assert_eq!(ov.by_sync.get("local_only"), Some(&1));
         assert_eq!(ov.by_sync.get("staged"), Some(&1));
         assert_eq!(ov.unsynced_task_count, 2);
+    }
+
+    #[tokio::test]
+    async fn unsynced_surfaces_synced_task_with_pending_comment() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let workspace_id = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        // A fully-synced task: clean on the snapshot axis.
+        let mut t = Task::new_draft(workspace_id, None, "synced task".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "1".into(),
+        })
+        .unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        // No outbound work yet → absent from unsynced.
+        assert!(
+            svc.unsynced_tasks(&workspace_id.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A pending comment surfaces the task even though it stays `Synced`.
+        ts.add_pending_comment(t.id, "me", "ping", domain_core::Timestamp::now())
+            .await
+            .unwrap();
+        let rows = svc.unsynced_tasks(&workspace_id.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sync_state, "synced");
+        assert_eq!(rows[0].pending_comments, 1);
     }
 
     #[tokio::test]

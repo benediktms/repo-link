@@ -603,6 +603,15 @@ mod tests {
         async fn fetch_remote(&self, _: &str, _: &str) -> PortResult<RemoteTaskSnapshot> {
             Err(ports::PortError::NotFound("no fetch fixture".into()))
         }
+
+        async fn create_comment(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> PortResult<ports::RemoteComment> {
+            Err(ports::PortError::NotFound("no comment fixture".into()))
+        }
     }
 
     #[tokio::test]

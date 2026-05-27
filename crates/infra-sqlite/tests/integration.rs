@@ -114,6 +114,59 @@ async fn task_comments_roundtrip_and_replace() {
 }
 
 #[tokio::test]
+async fn pending_comments_add_and_drain_on_push() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+    let t = Task::new_draft(w.id, None, "commented task".into()).unwrap();
+    ts.save(&t, SnapshotSource::Created).await.unwrap();
+
+    let base = chrono::Utc::now();
+    let at = |secs: i64| domain_core::Timestamp::from_utc(base + chrono::Duration::seconds(secs));
+
+    // One already-synced comment plus a locally-authored pending one.
+    ts.replace_comments(
+        t.id,
+        &[RemoteComment {
+            remote_id: "1".into(),
+            author: "octocat".into(),
+            body: "synced".into(),
+            created_at: at(0),
+        }],
+    )
+    .await
+    .unwrap();
+    ts.add_pending_comment(t.id, "me", "pending body", at(1))
+        .await
+        .unwrap();
+
+    let loaded = ts.get(t.id).await.unwrap();
+    assert_eq!(loaded.comments.len(), 2);
+    let pending: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_none()).collect();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].body, "pending body");
+
+    // Draining promotes the pending comment to synced — no duplicates, the
+    // already-synced comment is untouched.
+    ts.mark_comments_pushed(
+        t.id,
+        &[RemoteComment {
+            remote_id: "99".into(),
+            author: "octocat".into(),
+            body: "pending body".into(),
+            created_at: at(1),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let loaded = ts.get(t.id).await.unwrap();
+    assert_eq!(loaded.comments.len(), 2);
+    assert!(loaded.comments.iter().all(|c| c.remote_id.is_some()));
+    assert_eq!(loaded.comments[1].remote_id.as_deref(), Some("99"));
+}
+
+#[tokio::test]
 async fn remote_mapping_is_repo_scoped() {
     let (_dir, ws, rb, ts) = setup().await;
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);

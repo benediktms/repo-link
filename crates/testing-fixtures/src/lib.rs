@@ -387,6 +387,66 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(())
     }
 
+    async fn add_pending_comment(
+        &self,
+        task_id: TaskId,
+        author: &str,
+        body: &str,
+        created_at: Timestamp,
+    ) -> PortResult<()> {
+        let mut store = self.comments.lock().unwrap();
+        store.entry(task_id).or_default().push(TaskComment {
+            remote_id: None,
+            author: author.to_string(),
+            body: body.to_string(),
+            created_at,
+        });
+        Ok(())
+    }
+
+    async fn mark_comments_pushed(
+        &self,
+        task_id: TaskId,
+        pushed: &[RemoteComment],
+    ) -> PortResult<()> {
+        let mut store = self.comments.lock().unwrap();
+        let entry = store.entry(task_id).or_default();
+        // Drop pending (local-only) comments; keep synced ones and append the
+        // freshly-pushed comments as synced.
+        let mut next: Vec<TaskComment> =
+            entry.iter().filter(|c| c.remote_id.is_some()).cloned().collect();
+        next.extend(pushed.iter().map(|c| TaskComment {
+            remote_id: Some(c.remote_id.clone()),
+            author: c.author.clone(),
+            body: c.body.clone(),
+            created_at: c.created_at,
+        }));
+        *entry = next;
+        Ok(())
+    }
+
+    async fn pending_comment_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<std::collections::HashMap<TaskId, usize>> {
+        let tasks = self.inner.lock().unwrap();
+        let comments = self.comments.lock().unwrap();
+        let mut out = std::collections::HashMap::new();
+        for (task_id, cs) in comments.iter() {
+            let in_ws = tasks
+                .get(task_id)
+                .is_some_and(|t| t.workspace_id == workspace_id);
+            if !in_ws {
+                continue;
+            }
+            let n = cs.iter().filter(|c| c.remote_id.is_none()).count();
+            if n > 0 {
+                out.insert(*task_id, n);
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())

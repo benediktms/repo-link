@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use domain_core::{IdParseError, RepoId, TaskId, WorkspaceId};
+use domain_core::{IdParseError, RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_task::{
     Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus,
 };
@@ -287,6 +287,25 @@ impl TaskService {
 
     pub async fn show(&self, id: &str) -> Result<TaskDto> {
         let t = self.resolve_task(id).await?;
+        self.task_dto(&t).await
+    }
+
+    /// Add a pending (local-only) comment to a task. Persists straight to the
+    /// comment store — never a snapshot — so it does not flip the task to
+    /// `DirtyLocal`. Pending comments are a separate outbound axis, drained by
+    /// `sync push`; `author` is provisional and overwritten by the remote
+    /// (GitHub) author once pushed.
+    pub async fn add_comment(&self, task_ref: &str, body: &str, author: &str) -> Result<TaskDto> {
+        if body.trim().is_empty() {
+            return Err(ServiceError::Domain(domain_core::DomainError::validation(
+                "comment body must not be empty",
+            )));
+        }
+        let id = self.resolve_task(task_ref).await?.id;
+        self.repo
+            .add_pending_comment(id, author, body, Timestamp::now())
+            .await?;
+        let t = self.repo.get(id).await?;
         self.task_dto(&t).await
     }
 

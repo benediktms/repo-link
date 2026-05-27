@@ -375,6 +375,12 @@ enum TaskCmd {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
+    /// Add a pending local comment to a task. Pushed to the remote issue on
+    /// the next `sync push` (a separate axis — does not dirty the task).
+    Comment {
+        id: String,
+        body: String,
+    },
     Relate {
         id: String,
         #[arg(long)]
@@ -1512,6 +1518,16 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
         }
         TaskCmd::Archive { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.archive(&id).await }).await?;
+        }
+        TaskCmd::Comment { id, body } => {
+            // Provisional local author (same precedence as `query mine`); the
+            // real author is filled in from GitHub when the comment is pushed.
+            let author = git_user_name()
+                .or_else(|| std::env::var("REPO_LINK_USER").ok())
+                .or_else(|| std::env::var("USER").ok())
+                .unwrap_or_else(|| "local".into());
+            let dto = svc.tasks.add_comment(&id, &body, &author).await?;
+            render::task(&dto);
         }
         TaskCmd::Relate { id, kind, other } => {
             let dto = svc

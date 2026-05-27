@@ -9,7 +9,7 @@
 use domain_core::Timestamp;
 use octocrab::Octocrab;
 use octocrab::models::IssueState;
-use octocrab::models::issues::{Issue, IssueStateReason};
+use octocrab::models::issues::{Comment, Issue, IssueStateReason};
 use ports::{
     PortError, PortResult, RemoteChildIssue, RemoteComment, RemoteStateReason, RemoteTaskCreate,
     RemoteTaskSnapshot, RemoteTaskUpdate,
@@ -190,14 +190,7 @@ impl RestClient {
                 .await
                 .map_err(map_err)?;
             let full = batch.items.len() == PER_PAGE as usize;
-            for c in batch.items {
-                out.push(RemoteComment {
-                    remote_id: c.id.to_string(),
-                    author: c.user.login,
-                    body: c.body.unwrap_or_default(),
-                    created_at: Timestamp::from_utc(c.created_at),
-                });
-            }
+            out.extend(batch.items.into_iter().map(map_comment));
             if !full {
                 break;
             }
@@ -231,9 +224,38 @@ impl RestClient {
         }
         Ok(out)
     }
+
+    /// Post a comment to a remote issue and return it with the id/author/
+    /// timestamp GitHub assigned, so the caller can promote a pending local
+    /// comment to synced.
+    pub(crate) async fn create_comment(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+        body: &str,
+    ) -> PortResult<RemoteComment> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        let c = self
+            .http
+            .issues(owner.as_str(), repo.as_str())
+            .create_comment(number, body)
+            .await
+            .map_err(map_err)?;
+        Ok(map_comment(c))
+    }
 }
 
 // ---------- Mapping (octocrab models ↔ port types) ----------------------
+
+fn map_comment(c: Comment) -> RemoteComment {
+    RemoteComment {
+        remote_id: c.id.to_string(),
+        author: c.user.login,
+        body: c.body.unwrap_or_default(),
+        created_at: Timestamp::from_utc(c.created_at),
+    }
+}
 
 fn map_issue(issue: Issue) -> RemoteTaskSnapshot {
     RemoteTaskSnapshot {

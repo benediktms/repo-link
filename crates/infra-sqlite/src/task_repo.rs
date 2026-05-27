@@ -296,6 +296,93 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn add_pending_comment(
+        &self,
+        task_id: TaskId,
+        author: &str,
+        body: &str,
+        created_at: Timestamp,
+    ) -> PortResult<()> {
+        // '' sentinel marks this as pending (no remote id yet). No snapshot.
+        sqlx::query(
+            "INSERT INTO task_comments (id, task_id, remote_comment_id, author, body, created_at) \
+             VALUES (?, ?, '', ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(task_id.to_string())
+        .bind(author)
+        .bind(body)
+        .bind(created_at.into_inner())
+        .execute(&self.db.writes)
+        .await
+        .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
+    async fn mark_comments_pushed(
+        &self,
+        task_id: TaskId,
+        pushed: &[RemoteComment],
+    ) -> PortResult<()> {
+        let mut tx = self
+            .db
+            .writes
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_err)?;
+        // Drain every pending row at once, then re-insert the pushed comments
+        // as synced — no per-row matching needed.
+        sqlx::query("DELETE FROM task_comments WHERE task_id = ? AND remote_comment_id = ''")
+            .bind(task_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        for c in pushed {
+            sqlx::query(
+                "INSERT INTO task_comments (id, task_id, remote_comment_id, author, body, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(task_id.to_string())
+            .bind(&c.remote_id)
+            .bind(&c.author)
+            .bind(&c.body)
+            .bind(c.created_at.into_inner())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
+    async fn pending_comment_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<std::collections::HashMap<TaskId, usize>> {
+        let rows = sqlx::query(
+            "SELECT c.task_id AS task_id, COUNT(*) AS n \
+             FROM task_comments c JOIN tasks t ON t.id = c.task_id \
+             WHERE t.workspace_id = ? AND c.remote_comment_id = '' \
+             GROUP BY c.task_id",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
+
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let task_id: String = row.try_get("task_id").map_err(map_sqlx_err)?;
+            let n: i64 = row.try_get("n").map_err(map_sqlx_err)?;
+            let task_id: TaskId = task_id
+                .parse()
+                .map_err(|e: domain_core::IdParseError| PortError::Backend(e.to_string()))?;
+            out.insert(task_id, n as usize);
+        }
+        Ok(out)
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())
