@@ -63,7 +63,12 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# octocrab 0.51 requires exactly one JWT crypto backend even when we never
+# mint App JWTs (PAT-only); `jwt-rust-crypto` is the pure-Rust, lightest one.
+octocrab = { version = "0.51", default-features = false, features = [
+    "rustls", "rustls-ring", "tracing", "retry", "stream", "timeout",
+    "follow-redirect", "default-client", "jwt-rust-crypto",
+] }
 gix = { version = "0.66", default-features = false, features = ["max-performance-safe"] }
 notify = "6"
 walkdir = "2"

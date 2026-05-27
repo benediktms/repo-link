@@ -285,7 +285,9 @@ enum TaskCmd {
     Create {
         #[command(flatten)]
         ws: WorkspaceArg,
-        #[arg(long)]
+        /// Owning repo binding, by UUID / prefix / name / alias (same forms
+        /// as `rl repo show`).
+        #[arg(short = 'r', long)]
         repo: Option<String>,
         #[arg(long)]
         title: String,
@@ -316,11 +318,12 @@ enum TaskCmd {
         /// (matches the spec).
         #[arg(long = "assignee")]
         assignees: Vec<String>,
-        /// Reassign the task's owning repo binding (a repo UUID). Use this
-        /// to attach a repo to a task created without one — required
-        /// before `sync promote`, which needs a repo to know which GitHub
-        /// repo to open the issue in. Only valid while the task is not yet
-        /// synced to a remote issue; reassigning a synced task is rejected.
+        /// Reassign the task's owning repo binding, by UUID / prefix / name /
+        /// alias (same forms as `rl repo show`). Use this to attach a repo to
+        /// a task created without one — required before `sync promote`, which
+        /// needs a repo to know which GitHub repo to open the issue in. Only
+        /// valid while the task is not yet synced to a remote issue;
+        /// reassigning a synced task is rejected.
         #[arg(short = 'r', long)]
         repo: Option<String>,
     },
@@ -585,12 +588,22 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
                 cfg.token_file_path.display()
             )
         })?;
-    let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubTaskProvider::new(token));
+    let provider: Arc<dyn ports::RemoteTaskProvider> =
+        Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
     let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
+    // Resolve the friendly task reference (UUID / bare hash / prefix-hash)
+    // to a UUID here, at the CLI boundary, so `sync` accepts the same id
+    // forms as every other task command. `SyncService` stays UUID-only.
     let summary = match cmd {
-        SyncCmd::Promote { t: TaskArg { task } } => sync.promote(&task).await?,
-        SyncCmd::Push { t: TaskArg { task } } => sync.push(&task).await?,
-        SyncCmd::Pull { t: TaskArg { task } } => sync.pull(&task).await?,
+        SyncCmd::Promote { t: TaskArg { task } } => {
+            sync.promote(&svc.tasks.resolve_id(&task).await?).await?
+        }
+        SyncCmd::Push { t: TaskArg { task } } => {
+            sync.push(&svc.tasks.resolve_id(&task).await?).await?
+        }
+        SyncCmd::Pull { t: TaskArg { task } } => {
+            sync.pull(&svc.tasks.resolve_id(&task).await?).await?
+        }
     };
     render::sync(&summary);
     Ok(())
@@ -1166,6 +1179,17 @@ where
     Ok(())
 }
 
+/// Resolve a `--repo` argument (UUID / prefix / name / alias) to a binding
+/// UUID, reusing the same resolver as `rl repo show`. `None` stays `None`.
+/// Keeps `task create`/`edit` consistent with every other repo-addressing
+/// command instead of demanding a raw UUID.
+async fn resolve_repo_handle(svc: &Services, repo: Option<String>) -> Result<Option<String>> {
+    match repo {
+        Some(handle) => Ok(Some(svc.bindings.show(&handle).await.map_err(|e| anyhow!("{e}"))?.id)),
+        None => Ok(None),
+    }
+}
+
 async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
     match cmd {
         TaskCmd::Create {
@@ -1179,7 +1203,7 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
                 .tasks
                 .create(CreateTaskCmd {
                     workspace_id: workspace,
-                    repo_id: repo,
+                    repo_id: resolve_repo_handle(svc, repo).await?,
                     title,
                     body,
                     priority,
@@ -1221,7 +1245,7 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
                     body,
                     priority,
                     assignees: (!assignees.is_empty()).then_some(assignees),
-                    repo_id: repo,
+                    repo_id: resolve_repo_handle(svc, repo).await?,
                 })
                 .await?;
             render::task(&dto);

@@ -190,6 +190,14 @@ impl TaskService {
         Ok(task)
     }
 
+    /// Resolve a friendly task reference (UUID, bare hash, or `prefix-hash`
+    /// composite) to its canonical UUID string. Lets callers that only need
+    /// the identity — e.g. the `sync` CLI handing a task to `SyncService`,
+    /// which is UUID-only — reuse the single resolver rather than re-parsing.
+    pub async fn resolve_id(&self, query: &str) -> Result<String> {
+        Ok(self.resolve_task(query).await?.id.to_string())
+    }
+
     pub async fn create(&self, cmd: CreateTaskCmd) -> Result<TaskDto> {
         let workspace_id: WorkspaceId = cmd.workspace_id.parse()?;
         let repo_id = cmd
@@ -671,6 +679,28 @@ mod tests {
         // Bare hash also resolves to the same task.
         let by_hash = svc.resolve_task(&by_friendly.hash).await.unwrap();
         assert_eq!(by_hash.id, by_friendly.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_id_returns_canonical_uuid() {
+        // `resolve_id` is the thin wrapper the `sync` CLI uses so a friendly
+        // reference round-trips to the canonical UUID `SyncService` expects.
+        let svc = svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "sync me".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        let uuid = svc.resolve_id(&dto.id).await.unwrap();
+        // The returned string is a parseable UUID and resolves back to the
+        // same task.
+        assert!(uuid.parse::<domain_core::TaskId>().is_ok());
+        assert_eq!(svc.resolve_task(&uuid).await.unwrap().hash, dto.id);
     }
 
     #[tokio::test]
