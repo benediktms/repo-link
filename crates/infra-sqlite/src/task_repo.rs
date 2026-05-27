@@ -5,7 +5,7 @@ use domain_task::{
     Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment, TaskRelation,
     TaskSnapshot, TaskStatus,
 };
-use ports::{PortError, PortResult, TaskFilter, TaskRepository};
+use ports::{PortError, PortResult, RemoteComment, TaskFilter, TaskRepository};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::Db;
@@ -262,7 +262,7 @@ impl TaskRepository for SqliteTaskRepository {
     async fn replace_comments(
         &self,
         task_id: TaskId,
-        comments: &[TaskComment],
+        comments: &[RemoteComment],
     ) -> PortResult<()> {
         let mut tx = self
             .db
@@ -284,7 +284,7 @@ impl TaskRepository for SqliteTaskRepository {
             )
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(task_id.to_string())
-            .bind(c.remote_id.clone().unwrap_or_default())
+            .bind(&c.remote_id)
             .bind(&c.author)
             .bind(&c.body)
             .bind(c.created_at.into_inner())

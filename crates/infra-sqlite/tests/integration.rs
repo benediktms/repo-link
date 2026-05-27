@@ -2,13 +2,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use domain_repo::RepoBinding;
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task, TaskComment};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
     backfill_empty_repo_names, open_from_path,
 };
-use ports::{RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
+use ports::{RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
 use tempfile::TempDir;
 
 /// Build a fresh DB inside a TempDir. Caller MUST keep the TempDir alive for
@@ -84,8 +84,8 @@ async fn task_comments_roundtrip_and_replace() {
     // GitHub) is deterministic — `Timestamp::now()` for all three would
     // collide at storage precision and fall back to the random surrogate id.
     let base = chrono::Utc::now();
-    let mk = |id: &str, body: &str, secs: i64| TaskComment {
-        remote_id: Some(id.into()),
+    let mk = |id: &str, body: &str, secs: i64| RemoteComment {
+        remote_id: id.into(),
         author: "octocat".into(),
         body: body.into(),
         created_at: domain_core::Timestamp::from_utc(base + chrono::Duration::seconds(secs)),

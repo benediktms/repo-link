@@ -118,7 +118,7 @@ impl RestClient {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: u32 = 50;
         let mut issues: Vec<Issue> = Vec::new();
-        let mut truncated = false;
+        let mut cap_page_full = false;
         for page in 1..=MAX_PAGES {
             let route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
@@ -130,17 +130,23 @@ impl RestClient {
                 break;
             }
             if page == MAX_PAGES {
-                // Still a full page at the cap — more remain. Refuse rather
-                // than silently returning a truncated tree with no signal.
-                truncated = true;
+                cap_page_full = true;
             }
         }
-        if truncated {
-            return Err(PortError::Backend(format!(
-                "issue {number} in {canonical_repo} has more than {} sub-issues; \
-                 refusing to import a truncated tree",
-                MAX_PAGES as usize * PER_PAGE
-            )));
+        // A full final page isn't proof of overflow (could be exactly
+        // MAX_PAGES * PER_PAGE). Probe one more lightweight page to tell an
+        // exact boundary from genuine truncation.
+        if cap_page_full {
+            let probe_route =
+                format!("/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=1&page={}", MAX_PAGES + 1);
+            let probe: Vec<Issue> = self.http.get(probe_route, None::<&()>).await.map_err(map_err)?;
+            if !probe.is_empty() {
+                return Err(PortError::Backend(format!(
+                    "issue {number} in {canonical_repo} has more than {} sub-issues; \
+                     refusing to import a truncated tree",
+                    MAX_PAGES as usize * PER_PAGE
+                )));
+            }
         }
         Ok(issues
             .into_iter()
@@ -168,7 +174,7 @@ impl RestClient {
         const PER_PAGE: u8 = 100;
         const MAX_PAGES: u32 = 50;
         let mut out: Vec<RemoteComment> = Vec::new();
-        let mut truncated = false;
+        let mut cap_page_full = false;
         for page in 1..=MAX_PAGES {
             let batch = self
                 .http
@@ -192,10 +198,25 @@ impl RestClient {
                 break;
             }
             if page == MAX_PAGES {
-                truncated = true;
+                cap_page_full = true;
             }
         }
-        if truncated {
+        // A full final page isn't proof of overflow (it could be exactly
+        // MAX_PAGES * PER_PAGE). Probe one more lightweight page to tell an
+        // exact boundary from genuine truncation.
+        if cap_page_full
+            && !self
+                .http
+                .issues(owner.as_str(), repo.as_str())
+                .list_comments(number)
+                .per_page(1)
+                .page(MAX_PAGES + 1)
+                .send()
+                .await
+                .map_err(map_err)?
+                .items
+                .is_empty()
+        {
             return Err(PortError::Backend(format!(
                 "issue {number} in {canonical_repo} has more than {} comments; \
                  refusing to mirror a truncated set",

@@ -5,7 +5,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
-use domain_task::{SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot, TaskStatus};
+use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
 use domain_workspace::Workspace;
 use thiserror::Error;
 
@@ -119,12 +119,16 @@ pub trait TaskRepository: Send + Sync {
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>>;
-    /// Replace the task's *synced* comments (those with a remote id) with
-    /// `comments`, leaving any pending local-only comments untouched. Writes
-    /// only the `task_comments` table — never a snapshot — so mirroring
-    /// remote comments doesn't perturb the task's sync state.
-    async fn replace_comments(&self, task_id: TaskId, comments: &[TaskComment])
-    -> PortResult<()>;
+    /// Replace the task's *synced* comments with `comments` (always
+    /// remote-backed — taking [`RemoteComment`] rather than `TaskComment`
+    /// makes pending input unrepresentable), leaving any pending local-only
+    /// comments untouched. Writes only the `task_comments` table — never a
+    /// snapshot — so mirroring remote comments doesn't perturb sync state.
+    async fn replace_comments(
+        &self,
+        task_id: TaskId,
+        comments: &[RemoteComment],
+    ) -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 

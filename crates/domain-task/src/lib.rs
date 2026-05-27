@@ -764,20 +764,30 @@ mod tests {
     }
 
     #[test]
-    fn tasks_start_with_no_comments_and_comments_are_not_snapshotted() {
+    fn comments_do_not_dirty_a_synced_task() {
         let mut t = draft();
         assert!(t.comments.is_empty());
-        // Comments live outside the snapshot projection, so adding one never
-        // perturbs dirty detection (TaskSnapshot carries no comment data).
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        // Mirroring a comment must not perturb sync state: comments are
+        // excluded from the snapshot baseline, so a subsequent reconcile
+        // (here via a no-op body set) leaves the task Synced, not DirtyLocal.
         t.comments.push(TaskComment {
             remote_id: Some("7".into()),
             author: "octocat".into(),
             body: "looks good".into(),
             created_at: Timestamp::now(),
         });
-        let snap = t.snapshot_view(SnapshotSource::Pull);
-        assert_eq!(snap.title, t.title);
-        // (TaskSnapshot has no `comments` field — exclusion is structural.)
+        let body = t.body.clone();
+        t.set_body(body);
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "comment activity must not dirty a synced task"
+        );
+        assert_eq!(t.comments.len(), 1);
     }
 
     #[test]

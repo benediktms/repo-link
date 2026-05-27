@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use domain_core::{IdParseError, TaskId};
 use domain_sync::{SyncDecision, SyncPolicy, decide};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskComment, TaskStatus};
+use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{RemoteRefDto, SyncSummaryDto};
 use ports::{
     PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate,
@@ -211,19 +211,10 @@ impl SyncService {
         // comment activity is orthogonal to title/body drift, and
         // `replace_comments` writes no snapshot, so this can't cause the
         // cosmetic-refresh churn the field-level pull guards against.
-        let remote_comments = self
+        let comments = self
             .provider
             .fetch_comments(&canonical, &remote.remote_id)
             .await?;
-        let comments: Vec<TaskComment> = remote_comments
-            .into_iter()
-            .map(|c| TaskComment {
-                remote_id: Some(c.remote_id),
-                author: c.author,
-                body: c.body,
-                created_at: c.created_at,
-            })
-            .collect();
         self.tasks.replace_comments(id, &comments).await?;
 
         Ok(summary(&task, prev, decision))

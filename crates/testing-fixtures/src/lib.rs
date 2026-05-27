@@ -23,8 +23,8 @@ use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use domain_workspace::Workspace;
 use dto_events::EventEnvelope;
 use ports::{
-    Clock, EventSink, FilesystemProbe, PortError, PortResult, RepoBindingRepository, TaskFilter,
-    TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
+    Clock, EventSink, FilesystemProbe, PortError, PortResult, RemoteComment, RepoBindingRepository,
+    TaskFilter, TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
 };
 
 // ---------- Clock --------------------------------------------------------
@@ -370,14 +370,19 @@ impl TaskRepository for InMemoryTaskRepository {
     async fn replace_comments(
         &self,
         task_id: TaskId,
-        comments: &[TaskComment],
+        comments: &[RemoteComment],
     ) -> PortResult<()> {
         let mut store = self.comments.lock().unwrap();
         let entry = store.entry(task_id).or_default();
         // Keep pending (local-only) comments; replace the synced set.
         let mut next: Vec<TaskComment> =
             entry.iter().filter(|c| c.remote_id.is_none()).cloned().collect();
-        next.extend(comments.iter().cloned());
+        next.extend(comments.iter().map(|c| TaskComment {
+            remote_id: Some(c.remote_id.clone()),
+            author: c.author.clone(),
+            body: c.body.clone(),
+            created_at: c.created_at,
+        }));
         *entry = next;
         Ok(())
     }
