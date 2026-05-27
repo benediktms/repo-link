@@ -73,6 +73,53 @@ async fn unique_workspace_name_enforced_by_db() {
 }
 
 #[tokio::test]
+async fn remote_mapping_is_repo_scoped() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Two bindings in the same workspace.
+    let repo_a =
+        RepoBinding::new(w.id, "git@github.com:o/a.git".into(), "github.com/o/a".into()).unwrap();
+    let repo_b =
+        RepoBinding::new(w.id, "git@github.com:o/b.git".into(), "github.com/o/b".into()).unwrap();
+    rb.save(&repo_a).await.unwrap();
+    rb.save(&repo_b).await.unwrap();
+
+    // A task in `repo` mirroring github issue `num`.
+    let mk = |repo_id, num: &str| {
+        let mut t = Task::new_draft(w.id, Some(repo_id), format!("issue {num}")).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: num.into(),
+        })
+        .unwrap();
+        t
+    };
+
+    // Same issue number (#1) in two different repos must both persist —
+    // remote identity is repo-scoped, so they don't collide.
+    ts.save(&mk(repo_a.id, "1"), SnapshotSource::Promote)
+        .await
+        .unwrap();
+    ts.save(&mk(repo_b.id, "1"), SnapshotSource::Promote)
+        .await
+        .expect("repoB#1 must not collide with repoA#1");
+
+    // But the same (repo, provider, remote_id) still conflicts.
+    let err = ts
+        .save(&mk(repo_a.id, "1"), SnapshotSource::Promote)
+        .await
+        .expect_err("duplicate remote in the same repo should conflict");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("conflict"),
+        "got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn repo_with_worktrees_roundtrip() {
     let (_dir, ws, rb, _ts) = setup().await;
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
