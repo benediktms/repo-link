@@ -89,8 +89,8 @@ impl TaskRepository for SqliteTaskRepository {
         // (task_snapshots.task_id → tasks.id) is satisfied.
         sqlx::query(
             r#"
-            INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, source, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             "#,
         )
         .bind(t.id.to_string())
@@ -103,6 +103,7 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+        .bind(t.repo_id.map(|r| r.to_string()))
         .bind(enum_to_str(&source)?)
         .bind(Timestamp::now().into_inner())
         .execute(&mut *tx)
@@ -507,7 +508,8 @@ async fn load_latest_baseline(
     let row = sqlx::query(
         r#"
         SELECT version, title, body, status, sync_state, priority,
-               assignees_json, remote_provider, remote_id, source, captured_at
+               assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded,
+               source, captured_at
         FROM task_snapshots
         WHERE task_id = ?
           -- `link` is baseline-eligible only on the verified-relink path
@@ -539,6 +541,8 @@ async fn load_latest_baseline(
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let repo_id_raw: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
+    let repo_id_recorded_raw: i64 = row.try_get("repo_id_recorded").map_err(map_sqlx_err)?;
     let source: String = row.try_get("source").map_err(map_sqlx_err)?;
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
@@ -549,6 +553,11 @@ async fn load_latest_baseline(
         }),
         _ => None,
     };
+    let repo_id = repo_id_raw
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<RepoId>())
+        .transpose()
+        .map_err(|e: domain_core::IdParseError| PortError::Backend(e.to_string()))?;
 
     Ok(Some(TaskSnapshot {
         task_id,
@@ -560,6 +569,8 @@ async fn load_latest_baseline(
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
+        repo_id,
+        repo_id_recorded: repo_id_recorded_raw != 0,
         source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
         captured_at: Timestamp::from_utc(captured_at),
     }))

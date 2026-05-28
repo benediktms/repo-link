@@ -309,7 +309,7 @@ impl SyncService {
         if already_pointing
             && self.canonical_for(&task).await.ok().as_deref() == Some(new_canonical)
         {
-            return Ok(link_summary(&task, prev, "noop"));
+            return Ok(link_summary(&task, prev, "noop", None));
         }
 
         // Binding precondition: the target repo must already be attached to
@@ -390,12 +390,30 @@ impl SyncService {
             // the new set both drops stale comments and inserts the new ones.
             self.tasks.save(&task, SnapshotSource::Link).await?;
             self.tasks.replace_comments(id, &new_comments).await?;
-        } else {
-            // Validate the new remote exists before mutating local state.
-            let _ = self
-                .provider
-                .fetch_remote(new_canonical, new_remote_id)
-                .await?;
+        }
+        let mut note: Option<String> = None;
+        if !relink {
+            // Validate the new remote exists. `fetch_remote` post-checks the
+            // followed-redirect response, so a transferred-issue source URL
+            // surfaces as `IssueMoved`. For bare link that is *not* an error
+            // — the user knowingly wants the source-side pointer, even
+            // though the live issue is elsewhere. Capture the destination
+            // in a note so the CLI can surface it.
+            match self.provider.fetch_remote(new_canonical, new_remote_id).await {
+                Ok(_) => {}
+                Err(PortError::IssueMoved {
+                    to_canonical,
+                    to_remote_id,
+                    ..
+                }) => {
+                    note = Some(format!(
+                        "github.com/{}#{new_remote_id} 301-redirects to {to_canonical}#{to_remote_id}; \
+                         linked source URL as requested",
+                        new_canonical.trim_start_matches("github.com/")
+                    ));
+                }
+                Err(e) => return Err(SyncError::Port(e)),
+            }
             task.link_to_remote(binding.id, new_remote.clone(), true)?;
             // Same ordering as the relink branch: commit the link first; then
             // clear synced comments (pending preserved by contract). If the
@@ -405,7 +423,7 @@ impl SyncService {
             self.tasks.replace_comments(id, &[]).await?;
         }
 
-        Ok(link_summary(&task, prev, if relink { "relinked" } else { "linked" }))
+        Ok(link_summary(&task, prev, if relink { "relinked" } else { "linked" }, note))
     }
 
     async fn canonical_for(&self, task: &Task) -> Result<String> {
@@ -439,7 +457,12 @@ fn remote_mirrors_baseline(snap: &RemoteTaskSnapshot, baseline: &TaskSnapshot) -
         && assignees_equal(&snap.assignees, &baseline.assignees)
 }
 
-fn link_summary(task: &Task, prev: SyncState, decision: &str) -> SyncSummaryDto {
+fn link_summary(
+    task: &Task,
+    prev: SyncState,
+    decision: &str,
+    note: Option<String>,
+) -> SyncSummaryDto {
     SyncSummaryDto {
         task_id: task.id.to_string(),
         previous_state: enum_str(&prev),
@@ -449,6 +472,7 @@ fn link_summary(task: &Task, prev: SyncState, decision: &str) -> SyncSummaryDto 
             provider: r.provider.clone(),
             remote_id: r.remote_id.clone(),
         }),
+        note,
     }
 }
 
@@ -462,6 +486,7 @@ fn summary(task: &Task, prev: SyncState, decision: SyncDecision) -> SyncSummaryD
             provider: r.provider.clone(),
             remote_id: r.remote_id.clone(),
         }),
+        note: None,
     }
 }
 
@@ -508,6 +533,7 @@ mod tests {
         comments: Mutex<Vec<RemoteComment>>,
         created_comments: Mutex<Vec<String>>,
         move_target: Mutex<Option<(String, String)>>,
+        fetch_moved: Mutex<Option<(String, String)>>,
     }
 
     impl FakeProvider {
@@ -521,6 +547,13 @@ mod tests {
 
         fn set_move_target(&self, canonical: &str, remote_id: &str) {
             *self.move_target.lock().unwrap() = Some((canonical.into(), remote_id.into()));
+        }
+
+        /// Make the *next* `fetch_remote` call return `IssueMoved` with the
+        /// supplied target — simulates a source-side URL that 301-redirects.
+        fn set_fetch_moved(&self, to_canonical: &str, to_remote_id: &str) {
+            *self.fetch_moved.lock().unwrap() =
+                Some((to_canonical.into(), to_remote_id.into()));
         }
     }
 
@@ -557,7 +590,21 @@ mod tests {
             })
         }
 
-        async fn fetch_remote(&self, _: &str, _: &str) -> PortResult<RemoteTaskSnapshot> {
+        async fn fetch_remote(
+            &self,
+            canonical: &str,
+            remote_id: &str,
+        ) -> PortResult<RemoteTaskSnapshot> {
+            // `take()` so the staged "moved" response is one-shot — the next
+            // fetch_remote after this falls through to fetch_returns.
+            if let Some((to_c, to_r)) = self.fetch_moved.lock().unwrap().take() {
+                return Err(PortError::IssueMoved {
+                    from_canonical: canonical.to_string(),
+                    from_remote_id: remote_id.to_string(),
+                    to_canonical: to_c,
+                    to_remote_id: to_r,
+                });
+            }
             self.fetch_returns
                 .lock()
                 .unwrap()
@@ -1092,5 +1139,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::Domain(_)));
+    }
+
+    #[tokio::test]
+    async fn link_bare_to_source_side_url_succeeds_with_note() {
+        // The user-supplied URL 301-redirects (it's the *source* side of a
+        // GitHub transfer). Bare `task link` should accept it — the user
+        // wants the source-side pointer, even though the live issue is
+        // elsewhere — and emit a note naming the redirect target.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // `fetch_remote(o/r#5788)` will report the issue moved to o2/r2#1506.
+        provider.set_fetch_moved("github.com/o2/r2", "1506");
+
+        let s = svc
+            .link(&task.id.to_string(), "github.com/o/r", "5788", false)
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "linked");
+        assert_eq!(s.new_state, "conflict");
+        let note = s.note.expect("note must be set when source URL 301s");
+        assert!(note.contains("5788"), "note names the source: {note}");
+        assert!(note.contains("1506"), "note names the destination: {note}");
+
+        // Task's remote points at the SOURCE URL as requested.
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.remote.as_ref().unwrap().remote_id, "5788");
     }
 }

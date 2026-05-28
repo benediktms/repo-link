@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use domain_core::{TaskId, Timestamp};
+use domain_core::{RepoId, TaskId, Timestamp};
 use domain_task::{Priority, RemoteRef, SnapshotSource, SyncState, TaskSnapshot, TaskStatus};
 use ports::{PortError, PortResult, TaskSnapshotRepository};
 use sqlx::Row;
@@ -59,6 +59,8 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let repo_id_raw: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
+    let repo_id_recorded_raw: i64 = row.try_get("repo_id_recorded").map_err(map_sqlx_err)?;
     let source: String = row.try_get("source").map_err(map_sqlx_err)?;
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
@@ -71,6 +73,11 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         }),
         _ => None,
     };
+    let repo_id = repo_id_raw
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<RepoId>())
+        .transpose()
+        .map_err(|e: domain_core::IdParseError| PortError::Backend(e.to_string()))?;
 
     let version_u64 = u64::try_from(version)
         .map_err(|e| PortError::Backend(format!("snapshot version overflow: {e}")))?;
@@ -85,6 +92,8 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
+        repo_id,
+        repo_id_recorded: repo_id_recorded_raw != 0,
         source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
         captured_at: Timestamp::from_utc(captured_at),
     })
