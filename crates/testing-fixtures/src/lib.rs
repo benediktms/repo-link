@@ -378,6 +378,7 @@ impl TaskRepository for InMemoryTaskRepository {
         let mut next: Vec<TaskComment> =
             entry.iter().filter(|c| c.remote_id.is_none()).cloned().collect();
         next.extend(comments.iter().map(|c| TaskComment {
+            local_id: Some(uuid::Uuid::new_v4().to_string()),
             remote_id: Some(c.remote_id.clone()),
             author: c.author.clone(),
             body: c.body.clone(),
@@ -396,6 +397,7 @@ impl TaskRepository for InMemoryTaskRepository {
     ) -> PortResult<()> {
         let mut store = self.comments.lock().unwrap();
         store.entry(task_id).or_default().push(TaskComment {
+            local_id: Some(uuid::Uuid::new_v4().to_string()),
             remote_id: None,
             author: author.to_string(),
             body: body.to_string(),
@@ -407,15 +409,23 @@ impl TaskRepository for InMemoryTaskRepository {
     async fn mark_comments_pushed(
         &self,
         task_id: TaskId,
+        drained_local_ids: &[String],
         pushed: &[RemoteComment],
     ) -> PortResult<()> {
         let mut store = self.comments.lock().unwrap();
         let entry = store.entry(task_id).or_default();
-        // Drop pending (local-only) comments; keep synced ones and append the
+        // Identity-aware drain: drop only the rows whose local_id was actually
+        // pushed; newly-added pending comments are preserved. Append the
         // freshly-pushed comments as synced.
-        let mut next: Vec<TaskComment> =
-            entry.iter().filter(|c| c.remote_id.is_some()).cloned().collect();
+        let drained: std::collections::HashSet<&str> =
+            drained_local_ids.iter().map(String::as_str).collect();
+        let mut next: Vec<TaskComment> = entry
+            .iter()
+            .filter(|c| !c.local_id.as_deref().is_some_and(|id| drained.contains(id)))
+            .cloned()
+            .collect();
         next.extend(pushed.iter().map(|c| TaskComment {
+            local_id: Some(uuid::Uuid::new_v4().to_string()),
             remote_id: Some(c.remote_id.clone()),
             author: c.author.clone(),
             body: c.body.clone(),

@@ -322,6 +322,7 @@ impl TaskRepository for SqliteTaskRepository {
     async fn mark_comments_pushed(
         &self,
         task_id: TaskId,
+        drained_local_ids: &[String],
         pushed: &[RemoteComment],
     ) -> PortResult<()> {
         let mut tx = self
@@ -330,13 +331,20 @@ impl TaskRepository for SqliteTaskRepository {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(map_sqlx_err)?;
-        // Drain every pending row at once, then re-insert the pushed comments
-        // as synced — no per-row matching needed.
-        sqlx::query("DELETE FROM task_comments WHERE task_id = ? AND remote_comment_id = ''")
+        // Identity-aware drain: delete only the rows whose surrogate id was
+        // actually pushed. A pending comment added concurrently between push
+        // reading the task and this commit keeps its `''` sentinel and lands
+        // in the next drain rather than being silently destroyed.
+        for local_id in drained_local_ids {
+            sqlx::query(
+                "DELETE FROM task_comments WHERE task_id = ? AND id = ? AND remote_comment_id = ''",
+            )
             .bind(task_id.to_string())
+            .bind(local_id)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_err)?;
+        }
         for c in pushed {
             sqlx::query(
                 "INSERT INTO task_comments (id, task_id, remote_comment_id, author, body, created_at) \
@@ -465,7 +473,7 @@ async fn load_relations(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<Ta
 
 async fn load_comments(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<TaskComment>> {
     let rows = sqlx::query(
-        "SELECT remote_comment_id, author, body, created_at FROM task_comments \
+        "SELECT id, remote_comment_id, author, body, created_at FROM task_comments \
          WHERE task_id = ? ORDER BY created_at, id",
     )
     .bind(task_id.to_string())
@@ -475,11 +483,13 @@ async fn load_comments(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<Tas
 
     rows.iter()
         .map(|row| {
+            let id: String = row.try_get("id").map_err(map_sqlx_err)?;
             let remote_comment_id: String = row.try_get("remote_comment_id").map_err(map_sqlx_err)?;
             let author: String = row.try_get("author").map_err(map_sqlx_err)?;
             let body: String = row.try_get("body").map_err(map_sqlx_err)?;
             let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
             Ok(TaskComment {
+                local_id: Some(id),
                 // '' sentinel ⇒ a pending local comment with no remote id yet.
                 remote_id: (!remote_comment_id.is_empty()).then_some(remote_comment_id),
                 author,

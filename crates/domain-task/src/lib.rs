@@ -145,6 +145,11 @@ pub struct RemoteRef {
 /// doesn't perturb dirty detection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskComment {
+    /// Storage surrogate id (`task_comments.id`). `Some` once persisted —
+    /// needed so the outbound drain can replace a specific row by identity
+    /// rather than by `remote_id=''` predicate (which would race-delete a
+    /// pending comment added between push reading the task and the drain).
+    pub local_id: Option<String>,
     pub remote_id: Option<String>,
     pub author: String,
     pub body: String,
@@ -775,6 +780,7 @@ mod tests {
         // excluded from the snapshot baseline, so a subsequent reconcile
         // (here via a no-op body set) leaves the task Synced, not DirtyLocal.
         t.comments.push(TaskComment {
+            local_id: None,
             remote_id: Some("7".into()),
             author: "octocat".into(),
             body: "looks good".into(),

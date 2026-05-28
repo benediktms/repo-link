@@ -174,15 +174,24 @@ impl SyncService {
         // duplication is an accepted tradeoff for a low-frequency operation —
         // never lost comments, never a corrupted sync state.
         if has_pending_comments {
+            let mut drained_local_ids = Vec::new();
             let mut pushed = Vec::new();
             for comment in task.comments.iter().filter(|c| c.remote_id.is_none()) {
+                // Pending comments loaded from storage carry a surrogate id;
+                // skip any in-memory entries that don't (not safely drainable).
+                let Some(local_id) = comment.local_id.clone() else {
+                    continue;
+                };
                 pushed.push(
                     self.provider
                         .create_comment(&canonical, &remote.remote_id, &comment.body)
                         .await?,
                 );
+                drained_local_ids.push(local_id);
             }
-            self.tasks.mark_comments_pushed(id, &pushed).await?;
+            self.tasks
+                .mark_comments_pushed(id, &drained_local_ids, &pushed)
+                .await?;
         }
 
         let decision = if snapshot_dirty {

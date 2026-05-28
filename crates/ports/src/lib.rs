@@ -141,16 +141,16 @@ pub trait TaskRepository: Send + Sync {
         created_at: Timestamp,
     ) -> PortResult<()>;
     /// Promote a task's pending comments to synced after a successful remote
-    /// push: deletes every pending row (`remote_comment_id = ''`) for the task
-    /// and inserts `pushed` as synced rows. Drains all-at-once, so no per-row
-    /// matching is needed. Writes only `task_comments`, never a snapshot.
+    /// push: deletes the rows in `drained_local_ids` and inserts `pushed` as
+    /// synced rows. Writes only `task_comments`, never a snapshot.
     ///
-    /// Precondition: `pushed` must be the result of pushing *all* of the task's
-    /// pending comments. Since the method deletes every pending row, a caller
-    /// that drained only a subset would silently discard the remainder.
+    /// Identity-aware so the drain can't race-delete a pending comment that
+    /// was added between the caller reading the task and this call: only the
+    /// rows whose surrogate id was actually pushed are removed.
     async fn mark_comments_pushed(
         &self,
         task_id: TaskId,
+        drained_local_ids: &[String],
         pushed: &[RemoteComment],
     ) -> PortResult<()>;
     /// Count pending (local-only) comments per task across a workspace, so

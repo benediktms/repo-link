@@ -145,11 +145,13 @@ async fn pending_comments_add_and_drain_on_push() {
     let pending: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_none()).collect();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].body, "pending body");
+    let drained_id = pending[0].local_id.clone().expect("loaded comment has local_id");
 
     // Draining promotes the pending comment to synced — no duplicates, the
     // already-synced comment is untouched.
     ts.mark_comments_pushed(
         t.id,
+        &[drained_id],
         &[RemoteComment {
             remote_id: "99".into(),
             author: "octocat".into(),
@@ -164,6 +166,52 @@ async fn pending_comments_add_and_drain_on_push() {
     assert_eq!(loaded.comments.len(), 2);
     assert!(loaded.comments.iter().all(|c| c.remote_id.is_some()));
     assert_eq!(loaded.comments[1].remote_id.as_deref(), Some("99"));
+}
+
+#[tokio::test]
+async fn mark_comments_pushed_does_not_race_delete_concurrent_pending() {
+    // Simulates the concurrency hazard CodeRabbit flagged: a second pending
+    // comment lands between push reading the task and the drain commit. The
+    // drain must remove only the rows it actually pushed, leaving the fresh
+    // pending intact for the next push.
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+    let t = Task::new_draft(w.id, None, "commented task".into()).unwrap();
+    ts.save(&t, SnapshotSource::Created).await.unwrap();
+
+    let base = chrono::Utc::now();
+    let at = |secs: i64| domain_core::Timestamp::from_utc(base + chrono::Duration::seconds(secs));
+
+    // Pending A — what push will drain.
+    ts.add_pending_comment(t.id, "me", "A", at(0)).await.unwrap();
+    let loaded = ts.get(t.id).await.unwrap();
+    let a_local_id = loaded.comments[0].local_id.clone().unwrap();
+
+    // Concurrent add — lands after push read the task, before drain.
+    ts.add_pending_comment(t.id, "me", "B", at(1)).await.unwrap();
+
+    // Drain only A.
+    ts.mark_comments_pushed(
+        t.id,
+        &[a_local_id],
+        &[RemoteComment {
+            remote_id: "100".into(),
+            author: "octocat".into(),
+            body: "A".into(),
+            created_at: at(0),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let loaded = ts.get(t.id).await.unwrap();
+    assert_eq!(loaded.comments.len(), 2, "B must survive an A-only drain");
+    let pending: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_none()).collect();
+    assert_eq!(pending.len(), 1, "B remains pending");
+    assert_eq!(pending[0].body, "B");
+    let synced: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_some()).collect();
+    assert_eq!(synced[0].remote_id.as_deref(), Some("100"));
 }
 
 #[tokio::test]
