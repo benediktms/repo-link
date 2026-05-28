@@ -365,7 +365,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let c = read_token_file_contents(&path).unwrap();
         assert_eq!(c.token.as_deref(), Some("abc123"));
-        assert!(c.login.is_none(), "single-line file must not invent a login");
+        assert!(
+            c.login.is_none(),
+            "single-line file must not invent a login"
+        );
     }
 
     #[cfg(unix)]

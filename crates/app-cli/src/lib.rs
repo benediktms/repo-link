@@ -1050,11 +1050,7 @@ fn render_token_file_body(token: &str, login: Option<&str>) -> String {
 }
 
 #[cfg(unix)]
-fn write_token_file(
-    path: &std::path::Path,
-    token: &str,
-    login: Option<&str>,
-) -> Result<()> {
+fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) -> Result<()> {
     use std::fs::DirBuilder;
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -1093,11 +1089,7 @@ fn write_token_file(
 }
 
 #[cfg(not(unix))]
-fn write_token_file(
-    path: &std::path::Path,
-    token: &str,
-    login: Option<&str>,
-) -> Result<()> {
+fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -1641,10 +1633,16 @@ async fn claim_one(
     let mut dto = svc.tasks.show(&task_id).await?;
 
     match dto.status.as_str() {
-        "done" => return Err(anyhow!("task {task_ref} is done; reopen it before claiming")),
-        "archived" => return Err(anyhow!(
-            "task {task_ref} is archived; unarchive it before claiming"
-        )),
+        "done" => {
+            return Err(anyhow!(
+                "task {task_ref} is done; reopen it before claiming"
+            ));
+        }
+        "archived" => {
+            return Err(anyhow!(
+                "task {task_ref} is archived; unarchive it before claiming"
+            ));
+        }
         _ => {}
     }
 
