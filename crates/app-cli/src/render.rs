@@ -107,6 +107,10 @@ pub fn assigned(rows: &[AssignedTaskRow]) {
 // ---------- Sync / reconcile --------------------------------------------
 
 pub fn sync(summary: &SyncSummaryDto) {
+    // Caveats land on stderr so the JSON on stdout stays scriptable.
+    if let Some(note) = &summary.note {
+        eprintln!("note: {note}");
+    }
     print_json(summary);
 }
 

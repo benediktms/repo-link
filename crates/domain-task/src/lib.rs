@@ -222,6 +222,12 @@ pub struct TaskSnapshot {
     pub priority: Priority,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
+    /// The task's binding at the time of the snapshot. Captured so that
+    /// `rl task rollback` can restore the binding pointer too — link /
+    /// `--relink` operations mutate `repo_id`, and rolling content back
+    /// without rolling the binding back would leave the task pointing at a
+    /// foreign repo's remote_id.
+    pub repo_id: Option<RepoId>,
     pub source: SnapshotSource,
     pub captured_at: Timestamp,
 }
@@ -384,6 +390,7 @@ impl Task {
             priority: self.priority,
             assignees: self.assignees.clone(),
             remote: self.remote.clone(),
+            repo_id: self.repo_id,
             source,
             captured_at: Timestamp::now(),
         }
