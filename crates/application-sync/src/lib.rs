@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use domain_core::{IdParseError, TaskId};
 use domain_sync::{SyncDecision, SyncPolicy, decide};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
+use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
 use dto_shared::{RemoteRefDto, SyncSummaryDto};
 use ports::{
-    PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate,
-    RepoBindingRepository, TaskRepository,
+    PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
+    RemoteTaskUpdate, RepoBindingRepository, TaskRepository,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -215,7 +215,21 @@ impl SyncService {
             .provider
             .fetch_remote(&canonical, &remote.remote_id)
             .await?;
-        let remote_changed = snap.updated_at.into_inner() > task.updated_at.into_inner();
+        // Drift is decided on the *mirrored* content (title / body / assignees),
+        // not on `updated_at`. GitHub bumps `updated_at` on any activity —
+        // comments, reactions, label edits, sub-issue changes — none of which
+        // we mirror, so the old timestamp gate forced cosmetic pull_remote
+        // refreshes on every comment. Compare against the last aligned
+        // baseline so genuine remote field changes still pull, and unrelated
+        // remote activity stays a noop.
+        //
+        // A task with a remote but no synced_baseline is anomalous (some
+        // history was rolled back). Pull-and-restore is the safer fallback.
+        let remote_changed = task
+            .synced_baseline
+            .as_ref()
+            .map(|b| !remote_mirrors_baseline(&snap, b))
+            .unwrap_or(true);
         let decision = decide(task.sync, remote_changed, self.policy);
 
         // A conflict still records the conflicted state below, but we defer the
@@ -407,6 +421,19 @@ fn ensure_not_archived(task: &Task) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Whether the remote snapshot's *mirrored* fields match the task's last
+/// aligned baseline. Status/labels are deliberately excluded because the pull
+/// path doesn't copy them onto the local task (status' open/closed bit
+/// doesn't map cleanly onto our 5-state lifecycle; the `Task` struct has no
+/// label field). Comparing only mirrored fields prevents `updated_at` churn
+/// — comments, reactions, label edits — from forcing cosmetic pull_remote
+/// refreshes.
+fn remote_mirrors_baseline(snap: &RemoteTaskSnapshot, baseline: &TaskSnapshot) -> bool {
+    snap.title == baseline.title
+        && snap.body == baseline.body
+        && snap.assignees == baseline.assignees
 }
 
 fn link_summary(task: &Task, prev: SyncState, decision: &str) -> SyncSummaryDto {
@@ -712,6 +739,72 @@ mod tests {
         });
         let s = svc.pull(&task.id.to_string()).await.unwrap();
         assert_eq!(s.decision, "noop");
+    }
+
+    #[tokio::test]
+    async fn pull_is_noop_when_only_updated_at_bumps() {
+        // Regression for the issue this drift-hash work addresses: GitHub
+        // bumps `updated_at` on any activity (comments, reactions, label
+        // edits), so the old `snap.updated_at > task.updated_at` gate forced
+        // cosmetic pull_remote on every comment. Field-level drift detection
+        // must still say "noop" here.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let before = tasks.get(task.id).await.unwrap();
+
+        // Remote `updated_at` is *newer*, but title / body / assignees are
+        // identical to the baseline.
+        let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: much_later,
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "noop", "non-mirrored remote activity must not trigger pull_remote");
+        // And no spurious Pull snapshot lands in history.
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn pull_is_noop_on_remote_comment_only_activity_but_still_mirrors_the_comment() {
+        // Confirms the comments-as-separate-axis design under the new drift
+        // logic: a remote comment lands locally even when the snapshot
+        // decision is `noop` (no field churn). Comments are NOT part of the
+        // drift signal.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let before = tasks.get(task.id).await.unwrap();
+
+        let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: much_later,
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+        provider.set_comments(vec![RemoteComment {
+            remote_id: "42".into(),
+            author: "octocat".into(),
+            body: "from remote".into(),
+            created_at: Timestamp::from_utc(Utc::now()),
+        }]);
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "noop");
+
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.comments.len(), 1, "remote comment must still land locally");
+        assert_eq!(after.comments[0].body, "from remote");
     }
 
     #[tokio::test]
