@@ -381,6 +381,18 @@ enum TaskCmd {
         id: String,
         body: String,
     },
+    /// Re-wire a task to a different remote issue. Always flips the task to
+    /// `Conflict` (linking is destructive on remote identity; snapshots are
+    /// the audit trail). Pass `--relink/-r` to declare the URL is the verified
+    /// redirect target of the current remote (after a GitHub transfer) — in
+    /// that case identity is preserved and the task stays in its existing
+    /// sync state. Target repo must already be attached via `rl repo attach`.
+    Link {
+        id: String,
+        url: String,
+        #[arg(long, short = 'r')]
+        relink: bool,
+    },
     Relate {
         id: String,
         #[arg(long)]
@@ -544,7 +556,7 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Workspace(c) => workspace_dispatch(c, svc).await,
         Cmd::Repo(c) => repo_dispatch(c, svc).await,
         Cmd::Worktree(c) => worktree_dispatch(c, svc).await,
-        Cmd::Task(c) => task_dispatch(c, svc).await,
+        Cmd::Task(c) => task_dispatch(c, svc, cfg).await,
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg),
@@ -596,6 +608,25 @@ async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()> {
     }
 }
 
+/// If a sync verb (push / pull / promote) failed because the issue was
+/// transferred on GitHub, suffix the bare port error with the exact
+/// `rl task link --relink` command the user should run next.
+fn enrich_issue_moved(task_ref: &str, err: application_sync::SyncError) -> anyhow::Error {
+    if let application_sync::SyncError::Port(ports::PortError::IssueMoved {
+        to_canonical,
+        to_remote_id,
+        ..
+    }) = &err
+    {
+        let repo = to_canonical.trim_start_matches("github.com/");
+        return anyhow!(
+            "{err}\n\nThe issue was transferred. Re-link with:\n  \
+             rl task link --relink {task_ref} https://github.com/{repo}/issues/{to_remote_id}"
+        );
+    }
+    anyhow!("{err}")
+}
+
 async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     let token = cfg
         .resolve_github_token()
@@ -627,13 +658,16 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
     // forms as every other task command. `SyncService` stays UUID-only.
     let summary = match cmd {
         SyncCmd::Promote { t: TaskArg { task } } => {
-            sync.promote(&svc.tasks.resolve_id(&task).await?).await?
+            let id = svc.tasks.resolve_id(&task).await?;
+            sync.promote(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Push { t: TaskArg { task } } => {
-            sync.push(&svc.tasks.resolve_id(&task).await?).await?
+            let id = svc.tasks.resolve_id(&task).await?;
+            sync.push(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Pull { t: TaskArg { task } } => {
-            sync.pull(&svc.tasks.resolve_id(&task).await?).await?
+            let id = svc.tasks.resolve_id(&task).await?;
+            sync.pull(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Import { .. } => unreachable!("handled above"),
     };
@@ -1416,7 +1450,7 @@ async fn resolve_repo_handle(svc: &Services, repo: Option<String>) -> Result<Opt
     }
 }
 
-async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
+async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
         TaskCmd::Create {
             ws: WorkspaceArg { workspace },
@@ -1528,6 +1562,30 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services) -> Result<()> {
                 .unwrap_or_else(|| "local".into());
             let dto = svc.tasks.add_comment(&id, &body, &author).await?;
             render::task(&dto);
+        }
+        TaskCmd::Link { id, url, relink } => {
+            let (canonical, remote_id) = parse_issue_url(&url)
+                .ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
+            let task_id = svc.tasks.resolve_id(&id).await?;
+            let token = cfg
+                .resolve_github_token()
+                .map_err(|e| anyhow!("{e}"))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "task link requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
+                         or a token file at {} (write one with `rl gh auth`)",
+                        cfg.token_file_path.display()
+                    )
+                })?;
+            let provider: Arc<dyn ports::RemoteTaskProvider> =
+                Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
+            let sync = SyncService::new(
+                svc.tasks_repo.clone(),
+                svc.bindings_repo.clone(),
+                provider,
+            );
+            let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
+            render::sync(&summary);
         }
         TaskCmd::Relate { id, kind, other } => {
             let dto = svc

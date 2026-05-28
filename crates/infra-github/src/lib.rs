@@ -95,6 +95,16 @@ impl RemoteTaskProvider for GithubTaskProvider {
             .create_comment(canonical_repo, remote_id, body)
             .await
     }
+
+    async fn discover_move_target(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<(String, String)>> {
+        self.rest
+            .discover_move_target(canonical_repo, remote_id)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +413,124 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(children.len(), 101); // 100 + 1 across two pages
+    }
+
+    /// Build an Issue payload that pretends to live in a non-default repo —
+    /// the post-follow state octocrab sees after a GitHub transfer (which the
+    /// tower-http FollowRedirect layer silently resolves on GETs).
+    fn issue_payload_in_repo(
+        number: u64,
+        title: &str,
+        body: &str,
+        state: &str,
+        owner: &str,
+        repo: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": number,
+            "node_id": "I_kwDOAAAAAA",
+            "url": format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}"),
+            "repository_url": format!("https://api.github.com/repos/{owner}/{repo}"),
+            "labels_url": format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/labels"),
+            "comments_url": format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"),
+            "events_url": format!("https://api.github.com/repos/{owner}/{repo}/issues/{number}/events"),
+            "html_url": format!("https://github.com/{owner}/{repo}/issues/{number}"),
+            "number": number,
+            "state": state,
+            "title": title,
+            "body": body,
+            "user": user("octocat"),
+            "labels": [],
+            "assignee": null,
+            "assignees": [],
+            "milestone": null,
+            "locked": false,
+            "active_lock_reason": null,
+            "comments": 0,
+            "pull_request": null,
+            "closed_at": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "author_association": "OWNER"
+        })
+    }
+
+    #[tokio::test]
+    async fn discover_move_target_compares_repository_url_after_followed_redirect() {
+        // octocrab follows the 301 on a safe GET, so by the time we see the
+        // response the body's `repository_url` + `number` are the new repo's.
+        // We simulate the post-follow state here: mock GET on the old URL
+        // returns 200 with a body that names the new repo.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/5788"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                1506, "transferred", "moved", "open", "o2", "r2",
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let target = provider
+            .discover_move_target("github.com/o/r", "5788")
+            .await
+            .unwrap();
+        assert_eq!(target, Some(("github.com/o2/r2".into(), "1506".into())));
+    }
+
+    #[tokio::test]
+    async fn discover_move_target_returns_none_when_unchanged() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(issue_payload(42, "x", "y", "open")),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let target = provider
+            .discover_move_target("github.com/o/r", "42")
+            .await
+            .unwrap();
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_remote_on_transferred_issue_surfaces_issue_moved() {
+        // Same simulation: octocrab follows the 301 silently and lands on a
+        // response describing the *new* repo. fetch_remote post-checks
+        // `repository_url` and surfaces a typed IssueMoved instead of
+        // silently returning the wrong issue's data.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/5788"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                1506, "transferred", "moved", "open", "o2", "r2",
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let err = provider
+            .fetch_remote("github.com/o/r", "5788")
+            .await
+            .unwrap_err();
+        match err {
+            ports::PortError::IssueMoved {
+                from_canonical,
+                from_remote_id,
+                to_canonical,
+                to_remote_id,
+            } => {
+                assert_eq!(from_canonical, "github.com/o/r");
+                assert_eq!(from_remote_id, "5788");
+                assert_eq!(to_canonical, "github.com/o2/r2");
+                assert_eq!(to_remote_id, "1506");
+            }
+            other => panic!("expected IssueMoved, got {other:?}"),
+        }
     }
 
     #[tokio::test]

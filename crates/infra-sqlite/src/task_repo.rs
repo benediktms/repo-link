@@ -510,7 +510,7 @@ async fn load_latest_baseline(
                assignees_json, remote_provider, remote_id, source, captured_at
         FROM task_snapshots
         WHERE task_id = ?
-          AND source IN ('promote', 'push', 'pull', 'conflict_resolve')
+          AND source IN ('promote', 'push', 'pull', 'conflict_resolve', 'link')
         ORDER BY version DESC
         LIMIT 1
         "#,

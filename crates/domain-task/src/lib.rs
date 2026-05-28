@@ -185,6 +185,12 @@ pub enum SnapshotSource {
     ConflictResolve,
     /// Local state after a rollback applied a historical snapshot.
     Rollback,
+    /// Local state after `rl task link` rewired the task to a different
+    /// remote (verified relink after a transfer, or arbitrary attach). The
+    /// application layer is responsible for writing baseline data into the
+    /// snapshot only on the verified-relink path; bare link saves with this
+    /// source while leaving the task in `Conflict` for the user to resolve.
+    Link,
 }
 
 impl SnapshotSource {
@@ -197,6 +203,7 @@ impl SnapshotSource {
                 | SnapshotSource::Push
                 | SnapshotSource::Pull
                 | SnapshotSource::ConflictResolve
+                | SnapshotSource::Link
         )
     }
 }
@@ -466,6 +473,33 @@ impl Task {
                 "cannot mark conflict from sync={other:?}"
             ))),
         }
+    }
+
+    /// Rewire the task to a different `(repo_id, remote)` pair, used by
+    /// `rl task link` to attach an arbitrary remote (`force_conflict = true` →
+    /// flip to `Conflict`, the user must resolve via `sync pull` / explicit
+    /// accept) or to record a verified post-transfer relink
+    /// (`force_conflict = false` → keep the current sync state; the
+    /// application layer is responsible for refreshing the snapshot baseline
+    /// so the new remote becomes the dirty-detection ground truth).
+    ///
+    /// Rewrites both `repo_id` and `remote` atomically — `set_repo_id`'s "no
+    /// reassign while remote-backed" guard does not apply here because link is
+    /// the *intended* path for changing the remote. The snapshot history
+    /// (tagged [`SnapshotSource::Link`]) is the audit trail.
+    pub fn link_to_remote(
+        &mut self,
+        repo_id: RepoId,
+        remote: RemoteRef,
+        force_conflict: bool,
+    ) -> Result<()> {
+        self.repo_id = Some(repo_id);
+        self.remote = Some(remote);
+        if force_conflict {
+            self.sync = SyncState::Conflict;
+        }
+        self.touch();
+        Ok(())
     }
 
     // --- Lifecycle transitions ------------------------------------------
@@ -794,6 +828,54 @@ mod tests {
             "comment activity must not dirty a synced task"
         );
         assert_eq!(t.comments.len(), 1);
+    }
+
+    #[test]
+    fn link_to_remote_with_force_conflict_flips_synced_to_conflict() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        let new_remote = RemoteRef {
+            provider: "github".into(),
+            remote_id: "999".into(),
+        };
+        t.link_to_remote(RepoId::new(), new_remote.clone(), true).unwrap();
+        assert_eq!(t.sync, SyncState::Conflict);
+        assert_eq!(t.remote.as_ref(), Some(&new_remote));
+    }
+
+    #[test]
+    fn link_to_remote_verified_preserves_sync_state() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        let new_remote = RemoteRef {
+            provider: "github".into(),
+            remote_id: "1506".into(),
+        };
+        // Verified relink: caller asserts the new remote is identity-preserving.
+        t.link_to_remote(RepoId::new(), new_remote.clone(), false).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert_eq!(t.remote.as_ref(), Some(&new_remote));
+    }
+
+    #[test]
+    fn link_to_remote_from_local_only_with_force_conflict_attaches_and_conflicts() {
+        let mut t = draft();
+        assert_eq!(t.sync, SyncState::LocalOnly);
+        assert!(t.remote.is_none());
+
+        let repo = RepoId::new();
+        t.link_to_remote(repo, remote_ref(), true).unwrap();
+        // Arbitrary attach: local task had no remote; link wires it up and the
+        // user must resolve the divergence between the two histories.
+        assert_eq!(t.sync, SyncState::Conflict);
+        assert!(t.remote.is_some());
+        assert_eq!(t.repo_id, Some(repo));
     }
 
     #[test]
