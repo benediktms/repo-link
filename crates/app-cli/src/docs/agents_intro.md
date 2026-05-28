@@ -68,9 +68,12 @@ If drift is non-empty, reconcile with `rl sync pull <task-id>` before editing th
 ```bash
 rl task show  <task-id>             # full snapshot, including relations + remote ref
 rl task start <task-id>             # Open|Blocked → InProgress
+rl task claim <task-id>             # add me as assignee + start + push to GitHub (one shot)
 ```
 
 `task start` is what moves a task into `InProgress`; do this once per task at the beginning of a session so other queries (`query ready`, `query mine`) reflect reality.
+
+`task claim` is the orchestrator verb: it appends the authenticated GitHub user to `assignees` (merge, not replace), runs the same `Open|Blocked → InProgress` transition, and best-effort `sync push`-es the change to the remote issue. Pass `--no-sync` to skip the push for local-only / staged tasks. Requires the cached GitHub login — run `rl gh auth` once to populate it.
 
 ### Revising a task's content
 
