@@ -631,18 +631,9 @@ fn enrich_issue_moved(task_ref: &str, err: application_sync::SyncError) -> anyho
 }
 
 async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
-    let token = cfg
-        .resolve_github_token()
-        .map_err(|e| anyhow!("{e}"))?
-        .ok_or_else(|| {
-            anyhow!(
-                "sync requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
-                 or a token file at {} (write one with `rl gh auth`)",
-                cfg.token_file_path.display()
-            )
-        })?;
+    let token = require_github_token(cfg, "sync")?;
     let provider: Arc<dyn ports::RemoteTaskProvider> =
-        Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
+        Arc::new(build_github_provider(&token, cfg).map_err(|e| anyhow!("{e}"))?);
 
     // `import` has its own orchestration (fetch + materialise), not the
     // promote/push/pull reconciliation `SyncService` handles.
@@ -976,6 +967,36 @@ fn build_github_provider(
         Some(url) => GithubTaskProvider::with_base_url(token, url),
         None => GithubTaskProvider::new(token),
     }
+}
+
+/// Resolve the GitHub token or fail with a command-specific "set token or
+/// run `rl gh auth`" message. Centralised so the wording — including the
+/// resolved token-file path — stays in one place.
+fn require_github_token(cfg: &RepoLinkConfig, verb: &str) -> Result<String> {
+    cfg.resolve_github_token()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "{verb} requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
+                 or a token file at {} (write one with `rl gh auth`)",
+                cfg.token_file_path.display()
+            )
+        })
+}
+
+/// Build a [`SyncService`] wired to a GitHub provider for the current
+/// config. `verb` is interpolated into the "no token" error so a missing
+/// token reports against the actual verb the user typed (`sync push`,
+/// `task link`, `task claim`, …).
+fn build_sync_service(cfg: &RepoLinkConfig, svc: &Services, verb: &str) -> Result<SyncService> {
+    let token = require_github_token(cfg, verb)?;
+    let provider: Arc<dyn ports::RemoteTaskProvider> =
+        Arc::new(build_github_provider(&token, cfg).map_err(|e| anyhow!("{e}"))?);
+    Ok(SyncService::new(
+        svc.tasks_repo.clone(),
+        svc.bindings_repo.clone(),
+        provider,
+    ))
 }
 
 /// Best-effort: read the token cached by the official `gh` CLI. Any failure
@@ -1662,20 +1683,7 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
             let (canonical, remote_id) =
                 parse_issue_url(&url).ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
             let task_id = svc.tasks.resolve_id(&id).await?;
-            let token = cfg
-                .resolve_github_token()
-                .map_err(|e| anyhow!("{e}"))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "task link requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
-                         or a token file at {} (write one with `rl gh auth`)",
-                        cfg.token_file_path.display()
-                    )
-                })?;
-            let provider: Arc<dyn ports::RemoteTaskProvider> =
-                Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
-            let sync =
-                SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
+            let sync = build_sync_service(cfg, svc, "task link")?;
             let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
             render::sync(&summary);
         }
