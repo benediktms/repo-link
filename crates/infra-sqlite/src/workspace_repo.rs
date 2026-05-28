@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use domain_core::{Timestamp, WorkspaceId};
+use domain_core::{ProjectId, Timestamp, WorkspaceId};
 use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
 use ports::{PortError, PortResult, WorkspaceRepository};
 use sqlx::Row;
@@ -23,13 +23,14 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     async fn save(&self, w: &Workspace) -> PortResult<()> {
         sqlx::query(
             r#"
-            INSERT INTO workspaces (id, name, description, status, local_only, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO workspaces (id, name, description, status, local_only, project_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
                 status = excluded.status,
                 local_only = excluded.local_only,
+                project_id = excluded.project_id,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -38,6 +39,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         .bind(w.description.as_deref())
         .bind(enum_to_str(&w.status)?)
         .bind(w.local_only as i64)
+        .bind(w.project_id.as_ref().map(|p| p.as_str()))
         .bind(w.created_at.into_inner())
         .bind(w.updated_at.into_inner())
         .execute(&self.db.writes)
@@ -94,8 +96,14 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
     let description: Option<String> = row.try_get("description").map_err(map_sqlx_err)?;
     let status_str: String = row.try_get("status").map_err(map_sqlx_err)?;
     let local_only: i64 = row.try_get("local_only").map_err(map_sqlx_err)?;
+    let project_id_raw: Option<String> = row.try_get("project_id").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
+
+    let project_id = project_id_raw
+        .map(ProjectId::parse)
+        .transpose()
+        .map_err(|e| PortError::Backend(format!("decode workspace.project_id: {e}")))?;
 
     Ok(Workspace {
         id: parse_uuid::<WorkspaceId>("workspace_id", &id_str)?,
@@ -104,9 +112,7 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         description,
         status: enum_from_str::<WorkspaceStatus>("workspace status", &status_str)?,
         local_only: local_only != 0,
-        // Default None pre-Stage 3: no migration has landed for
-        // `workspaces.project_id` yet, so we don't read the column.
-        project_id: None,
+        project_id,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),
     })
