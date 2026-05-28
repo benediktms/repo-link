@@ -22,7 +22,8 @@ A mismatched prefix is a hard error: `rl task show wrong-ev6` will refuse rather
 
 The repo's prefix doubles as a globally-unique repo locator — `rl repo show rpl` works the same as `rl repo show <uuid>` or `rl repo show <name>`. The prefix is derived from the repo's name automatically at attach time; override with `rl repo attach --prefix <p>`, change later with `rl repo set-prefix --repo <id> --prefix <p>`.
 
-All commands emit JSON on stdout; pipe through `jq` for human-friendly views. Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference of any command — the workflow snippets below show the common path, not every option.
+All commands emit JSON on stdout. Use jq to extract or reshape fields; present results to a human as a markdown table, not raw JSON or a jq dump.
+Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference of any command — the workflow snippets below show the common path, not every option.
 
 ## Working with `rl` as an agent
 
@@ -51,6 +52,11 @@ rl query overview --workspace <id>  # counts by status / sync_state — useful s
 ```
 
 `query ready` is the canonical "what's next" answer. The first entry is the highest-priority unblocked task. Prefer it over `gh issue list`, because it also accounts for transitive blockers and local-only tasks that haven't been pushed to GitHub yet.
+
+Two wrinkles worth knowing when you present these results:
+
+- `query ready` / `query mine` identify each task by its bare `task_id` (UUID) only — **not** the friendly `id`, the repo, or the GitHub `#NNN`. To show the friendly `rpl-…` id (whose prefix tells you which repo a task belongs to) or the issue number, cross-reference `rl task list --workspace <id>` — its entries carry `id`, `repo_id`, and `remote.remote_id` — and match by title.
+- `query mine` resolves its assignee as `--assignee` > `git config user.name` > `$REPO_LINK_USER` > `$USER` — it does **not** use the GitHub login. But `task claim` assigns your *cached GitHub login* (`rl gh auth`), which usually differs from your committer name. So a task you've claimed can be missing from a bare `query mine`; pass `--assignee <github-login>` to be sure.
 
 ### Before you start: check drift
 
