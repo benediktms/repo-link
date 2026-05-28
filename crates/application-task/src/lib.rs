@@ -420,11 +420,12 @@ impl TaskService {
         // Restore the binding pointer too — `rl task link` / `--relink`
         // mutates `repo_id`, and rolling content back without rolling the
         // binding back leaves the task with a remote_id from the pre-link
-        // repo inside a post-link binding (incoherent). Pre-feature snapshots
-        // have `repo_id = None`; in that case preserve the current binding
-        // rather than wiping it.
-        if let Some(repo_id) = snapshot.repo_id {
-            task.repo_id = Some(repo_id);
+        // repo inside a post-link binding (incoherent). Only act when the
+        // snapshot actually recorded its binding: pre-migration rows have
+        // `repo_id_recorded = false` and the historical binding is unknown,
+        // so preserve the current binding rather than wiping it.
+        if snapshot.repo_id_recorded {
+            task.repo_id = snapshot.repo_id;
         }
         task.reconcile_dirty_against_baseline();
         self.repo.save(&task, SnapshotSource::Rollback).await?;
@@ -914,6 +915,38 @@ mod tests {
             rolled_back.repo_id.as_deref(),
             Some(repo_a.to_string().as_str()),
             "rollback must restore the historical binding pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_intentional_none_repo_id() {
+        // A snapshot where the task was *intentionally* unbound (post-feature
+        // write) must clear the binding on rollback, not preserve the
+        // current one. Distinguishes the "recorded None" case from the
+        // pre-migration "unknown" case.
+        let repo: Arc<InMemoryTaskRepository> = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings_repo: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let svc = TaskService::new(repo.clone(), snaps, bindings_repo);
+
+        let workspace_id = WorkspaceId::new();
+        let repo_b = domain_core::RepoId::new();
+
+        // v1: task starts unbound.
+        let mut task =
+            domain_task::Task::new_draft(workspace_id, None, "unbound start".into()).unwrap();
+        repo.save(&task, SnapshotSource::Created).await.unwrap();
+        // v2: bind to repo B (no DTO render needed; bypass binding lookup).
+        task.repo_id = Some(repo_b);
+        repo.save(&task, SnapshotSource::Link).await.unwrap();
+
+        let rolled_back = svc.rollback(&task.id.to_string(), 1).await.unwrap();
+        assert!(
+            rolled_back.repo_id.is_none(),
+            "rollback must restore intentional None binding, got {:?}",
+            rolled_back.repo_id
         );
     }
 

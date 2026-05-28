@@ -60,6 +60,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
     let repo_id_raw: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
+    let repo_id_recorded_raw: i64 = row.try_get("repo_id_recorded").map_err(map_sqlx_err)?;
     let source: String = row.try_get("source").map_err(map_sqlx_err)?;
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
@@ -92,6 +93,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         repo_id,
+        repo_id_recorded: repo_id_recorded_raw != 0,
         source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
         captured_at: Timestamp::from_utc(captured_at),
     })

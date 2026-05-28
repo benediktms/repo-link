@@ -4,10 +4,12 @@
 -- bound to the post-link repo with the pre-link `remote_id`, an incoherent
 -- state with no command path forward.
 --
--- Pre-migration snapshots leave the column NULL — rollback to those rows
--- will preserve the task's current binding (the safest fallback; we have no
--- record of what the binding was at the time the historical snapshot was
--- captured). Post-migration snapshots populate the column.
+-- Pre-migration snapshots leave the column NULL and `repo_id_recorded = 0`,
+-- so rollback to those rows will preserve the task's current binding (the
+-- safest fallback; we have no record of what the binding was at the time
+-- the historical snapshot was captured). Post-migration snapshots set
+-- `repo_id_recorded = 1` so rollback can distinguish "unknown" from
+-- "intentionally unbound".
 --
 -- Strict superset of the previous schema, so existing rows port cleanly.
 -- SQLite can't alter a CHECK constraint or add a column with a foreign-key
@@ -31,15 +33,17 @@ CREATE TABLE task_snapshots_new (
     remote_provider  TEXT,
     remote_id        TEXT,
     repo_id          TEXT,
+    repo_id_recorded INTEGER NOT NULL DEFAULT 0
+                     CHECK (repo_id_recorded IN (0, 1)),
     source           TEXT NOT NULL
                      CHECK (source IN ('created','local_edit','promote','push','pre_pull','pull','conflict_resolve','rollback','link')),
     captured_at      TEXT NOT NULL,
     PRIMARY KEY (task_id, version)
 );
 INSERT INTO task_snapshots_new (task_id, version, title, body, status, sync_state, priority,
-                                assignees_json, remote_provider, remote_id, repo_id, source, captured_at)
+                                assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at)
 SELECT task_id, version, title, body, status, sync_state, priority,
-       assignees_json, remote_provider, remote_id, NULL, source, captured_at
+       assignees_json, remote_provider, remote_id, NULL, 0, source, captured_at
 FROM task_snapshots;
 DROP TABLE task_snapshots;
 ALTER TABLE task_snapshots_new RENAME TO task_snapshots;

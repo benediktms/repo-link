@@ -228,6 +228,14 @@ pub struct TaskSnapshot {
     /// without rolling the binding back would leave the task pointing at a
     /// foreign repo's remote_id.
     pub repo_id: Option<RepoId>,
+    /// Whether the snapshot's `repo_id` was actually recorded at write time
+    /// (vs. NULL-backfilled by the migration that introduced the column).
+    /// Rollback uses this to tell "the task was intentionally unbound at v3"
+    /// (recorded = true, repo_id = None → clear the binding) apart from "we
+    /// don't know what v3's binding was" (recorded = false → preserve the
+    /// current binding). Always `true` for snapshots written after the
+    /// column landed.
+    pub repo_id_recorded: bool,
     pub source: SnapshotSource,
     pub captured_at: Timestamp,
 }
@@ -391,6 +399,8 @@ impl Task {
             assignees: self.assignees.clone(),
             remote: self.remote.clone(),
             repo_id: self.repo_id,
+            // Fresh snapshots always record the binding (even if it's None).
+            repo_id_recorded: true,
             source,
             captured_at: Timestamp::now(),
         }

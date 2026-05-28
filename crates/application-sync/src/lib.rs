@@ -595,7 +595,9 @@ mod tests {
             canonical: &str,
             remote_id: &str,
         ) -> PortResult<RemoteTaskSnapshot> {
-            if let Some((to_c, to_r)) = self.fetch_moved.lock().unwrap().clone() {
+            // `take()` so the staged "moved" response is one-shot — the next
+            // fetch_remote after this falls through to fetch_returns.
+            if let Some((to_c, to_r)) = self.fetch_moved.lock().unwrap().take() {
                 return Err(PortError::IssueMoved {
                     from_canonical: canonical.to_string(),
                     from_remote_id: remote_id.to_string(),

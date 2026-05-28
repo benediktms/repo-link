@@ -240,6 +240,7 @@ impl TaskRepository for InMemoryTaskRepository {
             assignees: task.assignees.clone(),
             remote: task.remote.clone(),
             repo_id: task.repo_id,
+            repo_id_recorded: true,
             source,
             captured_at: Timestamp::now(),
         });
