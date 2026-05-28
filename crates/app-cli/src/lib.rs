@@ -172,6 +172,9 @@ enum RepoCmd {
         #[arg(long)]
         prefix: Option<String>,
     },
+    /// Detach a binding. Accepts the same handle forms as `rl repo show`:
+    /// UUID / prefix / name / alias. Ambiguous matches exit 2 with a
+    /// candidate list.
     Detach {
         id: String,
     },
@@ -254,6 +257,8 @@ enum RepoAliasCmd {
 #[derive(Subcommand, Debug)]
 enum WorktreeCmd {
     Link {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
         #[arg(long)]
         repo: String,
         #[arg(short = 'p', long)]
@@ -262,12 +267,16 @@ enum WorktreeCmd {
         br: BranchArg,
     },
     Unlink {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
         #[arg(long)]
         repo: String,
         #[arg(short = 'p', long)]
         path: String,
     },
     PruneMissing {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
         #[arg(long)]
         repo: String,
     },
@@ -1070,8 +1079,9 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             render::attach_outcome(&outcome);
         }
         RepoCmd::Detach { id } => {
-            svc.bindings.detach(&id).await?;
-            println!("{}", serde_json::json!({ "detached": id }));
+            let resolved = resolve_repo_handle_required(svc, &id).await?;
+            svc.bindings.detach(&resolved).await?;
+            println!("{}", serde_json::json!({ "detached": resolved }));
         }
         RepoCmd::List { ws: WorkspaceArg { workspace } } => render::repos(&svc.bindings.list(&workspace).await?),
         RepoCmd::Show { id } => match svc.bindings.show(&id).await {
@@ -1280,7 +1290,17 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
                 Ok(Some(c)) => c,
             };
 
-            let binding = svc.bindings.show(&repo).await?;
+            // Route through the same resolver as `rl repo show`: a prefix /
+            // name / alias works wherever a UUID does. Ambiguous handles exit
+            // 2 with the candidate JSON rather than collapsing into a generic
+            // error from the `?`.
+            let binding = match svc.bindings.show(&repo).await {
+                Ok(b) => b,
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates)
+                }
+                Err(e) => return Err(anyhow!("{e}")),
+            };
             if discovered != binding.canonical_url {
                 // Surface every binding that matches the discovered canonical so
                 // the user can pick the right `--repo`. Picking arbitrarily (e.g.
@@ -1323,7 +1343,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             let dto = svc
                 .bindings
                 .link_worktree(LinkWorktreeCmd {
-                    repo_id: repo,
+                    repo_id: binding.id,
                     path: abs_path.display().to_string(),
                     branch,
                 })
@@ -1331,6 +1351,7 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             render::repo(&dto);
         }
         WorktreeCmd::Unlink { repo, path } => {
+            let resolved = resolve_repo_handle_required(svc, &repo).await?;
             // Mirror link's canonicalisation so identical --path input
             // round-trips. When the leaf is gone we still try to resolve
             // any symlinked prefix so e.g. macOS `/var/...` matches the
@@ -1339,14 +1360,15 @@ async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Result<()> {
             let dto = svc
                 .bindings
                 .unlink_worktree(UnlinkWorktreeCmd {
-                    repo_id: repo,
+                    repo_id: resolved,
                     path: canonical_path,
                 })
                 .await?;
             render::repo(&dto);
         }
         WorktreeCmd::PruneMissing { repo } => {
-            let dto = svc.bindings.prune_missing(&repo).await?;
+            let resolved = resolve_repo_handle_required(svc, &repo).await?;
+            let dto = svc.bindings.prune_missing(&resolved).await?;
             render::repo(&dto);
         }
         WorktreeCmd::Reconcile {
@@ -1437,16 +1459,22 @@ where
 /// command instead of demanding a raw UUID.
 async fn resolve_repo_handle(svc: &Services, repo: Option<String>) -> Result<Option<String>> {
     match repo {
-        // Mirror `repo show`: an ambiguous name/alias prints the candidate
-        // list and exits 2 rather than collapsing into a generic error.
-        Some(handle) => match svc.bindings.show(&handle).await {
-            Ok(dto) => Ok(Some(dto.id)),
-            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                handle_ambiguous(query, candidates)
-            }
-            Err(e) => Err(anyhow!("{e}")),
-        },
+        Some(handle) => resolve_repo_handle_required(svc, &handle).await.map(Some),
         None => Ok(None),
+    }
+}
+
+/// Required-arg sibling of `resolve_repo_handle`. Every command that takes a
+/// repo positionally or via a non-optional `--repo` resolves through here so
+/// a prefix / name / alias works in the same places a UUID does. Ambiguous
+/// matches exit 2 with the same candidate JSON as `rl repo show`.
+async fn resolve_repo_handle_required(svc: &Services, handle: &str) -> Result<String> {
+    match svc.bindings.show(handle).await {
+        Ok(dto) => Ok(dto.id),
+        Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+            handle_ambiguous(query, candidates)
+        }
+        Err(e) => Err(anyhow!("{e}")),
     }
 }
 
