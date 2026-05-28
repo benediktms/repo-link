@@ -1,0 +1,624 @@
+//! The clap command tree — declarations only. `Cli` is the root parser; the
+//! `Cmd` enum and every `*Cmd` subcommand enum live here, along with the
+//! shared `#[command(flatten)]` arg groups and the value-parser fns. The
+//! dispatch modules name these as `crate::cli::*`.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::daemon;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "repo-link",
+    version,
+    about = "Local-first workspace + task manager. All output is JSON; pipe through `jq` for human-friendly views."
+)]
+pub(crate) struct Cli {
+    /// SQLite database path. Falls back to platform data dir.
+    #[arg(long, env = "REPO_LINK_DB", global = true)]
+    pub(crate) db: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub(crate) cmd: Cmd,
+}
+
+// Shared `#[command(flatten)]` arg groups. One definition per concept,
+// reused by every variant that needs it — short/long mapping, help text,
+// and any future env var or alias live in exactly one place.
+
+#[derive(Args, Debug)]
+pub(crate) struct WorkspaceArg {
+    /// Workspace UUID.
+    #[arg(short = 'w', long)]
+    pub(crate) workspace: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct TaskArg {
+    /// Task reference: UUID, bare hash, or `prefix-hash`.
+    #[arg(short = 't', long)]
+    pub(crate) task: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BranchArg {
+    /// Tracked branch.
+    #[arg(short = 'b', long)]
+    pub(crate) branch: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct AliasArg {
+    /// Alias string.
+    #[arg(short = 'a', long)]
+    pub(crate) alias: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum Cmd {
+    /// Workspace lifecycle.
+    #[command(subcommand)]
+    Workspace(WorkspaceCmd),
+    /// Repo attachment + bindings.
+    #[command(subcommand)]
+    Repo(RepoCmd),
+    /// Worktree path links.
+    #[command(subcommand)]
+    Worktree(WorktreeCmd),
+    /// Task drafts and lifecycle.
+    #[command(subcommand)]
+    Task(TaskCmd),
+    /// Read-only workspace views.
+    #[command(subcommand)]
+    Query(QueryCmd),
+    /// Promote / push / pull tasks against GitHub.
+    #[command(subcommand)]
+    Sync(SyncCmd),
+    /// GitHub helper commands.
+    #[command(subcommand)]
+    Gh(GhCmd),
+    /// Documentation helpers for AI agents picking up this repo.
+    #[command(subcommand)]
+    Agents(AgentsCmd),
+    /// GitHub Projects v2 management (local-only in Stage 4 — `rl project link`
+    /// accepts hand-entered schema; Stage 5 swaps the GraphQL fetch in).
+    #[command(subcommand)]
+    Project(ProjectCmd),
+    /// Manage the background reconciliation daemon (launchd / systemd unit).
+    #[command(subcommand)]
+    Daemon(daemon::DaemonCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum WorkspaceCmd {
+    Create {
+        name: String,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+        #[arg(long)]
+        local_only: bool,
+        /// Optional GitHub Projects v2 board to attach the new workspace
+        /// to. Accepts a project node ID (`PVT_…`) or `owner/number`.
+        /// The project must already be linked locally — see `rl project link`.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        include_archived: bool,
+    },
+    Show {
+        id: String,
+    },
+    Activate {
+        id: String,
+    },
+    Pause {
+        id: String,
+    },
+    Archive {
+        id: String,
+    },
+    /// Attach a workspace to a project (or detach with `--none`). Resolves
+    /// `<project>` as a node ID or `owner/number`, same as
+    /// `rl project show`.
+    SetProject {
+        workspace: String,
+        /// Project to attach the workspace to (`PVT_…` or `owner/number`).
+        /// Mutually exclusive with `--none`.
+        #[arg(long, conflicts_with = "none")]
+        project: Option<String>,
+        /// Detach the workspace from any project. Mutually exclusive with
+        /// `--project`.
+        #[arg(long)]
+        none: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RepoCmd {
+    Attach {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        #[arg(short = 'u', long)]
+        url: String,
+        #[arg(short = 'c', long)]
+        canonical: String,
+        #[command(flatten)]
+        br: BranchArg,
+        /// Local checkout to register as a worktree of this binding.
+        /// Defaults to the current working directory. The path's git
+        /// origin must canonicalise to `--canonical`; otherwise the
+        /// command errors.
+        ///
+        /// When the same repo is cloned to multiple folders on disk
+        /// (separate `.git` dirs rather than `git worktree`-linked
+        /// checkouts), call `attach` once per path with `--path`;
+        /// each call merges into the same binding and accumulates
+        /// another worktree entry.
+        #[arg(short = 'p', long)]
+        path: Option<PathBuf>,
+        /// Skip auto-linking the current path. Use this when you're
+        /// sitting in one clone but don't want it recorded under this
+        /// binding — e.g. you have the same repo cloned twice and
+        /// only the *other* clone should be the tracked checkout.
+        /// Combine with `--path <other-clone>` (or follow up with
+        /// `rl worktree link`) to register the intended path instead.
+        #[arg(long)]
+        no_link: bool,
+        /// Override the auto-derived short prefix for this binding
+        /// (e.g. `--prefix gw` instead of letting the algorithm pick
+        /// `pck` from `app-packages`). Must match
+        /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's
+        /// prefix surface as a hard error — pick a different value.
+        /// Omit to let the system derive and collision-break itself.
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Detach a binding. Accepts the same handle forms as `rl repo show`:
+    /// UUID / prefix / name / alias. Ambiguous matches exit 2 with a
+    /// candidate list.
+    Detach { id: String },
+    List {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    /// Show a binding. Accepts a UUID, an exact `name`, or an exact alias.
+    /// Returns a JSON error with candidate IDs if a non-UUID handle matches
+    /// more than one binding — re-issue with a UUID.
+    Show { id: String },
+    /// Walk a directory and report every git repo found, with its origin URL.
+    /// Use this to populate a workspace from `~/code/` in one shot.
+    Discover {
+        #[arg(short = 'p', long)]
+        path: PathBuf,
+    },
+    /// Discover which repo binding (if any) owns the given path.
+    /// Reads the path's git origin, canonicalises it, and looks for a
+    /// matching binding across all non-archived workspaces.
+    Locate {
+        /// Path to probe. Defaults to current working directory.
+        #[arg(short = 'p', long)]
+        path: Option<PathBuf>,
+    },
+    /// Set a new short name on a binding. Identity stays at canonical_url —
+    /// rename is purely a display affordance.
+    Rename {
+        #[arg(long)]
+        repo: String,
+        #[arg(short = 'n', long)]
+        name: String,
+    },
+    /// Replace the binding's globally-unique short prefix (e.g. swap an
+    /// auto-derived `pck` for a manual `gw`). Must match
+    /// `^[a-z][a-z0-9]{1,19}$`. Conflicts with another binding's prefix
+    /// surface as a hard error — pick a different value.
+    ///
+    /// Warning: every composite task ID a user has already typed
+    /// against the *old* prefix (e.g. `oldpfx-ak7`) goes stale and
+    /// errors with `PrefixMismatch`. Bare-hash references (`ak7`) keep
+    /// working because the hash itself is globally unique.
+    SetPrefix {
+        #[arg(long)]
+        repo: String,
+        /// New prefix value. Must match `^[a-z][a-z0-9]{1,19}$`.
+        #[arg(short = 'p', long)]
+        prefix: String,
+    },
+    /// Manage aliases — alternative short names for a binding.
+    #[command(subcommand)]
+    Alias(RepoAliasCmd),
+    /// Search bindings across non-archived workspaces by name / alias /
+    /// canonical substring. Ranked: exact name > exact alias > canonical
+    /// substring > name substring. `ambiguous` is set when more than one
+    /// hit is returned.
+    Find { query: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum RepoAliasCmd {
+    Add {
+        #[arg(long)]
+        repo: String,
+        #[command(flatten)]
+        a: AliasArg,
+    },
+    Rm {
+        #[arg(long)]
+        repo: String,
+        #[command(flatten)]
+        a: AliasArg,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum WorktreeCmd {
+    Link {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
+        #[arg(long)]
+        repo: String,
+        #[arg(short = 'p', long)]
+        path: String,
+        #[command(flatten)]
+        br: BranchArg,
+    },
+    Unlink {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
+        #[arg(long)]
+        repo: String,
+        #[arg(short = 'p', long)]
+        path: String,
+    },
+    PruneMissing {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`).
+        #[arg(long)]
+        repo: String,
+    },
+    /// Scan every worktree in a workspace, mark missing paths, optionally
+    /// drop them. Use this after switching machines or pruning checkouts.
+    Reconcile {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        #[arg(long)]
+        prune: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum TaskCmd {
+    Create {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        /// Owning repo binding, by UUID / prefix / name / alias (same forms
+        /// as `rl repo show`).
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+    },
+    Show {
+        id: String,
+    },
+    /// Edit a task in place. Writes a new snapshot at `version = max + 1`
+    /// with `source = local_edit`; preserves the task's identity (UUID and
+    /// short prefix). At least one of `--title`, `--body`, `--priority`,
+    /// `--assignee`, or `--repo` must be supplied.
+    Edit {
+        id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        /// Replace-set: each `--assignee` flag adds one entry; the full
+        /// list replaces the current assignees. Omitting `--assignee`
+        /// entirely leaves the existing assignees untouched. There is no
+        /// way to clear assignees via `edit` — that's a deliberate gap
+        /// (matches the spec).
+        #[arg(long = "assignee")]
+        assignees: Vec<String>,
+        /// Reassign the task's owning repo binding, by UUID / prefix / name /
+        /// alias (same forms as `rl repo show`). Use this to attach a repo to
+        /// a task created without one — required before `sync promote`, which
+        /// needs a repo to know which GitHub repo to open the issue in. Only
+        /// valid while the task is not yet synced to a remote issue;
+        /// reassigning a synced task is rejected.
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
+    },
+    List {
+        #[arg(short = 'w', long)]
+        workspace: Option<String>,
+        /// Filter by lifecycle status (`open` / `in_progress` / `blocked` / `done` / `archived`).
+        #[arg(short = 's', long)]
+        status: Option<String>,
+        /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
+        #[arg(long)]
+        sync_state: Option<String>,
+        #[arg(long)]
+        include_archived: bool,
+    },
+    /// Stage one or more tasks for sync.
+    Stage {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Local-only lifecycle nudge: Open|Blocked → InProgress.
+    ///
+    /// Flips the task to `InProgress` so your local queries (`query ready`,
+    /// `query mine`) reflect reality. Does NOT touch `assignees` and does NOT
+    /// push to GitHub — teammates won't see anything change. Works on purely-
+    /// local tasks. Offline-safe. Use `task claim` instead when you want to
+    /// announce externally that you've picked up the task.
+    Start {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Mark one or more tasks complete.
+    Complete {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Reopen one or more `Done` tasks back to `Open`.
+    Reopen {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Move one or more tasks to `Blocked`.
+    Block {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Move one or more `Blocked` tasks back to `Open`.
+    Unblock {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Archive one or more tasks.
+    Archive {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+    },
+    /// Publicly take ownership of a task: assign + start + push in one shot.
+    ///
+    /// Use this — instead of `task start` — the moment you want teammates,
+    /// the GitHub issue list, and project boards to know you've picked
+    /// the task up. The lifecycle move is the same as `start`; the
+    /// difference is that `claim` ALSO updates `assignees` and mirrors
+    /// the change to GitHub.
+    ///
+    /// Pipeline (per task):
+    /// 1. Add the authenticated GitHub user to `assignees` (merge — leaves
+    ///    teammates intact; no-op if you're already an assignee).
+    /// 2. Transition `Open`|`Blocked` → `InProgress` (no-op if already
+    ///    in-progress).
+    /// 3. Best-effort `sync push` to mirror the new state to the remote
+    ///    issue. Local-only / staged tasks skip the push with a hint to
+    ///    promote first.
+    ///
+    /// Refuses on `Done` / `Archived`. Requires the cached GitHub login
+    /// (`rl gh auth` populates it); without one, errors with a re-auth
+    /// hint before touching any task state.
+    Claim {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+        /// Apply locally only; skip the GitHub push step.
+        #[arg(long)]
+        no_sync: bool,
+    },
+    /// Add a pending local comment to a task. Pushed to the remote issue on
+    /// the next `sync push` (a separate axis — does not dirty the task).
+    Comment {
+        id: String,
+        body: String,
+    },
+    /// Re-wire a task to a different remote issue. Always flips the task to
+    /// `Conflict` (linking is destructive on remote identity; snapshots are
+    /// the audit trail). Pass `--relink/-r` to declare the URL is the verified
+    /// redirect target of the current remote (after a GitHub transfer) — in
+    /// that case identity is preserved and the task stays in its existing
+    /// sync state. Target repo must already be attached via `rl repo attach`.
+    Link {
+        id: String,
+        url: String,
+        #[arg(long, short = 'r')]
+        relink: bool,
+    },
+    Relate {
+        id: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        other: String,
+    },
+    /// List the full snapshot history for a task.
+    Snapshots {
+        id: String,
+    },
+    /// Roll a task back to a historical snapshot version.
+    Rollback {
+        id: String,
+        #[arg(long)]
+        to_version: u64,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum QueryCmd {
+    Overview {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    Blocked {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    Stale {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    Unsynced {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    Contributors {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    Drift {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    /// Tasks that are actionable now: open + not transitively blocked.
+    Ready {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+    /// Open tasks assigned to a user. Defaults to $REPO_LINK_USER or $USER.
+    Mine {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        #[arg(long, env = "REPO_LINK_USER")]
+        assignee: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SyncCmd {
+    /// Create the remote issue for a Draft/Staged task.
+    Promote {
+        #[command(flatten)]
+        t: TaskArg,
+    },
+    /// Push local edits (state = DirtyLocal) to the remote.
+    Push {
+        #[command(flatten)]
+        t: TaskArg,
+    },
+    /// Pull the latest remote snapshot and reconcile.
+    Pull {
+        #[command(flatten)]
+        t: TaskArg,
+    },
+    /// Import a GitHub issue by URL as a local task, optionally cascading
+    /// into its sub-issues.
+    Import {
+        /// GitHub issue URL, e.g. https://github.com/owner/repo/issues/123.
+        url: String,
+        /// Also import the issue's sub-issue tree (recursively), wiring
+        /// `child_of` relations. Cross-repo sub-issues are skipped.
+        #[arg(long)]
+        cascade: bool,
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum GhCmd {
+    /// Save the GitHub token to a permission-restricted config file.
+    Auth {
+        /// Token value. If omitted, prompts on stdin with echo disabled.
+        /// Passing it as a flag avoids stdin but leaves the value in shell history.
+        #[arg(long)]
+        token: Option<String>,
+        /// Skip the overwrite confirmation if the file already exists.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AgentsCmd {
+    /// Render a self-documenting `rl` block into `./AGENTS.md`.
+    ///
+    /// Splices between `<!-- rl:doc:start -->` and `<!-- rl:doc:end -->`,
+    /// creating the file if missing or appending the block if no markers
+    /// are present. Always rewrites the block on every run.
+    Docs,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProjectCmd {
+    /// Link a project locally with hand-entered schema. Stage 5 will
+    /// rewire this to fetch the schema from GitHub; the local model and
+    /// CLI shape stay the same either way.
+    ///
+    /// `--option` takes `<option-id>:<name>` and is repeatable; the
+    /// option's `ordinal` is the order it appears on the command line.
+    /// `--map` takes `<status>:<option-id>` and seeds initial mappings.
+    /// Many-to-one mappings (multiple statuses → one option, e.g. `open`
+    /// and `blocked` both → "Backlog") are supported and persist losslessly.
+    Link {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        number: u64,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        status_field_id: String,
+        /// Status field option as `<option-id>:<name>`. Repeat per option.
+        #[arg(long = "option", value_parser = parse_option_kv)]
+        options: Vec<(String, String)>,
+        /// Initial mapping as `<status>:<option-id>`. Repeat per mapping.
+        /// `<status>` is one of `open`, `in_progress`, `blocked`, `done`.
+        #[arg(long = "map", value_parser = parse_mapping_kv)]
+        mappings: Vec<(String, String)>,
+    },
+    /// List every locally-known project (across all workspaces).
+    List,
+    /// Show one project. `<spec>` is `owner/number` or a `PVT_…` node id.
+    Show { spec: String },
+    /// Set a local TaskStatus → project option mapping.
+    Map {
+        spec: String,
+        /// Local task status (`open` / `in_progress` / `blocked` / `done`).
+        #[arg(long)]
+        local: String,
+        /// Option ID on the project's Status field.
+        #[arg(long = "option-id")]
+        option_id: String,
+    },
+    /// Unlink a project locally. Workspaces attached to it have their
+    /// `project_id` reset to NULL via the storage cascade.
+    Unlink { spec: String },
+}
+
+/// Parse `<option-id>:<name>` into a tuple for clap's `value_parser`.
+fn parse_option_kv(raw: &str) -> std::result::Result<(String, String), String> {
+    let (id, name) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected `<option-id>:<name>`, got {raw:?}"))?;
+    if id.is_empty() || name.is_empty() {
+        return Err(format!(
+            "option-id and name must both be non-empty, got {raw:?}"
+        ));
+    }
+    Ok((id.to_string(), name.to_string()))
+}
+
+/// Parse `<status>:<option-id>` into a tuple for clap's `value_parser`.
+fn parse_mapping_kv(raw: &str) -> std::result::Result<(String, String), String> {
+    let (status, opt) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected `<status>:<option-id>`, got {raw:?}"))?;
+    if status.is_empty() || opt.is_empty() {
+        return Err(format!(
+            "status and option-id must both be non-empty, got {raw:?}"
+        ));
+    }
+    Ok((status.to_string(), opt.to_string()))
+}
