@@ -93,6 +93,7 @@ name = "app-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "application-project",
  "application-query",
  "application-sync",
  "application-task",
@@ -148,6 +149,22 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "application-project"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "domain-core",
+ "domain-project",
+ "domain-task",
+ "dto-shared",
+ "ports",
+ "pretty_assertions",
+ "testing-fixtures",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
