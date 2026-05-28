@@ -124,39 +124,82 @@ impl SyncService {
         let prev = task.sync;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
 
-        if !matches!(task.sync, SyncState::DirtyLocal | SyncState::Staged) {
+        // Two independent push axes: the title/body/status snapshot (gated on
+        // DirtyLocal|Staged) and pending outbound comments (a separate axis —
+        // they never dirty the task, so a Synced task may still owe comments).
+        let snapshot_dirty = matches!(task.sync, SyncState::DirtyLocal | SyncState::Staged);
+        let has_pending_comments = task.comments.iter().any(|c| c.remote_id.is_none());
+        if !snapshot_dirty && !has_pending_comments {
             return Err(SyncError::Domain(domain_core::DomainError::transition(
-                format!("cannot push from sync={:?}", task.sync),
+                format!("cannot push from sync={:?} with no pending comments", task.sync),
             )));
         }
 
-        // Mirror the lifecycle status onto the remote issue's open/closed
-        // bit + state_reason. `Done` closes as `Completed`; `Archived`
-        // closes as `NotPlanned`. Any open status reopens (we don't
-        // currently know whether the remote was previously closed; sending
-        // `Reopened` unconditionally is harmless on GitHub when state is
-        // already open and informative otherwise).
-        let (closed, state_reason) = match task.status {
-            TaskStatus::Done => (true, Some(RemoteStateReason::Completed)),
-            TaskStatus::Archived => (true, Some(RemoteStateReason::NotPlanned)),
-            TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked => {
-                (false, Some(RemoteStateReason::Reopened))
-            }
-        };
-        self.provider
-            .update_remote(RemoteTaskUpdate {
-                canonical_repo: &canonical,
-                remote_id: &remote.remote_id,
-                title: Some(&task.title),
-                body: Some(&task.body),
-                closed: Some(closed),
-                state_reason,
-            })
-            .await?;
+        if snapshot_dirty {
+            // Mirror the lifecycle status onto the remote issue's open/closed
+            // bit + state_reason. `Done` closes as `Completed`; `Archived`
+            // closes as `NotPlanned`. Any open status reopens (we don't
+            // currently know whether the remote was previously closed; sending
+            // `Reopened` unconditionally is harmless on GitHub when state is
+            // already open and informative otherwise).
+            let (closed, state_reason) = match task.status {
+                TaskStatus::Done => (true, Some(RemoteStateReason::Completed)),
+                TaskStatus::Archived => (true, Some(RemoteStateReason::NotPlanned)),
+                TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked => {
+                    (false, Some(RemoteStateReason::Reopened))
+                }
+            };
+            self.provider
+                .update_remote(RemoteTaskUpdate {
+                    canonical_repo: &canonical,
+                    remote_id: &remote.remote_id,
+                    title: Some(&task.title),
+                    body: Some(&task.body),
+                    closed: Some(closed),
+                    state_reason,
+                })
+                .await?;
 
-        task.confirm_synced(SnapshotSource::Push)?;
-        self.tasks.save(&task, SnapshotSource::Push).await?;
-        Ok(summary(&task, prev, SyncDecision::PushLocal))
+            task.confirm_synced(SnapshotSource::Push)?;
+            self.tasks.save(&task, SnapshotSource::Push).await?;
+        }
+
+        // Drain pending comments after the snapshot push (independent of it):
+        // POST each, then promote them all to synced in one repo write.
+        //
+        // Not idempotent across a mid-batch failure: if a later POST fails, the
+        // earlier comments are already on GitHub but their local rows stay
+        // pending, so a re-run re-POSTs them (duplicate remote comments). GitHub
+        // issue comments have no idempotency key, so this at-most-once-per-retry
+        // duplication is an accepted tradeoff for a low-frequency operation —
+        // never lost comments, never a corrupted sync state.
+        if has_pending_comments {
+            let mut drained_local_ids = Vec::new();
+            let mut pushed = Vec::new();
+            for comment in task.comments.iter().filter(|c| c.remote_id.is_none()) {
+                // Pending comments loaded from storage carry a surrogate id;
+                // skip any in-memory entries that don't (not safely drainable).
+                let Some(local_id) = comment.local_id.clone() else {
+                    continue;
+                };
+                pushed.push(
+                    self.provider
+                        .create_comment(&canonical, &remote.remote_id, &comment.body)
+                        .await?,
+                );
+                drained_local_ids.push(local_id);
+            }
+            self.tasks
+                .mark_comments_pushed(id, &drained_local_ids, &pushed)
+                .await?;
+        }
+
+        let decision = if snapshot_dirty {
+            SyncDecision::PushLocal
+        } else {
+            SyncDecision::Noop
+        };
+        Ok(summary(&task, prev, decision))
     }
 
     /// Pull the latest remote snapshot and reconcile.
@@ -296,6 +339,7 @@ mod tests {
         last_update: Mutex<Option<RecordedUpdate>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
         comments: Mutex<Vec<RemoteComment>>,
+        created_comments: Mutex<Vec<String>>,
     }
 
     impl FakeProvider {
@@ -351,6 +395,22 @@ mod tests {
 
         async fn fetch_comments(&self, _: &str, _: &str) -> PortResult<Vec<RemoteComment>> {
             Ok(self.comments.lock().unwrap().clone())
+        }
+
+        async fn create_comment(
+            &self,
+            _: &str,
+            _: &str,
+            body: &str,
+        ) -> PortResult<RemoteComment> {
+            let mut created = self.created_comments.lock().unwrap();
+            created.push(body.to_string());
+            Ok(RemoteComment {
+                remote_id: format!("c{}", created.len()),
+                author: "remote-bot".into(),
+                body: body.to_string(),
+                created_at: Timestamp::from_utc(Utc::now()),
+            })
         }
     }
 
@@ -530,5 +590,70 @@ mod tests {
         assert_eq!(after.sync, SyncState::Conflict);
         assert_eq!(after.comments.len(), 1);
         assert_eq!(after.comments[0].body, "ping");
+    }
+
+    #[tokio::test]
+    async fn push_drains_pending_comments_on_synced_task() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(tasks.get(task.id).await.unwrap().sync, SyncState::Synced);
+
+        // A pending comment must NOT have dirtied the task.
+        tasks
+            .add_pending_comment(task.id, "me", "hello world", Timestamp::now())
+            .await
+            .unwrap();
+        assert_eq!(tasks.get(task.id).await.unwrap().sync, SyncState::Synced);
+
+        let s = svc.push(&task.id.to_string()).await.unwrap();
+        // Comment-only push: the snapshot axis is a noop, task stays synced.
+        assert_eq!(s.decision, "noop");
+        assert_eq!(s.new_state, "synced");
+
+        // create_comment was called; update_remote (title/body) was NOT.
+        assert_eq!(*provider.created_comments.lock().unwrap(), vec!["hello world".to_string()]);
+        assert!(provider.last_update.lock().unwrap().is_none());
+
+        // The pending comment is now synced.
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.comments.len(), 1);
+        assert!(after.comments[0].remote_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn push_drains_comments_and_snapshot_when_dirty() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_body("revised".into());
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        tasks
+            .add_pending_comment(task.id, "me", "also a comment", Timestamp::now())
+            .await
+            .unwrap();
+
+        let s = svc.push(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "push_local");
+        assert_eq!(s.new_state, "synced");
+
+        // Both axes pushed.
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.body.as_deref(), Some("revised"));
+        assert_eq!(*provider.created_comments.lock().unwrap(), vec!["also a comment".to_string()]);
+
+        let after = tasks.get(task.id).await.unwrap();
+        assert!(after.comments.iter().all(|c| c.remote_id.is_some()));
+    }
+
+    #[tokio::test]
+    async fn push_errors_when_clean_and_no_pending_comments() {
+        let (svc, tasks, task, _provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(tasks.get(task.id).await.unwrap().sync, SyncState::Synced);
+
+        let err = svc.push(&task.id.to_string()).await.unwrap_err();
+        assert!(matches!(err, SyncError::Domain(_)));
     }
 }

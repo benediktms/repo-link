@@ -129,6 +129,38 @@ pub trait TaskRepository: Send + Sync {
         task_id: TaskId,
         comments: &[RemoteComment],
     ) -> PortResult<()>;
+    /// Append a single pending (local-only) comment, stored with the empty
+    /// `remote_comment_id` sentinel. Writes only the `task_comments` table —
+    /// never a snapshot — so adding a comment never perturbs sync state
+    /// (pending comments are a separate outbound axis from title/body drift).
+    async fn add_pending_comment(
+        &self,
+        task_id: TaskId,
+        author: &str,
+        body: &str,
+        created_at: Timestamp,
+    ) -> PortResult<()>;
+    /// Promote a task's pending comments to synced after a successful remote
+    /// push: deletes the rows in `drained_local_ids` and inserts `pushed` as
+    /// synced rows. Writes only `task_comments`, never a snapshot.
+    ///
+    /// Identity-aware so the drain can't race-delete a pending comment that
+    /// was added between the caller reading the task and this call: only the
+    /// rows whose surrogate id was actually pushed are removed.
+    async fn mark_comments_pushed(
+        &self,
+        task_id: TaskId,
+        drained_local_ids: &[String],
+        pushed: &[RemoteComment],
+    ) -> PortResult<()>;
+    /// Count pending (local-only) comments per task across a workspace, so
+    /// `query unsynced` can surface comment-only outbound work without loading
+    /// every task's comments (`list` deliberately skips them). Returns only
+    /// tasks with at least one pending comment.
+    async fn pending_comment_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<std::collections::HashMap<TaskId, usize>>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
@@ -251,6 +283,16 @@ pub trait RemoteTaskProvider: Send + Sync {
     ) -> PortResult<Vec<RemoteComment>> {
         Ok(Vec::new())
     }
+
+    /// Create a comment on a remote task and return it with its provider-
+    /// assigned id/author/timestamp. Required (no default): a write has no
+    /// sensible no-op fallback, so each provider must implement it explicitly.
+    async fn create_comment(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+        body: &str,
+    ) -> PortResult<RemoteComment>;
 }
 
 // ---------- Filesystem probe ---------------------------------------------

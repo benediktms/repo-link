@@ -78,6 +78,56 @@ fn task_create_list_includes_state_filter() {
 }
 
 #[test]
+fn task_comment_creates_pending_and_surfaces_in_unsynced() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task", "create", "--workspace", &workspace, "--title", "ship it",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Adding a comment returns the task with one pending (remote_id null)
+    // comment, and must not dirty the task's snapshot axis.
+    let after = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "comment", &task_id, "looks good"],
+    );
+    let comments = after["comments"].as_array().unwrap();
+    assert_eq!(comments.len(), 1);
+    assert_eq!(comments[0]["body"], "looks good");
+    assert!(comments[0]["remote_id"].is_null());
+    assert_eq!(after["sync_state"], "local_only");
+
+    // It persists across reads.
+    let shown = run_json(&mut bin("repo-link", &dir), &["task", "show", &task_id]);
+    assert_eq!(shown["comments"].as_array().unwrap().len(), 1);
+
+    // query unsynced reports the pending-comment count (rows key by UUID, so
+    // assert on the single workspace task rather than the composite id).
+    let unsynced = run_json(
+        &mut bin("repo-link", &dir),
+        &["query", "unsynced", "--workspace", &workspace],
+    );
+    let rows = unsynced.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["pending_comments"], 1);
+
+    // Empty body is rejected.
+    bin("repo-link", &dir)
+        .args(["task", "comment", &task_id, "   "])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn task_batch_lifecycle_commands_emit_per_task_results() {
     let dir = TempDir::new().unwrap();
     let ws = run_json(
