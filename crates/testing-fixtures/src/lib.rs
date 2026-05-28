@@ -17,14 +17,17 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_core::{OutboxEntryId, ProjectId, RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_project::Project;
 use domain_repo::RepoBinding;
+use domain_sync::{OutboxEntry, OutboxStatus};
 use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use domain_workspace::Workspace;
 use dto_events::EventEnvelope;
 use ports::{
-    Clock, EventSink, FilesystemProbe, PortError, PortResult, RemoteComment, RepoBindingRepository,
-    TaskFilter, TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
+    Clock, EventSink, FilesystemProbe, OutboxRepository, PortError, PortResult, ProjectRepository,
+    RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
+    WorkspaceRepository,
 };
 
 // ---------- Clock --------------------------------------------------------
@@ -577,6 +580,152 @@ impl EventSink for CapturingEventSink {
     async fn record(&self, envelope: EventEnvelope) -> PortResult<()> {
         self.inner.lock().unwrap().push(envelope);
         Ok(())
+    }
+}
+
+// ---------- Project repository --------------------------------------------
+
+#[derive(Default)]
+pub struct InMemoryProjectRepository {
+    inner: Mutex<HashMap<ProjectId, Project>>,
+    /// Workspace → project membership map. Mirrors the SQLite world where
+    /// `workspaces.project_id` is the join column — by keeping a parallel
+    /// index here, `list_by_workspace` doesn't need to scan the workspace
+    /// repo, and tests can wire membership directly via `link_workspace`.
+    members: Mutex<HashMap<WorkspaceId, ProjectId>>,
+}
+
+impl InMemoryProjectRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind a workspace to a project for `list_by_workspace` to find. Tests
+    /// drive this directly because Stage 3 doesn't ship the
+    /// `rl project link` CLI yet — there's no service to call.
+    pub fn link_workspace(&self, ws: WorkspaceId, project: ProjectId) {
+        self.members.lock().unwrap().insert(ws, project);
+    }
+}
+
+#[async_trait]
+impl ProjectRepository for InMemoryProjectRepository {
+    async fn save(&self, project: &Project) -> PortResult<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(project.id.clone(), project.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: ProjectId) -> PortResult<Project> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| PortError::NotFound(format!("project {id}")))
+    }
+
+    async fn list_by_workspace(&self, ws: WorkspaceId) -> PortResult<Vec<Project>> {
+        let Some(project_id) = self.members.lock().unwrap().get(&ws).cloned() else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .get(&project_id)
+            .cloned()
+            .into_iter()
+            .collect())
+    }
+
+    async fn delete(&self, id: ProjectId) -> PortResult<()> {
+        self.inner.lock().unwrap().remove(&id);
+        // Mirror the SQL `ON DELETE SET NULL`: any workspace pointing at
+        // this project becomes projectless.
+        self.members.lock().unwrap().retain(|_, pid| pid != &id);
+        Ok(())
+    }
+}
+
+// ---------- Outbox repository ---------------------------------------------
+
+#[derive(Default)]
+pub struct InMemoryOutboxRepository {
+    /// Stored as an ordered `Vec` so `next_pending` can pop the oldest by
+    /// `enqueued_at` without re-sorting on every call. Writes are
+    /// append-only.
+    inner: Mutex<Vec<OutboxEntry>>,
+}
+
+impl InMemoryOutboxRepository {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for InMemoryOutboxRepository {
+    async fn enqueue(&self, entry: &OutboxEntry) -> PortResult<()> {
+        self.inner.lock().unwrap().push(entry.clone());
+        Ok(())
+    }
+
+    async fn next_pending(&self) -> PortResult<Option<OutboxEntry>> {
+        let mut guard = self.inner.lock().unwrap();
+        // Atomic claim: find the oldest pending entry by enqueued_at, flip
+        // it to inflight in place, and return the post-flip view. Mirrors
+        // the SQLite repo's transaction so test consumers see the same
+        // shape.
+        let oldest_idx = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.status == OutboxStatus::Pending)
+            .min_by_key(|(_, e)| e.enqueued_at)
+            .map(|(i, _)| i);
+        let Some(idx) = oldest_idx else {
+            return Ok(None);
+        };
+        let entry = &mut guard[idx];
+        entry.status = OutboxStatus::Inflight;
+        entry.updated_at = Timestamp::now();
+        Ok(Some(entry.clone()))
+    }
+
+    async fn mark_succeeded(&self, id: OutboxEntryId) -> PortResult<()> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(entry) = guard.iter_mut().find(|e| e.id == id) {
+            entry.status = OutboxStatus::Succeeded;
+            entry.last_error = None;
+            entry.updated_at = Timestamp::now();
+        }
+        Ok(())
+    }
+
+    async fn mark_failed(&self, id: OutboxEntryId, error: &str) -> PortResult<()> {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(entry) = guard.iter_mut().find(|e| e.id == id) {
+            entry.status = OutboxStatus::Failed;
+            entry.last_error = Some(error.to_string());
+            entry.attempts += 1;
+            entry.updated_at = Timestamp::now();
+        }
+        Ok(())
+    }
+
+    async fn list_pending(&self, task_id: TaskId) -> PortResult<Vec<OutboxEntry>> {
+        let mut out: Vec<OutboxEntry> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.task_id == task_id && e.status == OutboxStatus::Pending)
+            .cloned()
+            .collect();
+        out.sort_by_key(|e| e.enqueued_at);
+        Ok(out)
     }
 }
 

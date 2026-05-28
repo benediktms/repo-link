@@ -604,3 +604,221 @@ async fn aliases_check_rejects_non_array_json() {
         "expected a CHECK constraint failure, got: {msg}"
     );
 }
+
+// ---------- RFC 0001 Stage 3 — project + outbox round-trips ----------------
+
+#[tokio::test]
+async fn project_roundtrip_preserves_options_and_default_mapping() {
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_task::TaskStatus;
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db);
+    let id = ProjectId::parse("PVT_kwHO_test_abc").unwrap();
+    let saved = Project::new(
+        id.clone(),
+        "acme".into(),
+        7,
+        "Repo Link".into(),
+        "PVTSSF_field".into(),
+        vec![
+            StatusOption {
+                option_id: "o1".into(),
+                name: "Backlog".into(),
+                ordinal: 0,
+            },
+            StatusOption {
+                option_id: "o2".into(),
+                name: "Done".into(),
+                ordinal: 1,
+            },
+            StatusOption {
+                option_id: "o3".into(),
+                name: "Triage".into(),
+                ordinal: 2,
+            },
+        ],
+        vec![
+            StatusMapping {
+                status: TaskStatus::Open,
+                option_id: "o1".into(),
+            },
+            StatusMapping {
+                status: TaskStatus::Done,
+                option_id: "o2".into(),
+            },
+        ],
+        false,
+        Timestamp::now(),
+    )
+    .unwrap();
+
+    projects.save(&saved).await.unwrap();
+    let loaded = projects.get(id.clone()).await.unwrap();
+
+    // Identity + scalar fields round-trip unchanged.
+    assert_eq!(loaded.id.as_str(), id.as_str());
+    assert_eq!(loaded.owner_login, "acme");
+    assert_eq!(loaded.number, 7);
+    assert_eq!(loaded.title, "Repo Link");
+    assert_eq!(loaded.status_field_id, "PVTSSF_field");
+    assert!(!loaded.archived);
+
+    // Options come back in the order they were stored (sorted by ordinal).
+    assert_eq!(loaded.status_options.len(), 3);
+    let names: Vec<&str> = loaded
+        .status_options
+        .iter()
+        .map(|o| o.name.as_str())
+        .collect();
+    assert_eq!(names, ["Backlog", "Done", "Triage"]);
+
+    // The two real mappings round-trip; the "Triage" option stays unmapped
+    // (default_for IS NULL) exactly as it was saved.
+    assert_eq!(loaded.option_id_for(TaskStatus::Open), Some("o1"));
+    assert_eq!(loaded.option_id_for(TaskStatus::Done), Some("o2"));
+    assert_eq!(loaded.option_id_for(TaskStatus::InProgress), None);
+}
+
+#[tokio::test]
+async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
+    use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+
+    // We need a task row for the FK on outbox_entries.task_id. Make a
+    // minimal local-only one — the outbox doesn't read task fields.
+    let workspace = Workspace::new(WorkspaceName::new("wsx").unwrap(), None, true);
+    SqliteWorkspaceRepository::new(db.clone())
+        .save(&workspace)
+        .await
+        .unwrap();
+    let task = Task::new_draft(workspace.id, None, "t1".into()).unwrap();
+    ts.save(&task, SnapshotSource::Created).await.unwrap();
+
+    let outbox = SqliteOutboxRepository::new(db);
+
+    // Enqueue two entries. The drainer should claim the older one first.
+    let e1 = OutboxEntry::new(
+        task.id,
+        OutboxMutation::UpdateRemote {
+            canonical_repo: "github.com/o/r".into(),
+            remote_id: "1".into(),
+            title: Some("new title".into()),
+            body: None,
+            closed: None,
+        },
+    );
+    // Give e2 a strictly later enqueued_at by sleeping briefly — sub-µs
+    // ordering would otherwise be ambiguous on hot machines (we hit this
+    // exact thing on the rollback PR).
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let e2 = OutboxEntry::new(
+        task.id,
+        OutboxMutation::SetProjectStatus {
+            project_node_id: "PVT_kwHO_x".into(),
+            item_node_id: "PVTI_y".into(),
+            status_field_id: "PVTSSF_z".into(),
+            option_id: "abc12345".into(),
+        },
+    );
+    outbox.enqueue(&e1).await.unwrap();
+    outbox.enqueue(&e2).await.unwrap();
+
+    let pending = outbox.list_pending(task.id).await.unwrap();
+    assert_eq!(pending.len(), 2);
+
+    // Claim — should return e1 (older), now flipped to inflight.
+    let claimed = outbox
+        .next_pending()
+        .await
+        .unwrap()
+        .expect("a pending entry");
+    assert_eq!(claimed.id, e1.id);
+    assert_eq!(claimed.status, OutboxStatus::Inflight);
+
+    // list_pending now sees only e2.
+    let pending = outbox.list_pending(task.id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, e2.id);
+
+    // Mark e1 succeeded; mark_failed e2 to exercise both paths.
+    outbox.mark_succeeded(e1.id).await.unwrap();
+    outbox.mark_failed(e2.id, "graphql 5xx").await.unwrap();
+    // After mark_failed, e2 is no longer in `pending`.
+    let pending = outbox.list_pending(task.id).await.unwrap();
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn workspace_project_id_roundtrips() {
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::Project;
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
+
+    let (_dir, db, ws, _rb, _ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db);
+
+    // workspaces.project_id is a FK to projects(id) — the parent row must
+    // exist before a workspace can claim it.
+    let project_id = ProjectId::parse("PVT_kwHO_bound").unwrap();
+    let project = Project::new(
+        project_id.clone(),
+        "acme".into(),
+        1,
+        "scratch".into(),
+        "PVTSSF_x".into(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        Timestamp::now(),
+    )
+    .unwrap();
+    projects.save(&project).await.unwrap();
+
+    let mut workspace = Workspace::new(WorkspaceName::new("project-bound").unwrap(), None, false);
+    workspace.project_id = Some(project_id);
+    ws.save(&workspace).await.unwrap();
+
+    let back = ws.get(workspace.id).await.unwrap();
+    assert_eq!(
+        back.project_id.as_ref().map(|p| p.as_str()),
+        Some("PVT_kwHO_bound")
+    );
+}
+
+#[tokio::test]
+async fn task_remote_node_id_and_project_item_id_roundtrip() {
+    let (_dir, ws, rb, ts) = setup().await;
+
+    let workspace = Workspace::new(WorkspaceName::new("nodes").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "with node ids".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    let mut remote = RemoteRef::new("github", "42");
+    remote.node_id = Some("I_kwHO_xyz".into());
+    task.promote_to_remote(remote).unwrap();
+    task.project_item_id = Some("PVTI_kwHO_item".into());
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    let back = ts.get(task.id).await.unwrap();
+    assert_eq!(
+        back.remote.as_ref().and_then(|r| r.node_id.as_deref()),
+        Some("I_kwHO_xyz")
+    );
+    assert_eq!(back.project_item_id.as_deref(), Some("PVTI_kwHO_item"));
+}

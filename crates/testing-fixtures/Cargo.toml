@@ -11,6 +11,7 @@ domain-workspace = { workspace = true }
 domain-repo = { workspace = true }
 domain-task = { workspace = true }
 domain-sync = { workspace = true }
+domain-project = { workspace = true }
 ports = { workspace = true }
 dto-shared = { workspace = true }
 dto-events = { workspace = true }

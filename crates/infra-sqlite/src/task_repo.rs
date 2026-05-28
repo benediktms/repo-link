@@ -50,8 +50,8 @@ impl TaskRepository for SqliteTaskRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, hash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, hash, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 repo_id = excluded.repo_id,
@@ -63,6 +63,8 @@ impl TaskRepository for SqliteTaskRepository {
                 assignees_json = excluded.assignees_json,
                 remote_provider = excluded.remote_provider,
                 remote_id = excluded.remote_id,
+                remote_node_id = excluded.remote_node_id,
+                project_item_id = excluded.project_item_id,
                 hash = excluded.hash,
                 updated_at = excluded.updated_at
             "#,
@@ -78,6 +80,8 @@ impl TaskRepository for SqliteTaskRepository {
         .bind(json_to_string(&t.assignees)?)
         .bind(t.remote.as_ref().map(|r| r.provider.clone()))
         .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+        .bind(t.remote.as_ref().and_then(|r| r.node_id.clone()))
+        .bind(t.project_item_id.as_deref())
         .bind(&t.hash)
         .bind(t.created_at.into_inner())
         .bind(t.updated_at.into_inner())
@@ -414,6 +418,8 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
+    let remote_node_id: Option<String> = row.try_get("remote_node_id").map_err(map_sqlx_err)?;
+    let project_item_id: Option<String> = row.try_get("project_item_id").map_err(map_sqlx_err)?;
     let hash: String = row.try_get("hash").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
@@ -424,7 +430,11 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         .transpose()?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef::new(provider, remote_id)),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef {
+            provider,
+            remote_id,
+            node_id: remote_node_id,
+        }),
         _ => None,
     };
 
@@ -441,9 +451,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         remote,
         relations: Vec::new(),
         comments: Vec::new(),
-        // Default None pre-Stage 3: no migration has landed for
-        // `tasks.project_item_id` yet, so we don't read the column.
-        project_item_id: None,
+        project_item_id,
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
