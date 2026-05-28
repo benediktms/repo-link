@@ -319,6 +319,20 @@ impl SyncService {
         };
 
         if relink {
+            // Verified relink overwrites title/body/assignees from the new
+            // remote — only safe when the task is otherwise clean. Reject
+            // DirtyLocal / Staged so we don't silently clobber edits the user
+            // was about to push (the most common reason they hit the move
+            // error in the first place).
+            if task.sync != SyncState::Synced {
+                return Err(SyncError::Domain(domain_core::DomainError::validation(
+                    format!(
+                        "--relink is only safe for synced tasks (current: {:?}); \
+                         finish syncing first or use bare `task link`",
+                        task.sync
+                    ),
+                )));
+            }
             // Need a current remote to verify the redirect against.
             let current_remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
             let current_canonical = self.canonical_for(&task).await?;
@@ -352,26 +366,29 @@ impl SyncService {
             task.body = snap.body;
             task.assignees = snap.assignees;
             task.link_to_remote(binding.id, new_remote.clone(), false)?;
-            // Drop synced comments + refetch from the new remote; comment ids
-            // generally change across GitHub transfers.
-            self.tasks.replace_comments(id, &[]).await?;
             let new_comments = self
                 .provider
                 .fetch_comments(new_canonical, new_remote_id)
                 .await?;
-            self.tasks.replace_comments(id, &new_comments).await?;
+            // Save first so a comment-write failure can't leave a deleted-but-
+            // not-relinked state. `replace_comments` only touches synced rows
+            // (pending stays via the '' sentinel), so a one-shot replace with
+            // the new set both drops stale comments and inserts the new ones.
             self.tasks.save(&task, SnapshotSource::Link).await?;
+            self.tasks.replace_comments(id, &new_comments).await?;
         } else {
             // Validate the new remote exists before mutating local state.
             let _ = self
                 .provider
                 .fetch_remote(new_canonical, new_remote_id)
                 .await?;
-            // Drop synced comments; the user resolves via `sync pull` which
-            // will re-mirror from the new remote.
-            self.tasks.replace_comments(id, &[]).await?;
             task.link_to_remote(binding.id, new_remote.clone(), true)?;
+            // Same ordering as the relink branch: commit the link first; then
+            // clear synced comments (pending preserved by contract). If the
+            // comment write fails, the task is still on the new remote and a
+            // subsequent `sync pull` will refresh the synced set.
             self.tasks.save(&task, SnapshotSource::Link).await?;
+            self.tasks.replace_comments(id, &[]).await?;
         }
 
         Ok(link_summary(&task, prev, if relink { "relinked" } else { "linked" }))
@@ -910,6 +927,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::Domain(_)));
+    }
+
+    #[tokio::test]
+    async fn link_relink_refuses_when_task_is_dirty_local() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        // Make the task DirtyLocal (the typical state when a user hits the
+        // move error on `sync push`). `--relink` must refuse rather than
+        // silently overwrite their unpushed edits with the new remote's snap.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_body("local edit at risk".into());
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        provider.set_move_target("github.com/o2/r2", "1506");
+
+        let err = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "1506", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Domain(_)));
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.body, "local edit at risk", "local edit must survive");
+        assert_eq!(after.sync, SyncState::DirtyLocal);
     }
 
     #[tokio::test]

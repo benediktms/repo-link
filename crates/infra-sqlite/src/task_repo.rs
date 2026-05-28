@@ -510,7 +510,13 @@ async fn load_latest_baseline(
                assignees_json, remote_provider, remote_id, source, captured_at
         FROM task_snapshots
         WHERE task_id = ?
-          AND source IN ('promote', 'push', 'pull', 'conflict_resolve', 'link')
+          -- `link` is baseline-eligible only on the verified-relink path
+          -- (task stays Synced); bare links flip to Conflict and explicitly
+          -- do NOT establish remote alignment.
+          AND (
+              source IN ('promote', 'push', 'pull', 'conflict_resolve')
+              OR (source = 'link' AND sync_state != 'conflict')
+          )
         ORDER BY version DESC
         LIMIT 1
         "#,

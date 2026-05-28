@@ -126,6 +126,10 @@ impl RestClient {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<Vec<RemoteChildIssue>> {
+        // The `/sub_issues` response carries no `repository_url` for the
+        // parent, so without this pre-flight a transferred parent would
+        // silently return the new repo's children.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
         // Page through until a short page (or the safety cap), so issues with
@@ -194,6 +198,10 @@ impl RestClient {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<Vec<RemoteComment>> {
+        // Same redirect-silence hazard as `fetch_sub_issues`: comment payloads
+        // don't name the parent's `repository_url`, so a transferred parent
+        // would silently return the new repo's comments.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
         const PER_PAGE: u8 = 100;
@@ -295,6 +303,26 @@ impl RestClient {
             .await
             .map_err(map_err)?;
         Ok(detect_move_from_issue(canonical_repo, remote_id, &issue))
+    }
+
+    /// Pre-flight check used by endpoints whose responses don't carry the
+    /// parent issue's `repository_url` (e.g. `/sub_issues`, `/comments`). The
+    /// follow-redirect layer silently lands a transferred-issue request on
+    /// the new repo's data, so without this check those endpoints would
+    /// return foreign data without raising `IssueMoved`. Costs one extra GET
+    /// per call — fine for a rare path.
+    async fn ensure_not_moved(&self, canonical_repo: &str, remote_id: &str) -> PortResult<()> {
+        if let Some((to_canonical, to_remote_id)) =
+            self.discover_move_target(canonical_repo, remote_id).await?
+        {
+            return Err(PortError::IssueMoved {
+                from_canonical: canonical_repo.to_string(),
+                from_remote_id: remote_id.to_string(),
+                to_canonical,
+                to_remote_id,
+            });
+        }
+        Ok(())
     }
 
     /// If the octocrab call failed with a 301, probe `Location` and surface a

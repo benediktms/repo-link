@@ -226,6 +226,19 @@ pub struct TaskSnapshot {
     pub captured_at: Timestamp,
 }
 
+impl TaskSnapshot {
+    /// Whether this snapshot represents a moment of remote alignment that
+    /// dirty detection should diff against. Stricter than
+    /// [`SnapshotSource::is_baseline`]: a `Link` snapshot is baseline-eligible
+    /// only when the task ended up `Synced` (verified relink); a bare link
+    /// flips to `Conflict` and explicitly does NOT establish alignment, so
+    /// loading that row as the baseline would mis-anchor diff detection.
+    pub fn is_baseline(&self) -> bool {
+        self.source.is_baseline()
+            && !(self.source == SnapshotSource::Link && self.sync_state == SyncState::Conflict)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,

@@ -258,7 +258,7 @@ impl TaskRepository for InMemoryTaskRepository {
         let snaps = self.snapshots.lock().unwrap();
         task.synced_baseline = snaps
             .get(&id)
-            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+            .and_then(|h| h.iter().rfind(|s| s.is_baseline()).cloned());
         task.comments = self
             .comments
             .lock()
@@ -301,7 +301,7 @@ impl TaskRepository for InMemoryTaskRepository {
                 let mut task = t.clone();
                 task.synced_baseline = snaps
                     .get(&t.id)
-                    .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+                    .and_then(|h| h.iter().rfind(|s| s.is_baseline()).cloned());
                 task
             })
             .collect();
@@ -322,7 +322,7 @@ impl TaskRepository for InMemoryTaskRepository {
         let mut task = task;
         task.synced_baseline = snaps
             .get(&task.id)
-            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+            .and_then(|h| h.iter().rfind(|s| s.is_baseline()).cloned());
         task.comments = self
             .comments
             .lock()
@@ -356,7 +356,7 @@ impl TaskRepository for InMemoryTaskRepository {
         let mut task = task;
         task.synced_baseline = snaps
             .get(&task.id)
-            .and_then(|h| h.iter().rfind(|s| s.source.is_baseline()).cloned());
+            .and_then(|h| h.iter().rfind(|s| s.is_baseline()).cloned());
         task.comments = self
             .comments
             .lock()

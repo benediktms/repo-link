@@ -284,9 +284,24 @@ mod tests {
         })
     }
 
+    /// Mount the parent-issue stub that `fetch_sub_issues` / `fetch_comments`
+    /// pre-flight to detect a moved issue. Without this, those tests would
+    /// fail because the pre-flight GET hits an unmocked path.
+    async fn mount_parent_issue_ok(server: &MockServer, number: u64) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/o/r/issues/{number}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(issue_payload(number, "parent", "", "open")),
+            )
+            .mount(server)
+            .await;
+    }
+
     #[tokio::test]
     async fn fetch_comments_maps_and_paginates() {
         let server = MockServer::start().await;
+        mount_parent_issue_ok(&server, 1).await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/1/comments"))
             .respond_with(ResponseTemplate::new(200).set_body_json(vec![
@@ -308,6 +323,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_comments_paginates_past_one_page() {
         let server = MockServer::start().await;
+        mount_parent_issue_ok(&server, 1).await;
         // Page 1: a full page of 100 → the client must request page 2.
         let page1: Vec<serde_json::Value> = (0..100)
             .map(|i| comment_payload(1000 + i, "alice", "c"))
@@ -359,6 +375,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sub_issues_maps_children_with_canonical_repo() {
         let server = MockServer::start().await;
+        mount_parent_issue_ok(&server, 1).await;
         // GitHub returns a flat array of full issue objects (one level).
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/1/sub_issues"))
@@ -387,6 +404,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_sub_issues_paginates_past_one_page() {
         let server = MockServer::start().await;
+        mount_parent_issue_ok(&server, 1).await;
         // Page 1: a full page of 100 → the client must request page 2.
         let page1: Vec<serde_json::Value> = (0..100)
             .map(|i| issue_payload(1000 + i, "child", "b", "open"))
@@ -531,6 +549,28 @@ mod tests {
             }
             other => panic!("expected IssueMoved, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn fetch_comments_on_transferred_parent_surfaces_issue_moved() {
+        // GitHub's `/comments` payload doesn't name the parent's repo, so a
+        // silent redirect-follow would return the new repo's comments without
+        // the caller knowing. The pre-flight `ensure_not_moved` catches this.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/5788"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                1506, "moved", "x", "open", "o2", "r2",
+            )))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let err = provider
+            .fetch_comments("github.com/o/r", "5788")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ports::PortError::IssueMoved { .. }));
     }
 
     #[tokio::test]
