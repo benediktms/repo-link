@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
+use application_project::ProjectService;
 use application_query::QueryService;
 use application_sync::SyncService;
 use application_task::TaskService;
@@ -11,16 +12,16 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::{Args, Parser, Subcommand};
 use dto_shared::{
     AddTaskRelationCmd, AttachRepoCmd, CreateTaskCmd, CreateWorkspaceCmd, ImportMirrorCmd,
-    LinkWorktreeCmd, ListTasksQuery, ListWorkspacesQuery, LocateResponseDto, UnlinkWorktreeCmd,
-    UpdateTaskCmd,
+    LinkProjectCmd, LinkWorktreeCmd, ListTasksQuery, ListWorkspacesQuery, LocateResponseDto,
+    MapStatusCmd, StatusMappingDto, StatusOptionDto, UnlinkWorktreeCmd, UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
 use infra_git::discover_canonical;
 use infra_github::GithubTaskProvider;
 use infra_sqlite::{
-    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteTaskSnapshotRepository,
-    SqliteWorkspaceRepository, open_from_path,
+    SqliteProjectRepository, SqliteRepoBindingRepository, SqliteTaskRepository,
+    SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
 };
 
 mod daemon;
@@ -100,6 +101,10 @@ enum Cmd {
     /// Documentation helpers for AI agents picking up this repo.
     #[command(subcommand)]
     Agents(AgentsCmd),
+    /// GitHub Projects v2 management (local-only in Stage 4 — `rl project link`
+    /// accepts hand-entered schema; Stage 5 swaps the GraphQL fetch in).
+    #[command(subcommand)]
+    Project(ProjectCmd),
     /// Manage the background reconciliation daemon (launchd / systemd unit).
     #[command(subcommand)]
     Daemon(daemon::DaemonCmd),
@@ -113,6 +118,11 @@ enum WorkspaceCmd {
         description: Option<String>,
         #[arg(long)]
         local_only: bool,
+        /// Optional GitHub Projects v2 board to attach the new workspace
+        /// to. Accepts a project node ID (`PVT_…`) or `owner/number`.
+        /// The project must already be linked locally — see `rl project link`.
+        #[arg(long)]
+        project: Option<String>,
     },
     List {
         #[arg(long)]
@@ -129,6 +139,20 @@ enum WorkspaceCmd {
     },
     Archive {
         id: String,
+    },
+    /// Attach a workspace to a project (or detach with `--none`). Resolves
+    /// `<project>` as a node ID or `owner/number`, same as
+    /// `rl project show`.
+    SetProject {
+        workspace: String,
+        /// Project to attach the workspace to (`PVT_…` or `owner/number`).
+        /// Mutually exclusive with `--none`.
+        #[arg(long, conflicts_with = "none")]
+        project: Option<String>,
+        /// Detach the workspace from any project. Mutually exclusive with
+        /// `--project`.
+        #[arg(long)]
+        none: bool,
     },
 }
 
@@ -543,11 +567,87 @@ enum AgentsCmd {
     Docs,
 }
 
+#[derive(Subcommand, Debug)]
+enum ProjectCmd {
+    /// Link a project locally with hand-entered schema. Stage 5 will
+    /// rewire this to fetch the schema from GitHub; the local model and
+    /// CLI shape stay the same either way.
+    ///
+    /// `--option` takes `<option-id>:<name>` and is repeatable; the
+    /// option's `ordinal` is the order it appears on the command line.
+    /// `--map` takes `<status>:<option-id>` and seeds initial mappings.
+    /// Many-to-one mappings (multiple statuses → one option) are valid
+    /// in the domain but currently lossy on save — see #80.
+    Link {
+        #[arg(long)]
+        node_id: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        number: u64,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        status_field_id: String,
+        /// Status field option as `<option-id>:<name>`. Repeat per option.
+        #[arg(long = "option", value_parser = parse_option_kv)]
+        options: Vec<(String, String)>,
+        /// Initial mapping as `<status>:<option-id>`. Repeat per mapping.
+        /// `<status>` is one of `open`, `in_progress`, `blocked`, `done`.
+        #[arg(long = "map", value_parser = parse_mapping_kv)]
+        mappings: Vec<(String, String)>,
+    },
+    /// List every locally-known project (across all workspaces).
+    List,
+    /// Show one project. `<spec>` is `owner/number` or a `PVT_…` node id.
+    Show { spec: String },
+    /// Set a local TaskStatus → project option mapping.
+    Map {
+        spec: String,
+        /// Local task status (`open` / `in_progress` / `blocked` / `done`).
+        #[arg(long)]
+        local: String,
+        /// Option ID on the project's Status field.
+        #[arg(long = "option-id")]
+        option_id: String,
+    },
+    /// Unlink a project locally. Workspaces attached to it have their
+    /// `project_id` reset to NULL via the storage cascade.
+    Unlink { spec: String },
+}
+
+/// Parse `<option-id>:<name>` into a tuple for clap's `value_parser`.
+fn parse_option_kv(raw: &str) -> std::result::Result<(String, String), String> {
+    let (id, name) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected `<option-id>:<name>`, got {raw:?}"))?;
+    if id.is_empty() || name.is_empty() {
+        return Err(format!(
+            "option-id and name must both be non-empty, got {raw:?}"
+        ));
+    }
+    Ok((id.to_string(), name.to_string()))
+}
+
+/// Parse `<status>:<option-id>` into a tuple for clap's `value_parser`.
+fn parse_mapping_kv(raw: &str) -> std::result::Result<(String, String), String> {
+    let (status, opt) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected `<status>:<option-id>`, got {raw:?}"))?;
+    if status.is_empty() || opt.is_empty() {
+        return Err(format!(
+            "status and option-id must both be non-empty, got {raw:?}"
+        ));
+    }
+    Ok((status.to_string(), opt.to_string()))
+}
+
 struct Services {
     workspaces: WorkspaceService,
     bindings: RepoBindingService,
     tasks: TaskService,
     query: QueryService,
+    projects: ProjectService,
     tasks_repo: Arc<dyn ports::TaskRepository>,
     bindings_repo: Arc<dyn ports::RepoBindingRepository>,
 }
@@ -575,13 +675,16 @@ async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     let tasks_repo: Arc<dyn ports::TaskRepository> =
         Arc::new(SqliteTaskRepository::new(db.clone()));
     let snapshots_repo: Arc<dyn ports::TaskSnapshotRepository> =
-        Arc::new(SqliteTaskSnapshotRepository::new(db));
+        Arc::new(SqliteTaskSnapshotRepository::new(db.clone()));
+    let projects_repo: Arc<dyn ports::ProjectRepository> =
+        Arc::new(SqliteProjectRepository::new(db));
 
     Ok(Services {
-        workspaces: WorkspaceService::new(workspaces_repo.clone()),
+        workspaces: WorkspaceService::with_projects(workspaces_repo.clone(), projects_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
         tasks: TaskService::new(tasks_repo.clone(), snapshots_repo, bindings_repo.clone()),
         query: QueryService::new(workspaces_repo, bindings_repo.clone(), tasks_repo.clone()),
+        projects: ProjectService::new(projects_repo),
         tasks_repo,
         bindings_repo,
     })
@@ -597,6 +700,7 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg).await,
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
+        Cmd::Project(c) => project_dispatch(c, svc).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
     }
 }
@@ -661,6 +765,84 @@ fn enrich_issue_moved(task_ref: &str, err: application_sync::SyncError) -> anyho
         );
     }
     anyhow!("{err}")
+}
+
+async fn project_dispatch(cmd: ProjectCmd, svc: &Services) -> Result<()> {
+    match cmd {
+        ProjectCmd::Link {
+            node_id,
+            owner,
+            number,
+            title,
+            status_field_id,
+            options,
+            mappings,
+        } => {
+            let status_options: Vec<StatusOptionDto> = options
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, name))| StatusOptionDto {
+                    option_id: id,
+                    name,
+                    // The CLI surface uses positional order as the user's
+                    // intended display order; same as we'd get from the
+                    // GraphQL field response in Stage 5.
+                    ordinal: u32::try_from(i).unwrap_or(u32::MAX),
+                    default_for: None,
+                })
+                .collect();
+            let initial_mappings: Vec<StatusMappingDto> = mappings
+                .into_iter()
+                .map(|(status, option_id)| StatusMappingDto { status, option_id })
+                .collect();
+            let dto = svc
+                .projects
+                .link(LinkProjectCmd {
+                    node_id,
+                    owner_login: owner,
+                    number,
+                    title,
+                    status_field_id,
+                    status_options,
+                    initial_mappings,
+                })
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::to_string_pretty(&dto)?);
+        }
+        ProjectCmd::List => {
+            let dtos = svc.projects.list().await.map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::to_string_pretty(&dtos)?);
+        }
+        ProjectCmd::Show { spec } => {
+            let dto = svc.projects.get(&spec).await.map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::to_string_pretty(&dto)?);
+        }
+        ProjectCmd::Map {
+            spec,
+            local,
+            option_id,
+        } => {
+            let dto = svc
+                .projects
+                .map_status(MapStatusCmd {
+                    project_spec: spec,
+                    status: local,
+                    option_id,
+                })
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::to_string_pretty(&dto)?);
+        }
+        ProjectCmd::Unlink { spec } => {
+            svc.projects
+                .unlink(&spec)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::json!({ "unlinked": spec }));
+        }
+    }
+    Ok(())
 }
 
 async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
@@ -1119,6 +1301,7 @@ async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Result<()> {
             name,
             description,
             local_only,
+            project,
         } => {
             let dto = svc
                 .workspaces
@@ -1126,8 +1309,23 @@ async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Result<()> {
                     name,
                     description,
                     local_only,
+                    project_spec: project,
                 })
                 .await?;
+            render::workspace(&dto);
+        }
+        WorkspaceCmd::SetProject {
+            workspace,
+            project,
+            none,
+        } => {
+            if !none && project.is_none() {
+                return Err(anyhow!(
+                    "rl workspace set-project requires either --project <spec> or --none"
+                ));
+            }
+            let spec = if none { None } else { project.as_deref() };
+            let dto = svc.workspaces.set_project(&workspace, spec).await?;
             render::workspace(&dto);
         }
         WorkspaceCmd::List { include_archived } => {

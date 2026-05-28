@@ -10,6 +10,7 @@ application-workspace = { workspace = true }
 application-task = { workspace = true }
 application-query = { workspace = true }
 application-sync = { workspace = true }
+application-project = { workspace = true }
 infra-github = { workspace = true }
 dto-shared = { workspace = true }
 domain-task = { workspace = true }
