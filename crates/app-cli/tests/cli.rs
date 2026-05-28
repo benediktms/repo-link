@@ -2543,6 +2543,10 @@ fn worktree_prune_missing_ambiguous_alias_exits_with_candidates() {
         .failure()
         .get_output()
         .clone();
+    // Lock the resolver contract to exit code 2 specifically — a regression
+    // to any other non-zero status (e.g. an anyhow bubble at 1) should fail
+    // the test rather than silently passing under `assert().failure()`.
+    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     let body: serde_json::Value =
         serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
