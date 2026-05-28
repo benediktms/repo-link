@@ -831,6 +831,10 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
     cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
     cmd.env_remove("GITHUB_TOKEN");
+    // Point the GH API at a closed port so `gh auth`'s best-effort `/user`
+    // call fails fast (connection refused). The token still persists; the
+    // login simply isn't cached, matching offline / bad-token UX.
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", "http://127.0.0.1:1");
     let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
     // Use canonicalize so symlinks (e.g. /var → /private/var on macOS) don't
     // cause a mismatch between the path the binary resolves and what we built.

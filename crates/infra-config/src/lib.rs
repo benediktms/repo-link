@@ -62,6 +62,7 @@ struct RawEnv {
     github_token: Option<String>,
     github_token_file: Option<PathBuf>,
     github_login: Option<String>,
+    github_api_base_url: Option<String>,
     user: Option<String>,
 }
 
@@ -76,6 +77,11 @@ pub struct RepoLinkConfig {
     /// resolution chain that also reads the cached login from the token
     /// file, call [`Self::resolve_github_login`].
     pub github_login: Option<String>,
+    /// Override for the GitHub REST API root, sourced from
+    /// `REPO_LINK_GITHUB_API_BASE_URL`. `None` means the provider talks to
+    /// `api.github.com`. Useful for GitHub Enterprise and for pointing the
+    /// CLI at a mock server in integration tests.
+    pub github_api_base_url: Option<String>,
     pub default_user: Option<String>,
     /// Resolved path for the on-disk GitHub token. The file may or may not
     /// exist; it's read on demand by [`Self::resolve_github_token`] /
@@ -106,6 +112,7 @@ impl RepoLinkConfig {
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()));
         let github_login = raw.github_login.filter(|s| !s.is_empty());
+        let github_api_base_url = raw.github_api_base_url.filter(|s| !s.is_empty());
         let default_user = raw.user.or_else(|| std::env::var("USER").ok());
         let database_path = match raw.db {
             Some(p) => p,
@@ -119,6 +126,7 @@ impl RepoLinkConfig {
             database_path,
             github_token,
             github_login,
+            github_api_base_url,
             default_user,
             token_file_path,
         })
@@ -317,6 +325,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: None,
             github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: PathBuf::from("/tmp/github_token"),
         }
@@ -435,6 +444,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: Some("from-env".into()),
             github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: path,
         };
@@ -456,6 +466,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: None,
             github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: path,
         };
@@ -477,6 +488,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: None,
             github_login: Some("from-env".into()),
+            github_api_base_url: None,
             default_user: None,
             token_file_path: path,
         };
@@ -493,6 +505,7 @@ mod tests {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: None,
             github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: dir.path().join("does-not-exist"),
         };

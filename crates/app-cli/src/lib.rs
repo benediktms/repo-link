@@ -562,7 +562,7 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Task(c) => task_dispatch(c, svc, cfg).await,
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
-        Cmd::Gh(c) => gh_dispatch(c, cfg),
+        Cmd::Gh(c) => gh_dispatch(c, cfg).await,
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
     }
@@ -878,13 +878,13 @@ async fn sync_import(
     Ok(())
 }
 
-fn gh_dispatch(cmd: GhCmd, cfg: &RepoLinkConfig) -> Result<()> {
+async fn gh_dispatch(cmd: GhCmd, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
-        GhCmd::Auth { token, force } => gh_auth(token, force, cfg),
+        GhCmd::Auth { token, force } => gh_auth(token, force, cfg).await,
     }
 }
 
-fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<()> {
+async fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<()> {
     // Guard against overwriting an existing token file without explicit consent.
     if cfg.token_file_path.exists() && !force {
         eprint!(
@@ -920,7 +920,29 @@ fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<(
         return Err(anyhow!("token must not be empty"));
     }
 
-    write_token_file(&cfg.token_file_path, &trimmed)?;
+    // Best-effort: fetch the authenticated user's login and cache it next to
+    // the token. A network failure / invalid token shouldn't block the auth
+    // flow — the token still gets persisted and downstream verbs that need
+    // the login (e.g. `task claim`) report a clear "re-run rl gh auth" hint.
+    let login = match build_github_provider(&trimmed, cfg) {
+        Ok(provider) => match provider.current_user_login().await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "note: token saved, but couldn't fetch GitHub login ({e}). \
+                     Re-run `rl gh auth` once connectivity / the token is good \
+                     so commands like `rl task claim` can resolve your handle."
+                );
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("note: token saved, but provider init failed ({e}).");
+            None
+        }
+    };
+
+    write_token_file(&cfg.token_file_path, &trimmed, login.as_deref())?;
 
     let path_str = cfg
         .token_file_path
@@ -930,17 +952,30 @@ fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<(
         .to_string();
 
     #[cfg(unix)]
-    println!(
-        "{}",
-        serde_json::json!({ "file": path_str, "mode": "0600" })
-    );
+    let mode_value = "0600";
     #[cfg(not(unix))]
-    println!(
-        "{}",
-        serde_json::json!({ "file": path_str, "mode": "unrestricted" })
-    );
+    let mode_value = "unrestricted";
+
+    let mut payload = serde_json::json!({ "file": path_str, "mode": mode_value });
+    if let Some(l) = login.as_deref() {
+        payload["login"] = serde_json::Value::String(l.to_string());
+    }
+    println!("{payload}");
 
     Ok(())
+}
+
+/// Construct a `GithubTaskProvider`, honoring `REPO_LINK_GITHUB_API_BASE_URL`
+/// when set (for GitHub Enterprise or integration tests pointing at a
+/// wiremock). Falls back to api.github.com.
+fn build_github_provider(
+    token: &str,
+    cfg: &RepoLinkConfig,
+) -> Result<GithubTaskProvider, ports::PortError> {
+    match cfg.github_api_base_url.as_deref() {
+        Some(url) => GithubTaskProvider::with_base_url(token, url),
+        None => GithubTaskProvider::new(token),
+    }
 }
 
 /// Best-effort: read the token cached by the official `gh` CLI. Any failure
@@ -961,8 +996,23 @@ fn try_gh_cli_token() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Render the two-line file body: token on line 1, optional cached GitHub
+/// login on line 2. Single-line files (login = None) keep parsing through
+/// `infra_config::resolve_github_token` exactly as before — the second line
+/// is purely additive.
+fn render_token_file_body(token: &str, login: Option<&str>) -> String {
+    match login {
+        Some(l) => format!("{token}\n{l}\n"),
+        None => token.to_string(),
+    }
+}
+
 #[cfg(unix)]
-fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+fn write_token_file(
+    path: &std::path::Path,
+    token: &str,
+    login: Option<&str>,
+) -> Result<()> {
     use std::fs::DirBuilder;
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -989,7 +1039,7 @@ fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
         .mode(0o600)
         .open(path)
         .map_err(|e| anyhow!("failed to open token file: {e}"))?;
-    file.write_all(token.as_bytes())
+    file.write_all(render_token_file_body(token, login).as_bytes())
         .map_err(|e| anyhow!("failed to write token: {e}"))?;
     drop(file);
 
@@ -1001,14 +1051,19 @@ fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+fn write_token_file(
+    path: &std::path::Path,
+    token: &str,
+    login: Option<&str>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("failed to create config dir: {e}"))?;
         }
     }
-    std::fs::write(path, token).map_err(|e| anyhow!("failed to write token file: {e}"))?;
+    std::fs::write(path, render_token_file_body(token, login))
+        .map_err(|e| anyhow!("failed to write token file: {e}"))?;
     Ok(())
 }
 
