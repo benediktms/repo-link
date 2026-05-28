@@ -104,6 +104,9 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         description,
         status: enum_from_str::<WorkspaceStatus>("workspace status", &status_str)?,
         local_only: local_only != 0,
+        // Default None pre-Stage 3: no migration has landed for
+        // `workspaces.project_id` yet, so we don't read the column.
+        project_id: None,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),
     })

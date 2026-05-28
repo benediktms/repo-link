@@ -67,10 +67,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
     let _ = parse_uuid::<TaskId>("task_id", &id_str)?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef {
-            provider,
-            remote_id,
-        }),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef::new(provider, remote_id)),
         _ => None,
     };
     let repo_id = repo_id_raw

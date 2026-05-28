@@ -236,10 +236,7 @@ impl TaskService {
         let mut t = Task::import_mirror(
             workspace_id,
             repo_id,
-            RemoteRef {
-                provider: cmd.provider,
-                remote_id: cmd.remote_id,
-            },
+            RemoteRef::new(cmd.provider, cmd.remote_id),
             cmd.title,
             cmd.body,
             cmd.assignees,

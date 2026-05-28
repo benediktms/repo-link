@@ -641,11 +641,8 @@ mod tests {
         // A task that was synced + then locally edited.
         let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
-        task.promote_to_remote(domain_task::RemoteRef {
-            provider: "github".into(),
-            remote_id: "777".into(),
-        })
-        .unwrap();
+        task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
+            .unwrap();
         // promote_to_remote already lands on Synced — go straight to DirtyLocal
         // to simulate a post-sync local edit.
         task.mark_dirty_local().unwrap();

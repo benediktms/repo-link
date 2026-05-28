@@ -232,11 +232,7 @@ async fn remote_mapping_is_repo_scoped() {
     let mk = |repo_id, num: &str| {
         let mut t = Task::new_draft(w.id, Some(repo_id), format!("issue {num}")).unwrap();
         t.stage_for_sync().unwrap();
-        t.promote_to_remote(RemoteRef {
-            provider: "github".into(),
-            remote_id: num.into(),
-        })
-        .unwrap();
+        t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
         t
     };
 
@@ -312,11 +308,7 @@ async fn task_with_relations_and_remote_roundtrip() {
     task.assignees = vec!["alice".into(), "bob".into()];
     task.add_relation(RelationKind::BlockedBy, other.id);
     task.stage_for_sync().unwrap();
-    task.promote_to_remote(RemoteRef {
-        provider: "github".into(),
-        remote_id: "o/r#42".into(),
-    })
-    .unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "o/r#42")).unwrap();
     other.archive().unwrap();
 
     ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();
