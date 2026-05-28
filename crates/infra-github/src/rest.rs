@@ -81,7 +81,9 @@ impl RestClient {
                 builder = builder.state_reason(map_state_reason(reason));
             }
         }
-        let issue = builder.send().await.map_err(map_err)?;
+        let issue = self
+            .detect_move_or_map(cmd.canonical_repo, cmd.remote_id, builder.send().await)
+            .await?;
         Ok(map_issue(issue))
     }
 
@@ -92,12 +94,25 @@ impl RestClient {
     ) -> PortResult<RemoteTaskSnapshot> {
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
+        // GET is auto-followed by octocrab on a 301 — the response is from the
+        // *new* repo if the issue was transferred. Compare to detect the move.
         let issue = self
-            .http
-            .issues(owner, repo)
-            .get(number)
-            .await
-            .map_err(map_err)?;
+            .detect_move_or_map(
+                canonical_repo,
+                remote_id,
+                self.http.issues(owner, repo).get(number).await,
+            )
+            .await?;
+        if let Some((to_canonical, to_remote_id)) =
+            detect_move_from_issue(canonical_repo, remote_id, &issue)
+        {
+            return Err(PortError::IssueMoved {
+                from_canonical: canonical_repo.to_string(),
+                from_remote_id: remote_id.to_string(),
+                to_canonical,
+                to_remote_id,
+            });
+        }
         Ok(map_issue(issue))
     }
 
@@ -111,6 +126,10 @@ impl RestClient {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<Vec<RemoteChildIssue>> {
+        // The `/sub_issues` response carries no `repository_url` for the
+        // parent, so without this pre-flight a transferred parent would
+        // silently return the new repo's children.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
         // Page through until a short page (or the safety cap), so issues with
@@ -123,7 +142,13 @@ impl RestClient {
             let route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page={PER_PAGE}&page={page}"
             );
-            let batch: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+            let batch: Vec<Issue> = self
+                .detect_move_or_map(
+                    canonical_repo,
+                    remote_id,
+                    self.http.get(route, None::<&()>).await,
+                )
+                .await?;
             let full = batch.len() == PER_PAGE;
             issues.extend(batch);
             if !full {
@@ -173,6 +198,10 @@ impl RestClient {
         canonical_repo: &str,
         remote_id: &str,
     ) -> PortResult<Vec<RemoteComment>> {
+        // Same redirect-silence hazard as `fetch_sub_issues`: comment payloads
+        // don't name the parent's `repository_url`, so a transferred parent
+        // would silently return the new repo's comments.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
         const PER_PAGE: u8 = 100;
@@ -181,14 +210,18 @@ impl RestClient {
         let mut cap_page_full = false;
         for page in 1..=MAX_PAGES {
             let batch = self
-                .http
-                .issues(owner.as_str(), repo.as_str())
-                .list_comments(number)
-                .per_page(PER_PAGE)
-                .page(page)
-                .send()
-                .await
-                .map_err(map_err)?;
+                .detect_move_or_map(
+                    canonical_repo,
+                    remote_id,
+                    self.http
+                        .issues(owner.as_str(), repo.as_str())
+                        .list_comments(number)
+                        .per_page(PER_PAGE)
+                        .page(page)
+                        .send()
+                        .await,
+                )
+                .await?;
             let full = batch.items.len() == PER_PAGE as usize;
             out.extend(batch.items.into_iter().map(map_comment));
             if !full {
@@ -237,12 +270,90 @@ impl RestClient {
         let (owner, repo) = split_owner_repo(canonical_repo)?;
         let number = parse_issue_number(remote_id)?;
         let c = self
+            .detect_move_or_map(
+                canonical_repo,
+                remote_id,
+                self.http
+                    .issues(owner.as_str(), repo.as_str())
+                    .create_comment(number, body)
+                    .await,
+            )
+            .await?;
+        Ok(map_comment(c))
+    }
+
+    /// Probe whether an issue has been transferred to a different repo. GET on
+    /// `/repos/{o}/{r}/issues/{n}` is *safe*, so octocrab's tower-http
+    /// follow-redirect layer (`Standard` policy) silently follows a 301 to the
+    /// transferred issue's new URL. We then compare the response's
+    /// `repository_url`/`number` to what was requested: a mismatch means the
+    /// issue was administratively moved. Returns `Ok(None)` if the issue is
+    /// still at the supplied address.
+    pub(crate) async fn discover_move_target(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<(String, String)>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        let issue = self
             .http
-            .issues(owner.as_str(), repo.as_str())
-            .create_comment(number, body)
+            .issues(owner, repo)
+            .get(number)
             .await
             .map_err(map_err)?;
-        Ok(map_comment(c))
+        Ok(detect_move_from_issue(canonical_repo, remote_id, &issue))
+    }
+
+    /// Pre-flight check used by endpoints whose responses don't carry the
+    /// parent issue's `repository_url` (e.g. `/sub_issues`, `/comments`). The
+    /// follow-redirect layer silently lands a transferred-issue request on
+    /// the new repo's data, so without this check those endpoints would
+    /// return foreign data without raising `IssueMoved`. Costs one extra GET
+    /// per call — fine for a rare path.
+    async fn ensure_not_moved(&self, canonical_repo: &str, remote_id: &str) -> PortResult<()> {
+        if let Some((to_canonical, to_remote_id)) =
+            self.discover_move_target(canonical_repo, remote_id).await?
+        {
+            return Err(PortError::IssueMoved {
+                from_canonical: canonical_repo.to_string(),
+                from_remote_id: remote_id.to_string(),
+                to_canonical,
+                to_remote_id,
+            });
+        }
+        Ok(())
+    }
+
+    /// If the octocrab call failed with a 301, probe `Location` and surface a
+    /// typed `IssueMoved` instead of an opaque network error. All other errors
+    /// pass through `map_err` unchanged.
+    async fn detect_move_or_map<T>(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+        result: octocrab::Result<T>,
+    ) -> PortResult<T> {
+        match result {
+            Ok(v) => Ok(v),
+            Err(octocrab::Error::GitHub { source, .. }) if source.status_code.as_u16() == 301 => {
+                let (to_canonical, to_remote_id) = self
+                    .discover_move_target(canonical_repo, remote_id)
+                    .await?
+                    .ok_or_else(|| {
+                        PortError::Backend(format!(
+                            "github reported 301 for {canonical_repo}#{remote_id} but the issue endpoint no longer redirects"
+                        ))
+                    })?;
+                Err(PortError::IssueMoved {
+                    from_canonical: canonical_repo.to_string(),
+                    from_remote_id: remote_id.to_string(),
+                    to_canonical,
+                    to_remote_id,
+                })
+            }
+            Err(e) => Err(map_err(e)),
+        }
     }
 }
 
@@ -303,6 +414,24 @@ fn canonical_from_repository_url(url: &str) -> Option<String> {
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let repo = parts.next().filter(|s| !s.is_empty())?;
     Some(format!("github.com/{owner}/{repo}"))
+}
+
+/// If an `Issue` returned by GitHub no longer lives at the address we asked
+/// for, name the new `(canonical_repo, remote_id)`. octocrab's GET layer
+/// silently follows GitHub's 301 on a transferred issue, so the response's
+/// `repository_url` + `number` are authoritative.
+fn detect_move_from_issue(
+    expected_canonical: &str,
+    expected_remote_id: &str,
+    issue: &Issue,
+) -> Option<(String, String)> {
+    let actual_canonical = canonical_from_repository_url(issue.repository_url.as_str())?;
+    let actual_remote_id = issue.number.to_string();
+    if actual_canonical == expected_canonical && actual_remote_id == expected_remote_id {
+        None
+    } else {
+        Some((actual_canonical, actual_remote_id))
+    }
 }
 
 fn parse_issue_number(remote_id: &str) -> PortResult<u64> {

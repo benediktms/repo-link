@@ -270,6 +270,130 @@ impl SyncService {
         Ok(summary(&task, prev, decision))
     }
 
+    /// Re-wire a task to a different remote. Always Conflict by default
+    /// (linking is destructive on remote identity; snapshots are the audit
+    /// trail). `relink = true` verifies the supplied URL is GitHub's redirect
+    /// target for the *current* remote — if it is, the task stays in its
+    /// existing sync state (typically `Synced`) because identity is preserved.
+    pub async fn link(
+        &self,
+        task_id: &str,
+        new_canonical: &str,
+        new_remote_id: &str,
+        relink: bool,
+    ) -> Result<SyncSummaryDto> {
+        let id: TaskId = task_id.parse()?;
+        let mut task = self.tasks.get(id).await?;
+        let prev = task.sync;
+
+        // Same-URL no-op: linking a task to the URL it's already pointing at
+        // shouldn't churn the sync state or rewrite history.
+        let already_pointing = task
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.provider == "github" && r.remote_id == new_remote_id);
+        if already_pointing
+            && self.canonical_for(&task).await.ok().as_deref() == Some(new_canonical)
+        {
+            return Ok(link_summary(&task, prev, "noop"));
+        }
+
+        // Binding precondition: the target repo must already be attached to
+        // this workspace. We don't auto-attach — prefix choice and dedupe are
+        // intentionally explicit on this repo.
+        let workspace_id = task.workspace_id;
+        let binding = self
+            .bindings
+            .find_by_canonical_url(workspace_id, new_canonical)
+            .await?
+            .ok_or_else(|| {
+                SyncError::Domain(domain_core::DomainError::validation(format!(
+                    "repo {new_canonical} is not attached to this workspace; \
+                     run `rl repo attach <url>` first"
+                )))
+            })?;
+
+        let new_remote = RemoteRef {
+            provider: "github".into(),
+            remote_id: new_remote_id.to_string(),
+        };
+
+        if relink {
+            // Verified relink overwrites title/body/assignees from the new
+            // remote — only safe when the task is otherwise clean. Reject
+            // DirtyLocal / Staged so we don't silently clobber edits the user
+            // was about to push (the most common reason they hit the move
+            // error in the first place).
+            if task.sync != SyncState::Synced {
+                return Err(SyncError::Domain(domain_core::DomainError::validation(
+                    format!(
+                        "--relink is only safe for synced tasks (current: {:?}); \
+                         finish syncing first or use bare `task link`",
+                        task.sync
+                    ),
+                )));
+            }
+            // Need a current remote to verify the redirect against.
+            let current_remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
+            let current_canonical = self.canonical_for(&task).await?;
+            let target = self
+                .provider
+                .discover_move_target(&current_canonical, &current_remote.remote_id)
+                .await?
+                .ok_or_else(|| {
+                    SyncError::Domain(domain_core::DomainError::validation(format!(
+                        "--relink requires the current remote {current_canonical}#{} to \
+                         redirect; it does not",
+                        current_remote.remote_id
+                    )))
+                })?;
+            if target.0 != new_canonical || target.1 != new_remote_id {
+                return Err(SyncError::Domain(domain_core::DomainError::validation(
+                    format!(
+                        "--relink target {new_canonical}#{new_remote_id} does not match \
+                         GitHub's redirect target {}#{}",
+                        target.0, target.1
+                    ),
+                )));
+            }
+            // Rewrite fields to the new remote's authoritative state so the
+            // saved Link snapshot is a coherent baseline.
+            let snap = self
+                .provider
+                .fetch_remote(new_canonical, new_remote_id)
+                .await?;
+            task.title = snap.title;
+            task.body = snap.body;
+            task.assignees = snap.assignees;
+            task.link_to_remote(binding.id, new_remote.clone(), false)?;
+            let new_comments = self
+                .provider
+                .fetch_comments(new_canonical, new_remote_id)
+                .await?;
+            // Save first so a comment-write failure can't leave a deleted-but-
+            // not-relinked state. `replace_comments` only touches synced rows
+            // (pending stays via the '' sentinel), so a one-shot replace with
+            // the new set both drops stale comments and inserts the new ones.
+            self.tasks.save(&task, SnapshotSource::Link).await?;
+            self.tasks.replace_comments(id, &new_comments).await?;
+        } else {
+            // Validate the new remote exists before mutating local state.
+            let _ = self
+                .provider
+                .fetch_remote(new_canonical, new_remote_id)
+                .await?;
+            task.link_to_remote(binding.id, new_remote.clone(), true)?;
+            // Same ordering as the relink branch: commit the link first; then
+            // clear synced comments (pending preserved by contract). If the
+            // comment write fails, the task is still on the new remote and a
+            // subsequent `sync pull` will refresh the synced set.
+            self.tasks.save(&task, SnapshotSource::Link).await?;
+            self.tasks.replace_comments(id, &[]).await?;
+        }
+
+        Ok(link_summary(&task, prev, if relink { "relinked" } else { "linked" }))
+    }
+
     async fn canonical_for(&self, task: &Task) -> Result<String> {
         let repo_id = task.repo_id.ok_or(SyncError::NoRepo)?;
         let binding = self.bindings.get(repo_id).await?;
@@ -282,6 +406,19 @@ fn ensure_not_archived(task: &Task) -> Result<()> {
         Err(SyncError::Archived)
     } else {
         Ok(())
+    }
+}
+
+fn link_summary(task: &Task, prev: SyncState, decision: &str) -> SyncSummaryDto {
+    SyncSummaryDto {
+        task_id: task.id.to_string(),
+        previous_state: enum_str(&prev),
+        new_state: enum_str(&task.sync),
+        decision: decision.to_string(),
+        remote: task.remote.as_ref().map(|r| RemoteRefDto {
+            provider: r.provider.clone(),
+            remote_id: r.remote_id.clone(),
+        }),
     }
 }
 
@@ -340,6 +477,7 @@ mod tests {
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
         comments: Mutex<Vec<RemoteComment>>,
         created_comments: Mutex<Vec<String>>,
+        move_target: Mutex<Option<(String, String)>>,
     }
 
     impl FakeProvider {
@@ -349,6 +487,10 @@ mod tests {
 
         fn set_comments(&self, comments: Vec<RemoteComment>) {
             *self.comments.lock().unwrap() = comments;
+        }
+
+        fn set_move_target(&self, canonical: &str, remote_id: &str) {
+            *self.move_target.lock().unwrap() = Some((canonical.into(), remote_id.into()));
         }
     }
 
@@ -412,11 +554,30 @@ mod tests {
                 created_at: Timestamp::from_utc(Utc::now()),
             })
         }
+
+        async fn discover_move_target(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> PortResult<Option<(String, String)>> {
+            Ok(self.move_target.lock().unwrap().clone())
+        }
     }
 
     async fn setup() -> (
         SyncService,
         Arc<InMemoryTaskRepository>,
+        Task,
+        Arc<FakeProvider>,
+    ) {
+        let (svc, tasks, _bindings, task, provider) = setup_with_bindings().await;
+        (svc, tasks, task, provider)
+    }
+
+    async fn setup_with_bindings() -> (
+        SyncService,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryRepoBindingRepository>,
         Task,
         Arc<FakeProvider>,
     ) {
@@ -437,8 +598,8 @@ mod tests {
         let task = Task::new_draft(workspace_id, Some(repo_id), "ship it".into()).unwrap();
         tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
 
-        let svc = SyncService::new(tasks.clone(), bindings, provider.clone());
-        (svc, tasks, task, provider)
+        let svc = SyncService::new(tasks.clone(), bindings.clone(), provider.clone());
+        (svc, tasks, bindings, task, provider)
     }
 
     #[tokio::test]
@@ -654,6 +815,155 @@ mod tests {
         assert_eq!(tasks.get(task.id).await.unwrap().sync, SyncState::Synced);
 
         let err = svc.push(&task.id.to_string()).await.unwrap_err();
+        assert!(matches!(err, SyncError::Domain(_)));
+    }
+
+    async fn attach_second_binding(
+        bindings: &Arc<InMemoryRepoBindingRepository>,
+        workspace_id: WorkspaceId,
+        canonical: &str,
+    ) {
+        let b = RepoBinding::new(
+            workspace_id,
+            format!("git@github.com:{}", canonical.trim_start_matches("github.com/")),
+            canonical.to_string(),
+        )
+        .unwrap();
+        bindings.save(&b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn link_bare_flips_synced_to_conflict_and_drops_synced_comments() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Pre-condition: the second binding must exist before link.
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        // Some synced comment that must be dropped on link.
+        tasks
+            .replace_comments(
+                task.id,
+                &[RemoteComment {
+                    remote_id: "old".into(),
+                    author: "x".into(),
+                    body: "stale".into(),
+                    created_at: Timestamp::from_utc(Utc::now()),
+                }],
+            )
+            .await
+            .unwrap();
+        // Stub the new remote so the existence check inside link() succeeds.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "999".into(),
+            title: "irrelevant".into(),
+            body: "irrelevant".into(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        });
+
+        let s = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "999", false)
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "linked");
+        assert_eq!(s.new_state, "conflict");
+
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Conflict);
+        assert_eq!(after.remote.as_ref().unwrap().remote_id, "999");
+        assert!(after.comments.is_empty(), "synced comments must be dropped");
+    }
+
+    #[tokio::test]
+    async fn link_relink_verified_keeps_synced_and_rewrites_baseline() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        // The current remote (100, from promote) must report 301 to the target.
+        provider.set_move_target("github.com/o2/r2", "1506");
+        // The post-relink fetch_remote returns the new authoritative snapshot.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "1506".into(),
+            title: "transferred title".into(),
+            body: "transferred body".into(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec!["alice".into()],
+            labels: vec![],
+        });
+
+        let s = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "1506", true)
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "relinked");
+        assert_eq!(s.new_state, "synced", "verified relink preserves Synced");
+
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.remote.as_ref().unwrap().remote_id, "1506");
+        assert_eq!(after.title, "transferred title");
+        // Baseline rewritten from the new remote → reconcile sees no diff.
+        assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn link_relink_target_mismatch_errors() {
+        let (svc, _tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        // Current remote redirects, but to a DIFFERENT target than the user supplied.
+        provider.set_move_target("github.com/o3/r3", "777");
+
+        let err = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "1506", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Domain(_)));
+    }
+
+    #[tokio::test]
+    async fn link_relink_refuses_when_task_is_dirty_local() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        // Make the task DirtyLocal (the typical state when a user hits the
+        // move error on `sync push`). `--relink` must refuse rather than
+        // silently overwrite their unpushed edits with the new remote's snap.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_body("local edit at risk".into());
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        provider.set_move_target("github.com/o2/r2", "1506");
+
+        let err = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "1506", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Domain(_)));
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.body, "local edit at risk", "local edit must survive");
+        assert_eq!(after.sync, SyncState::DirtyLocal);
+    }
+
+    #[tokio::test]
+    async fn link_errors_when_target_binding_missing() {
+        let (svc, _tasks, _bindings, task, _provider) = setup_with_bindings().await;
+
+        // No second binding attached → bare link should refuse with a clear hint.
+        let err = svc
+            .link(&task.id.to_string(), "github.com/never/attached", "1", false)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SyncError::Domain(_)));
     }
 }

@@ -31,6 +31,21 @@ pub enum PortError {
 
     #[error("network failure: {0}")]
     Network(String),
+
+    /// The remote issue at `from_canonical#from_remote_id` was administratively
+    /// transferred to `to_canonical#to_remote_id` (GitHub returned 301 with a
+    /// `Location` header). Adapters surface this *typed* error instead of a
+    /// raw network failure so callers can offer a verified re-link rather than
+    /// asking the user to diagnose an opaque HTTP code.
+    #[error(
+        "remote issue {from_canonical}#{from_remote_id} moved to {to_canonical}#{to_remote_id}"
+    )]
+    IssueMoved {
+        from_canonical: String,
+        from_remote_id: String,
+        to_canonical: String,
+        to_remote_id: String,
+    },
 }
 
 impl PortError {
@@ -293,6 +308,21 @@ pub trait RemoteTaskProvider: Send + Sync {
         remote_id: &str,
         body: &str,
     ) -> PortResult<RemoteComment>;
+
+    /// Probe the remote for a transferred-issue redirect. Returns
+    /// `Some((to_canonical_repo, to_remote_id))` if the provider reports the
+    /// task at `(canonical_repo, remote_id)` has been moved, `None` if the
+    /// task is still at the supplied address. Used by `rl task link --relink`
+    /// to verify a user-supplied URL is GitHub's actual redirect target
+    /// before rewriting the task's remote identity. Providers without a
+    /// transfer concept inherit the default `Ok(None)`.
+    async fn discover_move_target(
+        &self,
+        _canonical_repo: &str,
+        _remote_id: &str,
+    ) -> PortResult<Option<(String, String)>> {
+        Ok(None)
+    }
 }
 
 // ---------- Filesystem probe ---------------------------------------------
