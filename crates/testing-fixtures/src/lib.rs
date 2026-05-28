@@ -377,8 +377,11 @@ impl TaskRepository for InMemoryTaskRepository {
         let mut store = self.comments.lock().unwrap();
         let entry = store.entry(task_id).or_default();
         // Keep pending (local-only) comments; replace the synced set.
-        let mut next: Vec<TaskComment> =
-            entry.iter().filter(|c| c.remote_id.is_none()).cloned().collect();
+        let mut next: Vec<TaskComment> = entry
+            .iter()
+            .filter(|c| c.remote_id.is_none())
+            .cloned()
+            .collect();
         next.extend(comments.iter().map(|c| TaskComment {
             local_id: Some(uuid::Uuid::new_v4().to_string()),
             remote_id: Some(c.remote_id.clone()),

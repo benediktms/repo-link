@@ -30,10 +30,9 @@ pub(super) fn write_if_changed(path: &Path, desired: &str) -> std::io::Result<bo
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| std::io::Error::other(format!("manifest path has no file name: {path:?}")))?;
+    let file_name = path.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+        std::io::Error::other(format!("manifest path has no file name: {path:?}"))
+    })?;
     let tmp = path.with_file_name(format!(".{file_name}.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(bytes)?;

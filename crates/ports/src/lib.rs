@@ -141,11 +141,8 @@ pub trait TaskRepository: Send + Sync {
     /// makes pending input unrepresentable), leaving any pending local-only
     /// comments untouched. Writes only the `task_comments` table — never a
     /// snapshot — so mirroring remote comments doesn't perturb sync state.
-    async fn replace_comments(
-        &self,
-        task_id: TaskId,
-        comments: &[RemoteComment],
-    ) -> PortResult<()>;
+    async fn replace_comments(&self, task_id: TaskId, comments: &[RemoteComment])
+    -> PortResult<()>;
     /// Append a single pending (local-only) comment, stored with the empty
     /// `remote_comment_id` sentinel. Writes only the `task_comments` table —
     /// never a snapshot — so adding a comment never perturbs sync state

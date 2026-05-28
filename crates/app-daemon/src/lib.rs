@@ -54,11 +54,7 @@ pub use logging::{LogFormat, init_subscriber};
 const STATUS_MISSING_PATH: &str = "missing_path";
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "rld",
-    version,
-    about = "Background reconciler for repo-link"
-)]
+#[command(name = "rld", version, about = "Background reconciler for repo-link")]
 pub struct Args {
     /// Tick interval in seconds.
     #[arg(long, default_value_t = 60, env = "REPO_LINK_INTERVAL_SECS")]
@@ -128,7 +124,11 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Some(token) => {
             let provider: Arc<dyn ports::RemoteTaskProvider> =
                 Arc::new(GithubTaskProvider::new(token)?);
-            Some(SyncService::new(tasks_repo.clone(), bindings_repo, provider))
+            Some(SyncService::new(
+                tasks_repo.clone(),
+                bindings_repo,
+                provider,
+            ))
         }
         None => None,
     };
@@ -537,8 +537,8 @@ fn write_last_tick_atomic(
         interval_secs,
         report: report.clone(),
     };
-    let bytes = serde_json::to_vec_pretty(&last_tick)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let bytes =
+        serde_json::to_vec_pretty(&last_tick).map_err(|e| std::io::Error::other(e.to_string()))?;
     let parent = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(&bytes)?;

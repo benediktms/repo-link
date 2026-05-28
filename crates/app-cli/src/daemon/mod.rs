@@ -148,9 +148,7 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
 /// `systemctl`/`launchctl` and exploding with a confusing "command not
 /// found" further down the stack.
 fn unsupported_platform() -> anyhow::Error {
-    anyhow::anyhow!(
-        "rl daemon is only supported on macOS (launchd) and Linux (systemd --user)"
-    )
+    anyhow::anyhow!("rl daemon is only supported on macOS (launchd) and Linux (systemd --user)")
 }
 
 /// Absolute path to the `rld` binary the unit will launch. `just install`
@@ -252,10 +250,7 @@ pub(super) fn read_last_tick(path: &std::path::Path) -> Result<Option<LastTickDt
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow::anyhow!(
-            "failed to read {}: {e}",
-            path.display()
-        )),
+        Err(e) => Err(anyhow::anyhow!("failed to read {}: {e}", path.display())),
     }
 }
 

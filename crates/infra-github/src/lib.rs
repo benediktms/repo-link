@@ -312,7 +312,10 @@ mod tests {
             .await;
 
         let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
-        let comments = provider.fetch_comments("github.com/o/r", "1").await.unwrap();
+        let comments = provider
+            .fetch_comments("github.com/o/r", "1")
+            .await
+            .unwrap();
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].remote_id, "10");
         assert_eq!(comments[0].author, "alice");
@@ -338,13 +341,17 @@ mod tests {
             .and(path("/repos/o/r/issues/1/comments"))
             .and(query_param("page", "2"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(vec![comment_payload(2000, "bob", "last")]),
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![comment_payload(2000, "bob", "last")]),
             )
             .mount(&server)
             .await;
 
         let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
-        let comments = provider.fetch_comments("github.com/o/r", "1").await.unwrap();
+        let comments = provider
+            .fetch_comments("github.com/o/r", "1")
+            .await
+            .unwrap();
         assert_eq!(comments.len(), 101); // 100 + 1 across two pages
     }
 
@@ -355,10 +362,11 @@ mod tests {
             .and(path("/repos/o/r/issues/1/comments"))
             .and(header("authorization", "Bearer t0k"))
             .and(body_partial_json(serde_json::json!({"body": "looks good"})))
-            .respond_with(
-                ResponseTemplate::new(201)
-                    .set_body_json(comment_payload(42, "alice", "looks good")),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(comment_payload(
+                42,
+                "alice",
+                "looks good",
+            )))
             .mount(&server)
             .await;
 
@@ -419,9 +427,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/1/sub_issues"))
             .and(query_param("page", "2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue_payload(
-                2000, "last", "b", "open",
-            )]))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![issue_payload(2000, "last", "b", "open")]),
+            )
             .mount(&server)
             .await;
 
@@ -482,9 +491,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/5788"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
-                1506, "transferred", "moved", "open", "o2", "r2",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                    1506,
+                    "transferred",
+                    "moved",
+                    "open",
+                    "o2",
+                    "r2",
+                )),
+            )
             .mount(&server)
             .await;
 
@@ -524,9 +540,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/5788"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
-                1506, "transferred", "moved", "open", "o2", "r2",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                    1506,
+                    "transferred",
+                    "moved",
+                    "open",
+                    "o2",
+                    "r2",
+                )),
+            )
             .mount(&server)
             .await;
 
@@ -559,9 +582,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/5788"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
-                1506, "moved", "x", "open", "o2", "r2",
-            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(issue_payload_in_repo(
+                    1506, "moved", "x", "open", "o2", "r2",
+                )),
+            )
             .mount(&server)
             .await;
 
@@ -582,7 +607,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/repos/o/r/issues/99"))
             .respond_with(
-                ResponseTemplate::new(404).set_body_json(serde_json::json!({"message": "Not Found"})),
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"message": "Not Found"})),
             )
             .mount(&server)
             .await;

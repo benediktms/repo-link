@@ -3,16 +3,12 @@
 use std::sync::Arc;
 
 use domain_core::{IdParseError, RepoId, TaskId, Timestamp, WorkspaceId};
-use domain_task::{
-    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus,
-};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto,
     TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,
 };
-use ports::{
-    PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
-};
+use ports::{PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -79,10 +75,7 @@ impl TaskService {
     /// Resolve a friendly task ID and list its snapshot history.
     /// Exists so the CLI can stay friendly-ID-aware without having to
     /// reach into [`snapshots_repo`] and parse a UUID itself.
-    pub async fn list_snapshots(
-        &self,
-        query: &str,
-    ) -> Result<Vec<domain_task::TaskSnapshot>> {
+    pub async fn list_snapshots(&self, query: &str) -> Result<Vec<domain_task::TaskSnapshot>> {
         let task = self.resolve_task(query).await?;
         Ok(self.snapshots.list(task.id).await?)
     }
@@ -851,10 +844,7 @@ mod tests {
         assert_eq!(by_hash.id, by_uuid.id);
 
         // A composite naming the wrong prefix is a hard error.
-        let err = svc
-            .resolve_task(&format!("nope-{hash}"))
-            .await
-            .unwrap_err();
+        let err = svc.resolve_task(&format!("nope-{hash}")).await.unwrap_err();
         assert!(matches!(err, ServiceError::PrefixMismatch { .. }));
     }
 

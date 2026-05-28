@@ -8,8 +8,8 @@ use domain_repo::RepoBinding;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{
     AttachRepoCmd, CreateWorkspaceCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd,
-    ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
-    WorkspaceDto, WorktreeLinkDto,
+    ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto,
+    UnlinkWorktreeCmd, WorkspaceDto, WorktreeLinkDto,
 };
 use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
 use serde::{Deserialize, Serialize};
@@ -162,9 +162,8 @@ impl RepoBindingService {
             binding.set_prefix(requested)?;
         }
 
-        let worktree_added = cmd.link_path.map(|path| {
-            binding.link_worktree(PathBuf::from(&path), cmd.link_branch);
-            path
+        let worktree_added = cmd.link_path.inspect(|path| {
+            binding.link_worktree(PathBuf::from(path), cmd.link_branch);
         });
 
         if explicit_prefix {
@@ -299,11 +298,7 @@ impl RepoBindingService {
     /// composite ID a user has already typed against the *old* prefix
     /// goes stale — the bare hash still resolves, but `oldprefix-ak7`
     /// will now error with PrefixMismatch. Document this in CLI help.
-    pub async fn set_prefix(
-        &self,
-        query: &str,
-        new_prefix: String,
-    ) -> Result<RepoBindingDto> {
+    pub async fn set_prefix(&self, query: &str, new_prefix: String) -> Result<RepoBindingDto> {
         let mut binding = self.resolve(query).await?;
         binding.set_prefix(new_prefix)?;
         self.bindings

@@ -175,9 +175,7 @@ enum RepoCmd {
     /// Detach a binding. Accepts the same handle forms as `rl repo show`:
     /// UUID / prefix / name / alias. Ambiguous matches exit 2 with a
     /// candidate list.
-    Detach {
-        id: String,
-    },
+    Detach { id: String },
     List {
         #[command(flatten)]
         ws: WorkspaceArg,
@@ -185,9 +183,7 @@ enum RepoCmd {
     /// Show a binding. Accepts a UUID, an exact `name`, or an exact alias.
     /// Returns a JSON error with candidate IDs if a non-UUID handle matches
     /// more than one binding — re-issue with a UUID.
-    Show {
-        id: String,
-    },
+    Show { id: String },
     /// Walk a directory and report every git repo found, with its origin URL.
     /// Use this to populate a workspace from `~/code/` in one shot.
     Discover {
@@ -233,9 +229,7 @@ enum RepoCmd {
     /// canonical substring. Ranked: exact name > exact alias > canonical
     /// substring > name substring. `ambiguous` is set when more than one
     /// hit is returned.
-    Find {
-        query: String,
-    },
+    Find { query: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -666,17 +660,29 @@ async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
     // to a UUID here, at the CLI boundary, so `sync` accepts the same id
     // forms as every other task command. `SyncService` stays UUID-only.
     let summary = match cmd {
-        SyncCmd::Promote { t: TaskArg { task } } => {
+        SyncCmd::Promote {
+            t: TaskArg { task },
+        } => {
             let id = svc.tasks.resolve_id(&task).await?;
-            sync.promote(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
+            sync.promote(&id)
+                .await
+                .map_err(|e| enrich_issue_moved(&task, e))?
         }
-        SyncCmd::Push { t: TaskArg { task } } => {
+        SyncCmd::Push {
+            t: TaskArg { task },
+        } => {
             let id = svc.tasks.resolve_id(&task).await?;
-            sync.push(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
+            sync.push(&id)
+                .await
+                .map_err(|e| enrich_issue_moved(&task, e))?
         }
-        SyncCmd::Pull { t: TaskArg { task } } => {
+        SyncCmd::Pull {
+            t: TaskArg { task },
+        } => {
             let id = svc.tasks.resolve_id(&task).await?;
-            sync.pull(&id).await.map_err(|e| enrich_issue_moved(&task, e))?
+            sync.pull(&id)
+                .await
+                .map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Import { .. } => unreachable!("handled above"),
     };
@@ -798,7 +804,9 @@ async fn sync_import(
                 // find_by_remote check and the save. The repo-scoped UNIQUE
                 // means the conflict is genuinely the same remote object, so
                 // treat it as an idempotent already-tracked rather than erroring.
-                Err(application_task::ServiceError::Port(ports::PortError::Conflict { .. })) => {
+                Err(application_task::ServiceError::Port(ports::PortError::Conflict {
+                    ..
+                })) => {
                     match svc
                         .tasks_repo
                         .find_by_remote(repo_id, PROVIDER, &number)
@@ -1083,7 +1091,9 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             svc.bindings.detach(&resolved).await?;
             println!("{}", serde_json::json!({ "detached": resolved }));
         }
-        RepoCmd::List { ws: WorkspaceArg { workspace } } => render::repos(&svc.bindings.list(&workspace).await?),
+        RepoCmd::List {
+            ws: WorkspaceArg { workspace },
+        } => render::repos(&svc.bindings.list(&workspace).await?),
         RepoCmd::Show { id } => match svc.bindings.show(&id).await {
             Ok(dto) => render::repo(&dto),
             Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
@@ -1105,24 +1115,26 @@ async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             }
             Err(e) => return Err(anyhow!("{e}")),
         },
-        RepoCmd::Alias(RepoAliasCmd::Add { repo, a: AliasArg { alias } }) => {
-            match svc.bindings.add_alias(&repo, alias).await {
-                Ok(dto) => render::repo(&dto),
-                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                    handle_ambiguous(query, candidates);
-                }
-                Err(e) => return Err(anyhow!("{e}")),
+        RepoCmd::Alias(RepoAliasCmd::Add {
+            repo,
+            a: AliasArg { alias },
+        }) => match svc.bindings.add_alias(&repo, alias).await {
+            Ok(dto) => render::repo(&dto),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates);
             }
-        }
-        RepoCmd::Alias(RepoAliasCmd::Rm { repo, a: AliasArg { alias } }) => {
-            match svc.bindings.remove_alias(&repo, &alias).await {
-                Ok(dto) => render::repo(&dto),
-                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                    handle_ambiguous(query, candidates);
-                }
-                Err(e) => return Err(anyhow!("{e}")),
+            Err(e) => return Err(anyhow!("{e}")),
+        },
+        RepoCmd::Alias(RepoAliasCmd::Rm {
+            repo,
+            a: AliasArg { alias },
+        }) => match svc.bindings.remove_alias(&repo, &alias).await {
+            Ok(dto) => render::repo(&dto),
+            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                handle_ambiguous(query, candidates);
             }
-        }
+            Err(e) => return Err(anyhow!("{e}")),
+        },
         RepoCmd::Find { query } => render::find(&svc.bindings.find(&query).await?),
         RepoCmd::Discover { path } => {
             let mut rows = Vec::new();
@@ -1203,7 +1215,7 @@ fn resolve_attach_link_path(
             "cwd is not a git repo: {}; pass --path <p> or --no-link",
             abs.display()
         ),
-        Err(e) => return Err(anyhow!("{e}")),
+        Err(e) => Err(anyhow!("{e}")),
         Ok(None) => anyhow::bail!(
             "git repo at {} has no `origin` remote; pass --path <p> or --no-link",
             abs.display()
@@ -1592,8 +1604,8 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
             render::task(&dto);
         }
         TaskCmd::Link { id, url, relink } => {
-            let (canonical, remote_id) = parse_issue_url(&url)
-                .ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
+            let (canonical, remote_id) =
+                parse_issue_url(&url).ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
             let task_id = svc.tasks.resolve_id(&id).await?;
             let token = cfg
                 .resolve_github_token()
@@ -1607,11 +1619,8 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
                 })?;
             let provider: Arc<dyn ports::RemoteTaskProvider> =
                 Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
-            let sync = SyncService::new(
-                svc.tasks_repo.clone(),
-                svc.bindings_repo.clone(),
-                provider,
-            );
+            let sync =
+                SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
             let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
             render::sync(&summary);
         }
@@ -1648,31 +1657,45 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
 
 async fn query_dispatch(cmd: QueryCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
-        QueryCmd::Overview { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Overview {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.overview(&workspace).await?;
             render::overview(&v);
         }
-        QueryCmd::Blocked { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Blocked {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.blocked_tasks(&workspace).await?;
             render::blocked(&v);
         }
-        QueryCmd::Stale { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Stale {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.stale_worktrees(&workspace).await?;
             render::stale(&v);
         }
-        QueryCmd::Unsynced { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Unsynced {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.unsynced_tasks(&workspace).await?;
             render::unsynced(&v);
         }
-        QueryCmd::Contributors { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Contributors {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.contributors(&workspace).await?;
             render::contributors(&v);
         }
-        QueryCmd::Drift { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Drift {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.drift(&workspace).await?;
             render::drift(&v);
         }
-        QueryCmd::Ready { ws: WorkspaceArg { workspace } } => {
+        QueryCmd::Ready {
+            ws: WorkspaceArg { workspace },
+        } => {
             let v = svc.query.ready_tasks(&workspace).await?;
             render::ready(&v);
         }
@@ -1726,6 +1749,9 @@ mod tests {
         assert_eq!(parse_issue_url("https://github.com/o/r/pull/1"), None); // PR, not issue
         assert_eq!(parse_issue_url("https://gitlab.com/o/r/issues/1"), None); // wrong host
         assert_eq!(parse_issue_url("https://github.com/o/r/issues/abc"), None); // non-numeric
-        assert_eq!(parse_issue_url("https://github.com/o/r/issues/1/extra"), None); // trailing
+        assert_eq!(
+            parse_issue_url("https://github.com/o/r/issues/1/extra"),
+            None
+        ); // trailing
     }
 }

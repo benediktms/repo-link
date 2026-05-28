@@ -223,7 +223,9 @@ fn current_uid() -> Result<u32> {
         ));
     }
     let s = String::from_utf8(out.stdout)?;
-    s.trim().parse::<u32>().map_err(|e| anyhow!("uid parse: {e}"))
+    s.trim()
+        .parse::<u32>()
+        .map_err(|e| anyhow!("uid parse: {e}"))
 }
 
 fn require_success(action: &str, outcome: &LaunchOutcome) -> Result<()> {

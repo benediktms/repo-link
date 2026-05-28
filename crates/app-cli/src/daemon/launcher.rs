@@ -15,9 +15,14 @@ use std::process::Command;
 pub enum LaunchOutcome {
     /// Carries stdout so `status`'s callers can parse out the PID / active
     /// state from `launchctl print` / `systemctl show`.
-    Success { stdout: String },
+    Success {
+        stdout: String,
+    },
     NotFound,
-    Failed { code: i32, stderr: String },
+    Failed {
+        code: i32,
+        stderr: String,
+    },
 }
 
 pub trait Launcher: Send + Sync {

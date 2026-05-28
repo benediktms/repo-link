@@ -485,7 +485,8 @@ async fn load_comments(pool: &SqlitePool, task_id: TaskId) -> PortResult<Vec<Tas
     rows.iter()
         .map(|row| {
             let id: String = row.try_get("id").map_err(map_sqlx_err)?;
-            let remote_comment_id: String = row.try_get("remote_comment_id").map_err(map_sqlx_err)?;
+            let remote_comment_id: String =
+                row.try_get("remote_comment_id").map_err(map_sqlx_err)?;
             let author: String = row.try_get("author").map_err(map_sqlx_err)?;
             let body: String = row.try_get("body").map_err(map_sqlx_err)?;
             let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;

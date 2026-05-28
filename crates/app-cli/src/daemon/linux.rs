@@ -35,7 +35,10 @@ pub(super) fn install(
     let reload = launcher.run(&["systemctl", "--user", "daemon-reload"])?;
     require_success("systemctl --user daemon-reload", &reload)?;
     let enable = launcher.run(&["systemctl", "--user", "enable", "--now", UNIT_NAME])?;
-    require_success(&format!("systemctl --user enable --now {UNIT_NAME}"), &enable)?;
+    require_success(
+        &format!("systemctl --user enable --now {UNIT_NAME}"),
+        &enable,
+    )?;
 
     Ok(InstallOutcome {
         label: infra_config::DAEMON_LABEL,
@@ -135,7 +138,10 @@ pub(super) fn start(launcher: &dyn Launcher) -> Result<StartStopOutcome> {
     // `enable --now` is idempotent: it sets the persistent "should be loaded"
     // bit and starts the unit if not already running.
     let enable = launcher.run(&["systemctl", "--user", "enable", "--now", UNIT_NAME])?;
-    require_success(&format!("systemctl --user enable --now {UNIT_NAME}"), &enable)?;
+    require_success(
+        &format!("systemctl --user enable --now {UNIT_NAME}"),
+        &enable,
+    )?;
     Ok(StartStopOutcome {
         label: infra_config::DAEMON_LABEL,
         platform: PLATFORM,

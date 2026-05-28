@@ -168,7 +168,11 @@ impl RestClient {
             let probe_route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/sub_issues?per_page=1&page={probe_page}"
             );
-            let probe: Vec<Issue> = self.http.get(probe_route, None::<&()>).await.map_err(map_err)?;
+            let probe: Vec<Issue> = self
+                .http
+                .get(probe_route, None::<&()>)
+                .await
+                .map_err(map_err)?;
             if !probe.is_empty() {
                 return Err(PortError::Backend(format!(
                     "issue {number} in {canonical_repo} has more than {} sub-issues; \
