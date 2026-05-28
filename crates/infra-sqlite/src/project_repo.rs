@@ -138,6 +138,20 @@ impl ProjectRepository for SqliteProjectRepository {
         Ok(out)
     }
 
+    async fn list_all(&self) -> PortResult<Vec<Project>> {
+        let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
+        let rows = sqlx::query("SELECT * FROM projects ORDER BY owner_login, number")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows.iter() {
+            out.push(row_to_project(row, &mut tx).await?);
+        }
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(out)
+    }
+
     async fn delete(&self, id: ProjectId) -> PortResult<()> {
         // `project_status_options.project_id` is ON DELETE CASCADE, so the
         // option rows clear automatically. Workspaces with a `project_id`

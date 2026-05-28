@@ -443,6 +443,11 @@ pub trait ProjectRepository: Send + Sync {
     async fn save(&self, project: &Project) -> PortResult<()>;
     async fn get(&self, id: ProjectId) -> PortResult<Project>;
     async fn list_by_workspace(&self, ws: WorkspaceId) -> PortResult<Vec<Project>>;
+    /// All locally-known projects, irrespective of workspace membership.
+    /// Backs `rl project list` and the `owner/number` resolver in the
+    /// application layer (projects have no UNIQUE index on `(owner, number)`,
+    /// so the resolver scans this set).
+    async fn list_all(&self) -> PortResult<Vec<Project>>;
     async fn delete(&self, id: ProjectId) -> PortResult<()>;
 }
 

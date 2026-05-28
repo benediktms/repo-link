@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use domain_core::{IdParseError, RepoId, WorkspaceId};
+use domain_core::{IdParseError, ProjectId, RepoId, WorkspaceId};
 use domain_repo::RepoBinding;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{
@@ -11,7 +11,9 @@ use dto_shared::{
     ListWorkspacesQuery, RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto,
     UnlinkWorktreeCmd, WorkspaceDto, WorktreeLinkDto,
 };
-use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
+use ports::{
+    FilesystemProbe, PortError, ProjectRepository, RepoBindingRepository, WorkspaceRepository,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,6 +27,12 @@ pub enum ServiceError {
     DuplicateName(String),
     #[error("invalid id: {0}")]
     BadId(String),
+    #[error("project not found: no match for '{0}'")]
+    ProjectNotFound(String),
+    #[error(
+        "project ops require a configured ProjectRepository (use WorkspaceService::with_projects)"
+    )]
+    ProjectsUnconfigured,
     #[error("binding not found: no match for '{0}'")]
     BindingNotFound(String),
     #[error("prefix '{0}' is already taken by another binding — pick a different one")]
@@ -56,11 +64,29 @@ pub type Result<T> = std::result::Result<T, ServiceError>;
 
 pub struct WorkspaceService {
     repo: Arc<dyn WorkspaceRepository>,
+    /// Optional `ProjectRepository` for the project-aware methods (`create`
+    /// with `project_spec`, `set_project`). Callers that never need them —
+    /// the daemon's internal services, most tests — wire only the workspace
+    /// repo via `new`; the CLI wires both via `with_projects`.
+    projects: Option<Arc<dyn ProjectRepository>>,
 }
 
 impl WorkspaceService {
     pub fn new(repo: Arc<dyn WorkspaceRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            projects: None,
+        }
+    }
+
+    pub fn with_projects(
+        repo: Arc<dyn WorkspaceRepository>,
+        projects: Arc<dyn ProjectRepository>,
+    ) -> Self {
+        Self {
+            repo,
+            projects: Some(projects),
+        }
     }
 
     pub async fn create(&self, cmd: CreateWorkspaceCmd) -> Result<WorkspaceDto> {
@@ -68,9 +94,62 @@ impl WorkspaceService {
         if self.repo.find_by_name(name.as_str()).await?.is_some() {
             return Err(ServiceError::DuplicateName(name.as_str().to_string()));
         }
-        let w = Workspace::new(name, cmd.description, cmd.local_only);
+        let mut w = Workspace::new(name, cmd.description, cmd.local_only);
+        if let Some(spec) = cmd.project_spec.as_deref() {
+            w.project_id = Some(self.resolve_project(spec).await?);
+        }
         self.repo.save(&w).await?;
         Ok(workspace_to_dto(&w))
+    }
+
+    /// Attach (`Some`) or detach (`None`) a workspace from a project.
+    /// Resolution accepts a `PVT_…` node id or `owner/number`.
+    pub async fn set_project(
+        &self,
+        workspace_id: &str,
+        project_spec: Option<&str>,
+    ) -> Result<WorkspaceDto> {
+        let id: WorkspaceId = workspace_id.parse()?;
+        let mut w = self.repo.get(id).await?;
+        w.project_id = match project_spec {
+            Some(spec) => Some(self.resolve_project(spec).await?),
+            None => None,
+        };
+        self.repo.save(&w).await?;
+        Ok(workspace_to_dto(&w))
+    }
+
+    /// Resolve a `<project-spec>` to a `ProjectId`. Centralised here so the
+    /// CLI and service share one form. `owner/number` falls through to a
+    /// `list_all` scan because projects have no `UNIQUE(owner, number)` —
+    /// they're addressed by node id everywhere downstream.
+    async fn resolve_project(&self, spec: &str) -> Result<ProjectId> {
+        let projects = self
+            .projects
+            .as_ref()
+            .ok_or(ServiceError::ProjectsUnconfigured)?;
+        let trimmed = spec.trim();
+        if let Ok(id) = ProjectId::parse(trimmed.to_string()) {
+            // Confirm the id actually corresponds to a known project so we
+            // don't store a dangling FK reference. Normalize NotFound here
+            // so callers see one shape regardless of node-id vs owner/number.
+            projects.get(id.clone()).await.map_err(|e| match e {
+                PortError::NotFound(_) => ServiceError::ProjectNotFound(spec.to_string()),
+                other => ServiceError::Port(other),
+            })?;
+            return Ok(id);
+        }
+        let (owner, number_str) = trimmed
+            .split_once('/')
+            .ok_or_else(|| ServiceError::ProjectNotFound(spec.to_string()))?;
+        let number: u64 = number_str
+            .parse()
+            .map_err(|_| ServiceError::ProjectNotFound(spec.to_string()))?;
+        let all = projects.list_all().await?;
+        all.into_iter()
+            .find(|p| p.owner_login == owner && p.number == number)
+            .map(|p| p.id)
+            .ok_or_else(|| ServiceError::ProjectNotFound(spec.to_string()))
     }
 
     pub async fn show(&self, id: &str) -> Result<WorkspaceDto> {
@@ -508,6 +587,7 @@ pub fn workspace_to_dto(w: &Workspace) -> WorkspaceDto {
         description: w.description.clone(),
         status: enum_str(&w.status),
         local_only: w.local_only,
+        project_id: w.project_id.as_ref().map(|p| p.as_str().to_string()),
         created_at: w.created_at.into(),
         updated_at: w.updated_at.into(),
     }
@@ -561,6 +641,7 @@ mod tests {
                 name: "scratch".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -582,6 +663,7 @@ mod tests {
             name: "a".into(),
             description: None,
             local_only: true,
+            project_spec: None,
         })
         .await
         .unwrap();
@@ -590,6 +672,7 @@ mod tests {
                 name: "a".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap_err();
@@ -604,6 +687,7 @@ mod tests {
                 name: "demo".into(),
                 description: None,
                 local_only: false,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -639,6 +723,7 @@ mod tests {
                 name: "w".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -677,6 +762,7 @@ mod tests {
                 name: "w".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -755,6 +841,7 @@ mod tests {
                 name: "w".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -782,6 +869,7 @@ mod tests {
                 name: "w2".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -827,6 +915,7 @@ mod tests {
                 name: "w3".into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();
@@ -863,6 +952,7 @@ mod tests {
                 name: ws_name.into(),
                 description: None,
                 local_only: true,
+                project_spec: None,
             })
             .await
             .unwrap();

@@ -2803,3 +2803,227 @@ fn task_claim_is_idempotent_when_already_claimed() {
         "second claim must not touch updated_at",
     );
 }
+
+// ---------- RFC 0001 Stage 4 — `rl project` + workspace ↔ project ----------
+
+/// Helper: link a stock project named "acme/7" with two options (Backlog,
+/// Done) and the canonical open→Backlog mapping. Returns the project
+/// node id.
+fn link_demo_project(dir: &TempDir) -> String {
+    let dto = run_json(
+        &mut bin("repo-link", dir),
+        &[
+            "project",
+            "link",
+            "--node-id",
+            "PVT_demo_abc",
+            "--owner",
+            "acme",
+            "--number",
+            "7",
+            "--title",
+            "Repo Link",
+            "--status-field-id",
+            "PVTSSF_x",
+            "--option",
+            "o1:Backlog",
+            "--option",
+            "o2:Done",
+            "--map",
+            "open:o1",
+        ],
+    );
+    assert_eq!(dto["id"], "PVT_demo_abc");
+    dto["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn project_link_show_and_list_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let _id = link_demo_project(&dir);
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["project", "show", "acme/7"]);
+    assert_eq!(shown["id"], "PVT_demo_abc");
+    assert_eq!(shown["status_options"].as_array().unwrap().len(), 2);
+    assert_eq!(shown["status_mappings"].as_array().unwrap().len(), 1);
+
+    // `default_for` should also surface inline on the matching option row
+    // so a single render covers both the catalog and the mapping.
+    let backlog = shown["status_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["option_id"] == "o1")
+        .unwrap();
+    assert_eq!(backlog["default_for"], "open");
+
+    // Show by node id resolves to the same project.
+    let by_node = run_json(
+        &mut bin("repo-link", &dir),
+        &["project", "show", "PVT_demo_abc"],
+    );
+    assert_eq!(by_node["id"], shown["id"]);
+
+    let listed = run_json(&mut bin("repo-link", &dir), &["project", "list"]);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn project_map_appends_then_overwrites() {
+    let dir = TempDir::new().unwrap();
+    link_demo_project(&dir);
+
+    // done→o2 is a new mapping (append).
+    let after_append = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "project",
+            "map",
+            "acme/7",
+            "--local",
+            "done",
+            "--option-id",
+            "o2",
+        ],
+    );
+    assert_eq!(after_append["status_mappings"].as_array().unwrap().len(), 2);
+
+    // open→o2 overwrites the existing open→o1 mapping.
+    let after_overwrite = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "project",
+            "map",
+            "acme/7",
+            "--local",
+            "open",
+            "--option-id",
+            "o2",
+        ],
+    );
+    let mappings = after_overwrite["status_mappings"].as_array().unwrap();
+    let open_mapping = mappings.iter().find(|m| m["status"] == "open").unwrap();
+    assert_eq!(open_mapping["option_id"], "o2");
+    assert_eq!(
+        mappings.len(),
+        2,
+        "overwrite must not append a duplicate row"
+    );
+}
+
+#[test]
+fn project_map_rejects_option_outside_catalog() {
+    let dir = TempDir::new().unwrap();
+    link_demo_project(&dir);
+
+    let output = bin("repo-link", &dir)
+        .args([
+            "project",
+            "map",
+            "acme/7",
+            "--local",
+            "open",
+            "--option-id",
+            "ghost",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("ghost"),
+        "error should name the offending option_id: {stderr}"
+    );
+}
+
+#[test]
+fn project_unlink_removes_and_clears_workspace_membership() {
+    let dir = TempDir::new().unwrap();
+    link_demo_project(&dir);
+
+    // Create a workspace attached to the project.
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "create",
+            "bound",
+            "--local-only",
+            "--project",
+            "acme/7",
+        ],
+    );
+    assert_eq!(ws["project_id"], "PVT_demo_abc");
+
+    // Unlink the project locally.
+    let result = run_json(
+        &mut bin("repo-link", &dir),
+        &["project", "unlink", "acme/7"],
+    );
+    assert_eq!(result["unlinked"], "acme/7");
+
+    // The workspace survives but its project_id is cleared
+    // (`workspaces.project_id` is `ON DELETE SET NULL`).
+    let reloaded = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "show", ws["id"].as_str().unwrap()],
+    );
+    assert!(
+        reloaded.get("project_id").is_none()
+            || reloaded["project_id"].is_null()
+            || reloaded["project_id"].as_str().is_none(),
+        "workspace must lose its project_id after the project is unlinked: {reloaded}"
+    );
+}
+
+#[test]
+fn workspace_set_project_attaches_and_detaches() {
+    let dir = TempDir::new().unwrap();
+    link_demo_project(&dir);
+
+    // Start projectless, attach, then detach.
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+    assert!(ws.get("project_id").is_none() || ws["project_id"].is_null());
+
+    let attached = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-project", &ws_id, "--project", "acme/7"],
+    );
+    assert_eq!(attached["project_id"], "PVT_demo_abc");
+
+    let detached = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-project", &ws_id, "--none"],
+    );
+    assert!(
+        detached.get("project_id").is_none() || detached["project_id"].is_null(),
+        "detached workspace must have no project_id: {detached}"
+    );
+}
+
+#[test]
+fn workspace_set_project_requires_one_of_project_or_none() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let ws_id = ws["id"].as_str().unwrap().to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "set-project", &ws_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--project") || stderr.contains("--none"),
+        "error should mention the required flags: {stderr}"
+    );
+}

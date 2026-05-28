@@ -641,6 +641,16 @@ impl ProjectRepository for InMemoryProjectRepository {
             .collect())
     }
 
+    async fn list_all(&self) -> PortResult<Vec<Project>> {
+        let mut out: Vec<Project> = self.inner.lock().unwrap().values().cloned().collect();
+        out.sort_by(|a, b| {
+            a.owner_login
+                .cmp(&b.owner_login)
+                .then_with(|| a.number.cmp(&b.number))
+        });
+        Ok(out)
+    }
+
     async fn delete(&self, id: ProjectId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         // Mirror the SQL `ON DELETE SET NULL`: any workspace pointing at

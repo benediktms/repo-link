@@ -13,6 +13,7 @@ members = [
     "crates/application-task",
     "crates/application-sync",
     "crates/application-query",
+    "crates/application-project",
     "crates/dto-shared",
     "crates/dto-events",
     "crates/infra-sqlite",
@@ -43,6 +44,7 @@ application-workspace = { path = "crates/application-workspace" }
 application-task = { path = "crates/application-task" }
 application-sync = { path = "crates/application-sync" }
 application-query = { path = "crates/application-query" }
+application-project = { path = "crates/application-project" }
 dto-shared = { path = "crates/dto-shared" }
 dto-events = { path = "crates/dto-events" }
 infra-sqlite = { path = "crates/infra-sqlite" }
