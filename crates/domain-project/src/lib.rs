@@ -113,11 +113,23 @@ impl Project {
     }
 
     fn validate_mappings(mappings: &[StatusMapping], options: &[StatusOption]) -> Result<()> {
+        let mut seen_statuses = std::collections::HashSet::new();
         for m in mappings {
             if !options.iter().any(|o| o.option_id == m.option_id) {
                 return Err(DomainError::validation(format!(
                     "status mapping references unknown option_id '{}'",
                     m.option_id
+                )));
+            }
+            // Multiple statuses MAY share one option_id (e.g. Open + Blocked
+            // → "Backlog"), but a single status cannot legitimately map to
+            // two options — `option_id_for` returns the first match and the
+            // result would otherwise depend on insertion order, masking a
+            // user error as a sometimes-works lookup.
+            if !seen_statuses.insert(m.status) {
+                return Err(DomainError::validation(format!(
+                    "duplicate status mapping for '{:?}'",
+                    m.status
                 )));
             }
         }
@@ -204,6 +216,34 @@ mod tests {
         assert_eq!(p.option_id_for(TaskStatus::Open), Some("o1"));
         assert_eq!(p.option_id_for(TaskStatus::Done), Some("o2"));
         assert_eq!(p.option_id_for(TaskStatus::InProgress), None);
+    }
+
+    #[test]
+    fn new_rejects_duplicate_status_mappings() {
+        // Same status mapped twice — option_id_for would return the first
+        // match and silently mask the user error. Reject at construction.
+        let err = Project::new(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            "PVTSSF_field".into(),
+            vec![opt("o1", "Backlog", 0), opt("o2", "In Progress", 1)],
+            vec![
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o1".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o2".into(),
+                },
+            ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
     }
 
     #[test]

@@ -83,8 +83,14 @@ pub enum ProjectIdParseError {
 /// its primary key. The newtype guards against typos by validating the
 /// `PVT_` prefix at parse time; the rest is treated as an opaque bag of
 /// bytes.
+///
+/// `#[serde(try_from = "String", into = "String")]` routes deserialization
+/// through [`TryFrom<String>`] → [`ProjectId::parse`], so JSON / SQLite /
+/// any other on-disk store cannot smuggle an unvalidated prefix into the
+/// domain — derived `Deserialize` on a `#[serde(transparent)]` newtype
+/// would silently accept any string.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct ProjectId(String);
 
 impl ProjectId {
@@ -120,6 +126,19 @@ impl FromStr for ProjectId {
     type Err = ProjectIdParseError;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         Self::parse(s)
+    }
+}
+
+impl TryFrom<String> for ProjectId {
+    type Error = ProjectIdParseError;
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl From<ProjectId> for String {
+    fn from(value: ProjectId) -> Self {
+        value.0
     }
 }
 
@@ -184,6 +203,22 @@ mod tests {
         assert_eq!(json, "\"PVT_kwHO_xyz\"");
         let back: ProjectId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn project_id_deserialize_rejects_missing_prefix() {
+        // Without `try_from`, a derived `#[serde(transparent)]` Deserialize
+        // would happily wrap any string. We explicitly route through parse
+        // so an on-disk corruption or a malformed remote payload cannot
+        // smuggle an unvalidated prefix into the domain.
+        let err = serde_json::from_str::<ProjectId>("\"not-pvt\"").unwrap_err();
+        assert!(err.to_string().contains("PVT_"), "error: {err}");
+    }
+
+    #[test]
+    fn project_id_deserialize_rejects_empty() {
+        let err = serde_json::from_str::<ProjectId>("\"\"").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "error: {err}");
     }
 
     #[test]
