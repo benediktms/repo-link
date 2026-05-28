@@ -84,9 +84,9 @@ async fn resolve_project(repo: &Arc<dyn ProjectRepository>, spec: &str) -> Resul
 
 fn parse_status(raw: &str) -> Result<TaskStatus> {
     // `Archived` is intentionally not accepted: the schema CHECK on
-    // `project_status_options.default_for` only allows the four
-    // workflow-visible statuses, and an archived task is hidden from sync
-    // anyway. Mapping it would never have an effect.
+    // `project_status_mappings.status` only allows the four workflow-visible
+    // statuses, and an archived task is hidden from sync anyway. Mapping it
+    // would never have an effect.
     match raw {
         "open" => Ok(TaskStatus::Open),
         "in_progress" => Ok(TaskStatus::InProgress),

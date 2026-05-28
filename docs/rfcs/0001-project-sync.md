@@ -119,7 +119,7 @@ When a workspace has a `project_id`, the project is *always* the primary sync ta
 
 All patterns are anchored (`^...$`) so they match the option's full name exactly — substring matching would let "Not done" trip the `Done` rule. Auto-derivation runs once at `link` time; the resulting map is stored and editable via `rl project map`.
 
-**Fallback semantics — app level, not DB.** Most projects don't have a `Blocked`-like option. When no option matches the Blocked regex, no row in `project_status_options` claims `default_for = 'blocked'`. The application layer reuses the `Open` mapping when a task transitions to Blocked. This is app-level fallback only — the DB column has zero or one row per `default_for` value, never two rows pointing at the same option.
+**Fallback semantics — app level, not DB.** Most projects don't have a `Blocked`-like option. When no option matches the Blocked regex, no row in `project_status_mappings` claims `status = 'blocked'`. The application layer reuses the `Open` mapping when a task transitions to Blocked. This is app-level fallback only: rather than persisting a second `(blocked → same option)` row, we leave `blocked` unmapped and resolve it to the `Open` option at lookup time. (The schema *can* represent `Open` and `Blocked` both pointing at one option — many statuses → one option is a first-class case — so making this fallback explicit later is a non-breaking change.)
 
 **Project identity is the GitHub node ID.** `ProjectId` is a newtype wrapping a String (validated as a GitHub `PVT_…` node ID), defined in `domain-core` — *not* a `define_id!`-style UUID. Project records are 100% mirrors of the GitHub entity; we don't generate a local identity for them. See §6 for the type sketch.
 
@@ -465,12 +465,27 @@ CREATE TABLE project_status_options (
   project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   option_id         TEXT NOT NULL,
   name              TEXT NOT NULL,
-  -- which local TaskStatus this option is the default for; nullable so
-  -- options that aren't anyone's default don't get a default_for value.
-  default_for       TEXT CHECK (default_for IN ('open','in_progress','blocked','done')),
   -- captured from the GraphQL response array index at fetch time. UI order.
   ordinal           INTEGER NOT NULL,
   PRIMARY KEY (project_id, option_id)
+);
+
+-- The local-status → project-option mapping. Its own table (not a column on
+-- project_status_options) precisely because the relationship is **many
+-- statuses → one option**: e.g. Open + Blocked both → "Backlog" on a board
+-- with fewer columns than we have local statuses. Keying on
+-- (project_id, status) enforces "one option per status per project" at the
+-- DB — the same invariant `Project::new` checks in code — while leaving
+-- option_id free to repeat. The composite FK keeps every mapping pointing at
+-- an option the project owns and cascades mappings away when an option is
+-- dropped during the wholesale option-set replace.
+CREATE TABLE project_status_mappings (
+  project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  status            TEXT NOT NULL CHECK (status IN ('open','in_progress','blocked','done')),
+  option_id         TEXT NOT NULL,
+  PRIMARY KEY (project_id, status),
+  FOREIGN KEY (project_id, option_id)
+    REFERENCES project_status_options(project_id, option_id) ON DELETE CASCADE
 );
 
 -- Workspaces gain an optional parent project. Existing rows migrate cleanly
@@ -582,7 +597,7 @@ These don't block Stage 1 (REST → octocrab swap) — they only need to be answ
 
 1. **Where does `application-project` register `ProjectService`?** Same composition root as `TaskService` (the daemon and CLI both wire it). No real choice — calling out for symmetry.
 2. **Outbox ordering guarantees.** FIFO per task? Strict global FIFO? Lean: FIFO per task (a single-task `start → edit → complete` sequence must apply in order), but parallel across tasks (a stuck mutation on task A shouldn't block task B). Stage 6 makes this concrete.
-3. **`default_for` collisions** in `project_status_options`. If the auto-derivation maps two `TaskStatus` values to the same option (e.g. a 2-state board has only "Open" and "Done"), what happens? Lean: store the collision as-is; surface a warning on `rl project show`; let the user fix via `rl project map`.
+3. **Many-to-one mappings** in `project_status_mappings`. If the auto-derivation maps two `TaskStatus` values to the same option (e.g. a 2-state board has only "Open" and "Done"), what happens? The schema represents this natively — two `(project_id, status)` rows sharing one `option_id` — so we store the collision as-is; surface a note on `rl project show`; let the user re-target via `rl project map`. (The earlier scalar `default_for` column couldn't store this and silently dropped the second mapping; see #80.)
 4. **Project archival semantics.** A GitHub project can be closed/archived from the UI. **Decision: archival is cosmetic only — no cascade.** We mirror the `archived` flag on the local `projects` row and surface it on `rl project show` / `rl workspace show`, but: child workspaces are unaffected, polling continues (the user may un-archive), and existing outbox entries still drain. The flag is purely a hint for the human reader.
 5. **Unlinking a project with active orphan-drafts.** If a user runs `rl project unlink <p>` while orphan tasks (`repo_id = NULL`, `project_item_id IS NOT NULL`) exist under workspaces attached to that project, the drafts on GitHub aren't affected — but the local task loses its only sync anchor (no repo, no project to track via). Options: (a) refuse the unlink until those tasks are resolved, (b) auto-detach drafts (keep them locally as orphan + projectless, no further sync), (c) prompt per task. Lean: (b), with a `rl project unlink --force` to skip prompting and a summary of affected tasks. Decide before Stage 8.
 
