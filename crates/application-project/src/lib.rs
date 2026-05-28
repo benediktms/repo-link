@@ -52,7 +52,12 @@ async fn resolve_project(repo: &Arc<dyn ProjectRepository>, spec: &str) -> Resul
     }
     // Try node id first — cheap O(1) lookup and the canonical form.
     if let Ok(id) = ProjectId::parse(trimmed.to_string()) {
-        return Ok(repo.get(id).await?);
+        // Normalize "id parses but no row exists" to ProjectNotFound so
+        // callers can match on one variant regardless of input form.
+        return repo.get(id).await.map_err(|e| match e {
+            PortError::NotFound(_) => ServiceError::ProjectNotFound(spec.to_string()),
+            other => ServiceError::Port(other),
+        });
     }
     // Fall back to `owner/number`. Reject anything else with a clear error.
     let (owner, number_str) = trimmed
@@ -328,6 +333,19 @@ mod tests {
         let svc = service();
         let err = svc.get("noone/99").await.unwrap_err();
         assert!(matches!(err, ServiceError::ProjectNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn get_errors_consistently_on_unknown_node_id() {
+        // Same logical failure as `owner/number` missing should surface as
+        // ServiceError::ProjectNotFound regardless of input form — otherwise
+        // callers pattern-matching on the variant miss the node-id path.
+        let svc = service();
+        let err = svc.get("PVT_does_not_exist").await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::ProjectNotFound(_)),
+            "expected ProjectNotFound, got: {err:?}"
+        );
     }
 
     #[tokio::test]

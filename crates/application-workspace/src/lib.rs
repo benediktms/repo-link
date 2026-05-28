@@ -131,8 +131,12 @@ impl WorkspaceService {
         let trimmed = spec.trim();
         if let Ok(id) = ProjectId::parse(trimmed.to_string()) {
             // Confirm the id actually corresponds to a known project so we
-            // don't store a dangling FK reference.
-            projects.get(id.clone()).await?;
+            // don't store a dangling FK reference. Normalize NotFound here
+            // so callers see one shape regardless of node-id vs owner/number.
+            projects.get(id.clone()).await.map_err(|e| match e {
+                PortError::NotFound(_) => ServiceError::ProjectNotFound(spec.to_string()),
+                other => ServiceError::Port(other),
+            })?;
             return Ok(id);
         }
         let (owner, number_str) = trimmed
