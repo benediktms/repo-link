@@ -1215,7 +1215,7 @@ fn resolve_attach_link_path(
             "cwd is not a git repo: {}; pass --path <p> or --no-link",
             abs.display()
         ),
-        Err(e) => return Err(anyhow!("{e}")),
+        Err(e) => Err(anyhow!("{e}")),
         Ok(None) => anyhow::bail!(
             "git repo at {} has no `origin` remote; pass --path <p> or --no-link",
             abs.display()

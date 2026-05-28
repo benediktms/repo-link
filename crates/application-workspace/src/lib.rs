@@ -162,9 +162,8 @@ impl RepoBindingService {
             binding.set_prefix(requested)?;
         }
 
-        let worktree_added = cmd.link_path.map(|path| {
-            binding.link_worktree(PathBuf::from(&path), cmd.link_branch);
-            path
+        let worktree_added = cmd.link_path.inspect(|path| {
+            binding.link_worktree(PathBuf::from(path), cmd.link_branch);
         });
 
         if explicit_prefix {
