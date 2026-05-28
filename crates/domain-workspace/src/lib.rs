@@ -1,6 +1,6 @@
 //! domain-workspace — Workspace aggregate + lifecycle transitions.
 
-use domain_core::{Aggregate, DomainError, Result, Timestamp, WorkspaceId};
+use domain_core::{Aggregate, DomainError, ProjectId, Result, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +49,12 @@ pub struct Workspace {
     pub description: Option<String>,
     pub status: WorkspaceStatus,
     pub local_only: bool,
+    /// Optional parent GitHub Projects v2 board. When `Some`, the project
+    /// is the primary sync target for tasks in this workspace (per RFC
+    /// 0001 §3 D1). `None` = the local-only / projectless path; existing
+    /// workspaces stay valid because the field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -62,6 +68,7 @@ impl Workspace {
             description,
             status: WorkspaceStatus::Created,
             local_only,
+            project_id: None,
             created_at: now,
             updated_at: now,
         }

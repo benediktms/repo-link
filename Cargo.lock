@@ -748,6 +748,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "domain-project"
+version = "0.1.0"
+dependencies = [
+ "domain-core",
+ "domain-task",
+ "serde",
+]
+
+[[package]]
 name = "domain-repo"
 version = "0.1.0"
 dependencies = [
@@ -763,6 +772,7 @@ dependencies = [
  "domain-core",
  "domain-task",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
@@ -2724,6 +2734,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "domain-core",
+ "domain-project",
  "domain-repo",
  "domain-sync",
  "domain-task",

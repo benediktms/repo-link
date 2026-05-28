@@ -1,5 +1,5 @@
 [package]
-name = "domain-sync"
+name = "domain-project"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,3 @@ publish.workspace = true
 domain-core = { workspace = true }
 domain-task = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
-
-[dev-dependencies]
-serde_json = { workspace = true }

@@ -424,10 +424,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         .transpose()?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef {
-            provider,
-            remote_id,
-        }),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef::new(provider, remote_id)),
         _ => None,
     };
 
@@ -444,6 +441,9 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         remote,
         relations: Vec::new(),
         comments: Vec::new(),
+        // Default None pre-Stage 3: no migration has landed for
+        // `tasks.project_item_id` yet, so we don't read the column.
+        project_item_id: None,
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
@@ -547,10 +547,7 @@ async fn load_latest_baseline(
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
     let remote = match (remote_provider, remote_id) {
-        (Some(provider), Some(remote_id)) => Some(RemoteRef {
-            provider,
-            remote_id,
-        }),
+        (Some(provider), Some(remote_id)) => Some(RemoteRef::new(provider, remote_id)),
         _ => None,
     };
     let repo_id = repo_id_raw

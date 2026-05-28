@@ -134,7 +134,28 @@ pub struct TaskRelation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRef {
     pub provider: String,
+    /// Provider-native numeric identifier (e.g. GitHub issue `number`). The
+    /// historical primary key from the REST world; kept because every CLI
+    /// surface still speaks numbers.
     pub remote_id: String,
+    /// Provider-native opaque node ID (e.g. GitHub `I_kwHO…`). Required by
+    /// GraphQL mutations such as `addProjectV2ItemById`. Stays `None` for
+    /// rows that pre-date the column or for providers that have no
+    /// equivalent — the field is purely additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+impl RemoteRef {
+    /// Build a `RemoteRef` carrying just the provider+number pair. Defaults
+    /// `node_id` to `None`, matching every pre-Stage-2 construction site.
+    pub fn new(provider: impl Into<String>, remote_id: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            remote_id: remote_id.into(),
+            node_id: None,
+        }
+    }
 }
 
 /// A comment mirrored from (or destined for) the remote issue. `remote_id`
@@ -271,6 +292,13 @@ pub struct Task {
     /// reconciled by `sync pull`. Deliberately excluded from `snapshot_view`
     /// so comment activity never marks the task dirty.
     pub comments: Vec<TaskComment>,
+    /// GitHub Projects v2 item node ID (`PVTI_…`) when the task is mirrored
+    /// to a project — i.e. when its workspace has `project_id` set and the
+    /// task has been promoted at least once. `None` for projectless
+    /// workspaces and for project-bound tasks that haven't been promoted
+    /// yet. Like `node_id` on [`RemoteRef`], purely additive: no consumer
+    /// reads it before Stage 5 wires the GraphQL surface in.
+    pub project_item_id: Option<String>,
     /// Short globally-unique hash used to assemble the friendly composite
     /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
     /// (grown by the persistence layer on collision). Empty string is the
@@ -312,6 +340,7 @@ impl Task {
             remote: None,
             relations: Vec::new(),
             comments: Vec::new(),
+            project_item_id: None,
             // Empty until the persistence layer mints a unique base32
             // hash on first save. Domain stays agnostic to randomness
             // and DB-backed uniqueness retries.
@@ -360,6 +389,7 @@ impl Task {
             remote: Some(remote),
             relations: Vec::new(),
             comments: Vec::new(),
+            project_item_id: None,
             hash: String::new(),
             created_at: now,
             updated_at: now,
@@ -785,10 +815,7 @@ mod tests {
     }
 
     fn remote_ref() -> RemoteRef {
-        RemoteRef {
-            provider: "github".into(),
-            remote_id: "org/repo#1".into(),
-        }
+        RemoteRef::new("github", "org/repo#1")
     }
 
     #[test]
@@ -870,10 +897,7 @@ mod tests {
         t.promote_to_remote(remote_ref()).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
 
-        let new_remote = RemoteRef {
-            provider: "github".into(),
-            remote_id: "999".into(),
-        };
+        let new_remote = RemoteRef::new("github", "999");
         t.link_to_remote(RepoId::new(), new_remote.clone(), true).unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
         assert_eq!(t.remote.as_ref(), Some(&new_remote));
@@ -886,10 +910,7 @@ mod tests {
         t.promote_to_remote(remote_ref()).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
 
-        let new_remote = RemoteRef {
-            provider: "github".into(),
-            remote_id: "1506".into(),
-        };
+        let new_remote = RemoteRef::new("github", "1506");
         // Verified relink: caller asserts the new remote is identity-preserving.
         t.link_to_remote(RepoId::new(), new_remote.clone(), false).unwrap();
         assert_eq!(t.sync, SyncState::Synced);

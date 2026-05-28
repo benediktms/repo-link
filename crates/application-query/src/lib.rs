@@ -525,11 +525,7 @@ mod tests {
         // A fully-synced task: clean on the snapshot axis.
         let mut t = Task::new_draft(workspace_id, None, "synced task".into()).unwrap();
         t.stage_for_sync().unwrap();
-        t.promote_to_remote(RemoteRef {
-            provider: "github".into(),
-            remote_id: "1".into(),
-        })
-        .unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "1")).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
         ts.save(&t, SnapshotSource::Push).await.unwrap();
 
@@ -687,10 +683,7 @@ mod tests {
         let mut dirty = Task::new_draft(wid, None, "edited locally".into()).unwrap();
         dirty.stage_for_sync().unwrap();
         dirty
-            .promote_to_remote(domain_task::RemoteRef {
-                provider: "github".into(),
-                remote_id: "42".into(),
-            })
+            .promote_to_remote(domain_task::RemoteRef::new("github", "42"))
             .unwrap();
         // promote_to_remote lands on Synced; flip to DirtyLocal to exercise drift.
         dirty.mark_dirty_local().unwrap();

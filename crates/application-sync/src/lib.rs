@@ -100,10 +100,7 @@ impl SyncService {
             })
             .await?;
 
-        task.promote_to_remote(RemoteRef {
-            provider: provider_label(&canonical),
-            remote_id: snap.remote_id.clone(),
-        })?;
+        task.promote_to_remote(RemoteRef::new(provider_label(&canonical), snap.remote_id.clone()))?;
         self.tasks.save(&task, SnapshotSource::Promote).await?;
         Ok(summary(&task, prev, SyncDecision::PushLocal))
     }
@@ -327,10 +324,7 @@ impl SyncService {
                 )))
             })?;
 
-        let new_remote = RemoteRef {
-            provider: "github".into(),
-            remote_id: new_remote_id.to_string(),
-        };
+        let new_remote = RemoteRef::new("github", new_remote_id.to_string());
 
         if relink {
             // Verified relink overwrites title/body/assignees from the new
