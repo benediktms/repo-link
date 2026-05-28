@@ -63,7 +63,16 @@ impl ProjectRepository for SqliteProjectRepository {
 
         // Replace the option set wholesale. Options are a 100% mirror of
         // the remote field definition — diffing locally adds no value and
-        // would mishandle renames (same option_id, different name).
+        // would mishandle renames (same option_id, different name). The
+        // mappings rows FK onto options with ON DELETE CASCADE, so clearing
+        // options also clears the project's mappings; we re-insert both from
+        // the domain object below. Delete mappings first anyway so the
+        // ordering is explicit and doesn't lean on cascade timing.
+        sqlx::query("DELETE FROM project_status_mappings WHERE project_id = ?")
+            .bind(project.id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
         sqlx::query("DELETE FROM project_status_options WHERE project_id = ?")
             .bind(project.id.as_str())
             .execute(&mut *tx)
@@ -71,24 +80,41 @@ impl ProjectRepository for SqliteProjectRepository {
             .map_err(map_sqlx_err)?;
 
         for opt in &project.status_options {
-            let default_for = project
-                .status_mappings
-                .iter()
-                .find(|m| m.option_id == opt.option_id)
-                .map(|m| enum_to_str(&m.status))
-                .transpose()?;
             sqlx::query(
                 r#"
                 INSERT INTO project_status_options
-                    (project_id, option_id, name, default_for, ordinal)
-                VALUES (?, ?, ?, ?, ?)
+                    (project_id, option_id, name, ordinal)
+                VALUES (?, ?, ?, ?)
                 "#,
             )
             .bind(project.id.as_str())
             .bind(&opt.option_id)
             .bind(&opt.name)
-            .bind(default_for)
             .bind(i64::from(opt.ordinal))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        }
+
+        // Write mappings from `status_mappings` — the domain source of truth
+        // — rather than reverse-deriving a single `default_for` per option.
+        // That's the whole point of the dedicated table: a `(status,
+        // option_id)` pair per mapping means many statuses can share one
+        // option (Open + Blocked → "Backlog") without loss. The
+        // `(project_id, status)` PK rejects a duplicate status at the DB,
+        // matching the `Project::new` invariant. Options are all inserted
+        // above, so the composite FK is satisfied.
+        for m in &project.status_mappings {
+            sqlx::query(
+                r#"
+                INSERT INTO project_status_mappings
+                    (project_id, status, option_id)
+                VALUES (?, ?, ?)
+                "#,
+            )
+            .bind(project.id.as_str())
+            .bind(enum_to_str(&m.status)?)
+            .bind(&m.option_id)
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_err)?;
@@ -153,9 +179,11 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 
     async fn delete(&self, id: ProjectId) -> PortResult<()> {
-        // `project_status_options.project_id` is ON DELETE CASCADE, so the
-        // option rows clear automatically. Workspaces with a `project_id`
-        // pointing here are ON DELETE SET NULL — they become projectless.
+        // `project_status_options.project_id` and
+        // `project_status_mappings.project_id` are both ON DELETE CASCADE, so
+        // the option and mapping rows clear automatically. Workspaces with a
+        // `project_id` pointing here are ON DELETE SET NULL — they become
+        // projectless.
         sqlx::query("DELETE FROM projects WHERE id = ?")
             .bind(id.as_str())
             .execute(&self.db.writes)
@@ -185,7 +213,7 @@ async fn row_to_project(
 
     let option_rows = sqlx::query(
         r#"
-        SELECT option_id, name, default_for, ordinal
+        SELECT option_id, name, ordinal
           FROM project_status_options
          WHERE project_id = ?
          ORDER BY ordinal ASC
@@ -197,28 +225,54 @@ async fn row_to_project(
     .map_err(map_sqlx_err)?;
 
     let mut status_options = Vec::with_capacity(option_rows.len());
-    let mut status_mappings = Vec::new();
     for opt in option_rows.iter() {
         let option_id: String = opt.try_get("option_id").map_err(map_sqlx_err)?;
         let name: String = opt.try_get("name").map_err(map_sqlx_err)?;
-        let default_for: Option<String> = opt.try_get("default_for").map_err(map_sqlx_err)?;
         let ordinal_raw: i64 = opt.try_get("ordinal").map_err(map_sqlx_err)?;
         let ordinal = u32::try_from(ordinal_raw)
             .map_err(|e| PortError::Backend(format!("ordinal overflow: {e}")))?;
-
-        if let Some(status_str) = default_for {
-            status_mappings.push(StatusMapping {
-                status: enum_from_str::<TaskStatus>(
-                    "project_status_options.default_for",
-                    &status_str,
-                )?,
-                option_id: option_id.clone(),
-            });
-        }
         status_options.push(StatusOption {
             option_id,
             name,
             ordinal,
+        });
+    }
+
+    // Mappings live in their own table now — one row per `(project, status)`,
+    // many of which may share one `option_id`. Read them all; the `Project`
+    // re-validation below re-checks they reference an owned option.
+    //
+    // Order by workflow position (Open → InProgress → Blocked → Done) so the
+    // load is deterministic. It matters downstream: `project_to_dto` picks
+    // the *first* mapping per option for the inline `default_for` field, so a
+    // many-to-one option (e.g. Open + Blocked → "Backlog") would otherwise
+    // surface an unstable status across reads. Lowest workflow status wins,
+    // which reads as the option's primary status.
+    let mapping_rows = sqlx::query(
+        r#"
+        SELECT status, option_id
+          FROM project_status_mappings
+         WHERE project_id = ?
+         ORDER BY CASE status
+             WHEN 'open'        THEN 0
+             WHEN 'in_progress' THEN 1
+             WHEN 'blocked'     THEN 2
+             WHEN 'done'        THEN 3
+         END
+        "#,
+    )
+    .bind(id.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    let mut status_mappings = Vec::with_capacity(mapping_rows.len());
+    for m in mapping_rows.iter() {
+        let status_str: String = m.try_get("status").map_err(map_sqlx_err)?;
+        let option_id: String = m.try_get("option_id").map_err(map_sqlx_err)?;
+        status_mappings.push(StatusMapping {
+            status: enum_from_str::<TaskStatus>("project_status_mappings.status", &status_str)?,
+            option_id,
         });
     }
 

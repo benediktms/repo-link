@@ -576,8 +576,8 @@ enum ProjectCmd {
     /// `--option` takes `<option-id>:<name>` and is repeatable; the
     /// option's `ordinal` is the order it appears on the command line.
     /// `--map` takes `<status>:<option-id>` and seeds initial mappings.
-    /// Many-to-one mappings (multiple statuses → one option) are valid
-    /// in the domain but currently lossy on save — see #80.
+    /// Many-to-one mappings (multiple statuses → one option, e.g. `open`
+    /// and `blocked` both → "Backlog") are supported and persist losslessly.
     Link {
         #[arg(long)]
         node_id: String,

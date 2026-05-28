@@ -677,10 +677,81 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
     assert_eq!(names, ["Backlog", "Done", "Triage"]);
 
     // The two real mappings round-trip; the "Triage" option stays unmapped
-    // (default_for IS NULL) exactly as it was saved.
+    // (no project_status_mappings row) exactly as it was saved.
     assert_eq!(loaded.option_id_for(TaskStatus::Open), Some("o1"));
     assert_eq!(loaded.option_id_for(TaskStatus::Done), Some("o2"));
     assert_eq!(loaded.option_id_for(TaskStatus::InProgress), None);
+}
+
+#[tokio::test]
+async fn project_roundtrip_preserves_many_to_one_mapping() {
+    // Regression for #80: the Stage 3 scalar `default_for` column could hold
+    // at most one TaskStatus per option, so saving a Project where two
+    // statuses share one option silently dropped the second mapping. The
+    // dedicated `project_status_mappings` table stores both rows; this test
+    // pins that they survive the round-trip.
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_task::TaskStatus;
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db);
+    let id = ProjectId::parse("PVT_kwHO_many_to_one").unwrap();
+
+    // A board with fewer columns than we have local statuses: Open AND
+    // Blocked both map to "Backlog"; InProgress and Done map to "Done".
+    let saved = Project::new(
+        id.clone(),
+        "acme".into(),
+        9,
+        "Tight Board".into(),
+        "PVTSSF_field".into(),
+        vec![
+            StatusOption {
+                option_id: "backlog".into(),
+                name: "Backlog".into(),
+                ordinal: 0,
+            },
+            StatusOption {
+                option_id: "done".into(),
+                name: "Done".into(),
+                ordinal: 1,
+            },
+        ],
+        vec![
+            StatusMapping {
+                status: TaskStatus::Open,
+                option_id: "backlog".into(),
+            },
+            StatusMapping {
+                status: TaskStatus::Blocked,
+                option_id: "backlog".into(),
+            },
+            StatusMapping {
+                status: TaskStatus::InProgress,
+                option_id: "done".into(),
+            },
+            StatusMapping {
+                status: TaskStatus::Done,
+                option_id: "done".into(),
+            },
+        ],
+        false,
+        Timestamp::now(),
+    )
+    .unwrap();
+
+    projects.save(&saved).await.unwrap();
+    let loaded = projects.get(id).await.unwrap();
+
+    // All four mappings round-trip — not just the first one per option.
+    assert_eq!(loaded.status_mappings.len(), 4);
+    assert_eq!(loaded.option_id_for(TaskStatus::Open), Some("backlog"));
+    assert_eq!(loaded.option_id_for(TaskStatus::Blocked), Some("backlog"));
+    assert_eq!(loaded.option_id_for(TaskStatus::InProgress), Some("done"));
+    assert_eq!(loaded.option_id_for(TaskStatus::Done), Some("done"));
 }
 
 #[tokio::test]
