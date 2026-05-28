@@ -831,6 +831,10 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
     cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
     cmd.env_remove("GITHUB_TOKEN");
+    // Point the GH API at a closed port so `gh auth`'s best-effort `/user`
+    // call fails fast (connection refused). The token still persists; the
+    // login simply isn't cached, matching offline / bad-token UX.
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", "http://127.0.0.1:1");
     let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
     // Use canonicalize so symlinks (e.g. /var → /private/var on macOS) don't
     // cause a mismatch between the path the binary resolves and what we built.
@@ -2597,4 +2601,205 @@ fn worktree_prune_missing_ambiguous_alias_exits_with_candidates() {
         serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
     assert_eq!(body["error"], "ambiguous");
     assert_eq!(body["candidates"].as_array().unwrap().len(), 2);
+}
+
+// ---------- rl task claim ------------------------------------------------
+
+/// Write a two-line token file (`<token>\n<login>\n`) with mode 0o600 so
+/// `cfg.resolve_github_login()` returns `Some(login)`. The claim tests need
+/// this seed because the cache normally gets populated by `rl gh auth`, but
+/// that command makes a real /user round-trip we don't want to mock here.
+#[cfg(unix)]
+fn seed_token_file(path: &std::path::Path, token: &str, login: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("{token}\n{login}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn task_claim_local_only_assigns_and_starts_skipping_push() {
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("github_token");
+    seed_token_file(&token_file, "tok", "benediktms");
+
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let task = run_json(
+        &mut bin("rl", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "claim me",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let rows = run_json(&mut cmd, &["task", "claim", "--no-sync", &task_id]);
+
+    let arr = rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    let row = &arr[0];
+    assert_eq!(row["ok"], true);
+    assert_eq!(row["push"], "skipped: --no-sync");
+    assert_eq!(row["task"]["status"], "in_progress");
+    let assignees: Vec<&str> = row["task"]["assignees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(assignees, vec!["benediktms"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn task_claim_errors_without_cached_login() {
+    let dir = TempDir::new().unwrap();
+    // No token file written — `resolve_github_login` returns None.
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let task = run_json(
+        &mut bin("rl", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "claim me",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let token_file = dir.path().join("does-not-exist");
+    let output = bin("rl", &dir)
+        .env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file)
+        .env_remove("REPO_LINK_GITHUB_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("REPO_LINK_GITHUB_LOGIN")
+        .args(["task", "claim", "--no-sync", &task_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cached GitHub login") && stderr.contains("rl gh auth"),
+        "expected login-missing hint; got: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn task_claim_refuses_done_task() {
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("github_token");
+    seed_token_file(&token_file, "tok", "benediktms");
+
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let task = run_json(
+        &mut bin("rl", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "done already",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+    // Drive the task all the way to Done.
+    run_json(&mut bin("rl", &dir), &["task", "start", &task_id]);
+    run_json(&mut bin("rl", &dir), &["task", "complete", &task_id]);
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let output = cmd
+        .args(["task", "claim", "--no-sync", &task_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    // `claim_dispatch` records the per-task error in the JSON array AND
+    // bubbles a non-zero exit. The row carries the hint.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let row = &rows.as_array().unwrap()[0];
+    assert_eq!(row["ok"], false);
+    let err_msg = row["error"].as_str().unwrap();
+    assert!(
+        err_msg.contains("done") && err_msg.contains("reopen"),
+        "expected 'done; reopen' hint; got: {err_msg}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn task_claim_is_idempotent_when_already_claimed() {
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("github_token");
+    seed_token_file(&token_file, "tok", "benediktms");
+
+    let ws = run_json(
+        &mut bin("rl", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let task = run_json(
+        &mut bin("rl", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "claim me twice",
+        ],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let first = run_json(&mut cmd, &["task", "claim", "--no-sync", &task_id]);
+    let first_updated_at = first[0]["task"]["updated_at"].clone();
+    let first_assignees = first[0]["task"]["assignees"].clone();
+
+    // Second invocation must not mutate the task — already in_progress and
+    // the cached login is already in `assignees`, so both branches in
+    // `claim_one` are skipped. `updated_at` is the cheap idempotency probe.
+    let mut cmd2 = bin("rl", &dir);
+    cmd2.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd2.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd2.env_remove("GITHUB_TOKEN");
+    let second = run_json(&mut cmd2, &["task", "claim", "--no-sync", &task_id]);
+    assert_eq!(second[0]["ok"], true);
+    assert_eq!(second[0]["task"]["status"], "in_progress");
+    assert_eq!(second[0]["task"]["assignees"], first_assignees);
+    assert_eq!(
+        second[0]["task"]["updated_at"], first_updated_at,
+        "second claim must not touch updated_at",
+    );
 }

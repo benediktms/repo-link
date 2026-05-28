@@ -61,6 +61,8 @@ struct RawEnv {
     db: Option<PathBuf>,
     github_token: Option<String>,
     github_token_file: Option<PathBuf>,
+    github_login: Option<String>,
+    github_api_base_url: Option<String>,
     user: Option<String>,
 }
 
@@ -71,10 +73,23 @@ pub struct RepoLinkConfig {
     /// For the full resolution chain that also walks to the on-disk file,
     /// call [`Self::resolve_github_token`].
     pub github_token: Option<String>,
+    /// Env-derived GitHub login only (REPO_LINK_GITHUB_LOGIN). For the full
+    /// resolution chain that also reads the cached login from the token
+    /// file, call [`Self::resolve_github_login`].
+    pub github_login: Option<String>,
+    /// Override for the GitHub REST API root, sourced from
+    /// `REPO_LINK_GITHUB_API_BASE_URL`. `None` means the provider talks to
+    /// `api.github.com`. Useful for GitHub Enterprise and for pointing the
+    /// CLI at a mock server in integration tests.
+    pub github_api_base_url: Option<String>,
     pub default_user: Option<String>,
     /// Resolved path for the on-disk GitHub token. The file may or may not
-    /// exist; it's read on demand by [`Self::resolve_github_token`] and
-    /// written to by `rl gh auth`.
+    /// exist; it's read on demand by [`Self::resolve_github_token`] /
+    /// [`Self::resolve_github_login`] and written to by `rl gh auth`.
+    ///
+    /// File format: line 1 is the token, optional line 2 is the cached
+    /// GitHub login. Single-line files written by older versions still
+    /// parse — the login simply comes back as `None`.
     pub token_file_path: PathBuf,
 }
 
@@ -96,6 +111,8 @@ impl RepoLinkConfig {
             .github_token
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()));
+        let github_login = raw.github_login.filter(|s| !s.is_empty());
+        let github_api_base_url = raw.github_api_base_url.filter(|s| !s.is_empty());
         let default_user = raw.user.or_else(|| std::env::var("USER").ok());
         let database_path = match raw.db {
             Some(p) => p,
@@ -108,6 +125,8 @@ impl RepoLinkConfig {
         Ok(Self {
             database_path,
             github_token,
+            github_login,
+            github_api_base_url,
             default_user,
             token_file_path,
         })
@@ -129,7 +148,20 @@ impl RepoLinkConfig {
         {
             return Ok(Some(t.to_string()));
         }
-        read_token_file(&self.token_file_path)
+        Ok(read_token_file_contents(&self.token_file_path)?.token)
+    }
+
+    /// Effective GitHub login: env-derived value (`REPO_LINK_GITHUB_LOGIN`)
+    /// wins; otherwise read from line 2 of the token file. Returns
+    /// `Ok(None)` if neither source provides a login. Inherits the same
+    /// permission check as the token, since they share a file.
+    pub fn resolve_github_login(&self) -> Result<Option<String>, TokenFileError> {
+        if let Some(l) = self.github_login.as_deref()
+            && !l.is_empty()
+        {
+            return Ok(Some(l.to_string()));
+        }
+        Ok(read_token_file_contents(&self.token_file_path)?.login)
     }
 }
 
@@ -205,7 +237,16 @@ fn xdg_config_dir() -> Result<PathBuf, ConfigError> {
     Ok(home_dir()?.join(".config"))
 }
 
-fn read_token_file(path: &Path) -> Result<Option<String>, TokenFileError> {
+/// Parsed contents of the on-disk token file. Two-line format: line 1 is
+/// the token, optional line 2 is the cached GitHub login. Single-line files
+/// written before the login was cached parse with `login = None`.
+#[derive(Debug, Default)]
+pub struct TokenFileContents {
+    pub token: Option<String>,
+    pub login: Option<String>,
+}
+
+fn read_token_file_contents(path: &Path) -> Result<TokenFileContents, TokenFileError> {
     use std::io::Read;
 
     // Open first, then fstat through the file handle so the permission check
@@ -213,7 +254,9 @@ fn read_token_file(path: &Path) -> Result<Option<String>, TokenFileError> {
     // between two path-based syscalls.
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TokenFileContents::default());
+        }
         Err(source) => {
             return Err(TokenFileError::Io {
                 path: path.to_path_buf(),
@@ -232,8 +275,18 @@ fn read_token_file(path: &Path) -> Result<Option<String>, TokenFileError> {
             path: path.to_path_buf(),
             source,
         })?;
-    let trimmed = raw.trim();
-    Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+    let mut lines = raw.lines();
+    let token = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let login = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(TokenFileContents { token, login })
 }
 
 #[cfg(unix)]
@@ -271,6 +324,8 @@ mod tests {
         let cfg = RepoLinkConfig {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: None,
+            github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: PathBuf::from("/tmp/github_token"),
         }
@@ -279,32 +334,54 @@ mod tests {
     }
 
     #[test]
-    fn read_token_file_missing_returns_none() {
+    fn read_token_file_missing_returns_empty_contents() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("does-not-exist");
-        assert!(read_token_file(&path).unwrap().is_none());
+        let c = read_token_file_contents(&path).unwrap();
+        assert!(c.token.is_none());
+        assert!(c.login.is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_token_file_empty_returns_none() {
+    fn read_token_file_empty_returns_empty_contents() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("github_token");
         std::fs::write(&path, "   \n  \n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(read_token_file(&path).unwrap().is_none());
+        let c = read_token_file_contents(&path).unwrap();
+        assert!(c.token.is_none());
+        assert!(c.login.is_none());
     }
 
     #[cfg(unix)]
     #[test]
-    fn read_token_file_strips_trailing_whitespace() {
+    fn read_token_file_legacy_single_line_token_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("github_token");
         std::fs::write(&path, "abc123\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(read_token_file(&path).unwrap().as_deref(), Some("abc123"));
+        let c = read_token_file_contents(&path).unwrap();
+        assert_eq!(c.token.as_deref(), Some("abc123"));
+        assert!(
+            c.login.is_none(),
+            "single-line file must not invent a login"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_token_file_two_line_yields_token_and_login() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("github_token");
+        std::fs::write(&path, "abc123\nbenediktms\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let c = read_token_file_contents(&path).unwrap();
+        assert_eq!(c.token.as_deref(), Some("abc123"));
+        assert_eq!(c.login.as_deref(), Some("benediktms"));
     }
 
     #[cfg(unix)]
@@ -315,7 +392,7 @@ mod tests {
         let path = dir.path().join("github_token");
         std::fs::write(&path, "abc123").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = read_token_file(&path).unwrap_err();
+        let err = read_token_file_contents(&path).unwrap_err();
         match err {
             TokenFileError::InsecurePermissions { mode, .. } => assert_eq!(mode, 0o644),
             other => panic!("expected InsecurePermissions, got {other:?}"),
@@ -369,6 +446,8 @@ mod tests {
         let cfg = RepoLinkConfig {
             database_path: PathBuf::from("/tmp/x.db"),
             github_token: Some("from-env".into()),
+            github_login: None,
+            github_api_base_url: None,
             default_user: None,
             token_file_path: path,
         };
@@ -376,5 +455,63 @@ mod tests {
             cfg.resolve_github_token().unwrap().as_deref(),
             Some("from-env")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_github_login_reads_line_two_of_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("github_token");
+        std::fs::write(&path, "tok\nbenediktms\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = RepoLinkConfig {
+            database_path: PathBuf::from("/tmp/x.db"),
+            github_token: None,
+            github_login: None,
+            github_api_base_url: None,
+            default_user: None,
+            token_file_path: path,
+        };
+        assert_eq!(
+            cfg.resolve_github_login().unwrap().as_deref(),
+            Some("benediktms")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_github_login_prefers_env_over_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("github_token");
+        std::fs::write(&path, "tok\nfrom-file\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cfg = RepoLinkConfig {
+            database_path: PathBuf::from("/tmp/x.db"),
+            github_token: None,
+            github_login: Some("from-env".into()),
+            github_api_base_url: None,
+            default_user: None,
+            token_file_path: path,
+        };
+        assert_eq!(
+            cfg.resolve_github_login().unwrap().as_deref(),
+            Some("from-env")
+        );
+    }
+
+    #[test]
+    fn resolve_github_login_returns_none_when_no_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = RepoLinkConfig {
+            database_path: PathBuf::from("/tmp/x.db"),
+            github_token: None,
+            github_login: None,
+            github_api_base_url: None,
+            default_user: None,
+            token_file_path: dir.path().join("does-not-exist"),
+        };
+        assert!(cfg.resolve_github_login().unwrap().is_none());
     }
 }

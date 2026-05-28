@@ -348,7 +348,13 @@ enum TaskCmd {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
-    /// Start work on one or more tasks (Open|Blocked → InProgress).
+    /// Local-only lifecycle nudge: Open|Blocked → InProgress.
+    ///
+    /// Flips the task to `InProgress` so your local queries (`query ready`,
+    /// `query mine`) reflect reality. Does NOT touch `assignees` and does NOT
+    /// push to GitHub — teammates won't see anything change. Works on purely-
+    /// local tasks. Offline-safe. Use `task claim` instead when you want to
+    /// announce externally that you've picked up the task.
     Start {
         #[arg(required = true)]
         tasks: Vec<String>,
@@ -377,6 +383,33 @@ enum TaskCmd {
     Archive {
         #[arg(required = true)]
         tasks: Vec<String>,
+    },
+    /// Publicly take ownership of a task: assign + start + push in one shot.
+    ///
+    /// Use this — instead of `task start` — the moment you want teammates,
+    /// the GitHub issue list, and project boards to know you've picked
+    /// the task up. The lifecycle move is the same as `start`; the
+    /// difference is that `claim` ALSO updates `assignees` and mirrors
+    /// the change to GitHub.
+    ///
+    /// Pipeline (per task):
+    /// 1. Add the authenticated GitHub user to `assignees` (merge — leaves
+    ///    teammates intact; no-op if you're already an assignee).
+    /// 2. Transition `Open`|`Blocked` → `InProgress` (no-op if already
+    ///    in-progress).
+    /// 3. Best-effort `sync push` to mirror the new state to the remote
+    ///    issue. Local-only / staged tasks skip the push with a hint to
+    ///    promote first.
+    ///
+    /// Refuses on `Done` / `Archived`. Requires the cached GitHub login
+    /// (`rl gh auth` populates it); without one, errors with a re-auth
+    /// hint before touching any task state.
+    Claim {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+        /// Apply locally only; skip the GitHub push step.
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Add a pending local comment to a task. Pushed to the remote issue on
     /// the next `sync push` (a separate axis — does not dirty the task).
@@ -562,7 +595,7 @@ async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> 
         Cmd::Task(c) => task_dispatch(c, svc, cfg).await,
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
-        Cmd::Gh(c) => gh_dispatch(c, cfg),
+        Cmd::Gh(c) => gh_dispatch(c, cfg).await,
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
     }
@@ -631,18 +664,9 @@ fn enrich_issue_moved(task_ref: &str, err: application_sync::SyncError) -> anyho
 }
 
 async fn sync_dispatch(cmd: SyncCmd, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
-    let token = cfg
-        .resolve_github_token()
-        .map_err(|e| anyhow!("{e}"))?
-        .ok_or_else(|| {
-            anyhow!(
-                "sync requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
-                 or a token file at {} (write one with `rl gh auth`)",
-                cfg.token_file_path.display()
-            )
-        })?;
+    let token = require_github_token(cfg, "sync")?;
     let provider: Arc<dyn ports::RemoteTaskProvider> =
-        Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
+        Arc::new(build_github_provider(&token, cfg).map_err(|e| anyhow!("{e}"))?);
 
     // `import` has its own orchestration (fetch + materialise), not the
     // promote/push/pull reconciliation `SyncService` handles.
@@ -878,13 +902,13 @@ async fn sync_import(
     Ok(())
 }
 
-fn gh_dispatch(cmd: GhCmd, cfg: &RepoLinkConfig) -> Result<()> {
+async fn gh_dispatch(cmd: GhCmd, cfg: &RepoLinkConfig) -> Result<()> {
     match cmd {
-        GhCmd::Auth { token, force } => gh_auth(token, force, cfg),
+        GhCmd::Auth { token, force } => gh_auth(token, force, cfg).await,
     }
 }
 
-fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<()> {
+async fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<()> {
     // Guard against overwriting an existing token file without explicit consent.
     if cfg.token_file_path.exists() && !force {
         eprint!(
@@ -920,7 +944,29 @@ fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<(
         return Err(anyhow!("token must not be empty"));
     }
 
-    write_token_file(&cfg.token_file_path, &trimmed)?;
+    // Best-effort: fetch the authenticated user's login and cache it next to
+    // the token. A network failure / invalid token shouldn't block the auth
+    // flow — the token still gets persisted and downstream verbs that need
+    // the login (e.g. `task claim`) report a clear "re-run rl gh auth" hint.
+    let login = match build_github_provider(&trimmed, cfg) {
+        Ok(provider) => match provider.current_user_login().await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "note: token saved, but couldn't fetch GitHub login ({e}). \
+                     Re-run `rl gh auth` once connectivity / the token is good \
+                     so commands like `rl task claim` can resolve your handle."
+                );
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("note: token saved, but provider init failed ({e}).");
+            None
+        }
+    };
+
+    write_token_file(&cfg.token_file_path, &trimmed, login.as_deref())?;
 
     let path_str = cfg
         .token_file_path
@@ -930,17 +976,60 @@ fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Result<(
         .to_string();
 
     #[cfg(unix)]
-    println!(
-        "{}",
-        serde_json::json!({ "file": path_str, "mode": "0600" })
-    );
+    let mode_value = "0600";
     #[cfg(not(unix))]
-    println!(
-        "{}",
-        serde_json::json!({ "file": path_str, "mode": "unrestricted" })
-    );
+    let mode_value = "unrestricted";
+
+    let mut payload = serde_json::json!({ "file": path_str, "mode": mode_value });
+    if let Some(l) = login.as_deref() {
+        payload["login"] = serde_json::Value::String(l.to_string());
+    }
+    println!("{payload}");
 
     Ok(())
+}
+
+/// Construct a `GithubTaskProvider`, honoring `REPO_LINK_GITHUB_API_BASE_URL`
+/// when set (for GitHub Enterprise or integration tests pointing at a
+/// wiremock). Falls back to api.github.com.
+fn build_github_provider(
+    token: &str,
+    cfg: &RepoLinkConfig,
+) -> Result<GithubTaskProvider, ports::PortError> {
+    match cfg.github_api_base_url.as_deref() {
+        Some(url) => GithubTaskProvider::with_base_url(token, url),
+        None => GithubTaskProvider::new(token),
+    }
+}
+
+/// Resolve the GitHub token or fail with a command-specific "set token or
+/// run `rl gh auth`" message. Centralised so the wording — including the
+/// resolved token-file path — stays in one place.
+fn require_github_token(cfg: &RepoLinkConfig, verb: &str) -> Result<String> {
+    cfg.resolve_github_token()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "{verb} requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
+                 or a token file at {} (write one with `rl gh auth`)",
+                cfg.token_file_path.display()
+            )
+        })
+}
+
+/// Build a [`SyncService`] wired to a GitHub provider for the current
+/// config. `verb` is interpolated into the "no token" error so a missing
+/// token reports against the actual verb the user typed (`sync push`,
+/// `task link`, `task claim`, …).
+fn build_sync_service(cfg: &RepoLinkConfig, svc: &Services, verb: &str) -> Result<SyncService> {
+    let token = require_github_token(cfg, verb)?;
+    let provider: Arc<dyn ports::RemoteTaskProvider> =
+        Arc::new(build_github_provider(&token, cfg).map_err(|e| anyhow!("{e}"))?);
+    Ok(SyncService::new(
+        svc.tasks_repo.clone(),
+        svc.bindings_repo.clone(),
+        provider,
+    ))
 }
 
 /// Best-effort: read the token cached by the official `gh` CLI. Any failure
@@ -961,8 +1050,19 @@ fn try_gh_cli_token() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Render the two-line file body: token on line 1, optional cached GitHub
+/// login on line 2. Single-line files (login = None) keep parsing through
+/// `infra_config::resolve_github_token` exactly as before — the second line
+/// is purely additive.
+fn render_token_file_body(token: &str, login: Option<&str>) -> String {
+    match login {
+        Some(l) => format!("{token}\n{l}\n"),
+        None => token.to_string(),
+    }
+}
+
 #[cfg(unix)]
-fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) -> Result<()> {
     use std::fs::DirBuilder;
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -989,7 +1089,7 @@ fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
         .mode(0o600)
         .open(path)
         .map_err(|e| anyhow!("failed to open token file: {e}"))?;
-    file.write_all(token.as_bytes())
+    file.write_all(render_token_file_body(token, login).as_bytes())
         .map_err(|e| anyhow!("failed to write token: {e}"))?;
     drop(file);
 
@@ -1001,14 +1101,15 @@ fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_token_file(path: &std::path::Path, token: &str) -> Result<()> {
+fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("failed to create config dir: {e}"))?;
         }
     }
-    std::fs::write(path, token).map_err(|e| anyhow!("failed to write token file: {e}"))?;
+    std::fs::write(path, render_token_file_body(token, login))
+        .map_err(|e| anyhow!("failed to write token file: {e}"))?;
     Ok(())
 }
 
@@ -1465,6 +1566,137 @@ where
     Ok(())
 }
 
+/// Drive `rl task claim` across a batch. Mirrors [`batch_task_op`]'s output
+/// shape (`task_id` / `ok` / `task` | `error`) and adds a `push` field so the
+/// caller can see whether the GitHub round-trip happened.
+async fn claim_dispatch(
+    svc: &Services,
+    cfg: &RepoLinkConfig,
+    tasks: Vec<String>,
+    no_sync: bool,
+) -> Result<()> {
+    // Front-load both the login and the sync service so a misconfiguration
+    // errors before mutating any task state. The whole batch shares one
+    // SyncService instance.
+    let login = cfg
+        .resolve_github_login()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "rl task claim needs the cached GitHub login. \
+                 Run `rl gh auth` (with network access + a valid token) \
+                 so the login can be cached."
+            )
+        })?;
+    let sync = if no_sync {
+        None
+    } else {
+        Some(build_sync_service(cfg, svc, "task claim")?)
+    };
+
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+    let mut had_errors = false;
+    let mut failed_ids: Vec<String> = Vec::new();
+    for task_ref in tasks {
+        let recorded = task_ref.clone();
+        match claim_one(svc, sync.as_ref(), &task_ref, &login).await {
+            Ok((dto, push)) => rows.push(serde_json::json!({
+                "task_id": recorded,
+                "ok": true,
+                "task": dto,
+                "push": push,
+            })),
+            Err(e) => {
+                had_errors = true;
+                failed_ids.push(recorded.clone());
+                rows.push(serde_json::json!({
+                    "task_id": recorded,
+                    "ok": false,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+    );
+    if had_errors {
+        return Err(anyhow!(
+            "batch had {} failed task(s): {}",
+            failed_ids.len(),
+            failed_ids.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// One iteration of `rl task claim`. Refuses on `Done` / `Archived`; for
+/// everything else the pipeline is merge-then-start-then-push. Idempotent:
+/// if the login is already in `assignees` AND the task is already
+/// in-progress, the push step is reported as `noop`.
+async fn claim_one(
+    svc: &Services,
+    sync: Option<&SyncService>,
+    task_ref: &str,
+    login: &str,
+) -> Result<(dto_shared::TaskDto, String)> {
+    let task_id = svc.tasks.resolve_id(task_ref).await?;
+    let mut dto = svc.tasks.show(&task_id).await?;
+
+    match dto.status.as_str() {
+        "done" => {
+            return Err(anyhow!(
+                "task {task_ref} is done; reopen it before claiming"
+            ));
+        }
+        "archived" => {
+            return Err(anyhow!(
+                "task {task_ref} is archived; unarchive it before claiming"
+            ));
+        }
+        _ => {}
+    }
+
+    let need_assign = !dto.assignees.iter().any(|a| a == login);
+    let need_start = matches!(dto.status.as_str(), "open" | "blocked");
+
+    if need_assign {
+        let mut next = dto.assignees.clone();
+        next.push(login.to_string());
+        dto = svc
+            .tasks
+            .update(UpdateTaskCmd {
+                task_id: task_id.clone(),
+                title: None,
+                body: None,
+                priority: None,
+                assignees: Some(next),
+                repo_id: None,
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    if need_start {
+        dto = svc
+            .tasks
+            .start(&task_id)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+
+    let push = match sync {
+        None => "skipped: --no-sync".to_string(),
+        Some(_) if dto.remote.is_none() => "skipped: not promoted".to_string(),
+        Some(_) if !need_assign && !need_start => "noop".to_string(),
+        Some(s) => match s.push(&task_id).await {
+            Ok(_) => "synced".to_string(),
+            Err(e) => format!("failed: {e}"),
+        },
+    };
+    Ok((dto, push))
+}
+
 /// Resolve a `--repo` argument (UUID / prefix / name / alias) to a binding
 /// UUID, reusing the same resolver as `rl repo show`. `None` stays `None`.
 /// Keeps `task create`/`edit` consistent with every other repo-addressing
@@ -1593,6 +1825,9 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
         TaskCmd::Archive { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.archive(&id).await }).await?;
         }
+        TaskCmd::Claim { tasks, no_sync } => {
+            claim_dispatch(svc, cfg, tasks, no_sync).await?;
+        }
         TaskCmd::Comment { id, body } => {
             // Provisional local author (same precedence as `query mine`); the
             // real author is filled in from GitHub when the comment is pushed.
@@ -1607,20 +1842,7 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
             let (canonical, remote_id) =
                 parse_issue_url(&url).ok_or_else(|| anyhow!("not a github issue url: {url}"))?;
             let task_id = svc.tasks.resolve_id(&id).await?;
-            let token = cfg
-                .resolve_github_token()
-                .map_err(|e| anyhow!("{e}"))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "task link requires REPO_LINK_GITHUB_TOKEN or GITHUB_TOKEN to be set, \
-                         or a token file at {} (write one with `rl gh auth`)",
-                        cfg.token_file_path.display()
-                    )
-                })?;
-            let provider: Arc<dyn ports::RemoteTaskProvider> =
-                Arc::new(GithubTaskProvider::new(token).map_err(|e| anyhow!("{e}"))?);
-            let sync =
-                SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
+            let sync = build_sync_service(cfg, svc, "task link")?;
             let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
             render::sync(&summary);
         }

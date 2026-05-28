@@ -286,6 +286,15 @@ impl RestClient {
         Ok(map_comment(c))
     }
 
+    /// `GET /user` — the GitHub login of the token's owner. Called once by
+    /// `rl gh auth` to cache the login alongside the token; downstream verbs
+    /// (e.g. `task claim`) read the cached value rather than re-asking
+    /// GitHub on every invocation.
+    pub(crate) async fn current_user_login(&self) -> PortResult<String> {
+        let me = self.http.current().user().await.map_err(map_err)?;
+        Ok(me.login)
+    }
+
     /// Probe whether an issue has been transferred to a different repo. GET on
     /// `/repos/{o}/{r}/issues/{n}` is *safe*, so octocrab's tower-http
     /// follow-redirect layer (`Standard` policy) silently follows a 301 to the

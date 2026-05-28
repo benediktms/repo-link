@@ -67,10 +67,16 @@ If drift is non-empty, reconcile with `rl sync pull <task-id>` before editing th
 
 ```bash
 rl task show  <task-id>             # full snapshot, including relations + remote ref
-rl task start <task-id>             # Open|Blocked → InProgress
+rl task start <task-id>             # local-only lifecycle nudge: Open|Blocked → InProgress
+rl task claim <task-id>             # public commitment: assign me + start + push to GitHub
 ```
 
-`task start` is what moves a task into `InProgress`; do this once per task at the beginning of a session so other queries (`query ready`, `query mine`) reflect reality.
+`start` and `claim` differ in **what other people see**, not in the lifecycle transition itself — both move the task to `InProgress`. Pick by audience:
+
+- **`task start`** — flip a task to `InProgress` for your own queries (`query ready` / `query mine`) without touching `assignees` or the remote issue. Use it for purely-local tasks, for tasks you're not announcing yet, or when you want to start work without changing who owns the issue. Idempotent and offline-safe.
+- **`task claim`** — announce externally that you've picked up the task: appends the authenticated GitHub user to `assignees` (merge, not replace), runs the same `Open|Blocked → InProgress` transition, and best-effort `sync push`-es the change so teammates, the issue list, and project boards reflect it. Use it the moment your work becomes something others should coordinate around. Pass `--no-sync` to skip the push for local-only / staged tasks. Requires the cached GitHub login — run `rl gh auth` once to populate it.
+
+Rule of thumb: if nobody else needs to know you've started, `start` is enough. If anybody else might pick up the same task, run `claim` so they don't.
 
 ### Revising a task's content
 

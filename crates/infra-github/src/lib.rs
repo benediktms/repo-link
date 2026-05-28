@@ -49,6 +49,13 @@ impl GithubTaskProvider {
             rest: rest::RestClient::new(token, base_url)?,
         })
     }
+
+    /// Resolve the GitHub login of the token's owner via `GET /user`. Used by
+    /// `rl gh auth` to cache the login alongside the token; not on the
+    /// `RemoteTaskProvider` trait because only the auth flow needs it.
+    pub async fn current_user_login(&self) -> PortResult<String> {
+        self.rest.current_user_login().await
+    }
 }
 
 #[async_trait]
@@ -596,6 +603,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ports::PortError::IssueMoved { .. }));
+    }
+
+    #[tokio::test]
+    async fn current_user_login_returns_token_owner() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .and(header("authorization", "Bearer t0k"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user("benediktms")))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+        let login = provider.current_user_login().await.unwrap();
+        assert_eq!(login, "benediktms");
+    }
+
+    #[tokio::test]
+    async fn current_user_login_maps_401_to_network_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "message": "Bad credentials"
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = GithubTaskProvider::with_base_url("bad", server.uri()).unwrap();
+        let err = provider.current_user_login().await.unwrap_err();
+        assert!(
+            matches!(err, ports::PortError::Network(_)),
+            "expected Network for 401, got {err:?}"
+        );
     }
 
     #[tokio::test]
