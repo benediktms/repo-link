@@ -1,0 +1,134 @@
+//! Task-side repository contracts.
+
+use async_trait::async_trait;
+use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_repo::RepoBinding;
+use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
+use domain_workspace::Workspace;
+
+use crate::error::PortResult;
+use crate::remote_task::RemoteComment;
+
+// ---------- Workspace repository -----------------------------------------
+
+#[async_trait]
+pub trait WorkspaceRepository: Send + Sync {
+    async fn save(&self, workspace: &Workspace) -> PortResult<()>;
+    async fn get(&self, id: WorkspaceId) -> PortResult<Workspace>;
+    async fn find_by_name(&self, name: &str) -> PortResult<Option<Workspace>>;
+    async fn list(&self, include_archived: bool) -> PortResult<Vec<Workspace>>;
+    async fn delete(&self, id: WorkspaceId) -> PortResult<()>;
+}
+
+// ---------- Repo binding repository --------------------------------------
+
+#[async_trait]
+pub trait RepoBindingRepository: Send + Sync {
+    async fn save(&self, binding: &RepoBinding) -> PortResult<()>;
+    async fn get(&self, id: RepoId) -> PortResult<RepoBinding>;
+    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> PortResult<Vec<RepoBinding>>;
+    async fn find_by_canonical_url(
+        &self,
+        workspace_id: WorkspaceId,
+        canonical_url: &str,
+    ) -> PortResult<Option<RepoBinding>>;
+    /// Look up a binding by its globally-unique `prefix`. Used by the
+    /// repo locator path so callers can pass `--repo rpl` (or use
+    /// `rpl-ak7` for tasks and reuse the prefix half here) instead of a
+    /// UUID.
+    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>>;
+    async fn delete(&self, id: RepoId) -> PortResult<()>;
+}
+
+// ---------- Task repository -----------------------------------------------
+
+#[derive(Clone, Debug, Default)]
+pub struct TaskFilter {
+    pub workspace_id: Option<WorkspaceId>,
+    pub repo_id: Option<RepoId>,
+    /// Filter by lifecycle status. When `None`, callers usually want
+    /// non-archived rows only — see `include_archived`.
+    pub status: Option<TaskStatus>,
+    /// Filter by sync state.
+    pub sync_state: Option<SyncState>,
+    /// When `status` is `None`, include `Archived` rows. Ignored if
+    /// `status` is set explicitly.
+    pub include_archived: bool,
+}
+
+#[async_trait]
+pub trait TaskRepository: Send + Sync {
+    /// Persist `task` and append a new row to its snapshot history,
+    /// tagged with `source`. The adapter assigns the next monotonic
+    /// `version`. Both writes are committed in a single transaction.
+    async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()>;
+    async fn get(&self, id: TaskId) -> PortResult<Task>;
+    async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>>;
+    /// Look up a task by its globally-unique `hash`. Used by the
+    /// friendly-ID resolver so callers can pass a bare hash (`ak7`) or
+    /// the prefix half of a composite (`rlk-ak7`) instead of a UUID.
+    async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>>;
+    /// Look up the task mirroring a given remote issue within a repo
+    /// (`repo_id` + `provider` + `remote_id`). Scoped by repo because remote
+    /// issue numbers are only unique per repo (GitHub `repoA#123` ≠
+    /// `repoB#123`). Used by `sync import` to skip already-tracked issues.
+    async fn find_by_remote(
+        &self,
+        repo_id: RepoId,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<Task>>;
+    /// Replace the task's *synced* comments with `comments` (always
+    /// remote-backed — taking [`RemoteComment`] rather than `TaskComment`
+    /// makes pending input unrepresentable), leaving any pending local-only
+    /// comments untouched. Writes only the `task_comments` table — never a
+    /// snapshot — so mirroring remote comments doesn't perturb sync state.
+    async fn replace_comments(&self, task_id: TaskId, comments: &[RemoteComment])
+    -> PortResult<()>;
+    /// Append a single pending (local-only) comment, stored with the empty
+    /// `remote_comment_id` sentinel. Writes only the `task_comments` table —
+    /// never a snapshot — so adding a comment never perturbs sync state
+    /// (pending comments are a separate outbound axis from title/body drift).
+    async fn add_pending_comment(
+        &self,
+        task_id: TaskId,
+        author: &str,
+        body: &str,
+        created_at: Timestamp,
+    ) -> PortResult<()>;
+    /// Promote a task's pending comments to synced after a successful remote
+    /// push: deletes the rows in `drained_local_ids` and inserts `pushed` as
+    /// synced rows. Writes only `task_comments`, never a snapshot.
+    ///
+    /// Identity-aware so the drain can't race-delete a pending comment that
+    /// was added between the caller reading the task and this call: only the
+    /// rows whose surrogate id was actually pushed are removed.
+    async fn mark_comments_pushed(
+        &self,
+        task_id: TaskId,
+        drained_local_ids: &[String],
+        pushed: &[RemoteComment],
+    ) -> PortResult<()>;
+    /// Count pending (local-only) comments per task across a workspace, so
+    /// `query unsynced` can surface comment-only outbound work without loading
+    /// every task's comments (`list` deliberately skips them). Returns only
+    /// tasks with at least one pending comment.
+    async fn pending_comment_counts(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<std::collections::HashMap<TaskId, usize>>;
+    async fn delete(&self, id: TaskId) -> PortResult<()>;
+}
+
+/// History queries over [`TaskSnapshot`] rows. Reads only — appends are
+/// the side-effect of [`TaskRepository::save`] (so the snapshot table and
+/// the task projection can't drift apart).
+#[async_trait]
+pub trait TaskSnapshotRepository: Send + Sync {
+    /// All snapshots for a task, oldest version first.
+    async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>>;
+
+    /// Fetch a specific version. Returns `NotFound` if the version
+    /// doesn't exist.
+    async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot>;
+}
