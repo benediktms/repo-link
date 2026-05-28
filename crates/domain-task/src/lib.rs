@@ -731,7 +731,10 @@ impl Task {
 /// Order-insensitive assignee comparison. GitHub does not preserve the order
 /// of assignees in its REST responses, so `["alice","bob"]` and `["bob","alice"]`
 /// must be treated as equal to avoid spurious `DirtyLocal` transitions.
-fn assignees_equal(a: &[String], b: &[String]) -> bool {
+/// Order-insensitive set equality for assignee lists. GitHub doesn't guarantee
+/// a stable order across responses, so callers reconciling local + remote
+/// assignees must compare as sets to avoid spurious drift on re-ordering.
+pub fn assignees_equal(a: &[String], b: &[String]) -> bool {
     if a.len() != b.len() {
         return false;
     }

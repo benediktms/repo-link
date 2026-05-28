@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use domain_core::{IdParseError, TaskId};
 use domain_sync::{SyncDecision, SyncPolicy, decide};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
+use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus, assignees_equal};
 use dto_shared::{RemoteRefDto, SyncSummaryDto};
 use ports::{
     PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
@@ -433,7 +433,10 @@ fn ensure_not_archived(task: &Task) -> Result<()> {
 fn remote_mirrors_baseline(snap: &RemoteTaskSnapshot, baseline: &TaskSnapshot) -> bool {
     snap.title == baseline.title
         && snap.body == baseline.body
-        && snap.assignees == baseline.assignees
+        // Order-insensitive: GitHub doesn't guarantee a stable assignee
+        // ordering, and the domain's reconcile uses set equality too, so
+        // matching on the same rule keeps the two views consistent.
+        && assignees_equal(&snap.assignees, &baseline.assignees)
 }
 
 fn link_summary(task: &Task, prev: SyncState, decision: &str) -> SyncSummaryDto {
@@ -770,6 +773,37 @@ mod tests {
         // And no spurious Pull snapshot lands in history.
         let after = tasks.get(task.id).await.unwrap();
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn pull_is_noop_when_remote_assignees_are_reordered() {
+        // GitHub doesn't guarantee a stable assignee order across responses;
+        // a re-ordering must not be detected as drift. Mirrors the
+        // order-insensitive comparison already used by the domain's
+        // reconcile_dirty_against_baseline.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Plant a baseline with two assignees in a known order.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.assignees = vec!["alice".into(), "bob".into()];
+        // Re-promote the baseline by saving with a Pull source so the
+        // synced_baseline reflects the new assignees.
+        tasks.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            title: t.title.clone(),
+            body: t.body.clone(),
+            closed: false,
+            updated_at: much_later,
+            assignees: vec!["bob".into(), "alice".into()],
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "noop", "assignee re-ordering must not trigger pull_remote");
     }
 
     #[tokio::test]
