@@ -348,7 +348,13 @@ enum TaskCmd {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
-    /// Start work on one or more tasks (Open|Blocked → InProgress).
+    /// Local-only lifecycle nudge: Open|Blocked → InProgress.
+    ///
+    /// Flips the task to `InProgress` so your local queries (`query ready`,
+    /// `query mine`) reflect reality. Does NOT touch `assignees` and does NOT
+    /// push to GitHub — teammates won't see anything change. Works on purely-
+    /// local tasks. Offline-safe. Use `task claim` instead when you want to
+    /// announce externally that you've picked up the task.
     Start {
         #[arg(required = true)]
         tasks: Vec<String>,
@@ -378,11 +384,17 @@ enum TaskCmd {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
-    /// Self-assign + start + push in one shot.
+    /// Publicly take ownership of a task: assign + start + push in one shot.
+    ///
+    /// Use this — instead of `task start` — the moment you want teammates,
+    /// the GitHub issue list, and project boards to know you've picked
+    /// the task up. The lifecycle move is the same as `start`; the
+    /// difference is that `claim` ALSO updates `assignees` and mirrors
+    /// the change to GitHub.
     ///
     /// Pipeline (per task):
     /// 1. Add the authenticated GitHub user to `assignees` (merge — leaves
-    ///    teammates intact).
+    ///    teammates intact; no-op if you're already an assignee).
     /// 2. Transition `Open`|`Blocked` → `InProgress` (no-op if already
     ///    in-progress).
     /// 3. Best-effort `sync push` to mirror the new state to the remote
