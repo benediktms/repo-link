@@ -241,11 +241,24 @@ async fn row_to_project(
     // Mappings live in their own table now — one row per `(project, status)`,
     // many of which may share one `option_id`. Read them all; the `Project`
     // re-validation below re-checks they reference an owned option.
+    //
+    // Order by workflow position (Open → InProgress → Blocked → Done) so the
+    // load is deterministic. It matters downstream: `project_to_dto` picks
+    // the *first* mapping per option for the inline `default_for` field, so a
+    // many-to-one option (e.g. Open + Blocked → "Backlog") would otherwise
+    // surface an unstable status across reads. Lowest workflow status wins,
+    // which reads as the option's primary status.
     let mapping_rows = sqlx::query(
         r#"
         SELECT status, option_id
           FROM project_status_mappings
          WHERE project_id = ?
+         ORDER BY CASE status
+             WHEN 'open'        THEN 0
+             WHEN 'in_progress' THEN 1
+             WHEN 'blocked'     THEN 2
+             WHEN 'done'        THEN 3
+         END
         "#,
     )
     .bind(id.as_str())
