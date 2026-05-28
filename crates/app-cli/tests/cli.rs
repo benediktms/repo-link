@@ -2367,3 +2367,185 @@ fn task_edit_with_no_flags_is_rejected() {
         "the at-least-one-flag error should now mention --repo: {stderr}"
     );
 }
+
+// ---------- Issue #47: handle resolution audit on `--repo` everywhere -------
+//
+// `task create/edit --repo` and `repo {rename,set-prefix,alias}` already
+// resolve via `RepoBindingService::show`. The tests below cover the sites
+// that were UUID-only before the audit: `repo detach`, `worktree link`,
+// `worktree unlink`, `worktree prune-missing`. One ambiguous-handle test
+// stands in for every site since they all share the same resolver helper.
+
+#[test]
+fn repo_detach_resolves_by_prefix() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    let shown = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id]);
+    let prefix = shown["prefix"].as_str().unwrap().to_string();
+
+    // Detach by prefix — the response should echo the resolved UUID, not the
+    // input handle, so callers can audit what was actually targeted.
+    let detached = run_json(&mut bin("repo-link", &dir), &["repo", "detach", &prefix]);
+    assert_eq!(detached["detached"].as_str().unwrap(), repo_id);
+
+    // The binding is gone.
+    bin("repo-link", &dir)
+        .args(["repo", "show", &repo_id])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn worktree_link_resolves_by_prefix() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    let prefix = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])["prefix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+
+    let linked = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "worktree",
+            "link",
+            "--repo",
+            &prefix,
+            "--path",
+            &repo_dir.path().display().to_string(),
+            "--branch",
+            "main",
+        ],
+    );
+    assert_eq!(linked["id"].as_str().unwrap(), repo_id);
+    assert!(!linked["worktrees"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn worktree_unlink_resolves_by_prefix() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    let prefix = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])["prefix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    let path_str = repo_dir.path().display().to_string();
+
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "worktree", "link", "--repo", &repo_id, "--path", &path_str, "--branch", "main",
+        ],
+    );
+
+    let unlinked = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "unlink", "--repo", &prefix, "--path", &path_str],
+    );
+    assert!(unlinked["worktrees"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn worktree_prune_missing_resolves_by_prefix() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    let prefix = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_id])["prefix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // `prune-missing` operates on the stored worktree list — it doesn't
+    // probe the filesystem itself; that's `worktree reconcile`. So we don't
+    // need a real (or vanished) path here. Any link + prune cycle proves
+    // the prefix was resolved to the UUID before the service was called.
+    let scratch = TempDir::new().unwrap();
+    init_git_repo_with_origin(scratch.path(), "git@github.com:o/r.git");
+    let path_str = scratch.path().display().to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "worktree", "link", "--repo", &repo_id, "--path", &path_str, "--branch", "main",
+        ],
+    );
+
+    let pruned = run_json(
+        &mut bin("repo-link", &dir),
+        &["worktree", "prune-missing", "--repo", &prefix],
+    );
+    assert_eq!(pruned["id"].as_str().unwrap(), repo_id);
+}
+
+#[test]
+fn worktree_prune_missing_ambiguous_alias_exits_with_candidates() {
+    // Two bindings sharing an alias. `worktree prune-missing` must exit 2
+    // with the same candidate-JSON shape as `rl repo show`. Prune-missing
+    // is the cleanest target because its dispatch only takes `--repo` —
+    // no path arg, no canonical discrepancy check fires first. One test
+    // stands in for every site because they all route through the single
+    // `resolve_repo_handle_required` helper in app-cli.
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id1 = attach_no_link(&dir, &workspace, "git@github.com:o/a.git", "github.com/o/a");
+    let id2 = attach_no_link(&dir, &workspace, "git@github.com:o/b.git", "github.com/o/b");
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &id1, "--alias", "shared"],
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "alias", "add", "--repo", &id2, "--alias", "shared"],
+    );
+
+    let output = bin("repo-link", &dir)
+        .args(["worktree", "prune-missing", "--repo", "shared"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&stderr).unwrap_or_else(|e| panic!("not JSON ({e}): {stderr}"));
+    assert_eq!(body["error"], "ambiguous");
+    assert_eq!(body["candidates"].as_array().unwrap().len(), 2);
+}
