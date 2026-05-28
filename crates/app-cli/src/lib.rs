@@ -378,6 +378,27 @@ enum TaskCmd {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
+    /// Self-assign + start + push in one shot.
+    ///
+    /// Pipeline (per task):
+    /// 1. Add the authenticated GitHub user to `assignees` (merge — leaves
+    ///    teammates intact).
+    /// 2. Transition `Open`|`Blocked` → `InProgress` (no-op if already
+    ///    in-progress).
+    /// 3. Best-effort `sync push` to mirror the new state to the remote
+    ///    issue. Local-only / staged tasks skip the push with a hint to
+    ///    promote first.
+    ///
+    /// Refuses on `Done` / `Archived`. Requires the cached GitHub login
+    /// (`rl gh auth` populates it); without one, errors with a re-auth
+    /// hint before touching any task state.
+    Claim {
+        #[arg(required = true)]
+        tasks: Vec<String>,
+        /// Apply locally only; skip the GitHub push step.
+        #[arg(long)]
+        no_sync: bool,
+    },
     /// Add a pending local comment to a task. Pushed to the remote issue on
     /// the next `sync push` (a separate axis — does not dirty the task).
     Comment {
@@ -1541,6 +1562,131 @@ where
     Ok(())
 }
 
+/// Drive `rl task claim` across a batch. Mirrors [`batch_task_op`]'s output
+/// shape (`task_id` / `ok` / `task` | `error`) and adds a `push` field so the
+/// caller can see whether the GitHub round-trip happened.
+async fn claim_dispatch(
+    svc: &Services,
+    cfg: &RepoLinkConfig,
+    tasks: Vec<String>,
+    no_sync: bool,
+) -> Result<()> {
+    // Front-load both the login and the sync service so a misconfiguration
+    // errors before mutating any task state. The whole batch shares one
+    // SyncService instance.
+    let login = cfg
+        .resolve_github_login()
+        .map_err(|e| anyhow!("{e}"))?
+        .ok_or_else(|| {
+            anyhow!(
+                "rl task claim needs the cached GitHub login. \
+                 Run `rl gh auth` (with network access + a valid token) \
+                 so the login can be cached."
+            )
+        })?;
+    let sync = if no_sync {
+        None
+    } else {
+        Some(build_sync_service(cfg, svc, "task claim")?)
+    };
+
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(tasks.len());
+    let mut had_errors = false;
+    let mut failed_ids: Vec<String> = Vec::new();
+    for task_ref in tasks {
+        let recorded = task_ref.clone();
+        match claim_one(svc, sync.as_ref(), &task_ref, &login).await {
+            Ok((dto, push)) => rows.push(serde_json::json!({
+                "task_id": recorded,
+                "ok": true,
+                "task": dto,
+                "push": push,
+            })),
+            Err(e) => {
+                had_errors = true;
+                failed_ids.push(recorded.clone());
+                rows.push(serde_json::json!({
+                    "task_id": recorded,
+                    "ok": false,
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".into())
+    );
+    if had_errors {
+        return Err(anyhow!(
+            "batch had {} failed task(s): {}",
+            failed_ids.len(),
+            failed_ids.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// One iteration of `rl task claim`. Refuses on `Done` / `Archived`; for
+/// everything else the pipeline is merge-then-start-then-push. Idempotent:
+/// if the login is already in `assignees` AND the task is already
+/// in-progress, the push step is reported as `noop`.
+async fn claim_one(
+    svc: &Services,
+    sync: Option<&SyncService>,
+    task_ref: &str,
+    login: &str,
+) -> Result<(dto_shared::TaskDto, String)> {
+    let task_id = svc.tasks.resolve_id(task_ref).await?;
+    let mut dto = svc.tasks.show(&task_id).await?;
+
+    match dto.status.as_str() {
+        "done" => return Err(anyhow!("task {task_ref} is done; reopen it before claiming")),
+        "archived" => return Err(anyhow!(
+            "task {task_ref} is archived; unarchive it before claiming"
+        )),
+        _ => {}
+    }
+
+    let need_assign = !dto.assignees.iter().any(|a| a == login);
+    let need_start = matches!(dto.status.as_str(), "open" | "blocked");
+
+    if need_assign {
+        let mut next = dto.assignees.clone();
+        next.push(login.to_string());
+        dto = svc
+            .tasks
+            .update(UpdateTaskCmd {
+                task_id: task_id.clone(),
+                title: None,
+                body: None,
+                priority: None,
+                assignees: Some(next),
+                repo_id: None,
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+    if need_start {
+        dto = svc
+            .tasks
+            .start(&task_id)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+    }
+
+    let push = match sync {
+        None => "skipped: --no-sync".to_string(),
+        Some(_) if dto.remote.is_none() => "skipped: not promoted".to_string(),
+        Some(_) if !need_assign && !need_start => "noop".to_string(),
+        Some(s) => match s.push(&task_id).await {
+            Ok(_) => "synced".to_string(),
+            Err(e) => format!("failed: {e}"),
+        },
+    };
+    Ok((dto, push))
+}
+
 /// Resolve a `--repo` argument (UUID / prefix / name / alias) to a binding
 /// UUID, reusing the same resolver as `rl repo show`. `None` stays `None`.
 /// Keeps `task create`/`edit` consistent with every other repo-addressing
@@ -1668,6 +1814,9 @@ async fn task_dispatch(cmd: TaskCmd, svc: &Services, cfg: &RepoLinkConfig) -> Re
         }
         TaskCmd::Archive { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.archive(&id).await }).await?;
+        }
+        TaskCmd::Claim { tasks, no_sync } => {
+            claim_dispatch(svc, cfg, tasks, no_sync).await?;
         }
         TaskCmd::Comment { id, body } => {
             // Provisional local author (same precedence as `query mine`); the
