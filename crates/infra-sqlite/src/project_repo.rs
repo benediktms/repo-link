@@ -182,7 +182,10 @@ async fn row_to_project(row: &sqlx::sqlite::SqliteRow, db: &Db) -> PortResult<Pr
 
         if let Some(status_str) = default_for {
             status_mappings.push(StatusMapping {
-                status: enum_from_str::<TaskStatus>("project_status_options.default_for", &status_str)?,
+                status: enum_from_str::<TaskStatus>(
+                    "project_status_options.default_for",
+                    &status_str,
+                )?,
                 option_id: option_id.clone(),
             });
         }

@@ -734,7 +734,11 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
     assert_eq!(pending.len(), 2);
 
     // Claim — should return e1 (older), now flipped to inflight.
-    let claimed = outbox.next_pending().await.unwrap().expect("a pending entry");
+    let claimed = outbox
+        .next_pending()
+        .await
+        .unwrap()
+        .expect("a pending entry");
     assert_eq!(claimed.id, e1.id);
     assert_eq!(claimed.status, OutboxStatus::Inflight);
 
@@ -745,10 +749,7 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
 
     // Mark e1 succeeded; mark_failed e2 to exercise both paths.
     outbox.mark_succeeded(e1.id).await.unwrap();
-    outbox
-        .mark_failed(e2.id, "graphql 5xx")
-        .await
-        .unwrap();
+    outbox.mark_failed(e2.id, "graphql 5xx").await.unwrap();
     // After mark_failed, e2 is no longer in `pending`.
     let pending = outbox.list_pending(task.id).await.unwrap();
     assert!(pending.is_empty());
@@ -781,11 +782,7 @@ async fn workspace_project_id_roundtrips() {
     .unwrap();
     projects.save(&project).await.unwrap();
 
-    let mut workspace = Workspace::new(
-        WorkspaceName::new("project-bound").unwrap(),
-        None,
-        false,
-    );
+    let mut workspace = Workspace::new(WorkspaceName::new("project-bound").unwrap(), None, false);
     workspace.project_id = Some(project_id);
     ws.save(&workspace).await.unwrap();
 
@@ -810,12 +807,7 @@ async fn task_remote_node_id_and_project_item_id_roundtrip() {
     .unwrap();
     rb.save(&binding).await.unwrap();
 
-    let mut task = Task::new_draft(
-        workspace.id,
-        Some(binding.id),
-        "with node ids".into(),
-    )
-    .unwrap();
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "with node ids".into()).unwrap();
     task.stage_for_sync().unwrap();
     let mut remote = RemoteRef::new("github", "42");
     remote.node_id = Some("I_kwHO_xyz".into());

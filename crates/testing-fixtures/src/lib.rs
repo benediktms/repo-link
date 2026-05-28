@@ -25,9 +25,9 @@ use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use domain_workspace::Workspace;
 use dto_events::EventEnvelope;
 use ports::{
-    Clock, EventSink, FilesystemProbe, OutboxRepository, PortError, PortResult,
-    ProjectRepository, RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository,
-    TaskSnapshotRepository, WorkspaceRepository,
+    Clock, EventSink, FilesystemProbe, OutboxRepository, PortError, PortResult, ProjectRepository,
+    RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository,
+    WorkspaceRepository,
 };
 
 // ---------- Clock --------------------------------------------------------

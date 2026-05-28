@@ -6,7 +6,9 @@ use ports::{OutboxRepository, PortError, PortResult};
 use sqlx::Row;
 
 use crate::Db;
-use crate::mapping::{enum_from_str, enum_to_str, json_from_string, json_to_string, map_sqlx_err, parse_uuid};
+use crate::mapping::{
+    enum_from_str, enum_to_str, json_from_string, json_to_string, map_sqlx_err, parse_uuid,
+};
 
 pub struct SqliteOutboxRepository {
     db: Db,
