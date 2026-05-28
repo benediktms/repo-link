@@ -195,21 +195,10 @@ impl QueryService {
                 && t.sync != SyncState::Conflict
         };
 
-        let is_open_blocker = |other: domain_core::TaskId| {
-            by_id
-                .get(&other)
-                .map(|t| !is_done_or_archived(t.status))
-                .unwrap_or(false)
-        };
-
         let mut ready: Vec<&domain_task::Task> = tasks
             .iter()
             .filter(|t| is_open_or_in_progress(t))
-            .filter(|t| {
-                !t.relations.iter().any(|r| {
-                    r.kind == domain_task::RelationKind::BlockedBy && is_open_blocker(r.other)
-                })
-            })
+            .filter(|t| !is_transitively_blocked(t.id, &by_id))
             .collect();
 
         ready.sort_by(|a, b| {
@@ -347,6 +336,54 @@ fn is_unsynced(sync: SyncState) -> bool {
 
 fn is_done_or_archived(status: TaskStatus) -> bool {
     matches!(status, TaskStatus::Done | TaskStatus::Archived)
+}
+
+/// Whether `task_id` is blocked by any task reachable through a chain of
+/// `BlockedBy` relations whose status is not `Done`/`Archived`.
+///
+/// DFS over `BlockedBy` edges only. A resolved (done/archived) blocker does not
+/// block on its own, but the chain behind it is still followed — the contract
+/// is "any *reachable* active blocker", so `A → B(done) → C(open)` leaves `A`
+/// blocked. A relation cycle (`A ↔ A`, `A ↔ B`) is bounded by `visited`.
+fn is_transitively_blocked(
+    task_id: domain_core::TaskId,
+    by_id: &std::collections::HashMap<domain_core::TaskId, &domain_task::Task>,
+) -> bool {
+    use std::collections::HashSet;
+
+    let mut visited: HashSet<domain_core::TaskId> = HashSet::new();
+    // Seed with the start task's direct blockers — the task's own status never
+    // blocks itself, but a self-`BlockedBy` edge (re-)enqueues it below.
+    let mut stack: Vec<domain_core::TaskId> = match by_id.get(&task_id) {
+        Some(start) => start
+            .relations
+            .iter()
+            .filter(|r| r.kind == domain_task::RelationKind::BlockedBy)
+            .map(|r| r.other)
+            .collect(),
+        None => return false,
+    };
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue; // already explored — breaks cycles
+        }
+        match by_id.get(&current) {
+            // An active blocker we can reach → blocked.
+            Some(blocker) if !is_done_or_archived(blocker.status) => return true,
+            // Resolved blocker: doesn't block, but keep following its chain.
+            Some(blocker) => stack.extend(
+                blocker
+                    .relations
+                    .iter()
+                    .filter(|r| r.kind == domain_task::RelationKind::BlockedBy)
+                    .map(|r| r.other),
+            ),
+            // Unknown id (e.g. archived-and-pruned) → treat as non-blocking.
+            None => {}
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -530,6 +567,113 @@ mod tests {
         let freed_idx = titles.iter().position(|t| *t == "freed up").unwrap();
         let low_idx = titles.iter().position(|t| *t == "low pri").unwrap();
         assert!(freed_idx < low_idx);
+    }
+
+    /// Move a freshly-drafted task all the way to `Done` (the only legal path is
+    /// `Open → InProgress → Done`).
+    fn completed(mut t: Task) -> Task {
+        t.start().unwrap();
+        t.complete().unwrap();
+        t
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_excludes_transitively_blocked() {
+        // A → B(done) → C(open): the *direct* blocker B is resolved, so the old
+        // one-hop check would wrongly mark A ready. The open tail C must keep A
+        // out of the ready list.
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let c_open = Task::new_draft(wid, None, "c (open tail)".into()).unwrap();
+        let mut b_done = Task::new_draft(wid, None, "b (done middle)".into()).unwrap();
+        b_done.add_relation(domain_task::RelationKind::BlockedBy, c_open.id);
+        let b_done = completed(b_done);
+        let mut a = Task::new_draft(wid, None, "a (head)".into()).unwrap();
+        a.add_relation(domain_task::RelationKind::BlockedBy, b_done.id);
+
+        for t in [&c_open, &b_done, &a] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let titles: Vec<String> = svc
+            .ready_tasks(&wid.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
+        assert!(titles.iter().any(|t| t == "c (open tail)"));
+        assert!(!titles.iter().any(|t| t == "a (head)"));
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_includes_fully_resolved_chain() {
+        // A → B(done) → C(done): every reachable blocker is resolved, so A is
+        // ready.
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let c_done = completed(Task::new_draft(wid, None, "c".into()).unwrap());
+        let mut b_done = Task::new_draft(wid, None, "b".into()).unwrap();
+        b_done.add_relation(domain_task::RelationKind::BlockedBy, c_done.id);
+        let b_done = completed(b_done);
+        let mut a = Task::new_draft(wid, None, "a".into()).unwrap();
+        a.add_relation(domain_task::RelationKind::BlockedBy, b_done.id);
+
+        for t in [&c_done, &b_done, &a] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let titles: Vec<String> = svc
+            .ready_tasks(&wid.to_string())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
+        assert!(titles.iter().any(|t| t == "a"));
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_handles_self_cycle() {
+        // A blocked by itself: must terminate and report A as blocked.
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut a = Task::new_draft(wid, None, "a".into()).unwrap();
+        a.add_relation(domain_task::RelationKind::BlockedBy, a.id);
+        ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
+
+        let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_tasks_handles_mutual_cycle() {
+        // A ↔ B (each blocks the other): must terminate with both blocked.
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut a = Task::new_draft(wid, None, "a".into()).unwrap();
+        let mut b = Task::new_draft(wid, None, "b".into()).unwrap();
+        a.add_relation(domain_task::RelationKind::BlockedBy, b.id);
+        b.add_relation(domain_task::RelationKind::BlockedBy, a.id);
+
+        for t in [&a, &b] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
+        assert!(rows.is_empty());
     }
 
     #[tokio::test]
