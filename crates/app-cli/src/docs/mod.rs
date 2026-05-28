@@ -83,8 +83,7 @@ pub fn render_repo_info(memberships: &[DocRepoMembership], canonical_url: Option
             "```\nstatus: unbound\ncanonical_url: {canonical}\nhint: run `rl repo attach --workspace <id> --url <git-remote> --canonical <canonical-url>` to bind this checkout to a workspace.\n```\n"
         ));
     } else {
-        let json =
-            serde_json::to_string_pretty(memberships).unwrap_or_else(|_| "[]".to_string());
+        let json = serde_json::to_string_pretty(memberships).unwrap_or_else(|_| "[]".to_string());
         out.push_str(&format!("```json\n{json}\n```\n"));
     }
     out

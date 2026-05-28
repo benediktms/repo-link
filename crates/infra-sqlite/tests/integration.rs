@@ -8,7 +8,9 @@ use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
     backfill_empty_repo_names, open_from_path,
 };
-use ports::{RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
+use ports::{
+    RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
+};
 use tempfile::TempDir;
 
 /// Build a fresh DB inside a TempDir. Caller MUST keep the TempDir alive for
@@ -104,7 +106,11 @@ async fn task_comments_roundtrip_and_replace() {
     // without duplicating the originals.
     ts.replace_comments(
         t.id,
-        &[mk("1", "first", 0), mk("2", "second", 1), mk("3", "third", 2)],
+        &[
+            mk("1", "first", 0),
+            mk("2", "second", 1),
+            mk("3", "third", 2),
+        ],
     )
     .await
     .unwrap();
@@ -142,10 +148,17 @@ async fn pending_comments_add_and_drain_on_push() {
 
     let loaded = ts.get(t.id).await.unwrap();
     assert_eq!(loaded.comments.len(), 2);
-    let pending: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_none()).collect();
+    let pending: Vec<_> = loaded
+        .comments
+        .iter()
+        .filter(|c| c.remote_id.is_none())
+        .collect();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].body, "pending body");
-    let drained_id = pending[0].local_id.clone().expect("loaded comment has local_id");
+    let drained_id = pending[0]
+        .local_id
+        .clone()
+        .expect("loaded comment has local_id");
 
     // Draining promotes the pending comment to synced — no duplicates, the
     // already-synced comment is untouched.
@@ -184,12 +197,16 @@ async fn mark_comments_pushed_does_not_race_delete_concurrent_pending() {
     let at = |secs: i64| domain_core::Timestamp::from_utc(base + chrono::Duration::seconds(secs));
 
     // Pending A — what push will drain.
-    ts.add_pending_comment(t.id, "me", "A", at(0)).await.unwrap();
+    ts.add_pending_comment(t.id, "me", "A", at(0))
+        .await
+        .unwrap();
     let loaded = ts.get(t.id).await.unwrap();
     let a_local_id = loaded.comments[0].local_id.clone().unwrap();
 
     // Concurrent add — lands after push read the task, before drain.
-    ts.add_pending_comment(t.id, "me", "B", at(1)).await.unwrap();
+    ts.add_pending_comment(t.id, "me", "B", at(1))
+        .await
+        .unwrap();
 
     // Drain only A.
     ts.mark_comments_pushed(
@@ -207,10 +224,18 @@ async fn mark_comments_pushed_does_not_race_delete_concurrent_pending() {
 
     let loaded = ts.get(t.id).await.unwrap();
     assert_eq!(loaded.comments.len(), 2, "B must survive an A-only drain");
-    let pending: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_none()).collect();
+    let pending: Vec<_> = loaded
+        .comments
+        .iter()
+        .filter(|c| c.remote_id.is_none())
+        .collect();
     assert_eq!(pending.len(), 1, "B remains pending");
     assert_eq!(pending[0].body, "B");
-    let synced: Vec<_> = loaded.comments.iter().filter(|c| c.remote_id.is_some()).collect();
+    let synced: Vec<_> = loaded
+        .comments
+        .iter()
+        .filter(|c| c.remote_id.is_some())
+        .collect();
     assert_eq!(synced[0].remote_id.as_deref(), Some("100"));
 }
 
@@ -221,10 +246,18 @@ async fn remote_mapping_is_repo_scoped() {
     ws.save(&w).await.unwrap();
 
     // Two bindings in the same workspace.
-    let repo_a =
-        RepoBinding::new(w.id, "git@github.com:o/a.git".into(), "github.com/o/a".into()).unwrap();
-    let repo_b =
-        RepoBinding::new(w.id, "git@github.com:o/b.git".into(), "github.com/o/b".into()).unwrap();
+    let repo_a = RepoBinding::new(
+        w.id,
+        "git@github.com:o/a.git".into(),
+        "github.com/o/a".into(),
+    )
+    .unwrap();
+    let repo_b = RepoBinding::new(
+        w.id,
+        "git@github.com:o/b.git".into(),
+        "github.com/o/b".into(),
+    )
+    .unwrap();
     rb.save(&repo_a).await.unwrap();
     rb.save(&repo_b).await.unwrap();
 
@@ -308,7 +341,8 @@ async fn task_with_relations_and_remote_roundtrip() {
     task.assignees = vec!["alice".into(), "bob".into()];
     task.add_relation(RelationKind::BlockedBy, other.id);
     task.stage_for_sync().unwrap();
-    task.promote_to_remote(RemoteRef::new("github", "o/r#42")).unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "o/r#42"))
+        .unwrap();
     other.archive().unwrap();
 
     ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();

@@ -7,5 +7,7 @@ mod time;
 
 pub use aggregate::Aggregate;
 pub use error::{DomainError, Result};
-pub use id::{IdParseError, OutboxEntryId, ProjectId, ProjectIdParseError, RepoId, TaskId, WorkspaceId};
+pub use id::{
+    IdParseError, OutboxEntryId, ProjectId, ProjectIdParseError, RepoId, TaskId, WorkspaceId,
+};
 pub use time::Timestamp;

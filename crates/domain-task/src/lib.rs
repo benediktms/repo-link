@@ -898,7 +898,8 @@ mod tests {
         assert_eq!(t.sync, SyncState::Synced);
 
         let new_remote = RemoteRef::new("github", "999");
-        t.link_to_remote(RepoId::new(), new_remote.clone(), true).unwrap();
+        t.link_to_remote(RepoId::new(), new_remote.clone(), true)
+            .unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
         assert_eq!(t.remote.as_ref(), Some(&new_remote));
     }
@@ -912,7 +913,8 @@ mod tests {
 
         let new_remote = RemoteRef::new("github", "1506");
         // Verified relink: caller asserts the new remote is identity-preserving.
-        t.link_to_remote(RepoId::new(), new_remote.clone(), false).unwrap();
+        t.link_to_remote(RepoId::new(), new_remote.clone(), false)
+            .unwrap();
         assert_eq!(t.sync, SyncState::Synced);
         assert_eq!(t.remote.as_ref(), Some(&new_remote));
     }

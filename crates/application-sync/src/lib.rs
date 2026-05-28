@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use domain_core::{IdParseError, TaskId};
 use domain_sync::{SyncDecision, SyncPolicy, decide};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus, assignees_equal};
+use domain_task::{
+    RemoteRef, SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus, assignees_equal,
+};
 use dto_shared::{RemoteRefDto, SyncSummaryDto};
 use ports::{
     PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
@@ -100,7 +102,10 @@ impl SyncService {
             })
             .await?;
 
-        task.promote_to_remote(RemoteRef::new(provider_label(&canonical), snap.remote_id.clone()))?;
+        task.promote_to_remote(RemoteRef::new(
+            provider_label(&canonical),
+            snap.remote_id.clone(),
+        ))?;
         self.tasks.save(&task, SnapshotSource::Promote).await?;
         Ok(summary(&task, prev, SyncDecision::PushLocal))
     }
@@ -128,7 +133,10 @@ impl SyncService {
         let has_pending_comments = task.comments.iter().any(|c| c.remote_id.is_none());
         if !snapshot_dirty && !has_pending_comments {
             return Err(SyncError::Domain(domain_core::DomainError::transition(
-                format!("cannot push from sync={:?} with no pending comments", task.sync),
+                format!(
+                    "cannot push from sync={:?} with no pending comments",
+                    task.sync
+                ),
             )));
         }
 
@@ -393,7 +401,11 @@ impl SyncService {
             // — the user knowingly wants the source-side pointer, even
             // though the live issue is elsewhere. Capture the destination
             // in a note so the CLI can surface it.
-            match self.provider.fetch_remote(new_canonical, new_remote_id).await {
+            match self
+                .provider
+                .fetch_remote(new_canonical, new_remote_id)
+                .await
+            {
                 Ok(_) => {}
                 Err(PortError::IssueMoved {
                     to_canonical,
@@ -417,7 +429,12 @@ impl SyncService {
             self.tasks.replace_comments(id, &[]).await?;
         }
 
-        Ok(link_summary(&task, prev, if relink { "relinked" } else { "linked" }, note))
+        Ok(link_summary(
+            &task,
+            prev,
+            if relink { "relinked" } else { "linked" },
+            note,
+        ))
     }
 
     async fn canonical_for(&self, task: &Task) -> Result<String> {
@@ -546,8 +563,7 @@ mod tests {
         /// Make the *next* `fetch_remote` call return `IssueMoved` with the
         /// supplied target — simulates a source-side URL that 301-redirects.
         fn set_fetch_moved(&self, to_canonical: &str, to_remote_id: &str) {
-            *self.fetch_moved.lock().unwrap() =
-                Some((to_canonical.into(), to_remote_id.into()));
+            *self.fetch_moved.lock().unwrap() = Some((to_canonical.into(), to_remote_id.into()));
         }
     }
 
@@ -610,12 +626,7 @@ mod tests {
             Ok(self.comments.lock().unwrap().clone())
         }
 
-        async fn create_comment(
-            &self,
-            _: &str,
-            _: &str,
-            body: &str,
-        ) -> PortResult<RemoteComment> {
+        async fn create_comment(&self, _: &str, _: &str, body: &str) -> PortResult<RemoteComment> {
             let mut created = self.created_comments.lock().unwrap();
             created.push(body.to_string());
             Ok(RemoteComment {
@@ -810,7 +821,10 @@ mod tests {
         });
 
         let s = svc.pull(&task.id.to_string()).await.unwrap();
-        assert_eq!(s.decision, "noop", "non-mirrored remote activity must not trigger pull_remote");
+        assert_eq!(
+            s.decision, "noop",
+            "non-mirrored remote activity must not trigger pull_remote"
+        );
         // And no spurious Pull snapshot lands in history.
         let after = tasks.get(task.id).await.unwrap();
         assert_eq!(after.sync, SyncState::Synced);
@@ -844,7 +858,10 @@ mod tests {
         });
 
         let s = svc.pull(&task.id.to_string()).await.unwrap();
-        assert_eq!(s.decision, "noop", "assignee re-ordering must not trigger pull_remote");
+        assert_eq!(
+            s.decision, "noop",
+            "assignee re-ordering must not trigger pull_remote"
+        );
     }
 
     #[tokio::test]
@@ -878,7 +895,11 @@ mod tests {
         assert_eq!(s.decision, "noop");
 
         let after = tasks.get(task.id).await.unwrap();
-        assert_eq!(after.comments.len(), 1, "remote comment must still land locally");
+        assert_eq!(
+            after.comments.len(),
+            1,
+            "remote comment must still land locally"
+        );
         assert_eq!(after.comments[0].body, "from remote");
     }
 
@@ -940,7 +961,10 @@ mod tests {
         assert_eq!(s.new_state, "synced");
 
         // create_comment was called; update_remote (title/body) was NOT.
-        assert_eq!(*provider.created_comments.lock().unwrap(), vec!["hello world".to_string()]);
+        assert_eq!(
+            *provider.created_comments.lock().unwrap(),
+            vec!["hello world".to_string()]
+        );
         assert!(provider.last_update.lock().unwrap().is_none());
 
         // The pending comment is now synced.
@@ -970,7 +994,10 @@ mod tests {
         // Both axes pushed.
         let recorded = provider.last_update.lock().unwrap().clone().unwrap();
         assert_eq!(recorded.body.as_deref(), Some("revised"));
-        assert_eq!(*provider.created_comments.lock().unwrap(), vec!["also a comment".to_string()]);
+        assert_eq!(
+            *provider.created_comments.lock().unwrap(),
+            vec!["also a comment".to_string()]
+        );
 
         let after = tasks.get(task.id).await.unwrap();
         assert!(after.comments.iter().all(|c| c.remote_id.is_some()));
@@ -993,7 +1020,10 @@ mod tests {
     ) {
         let b = RepoBinding::new(
             workspace_id,
-            format!("git@github.com:{}", canonical.trim_start_matches("github.com/")),
+            format!(
+                "git@github.com:{}",
+                canonical.trim_start_matches("github.com/")
+            ),
             canonical.to_string(),
         )
         .unwrap();
@@ -1129,7 +1159,12 @@ mod tests {
 
         // No second binding attached → bare link should refuse with a clear hint.
         let err = svc
-            .link(&task.id.to_string(), "github.com/never/attached", "1", false)
+            .link(
+                &task.id.to_string(),
+                "github.com/never/attached",
+                "1",
+                false,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SyncError::Domain(_)));

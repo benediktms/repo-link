@@ -218,7 +218,10 @@ mod tests {
     #[test]
     fn project_id_deserialize_rejects_empty() {
         let err = serde_json::from_str::<ProjectId>("\"\"").unwrap_err();
-        assert!(err.to_string().contains("must not be empty"), "error: {err}");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "error: {err}"
+        );
     }
 
     #[test]
