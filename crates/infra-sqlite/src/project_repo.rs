@@ -99,16 +99,24 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 
     async fn get(&self, id: ProjectId) -> PortResult<Project> {
+        // Read the project row and its option catalog inside one transaction
+        // so a concurrent writer commit between the two queries can't return
+        // torn state (project metadata from snapshot A, options from snapshot
+        // B). SQLite WAL gives the transaction a single consistent snapshot.
+        let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
         let row = sqlx::query("SELECT * FROM projects WHERE id = ?")
             .bind(id.as_str())
-            .fetch_optional(&self.db.reads)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(map_sqlx_err)?
             .ok_or_else(|| PortError::NotFound(format!("project {id}")))?;
-        row_to_project(&row, &self.db).await
+        let project = row_to_project(&row, &mut tx).await?;
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(project)
     }
 
     async fn list_by_workspace(&self, ws: WorkspaceId) -> PortResult<Vec<Project>> {
+        let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
         let rows = sqlx::query(
             r#"
             SELECT projects.*
@@ -118,14 +126,15 @@ impl ProjectRepository for SqliteProjectRepository {
             "#,
         )
         .bind(ws.to_string())
-        .fetch_all(&self.db.reads)
+        .fetch_all(&mut *tx)
         .await
         .map_err(map_sqlx_err)?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in rows.iter() {
-            out.push(row_to_project(row, &self.db).await?);
+            out.push(row_to_project(row, &mut tx).await?);
         }
+        tx.commit().await.map_err(map_sqlx_err)?;
         Ok(out)
     }
 
@@ -142,7 +151,10 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 }
 
-async fn row_to_project(row: &sqlx::sqlite::SqliteRow, db: &Db) -> PortResult<Project> {
+async fn row_to_project(
+    row: &sqlx::sqlite::SqliteRow,
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> PortResult<Project> {
     let id_str: String = row.try_get("id").map_err(map_sqlx_err)?;
     let id = ProjectId::parse(id_str.clone())
         .map_err(|e| PortError::Backend(format!("parse project id {id_str:?}: {e}")))?;
@@ -166,7 +178,7 @@ async fn row_to_project(row: &sqlx::sqlite::SqliteRow, db: &Db) -> PortResult<Pr
         "#,
     )
     .bind(id.as_str())
-    .fetch_all(&db.reads)
+    .fetch_all(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
 
