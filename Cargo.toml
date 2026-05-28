@@ -8,6 +8,7 @@ members = [
     "crates/domain-repo",
     "crates/domain-task",
     "crates/domain-sync",
+    "crates/domain-project",
     "crates/application-workspace",
     "crates/application-task",
     "crates/application-sync",
@@ -37,6 +38,7 @@ domain-workspace = { path = "crates/domain-workspace" }
 domain-repo = { path = "crates/domain-repo" }
 domain-task = { path = "crates/domain-task" }
 domain-sync = { path = "crates/domain-sync" }
+domain-project = { path = "crates/domain-project" }
 application-workspace = { path = "crates/application-workspace" }
 application-task = { path = "crates/application-task" }
 application-sync = { path = "crates/application-sync" }
