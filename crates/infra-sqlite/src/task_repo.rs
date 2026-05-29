@@ -24,7 +24,7 @@ impl SqliteTaskRepository {
     }
 }
 
-const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id";
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {

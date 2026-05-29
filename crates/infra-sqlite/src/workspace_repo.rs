@@ -18,7 +18,7 @@ impl SqliteWorkspaceRepository {
     }
 }
 
-const WORKSPACE_COLS: &str =
+pub(crate) const WORKSPACE_COLS: &str =
     "id, name, description, status, local_only, created_at, updated_at, project_id";
 
 #[async_trait]

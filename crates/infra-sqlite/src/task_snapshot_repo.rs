@@ -18,7 +18,7 @@ impl SqliteTaskSnapshotRepository {
     }
 }
 
-const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at";
+pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at";
 
 #[async_trait]
 impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {

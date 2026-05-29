@@ -9,7 +9,7 @@ use sqlx::Row;
 use crate::Db;
 use crate::mapping::{enum_from_str, enum_to_str, map_sqlx_err};
 
-const PROJECT_COLS: &str =
+pub(crate) const PROJECT_COLS: &str =
     "id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at";
 
 // Same column set as `PROJECT_COLS`, qualified to the `projects` table for use
@@ -17,7 +17,7 @@ const PROJECT_COLS: &str =
 // with the joined table (e.g. `workspaces`). Pinning the projection (rather
 // than `SELECT projects.*`) keeps `column_count()` constant across a
 // cross-process `ALTER TABLE projects ADD COLUMN`, which is the #110 fix.
-const PROJECT_COLS_QUALIFIED: &str = "projects.id, projects.provider, projects.owner_login, projects.number, projects.title, projects.status_field_id, projects.archived, projects.created_at, projects.updated_at";
+pub(crate) const PROJECT_COLS_QUALIFIED: &str = "projects.id, projects.provider, projects.owner_login, projects.number, projects.title, projects.status_field_id, projects.archived, projects.created_at, projects.updated_at";
 
 pub struct SqliteProjectRepository {
     db: Db,

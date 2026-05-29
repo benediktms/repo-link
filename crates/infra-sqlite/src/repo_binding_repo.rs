@@ -28,9 +28,12 @@ impl SqliteRepoBindingRepository {
 // the live count outruns the cached vec and `columns[len]` panics on a sqlx
 // worker, crashing the daemon. Decoding is by name (`row.try_get`), so order
 // is irrelevant — only completeness matters. Each const is the table's full
-// current column set as of the latest migration.
-const REPO_COLS: &str = "id, workspace_id, remote_url, canonical_url, tracked_branch, created_at, updated_at, name, aliases, prefix";
-const WORKTREE_LINK_COLS: &str = "repo_id, path, branch, status, last_seen_at";
+// current column set as of the latest migration. The `schema_const_consistency`
+// test in `lib.rs` enforces that against `PRAGMA table_info`, so a future
+// migration that forgets to update a const fails in CI rather than silently
+// dropping the new column from every read.
+pub(crate) const REPO_COLS: &str = "id, workspace_id, remote_url, canonical_url, tracked_branch, created_at, updated_at, name, aliases, prefix";
+pub(crate) const WORKTREE_LINK_COLS: &str = "repo_id, path, branch, status, last_seen_at";
 
 #[async_trait]
 impl RepoBindingRepository for SqliteRepoBindingRepository {
