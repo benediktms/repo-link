@@ -9,7 +9,8 @@ use infra_sqlite::{
     backfill_empty_repo_names, open_from_path,
 };
 use ports::{
-    RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
+    PortError, RemoteComment, RepoBindingRepository, TaskFilter, TaskRepository,
+    WorkspaceRepository,
 };
 use tempfile::TempDir;
 
@@ -416,6 +417,69 @@ async fn deleting_workspace_cascades_to_tasks() {
     assert!(
         after.is_empty(),
         "tasks should cascade with workspace delete"
+    );
+}
+
+#[tokio::test]
+async fn save_many_persists_both_sides_of_a_reciprocal_edge() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Both tasks already exist — `add_relation` only ever batches updates to
+    // tasks it has already loaded, so each relation's FK target is present.
+    let mut a = Task::new_draft(w.id, None, "A".into()).unwrap();
+    let mut b = Task::new_draft(w.id, None, "B".into()).unwrap();
+    ts.save(&a, SnapshotSource::Created).await.unwrap();
+    ts.save(&b, SnapshotSource::Created).await.unwrap();
+
+    // Now wire up the two reciprocal halves of a `blocked_by`/`blocks` pair
+    // and persist both sides in one atomic batch.
+    a.add_relation(RelationKind::BlockedBy, b.id);
+    b.add_relation(RelationKind::Blocks, a.id);
+    ts.save_many(&[
+        (&a, SnapshotSource::LocalEdit),
+        (&b, SnapshotSource::LocalEdit),
+    ])
+    .await
+    .unwrap();
+
+    let back_a = ts.get(a.id).await.unwrap();
+    let back_b = ts.get(b.id).await.unwrap();
+    assert_eq!(back_a.relations.len(), 1);
+    assert_eq!(back_a.relations[0].kind, RelationKind::BlockedBy);
+    assert_eq!(back_a.relations[0].other, b.id);
+    assert_eq!(back_b.relations.len(), 1);
+    assert_eq!(back_b.relations[0].kind, RelationKind::Blocks);
+    assert_eq!(back_b.relations[0].other, a.id);
+}
+
+#[tokio::test]
+async fn save_many_rolls_back_the_whole_batch_on_a_mid_batch_failure() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Two tasks claiming the SAME remote issue. The remote_mappings
+    // (repo_id, provider, remote_id) UNIQUE index rejects the second task's
+    // mirror insert, which must abort the entire batch — not just its own row.
+    let mut a = Task::new_draft(w.id, None, "A".into()).unwrap();
+    let mut b = Task::new_draft(w.id, None, "B".into()).unwrap();
+    for t in [&mut a, &mut b] {
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "o/r#1"))
+            .unwrap();
+    }
+
+    ts.save_many(&[(&a, SnapshotSource::Promote), (&b, SnapshotSource::Promote)])
+        .await
+        .expect_err("duplicate remote mapping should fail the batch");
+
+    // Atomicity: the first task in the batch must NOT have been committed.
+    let got = ts.get(a.id).await;
+    assert!(
+        matches!(got, Err(PortError::NotFound(_))),
+        "first task should have rolled back with the batch, got {got:?}"
     );
 }
 

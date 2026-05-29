@@ -35,137 +35,25 @@ impl TaskRepository for SqliteTaskRepository {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(map_sqlx_err)?;
+        write_task_in_tx(&mut tx, t, source).await?;
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(())
+    }
 
-        // Assign the next monotonic version for this task. COALESCE handles
-        // the first-snapshot case (no rows yet → version 1).
-        let next_version: i64 = sqlx::query(
-            "SELECT COALESCE(MAX(version), 0) + 1 FROM task_snapshots WHERE task_id = ?",
-        )
-        .bind(t.id.to_string())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_sqlx_err)?
-        .try_get(0)
-        .map_err(map_sqlx_err)?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, hash, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                workspace_id = excluded.workspace_id,
-                repo_id = excluded.repo_id,
-                title = excluded.title,
-                body = excluded.body,
-                status = excluded.status,
-                sync_state = excluded.sync_state,
-                priority = excluded.priority,
-                assignees_json = excluded.assignees_json,
-                remote_provider = excluded.remote_provider,
-                remote_id = excluded.remote_id,
-                remote_node_id = excluded.remote_node_id,
-                project_item_id = excluded.project_item_id,
-                hash = excluded.hash,
-                updated_at = excluded.updated_at
-            "#,
-        )
-        .bind(t.id.to_string())
-        .bind(t.workspace_id.to_string())
-        .bind(t.repo_id.map(|r| r.to_string()))
-        .bind(&t.title)
-        .bind(&t.body)
-        .bind(enum_to_str(&t.status)?)
-        .bind(enum_to_str(&t.sync)?)
-        .bind(enum_to_str(&t.priority)?)
-        .bind(json_to_string(&t.assignees)?)
-        .bind(t.remote.as_ref().map(|r| r.provider.clone()))
-        .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
-        .bind(t.remote.as_ref().and_then(|r| r.node_id.clone()))
-        .bind(t.project_item_id.as_deref())
-        .bind(&t.hash)
-        .bind(t.created_at.into_inner())
-        .bind(t.updated_at.into_inner())
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx_err)?;
-
-        // Append the snapshot row after the task upsert so the FK constraint
-        // (task_snapshots.task_id → tasks.id) is satisfied.
-        sqlx::query(
-            r#"
-            INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            "#,
-        )
-        .bind(t.id.to_string())
-        .bind(next_version)
-        .bind(&t.title)
-        .bind(&t.body)
-        .bind(enum_to_str(&t.status)?)
-        .bind(enum_to_str(&t.sync)?)
-        .bind(enum_to_str(&t.priority)?)
-        .bind(json_to_string(&t.assignees)?)
-        .bind(t.remote.as_ref().map(|r| r.provider.clone()))
-        .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
-        .bind(t.repo_id.map(|r| r.to_string()))
-        .bind(enum_to_str(&source)?)
-        .bind(Timestamp::now().into_inner())
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx_err)?;
-
-        sqlx::query("DELETE FROM task_relations WHERE task_id = ?")
-            .bind(t.id.to_string())
-            .execute(&mut *tx)
+    async fn save_many(&self, tasks: &[(&Task, SnapshotSource)]) -> PortResult<()> {
+        // One transaction spanning every task's write set, so the reciprocal
+        // sides of a relation edge either both persist or neither does — a
+        // mid-batch failure can't leave the graph asymmetric. BEGIN IMMEDIATE
+        // grabs the writer lock once for the whole batch.
+        let mut tx = self
+            .db
+            .writes
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(map_sqlx_err)?;
-
-        for r in &t.relations {
-            sqlx::query(
-                "INSERT INTO task_relations (task_id, kind, other_task_id) VALUES (?, ?, ?)",
-            )
-            .bind(t.id.to_string())
-            .bind(enum_to_str(&r.kind)?)
-            .bind(r.other.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
+        for (t, source) in tasks {
+            write_task_in_tx(&mut tx, t, *source).await?;
         }
-
-        // Mirror remote ref into the remote_mappings table for unique-index
-        // protection. The unique key is (repo_id, provider, remote_id) since
-        // remote issue numbers are only unique within a repo.
-        if let Some(remote) = &t.remote {
-            sqlx::query(
-                r#"
-                INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id, last_synced_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(task_id) DO UPDATE SET
-                    repo_id = excluded.repo_id,
-                    provider = excluded.provider,
-                    remote_id = excluded.remote_id,
-                    last_synced_at = excluded.last_synced_at
-                "#,
-            )
-            .bind(t.id.to_string())
-            // Empty-string sentinel for a repo-less remote task — keeps the
-            // (repo_id, provider, remote_id) UNIQUE key well-defined (NULLs
-            // would dedupe as distinct).
-            .bind(t.repo_id.map(|r| r.to_string()).unwrap_or_default())
-            .bind(&remote.provider)
-            .bind(&remote.remote_id)
-            .bind(t.updated_at.into_inner())
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
-        } else {
-            sqlx::query("DELETE FROM remote_mappings WHERE task_id = ?")
-                .bind(t.id.to_string())
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_err)?;
-        }
-
         tx.commit().await.map_err(map_sqlx_err)?;
         Ok(())
     }
@@ -404,6 +292,146 @@ impl TaskRepository for SqliteTaskRepository {
             .map_err(map_sqlx_err)?;
         Ok(())
     }
+}
+
+/// Apply one task's full write set — version bump, task upsert, snapshot
+/// append, relation replace, and remote-mapping mirror — inside an existing
+/// transaction. Shared by [`SqliteTaskRepository::save`] (single task) and
+/// `save_many` (a batch) so both get identical persistence semantics; the
+/// caller owns the surrounding `BEGIN`/`COMMIT`.
+async fn write_task_in_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    t: &Task,
+    source: SnapshotSource,
+) -> PortResult<()> {
+    // Assign the next monotonic version for this task. COALESCE handles
+    // the first-snapshot case (no rows yet → version 1).
+    let next_version: i64 =
+        sqlx::query("SELECT COALESCE(MAX(version), 0) + 1 FROM task_snapshots WHERE task_id = ?")
+            .bind(t.id.to_string())
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(map_sqlx_err)?
+            .try_get(0)
+            .map_err(map_sqlx_err)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            workspace_id = excluded.workspace_id,
+            repo_id = excluded.repo_id,
+            title = excluded.title,
+            body = excluded.body,
+            status = excluded.status,
+            sync_state = excluded.sync_state,
+            priority = excluded.priority,
+            assignees_json = excluded.assignees_json,
+            remote_provider = excluded.remote_provider,
+            remote_id = excluded.remote_id,
+            remote_node_id = excluded.remote_node_id,
+            project_item_id = excluded.project_item_id,
+            hash = excluded.hash,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(t.id.to_string())
+    .bind(t.workspace_id.to_string())
+    .bind(t.repo_id.map(|r| r.to_string()))
+    .bind(&t.title)
+    .bind(&t.body)
+    .bind(enum_to_str(&t.status)?)
+    .bind(enum_to_str(&t.sync)?)
+    .bind(enum_to_str(&t.priority)?)
+    .bind(json_to_string(&t.assignees)?)
+    .bind(t.remote.as_ref().map(|r| r.provider.clone()))
+    .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+    .bind(t.remote.as_ref().and_then(|r| r.node_id.clone()))
+    .bind(t.project_item_id.as_deref())
+    .bind(&t.hash)
+    .bind(t.created_at.into_inner())
+    .bind(t.updated_at.into_inner())
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    // Append the snapshot row after the task upsert so the FK constraint
+    // (task_snapshots.task_id → tasks.id) is satisfied.
+    sqlx::query(
+        r#"
+        INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        "#,
+    )
+    .bind(t.id.to_string())
+    .bind(next_version)
+    .bind(&t.title)
+    .bind(&t.body)
+    .bind(enum_to_str(&t.status)?)
+    .bind(enum_to_str(&t.sync)?)
+    .bind(enum_to_str(&t.priority)?)
+    .bind(json_to_string(&t.assignees)?)
+    .bind(t.remote.as_ref().map(|r| r.provider.clone()))
+    .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
+    .bind(t.repo_id.map(|r| r.to_string()))
+    .bind(enum_to_str(&source)?)
+    .bind(Timestamp::now().into_inner())
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    sqlx::query("DELETE FROM task_relations WHERE task_id = ?")
+        .bind(t.id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx_err)?;
+
+    for r in &t.relations {
+        sqlx::query("INSERT INTO task_relations (task_id, kind, other_task_id) VALUES (?, ?, ?)")
+            .bind(t.id.to_string())
+            .bind(enum_to_str(&r.kind)?)
+            .bind(r.other.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(map_sqlx_err)?;
+    }
+
+    // Mirror remote ref into the remote_mappings table for unique-index
+    // protection. The unique key is (repo_id, provider, remote_id) since
+    // remote issue numbers are only unique within a repo.
+    if let Some(remote) = &t.remote {
+        sqlx::query(
+            r#"
+            INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id, last_synced_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                repo_id = excluded.repo_id,
+                provider = excluded.provider,
+                remote_id = excluded.remote_id,
+                last_synced_at = excluded.last_synced_at
+            "#,
+        )
+        .bind(t.id.to_string())
+        // Empty-string sentinel for a repo-less remote task — keeps the
+        // (repo_id, provider, remote_id) UNIQUE key well-defined (NULLs
+        // would dedupe as distinct).
+        .bind(t.repo_id.map(|r| r.to_string()).unwrap_or_default())
+        .bind(&remote.provider)
+        .bind(&remote.remote_id)
+        .bind(t.updated_at.into_inner())
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx_err)?;
+    } else {
+        sqlx::query("DELETE FROM remote_mappings WHERE task_id = ?")
+            .bind(t.id.to_string())
+            .execute(&mut **tx)
+            .await
+            .map_err(map_sqlx_err)?;
+    }
+
+    Ok(())
 }
 
 fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {

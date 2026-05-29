@@ -382,14 +382,18 @@ impl TaskService {
         }
 
         t.add_relation(kind, other_task.id);
-        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-
         // Mirror the reciprocal edge onto the other task so the graph reads
         // coherently from both ends. `add_relation` is idempotent, so a
         // pre-existing reciprocal (or a re-run) is a no-op rather than a dup.
         other_task.add_relation(kind.inverse(), t.id);
+
+        // Persist both sides atomically: a partial write would leave the
+        // forward edge without its reciprocal (or vice-versa).
         self.repo
-            .save(&other_task, SnapshotSource::LocalEdit)
+            .save_many(&[
+                (&t, SnapshotSource::LocalEdit),
+                (&other_task, SnapshotSource::LocalEdit),
+            ])
             .await?;
 
         self.task_dto(&t).await
@@ -405,13 +409,19 @@ impl TaskService {
             return Err(ServiceError::SelfRelation);
         }
 
-        if t.remove_relation(kind, other_task.id) {
-            self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+        // Drop each side, then persist only the sides that actually changed —
+        // atomically, so removing one half can't outlive the other.
+        let t_changed = t.remove_relation(kind, other_task.id);
+        let other_changed = other_task.remove_relation(kind.inverse(), t.id);
+        let mut batch: Vec<(&Task, SnapshotSource)> = Vec::new();
+        if t_changed {
+            batch.push((&t, SnapshotSource::LocalEdit));
         }
-        if other_task.remove_relation(kind.inverse(), t.id) {
-            self.repo
-                .save(&other_task, SnapshotSource::LocalEdit)
-                .await?;
+        if other_changed {
+            batch.push((&other_task, SnapshotSource::LocalEdit));
+        }
+        if !batch.is_empty() {
+            self.repo.save_many(&batch).await?;
         }
         self.task_dto(&t).await
     }
@@ -424,7 +434,6 @@ impl TaskService {
         if removed.is_empty() {
             return self.task_dto(&t).await;
         }
-        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
 
         // Collect the reciprocal edges to strip, grouped by the other task so
         // each is loaded and saved at most once.
@@ -434,6 +443,7 @@ impl TaskService {
                 by_other.entry(r.other).or_default().push(r.kind.inverse());
             }
         }
+        let mut others_changed: Vec<Task> = Vec::new();
         for (other_id, inv_kinds) in by_other {
             let mut other = self.repo.get(other_id).await?;
             let mut changed = false;
@@ -441,9 +451,21 @@ impl TaskService {
                 changed |= other.remove_relation(k, t.id);
             }
             if changed {
-                self.repo.save(&other, SnapshotSource::LocalEdit).await?;
+                others_changed.push(other);
             }
         }
+
+        // Persist the stripped task and every touched back-edge holder in one
+        // transaction so no task is left pointing at a relation the cleared
+        // task no longer mirrors.
+        let mut batch: Vec<(&Task, SnapshotSource)> = vec![(&t, SnapshotSource::LocalEdit)];
+        batch.extend(
+            others_changed
+                .iter()
+                .map(|o| (o, SnapshotSource::LocalEdit)),
+        );
+        self.repo.save_many(&batch).await?;
+
         self.task_dto(&t).await
     }
 
