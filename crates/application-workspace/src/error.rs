@@ -18,6 +18,11 @@ pub enum ServiceError {
     #[error("project not found: no match for '{0}'")]
     ProjectNotFound(String),
     #[error(
+        "workspace is already attached to project '{current}'; reassigning to '{requested}' is not supported \
+         (detach with `--project none` first — moving board items between projects needs a migration path)"
+    )]
+    ProjectReassignmentUnsupported { current: String, requested: String },
+    #[error(
         "project ops require a configured ProjectRepository (use WorkspaceService::with_projects)"
     )]
     ProjectsUnconfigured,

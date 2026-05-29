@@ -534,6 +534,10 @@ pub(crate) enum SyncCmd {
         #[command(flatten)]
         ws: WorkspaceArg,
     },
+    /// Show dead-lettered outbox entries — outbound mutations that exhausted
+    /// their retries and were permanently parked (RFC 0001 Stage 6, #54).
+    /// Local read; no GitHub token required.
+    Outbox,
 }
 
 #[derive(Subcommand, Debug)]

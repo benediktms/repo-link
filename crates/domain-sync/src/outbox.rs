@@ -101,6 +101,14 @@ pub struct OutboxEntry {
     pub status: OutboxStatus,
     pub attempts: u32,
     pub last_error: Option<String>,
+    /// Earliest instant the drainer may re-claim this entry. `None` means
+    /// "eligible immediately" — the state of every freshly-enqueued entry.
+    /// After a recoverable failure under the attempt cap, the drainer sets
+    /// this to `now + backoff(attempts)` and flips `status` back to
+    /// `Pending` (RFC 0001 §10.2). The claim query honours
+    /// `next_attempt_at IS NULL OR next_attempt_at <= now`.
+    #[serde(default)]
+    pub next_attempt_at: Option<Timestamp>,
     pub enqueued_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -118,6 +126,7 @@ impl OutboxEntry {
             status: OutboxStatus::Pending,
             attempts: 0,
             last_error: None,
+            next_attempt_at: None,
             enqueued_at: now,
             updated_at: now,
         }

@@ -10,6 +10,8 @@ domain-core = { workspace = true }
 domain-task = { workspace = true }
 domain-sync = { workspace = true }
 domain-repo = { workspace = true }
+domain-project = { workspace = true }
+domain-workspace = { workspace = true }
 ports = { workspace = true }
 dto-shared = { workspace = true }
 dto-events = { workspace = true }
@@ -17,10 +19,10 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 testing-fixtures = { workspace = true }
-domain-workspace = { workspace = true }
 tokio = { workspace = true }
 pretty_assertions = { workspace = true }
-chrono = { workspace = true }

@@ -103,6 +103,7 @@ dependencies = [
  "clap",
  "directories",
  "domain-core",
+ "domain-sync",
  "domain-task",
  "dto-shared",
  "infra-config",
@@ -133,6 +134,7 @@ dependencies = [
  "clap",
  "domain-core",
  "domain-repo",
+ "domain-sync",
  "domain-task",
  "domain-workspace",
  "dto-shared",
@@ -195,6 +197,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "domain-core",
+ "domain-project",
  "domain-repo",
  "domain-sync",
  "domain-task",
@@ -208,16 +211,21 @@ dependencies = [
  "testing-fixtures",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "application-task"
 version = "0.1.0"
 dependencies = [
+ "application-sync",
  "async-trait",
  "domain-core",
+ "domain-project",
  "domain-repo",
+ "domain-sync",
  "domain-task",
+ "domain-workspace",
  "dto-shared",
  "ports",
  "pretty_assertions",
@@ -226,15 +234,20 @@ dependencies = [
  "testing-fixtures",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "application-workspace"
 version = "0.1.0"
 dependencies = [
+ "application-sync",
  "async-trait",
  "domain-core",
+ "domain-project",
  "domain-repo",
+ "domain-sync",
+ "domain-task",
  "domain-workspace",
  "dto-events",
  "dto-shared",

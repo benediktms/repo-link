@@ -147,7 +147,7 @@ impl RemoteProjectProvider for GithubAdapter {
         &self,
         item_node_id: &str,
         repo_node_id: &str,
-    ) -> PortResult<String> {
+    ) -> PortResult<(String, u64)> {
         self.graphql
             .convert_draft_to_issue(item_node_id, repo_node_id)
             .await

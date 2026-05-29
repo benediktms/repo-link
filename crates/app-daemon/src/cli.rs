@@ -2,14 +2,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application_sync::SyncService;
+use application_sync::OutboxDrainer;
 use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::Parser;
 use infra_config::RepoLinkConfig;
 use infra_filesystem::TokioFilesystemProbe;
 use infra_github::GithubAdapter;
 use infra_sqlite::{
-    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
+    SqliteOutboxRepository, SqliteProjectRepository, SqliteRepoBindingRepository,
+    SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
 };
 use tracing::info;
 
@@ -76,26 +77,40 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Arc::new(SqliteWorkspaceRepository::new(db.clone()));
     let bindings_repo: Arc<dyn ports::RepoBindingRepository> =
         Arc::new(SqliteRepoBindingRepository::new(db.clone()));
-    let tasks_repo: Arc<dyn ports::TaskRepository> = Arc::new(SqliteTaskRepository::new(db));
+    let tasks_repo: Arc<dyn ports::TaskRepository> =
+        Arc::new(SqliteTaskRepository::new(db.clone()));
+    let projects_repo: Arc<dyn ports::ProjectRepository> =
+        Arc::new(SqliteProjectRepository::new(db.clone()));
+    let outbox_repo: Arc<dyn ports::OutboxRepository> = Arc::new(SqliteOutboxRepository::new(db));
 
     let workspaces = WorkspaceService::new(workspaces_repo.clone());
-    let bindings = RepoBindingService::new(workspaces_repo, bindings_repo.clone());
+    let bindings = RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone());
 
     let probe: Arc<dyn ports::FilesystemProbe> = Arc::new(TokioFilesystemProbe::new());
 
-    let sync = match cfg.github_token.clone() {
+    // The drainer is the sole outbound path (#54). Gated on github_token the
+    // same way `SyncService` used to be — no token, no outbound work, but
+    // worktree reconciliation still runs. The GithubAdapter implements both
+    // RemoteTaskProvider (issues) and RemoteProjectProvider (Projects v2).
+    let (drainer, outbox) = match cfg.github_token.clone() {
         Some(token) => {
-            let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubAdapter::new(token)?);
-            Some(SyncService::new(
+            let adapter = Arc::new(GithubAdapter::new(token)?);
+            let remote_tasks: Arc<dyn ports::RemoteTaskProvider> = adapter.clone();
+            let remote_projects: Arc<dyn ports::RemoteProjectProvider> = adapter;
+            let drainer = Arc::new(OutboxDrainer::new(
+                outbox_repo.clone(),
                 tasks_repo.clone(),
-                bindings_repo,
-                provider,
-            ))
+                workspaces_repo.clone(),
+                projects_repo,
+                remote_tasks,
+                remote_projects,
+            ));
+            (Some(drainer), Some(outbox_repo))
         }
-        None => None,
+        None => (None, None),
     };
 
-    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, sync)
+    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, drainer, outbox)
         .with_prune(args.prune)
         .with_missing_grace_ticks(args.missing_grace_ticks)
         // Co-locate last_tick.json with the db + log so a `--db` override

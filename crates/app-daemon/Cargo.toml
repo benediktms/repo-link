@@ -14,6 +14,7 @@ application-sync = { workspace = true }
 application-query = { workspace = true }
 domain-core = { workspace = true }
 domain-task = { workspace = true }
+domain-sync = { workspace = true }
 dto-shared = { workspace = true }
 ports = { workspace = true }
 infra-sqlite = { workspace = true }

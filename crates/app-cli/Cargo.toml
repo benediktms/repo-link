@@ -15,6 +15,7 @@ infra-github = { workspace = true }
 dto-shared = { workspace = true }
 domain-task = { workspace = true }
 domain-core = { workspace = true }
+domain-sync = { workspace = true }
 ports = { workspace = true }
 infra-sqlite = { workspace = true }
 infra-filesystem = { workspace = true }

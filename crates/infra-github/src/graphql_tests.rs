@@ -294,17 +294,21 @@ async fn convert_draft_to_issue_returns_issue_node_id() {
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": { "convertProjectV2DraftIssueItemToIssue": {
-                "item": { "content": { "id": "I_converted" } }
+                "item": { "content": { "id": "I_converted", "number": 42 } }
             } }
         })))
         .mount(&server)
         .await;
 
-    let issue_id = provider(&server)
+    let (issue_id, number) = provider(&server)
         .convert_draft_to_issue("PVTI_draft", "R_repo")
         .await
         .unwrap();
     assert_eq!(issue_id, "I_converted");
+    assert_eq!(
+        number, 42,
+        "the REST number is captured for remote_id (#54)"
+    );
 }
 
 #[tokio::test]
@@ -316,6 +320,28 @@ async fn convert_draft_to_issue_errors_when_content_id_absent() {
         &server,
         "convertProjectV2DraftIssueItemToIssue",
         serde_json::json!({ "convertProjectV2DraftIssueItemToIssue": { "item": { "content": null } } }),
+    )
+    .await;
+
+    let err = provider(&server)
+        .convert_draft_to_issue("PVTI_draft", "R_repo")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PortError::Backend(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn convert_draft_to_issue_errors_when_number_absent() {
+    let server = MockServer::start().await;
+    // The id projected but the REST `number` is null. Without the number the
+    // task's `remote_id` would be empty (#54), so surface a backend error
+    // rather than persist a half-populated issue-backed RemoteRef.
+    mount_graphql(
+        &server,
+        "convertProjectV2DraftIssueItemToIssue",
+        serde_json::json!({ "convertProjectV2DraftIssueItemToIssue": {
+            "item": { "content": { "id": "I_converted" } }
+        } }),
     )
     .await;
 

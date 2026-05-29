@@ -79,14 +79,18 @@ pub trait RemoteProjectProvider: Send + Sync {
     /// Convert a draft item to a real issue in `repo_node_id`. The item
     /// retains its node ID; only the content union shifts from
     /// `ProjectV2DraftIssue` to `Issue`. Returns the newly-created issue's
-    /// `I_…` node ID — the caller needs this to populate `RemoteRef.node_id`
-    /// on the local task so future GraphQL mutations have an address.
-    /// Fires when an orphan task gets `--repo` attached via `rl task edit`.
+    /// `I_…` node ID **and** its REST `number` — the caller needs both to
+    /// populate a fully-addressable `RemoteRef` (`remote_id` = the number,
+    /// `node_id` = the node ID) on the local task: the node id addresses
+    /// GraphQL mutations, the number addresses REST `UpdateRemote`. Returning
+    /// the number here is what lets the write-back avoid persisting an
+    /// issue-backed `RemoteRef` with an empty `remote_id` (#54). Fires when an
+    /// orphan task gets `--repo` attached via `rl task edit`.
     async fn convert_draft_to_issue(
         &self,
         item_node_id: &str,
         repo_node_id: &str,
-    ) -> PortResult<String>;
+    ) -> PortResult<(String, u64)>;
 
     /// Set an item's single-select Status field. Works on both draft items
     /// and issue-backed items.

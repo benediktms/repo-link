@@ -483,6 +483,136 @@ async fn save_many_rolls_back_the_whole_batch_on_a_mid_batch_failure() {
     );
 }
 
+// ---------------- Transactional outbox (#54) ----------------------------
+
+#[tokio::test]
+async fn save_with_outbox_persists_task_snapshot_and_entries_in_one_tx() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::{OutboxRepository, TaskSnapshotRepository};
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // An issue-backed mirror with a lifecycle change to push.
+    let mut t = Task::new_draft(w.id, None, "atomic".into()).unwrap();
+    t.stage_for_sync().unwrap();
+    t.promote_to_remote(RemoteRef::new("github", "42")).unwrap();
+    t.start().unwrap();
+
+    let entries = vec![
+        OutboxEntry::new(
+            t.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "42".into(),
+                title: Some("atomic".into()),
+                body: None,
+                closed: None,
+            },
+        ),
+        OutboxEntry::new(
+            t.id,
+            OutboxMutation::SetProjectStatus {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                status_field_id: "PVTSSF_z".into(),
+                option_id: "opt12345".into(),
+            },
+        ),
+    ];
+    ts.save_with_outbox(&t, SnapshotSource::Promote, &entries)
+        .await
+        .unwrap();
+
+    // Task row round-trips with the lifecycle change.
+    let back = ts.get(t.id).await.unwrap();
+    assert_eq!(back.status, domain_task::TaskStatus::InProgress);
+    // Snapshot history recorded the write.
+    let snaps = infra_sqlite::SqliteTaskSnapshotRepository::new(db.clone())
+        .list(t.id)
+        .await
+        .unwrap();
+    assert_eq!(snaps.len(), 1, "exactly one snapshot for the single write");
+
+    // Both outbox rows round-trip, in order, all pending.
+    let outbox = SqliteOutboxRepository::new(db);
+    let pending = outbox.list_pending(t.id).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].mutation.kind(), "update_remote");
+    assert_eq!(pending[1].mutation.kind(), "set_project_status");
+}
+
+#[tokio::test]
+async fn save_with_outbox_empty_entries_behaves_like_save() {
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::OutboxRepository;
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let t = Task::new_draft(w.id, None, "no entries".into()).unwrap();
+    ts.save_with_outbox(&t, SnapshotSource::Created, &[])
+        .await
+        .unwrap();
+
+    // Task persisted exactly as `save` would.
+    let back = ts.get(t.id).await.unwrap();
+    assert_eq!(back.title, "no entries");
+    // No outbox rows written.
+    let outbox = SqliteOutboxRepository::new(db);
+    assert!(outbox.list_pending(t.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn save_with_outbox_rolls_back_task_and_entries_on_failure() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::OutboxRepository;
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Two entries sharing the SAME id forces a PRIMARY KEY violation on the
+    // second outbox INSERT, aborting the whole transaction — the task write and
+    // the first entry must roll back with it.
+    let mut t = Task::new_draft(w.id, None, "rollback".into()).unwrap();
+    t.start().unwrap();
+    let shared = OutboxEntry::new(
+        t.id,
+        OutboxMutation::UpdateRemote {
+            canonical_repo: "github.com/o/r".into(),
+            remote_id: "1".into(),
+            title: None,
+            body: None,
+            closed: None,
+        },
+    );
+    let dup = OutboxEntry {
+        id: shared.id, // duplicate primary key
+        ..shared.clone()
+    };
+
+    ts.save_with_outbox(&t, SnapshotSource::Created, &[shared, dup])
+        .await
+        .expect_err("duplicate outbox entry id must abort the transaction");
+
+    // Atomicity: neither the task nor any outbox row survived.
+    let got = ts.get(t.id).await;
+    assert!(
+        matches!(got, Err(PortError::NotFound(_))),
+        "task must have rolled back with the failed combined write, got {got:?}"
+    );
+    let outbox = SqliteOutboxRepository::new(db);
+    assert!(
+        outbox.list_pending(t.id).await.unwrap().is_empty(),
+        "no outbox row may survive a rolled-back combined write"
+    );
+}
+
 // Wire a one-line use to demonstrate we can construct adapters via Arc<dyn Trait>.
 #[tokio::test]
 async fn adapters_satisfy_port_traits() {
@@ -819,7 +949,8 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
 }
 
 #[tokio::test]
-async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
+async fn outbox_claim_next_eligible_claims_oldest_and_flips_to_inflight() {
+    use domain_core::Timestamp;
     use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
     use infra_sqlite::SqliteOutboxRepository;
     use ports::OutboxRepository;
@@ -838,7 +969,12 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
 
     let outbox = SqliteOutboxRepository::new(db);
 
-    // Enqueue two entries. The drainer should claim the older one first.
+    // Enqueue two entries for the same task. The claim must return the
+    // first-inserted one first; the tail must NOT be claimable while the head
+    // is inflight (per-task FIFO). No `sleep()` to stagger `enqueued_at`: the
+    // claim tie-breaks on the implicit `rowid`, so insertion order wins even at
+    // equal (second-granular) timestamps — this is the case the old sleep hack
+    // papered over.
     let e1 = OutboxEntry::new(
         task.id,
         OutboxMutation::UpdateRemote {
@@ -849,10 +985,6 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
             closed: None,
         },
     );
-    // Give e2 a strictly later enqueued_at by sleeping briefly — sub-µs
-    // ordering would otherwise be ambiguous on hot machines (we hit this
-    // exact thing on the rollback PR).
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let e2 = OutboxEntry::new(
         task.id,
         OutboxMutation::SetProjectStatus {
@@ -870,14 +1002,25 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
 
     // Claim — should return e1 (older), now flipped to inflight.
     let claimed = outbox
-        .next_pending()
+        .claim_next_eligible(Timestamp::now())
         .await
         .unwrap()
         .expect("a pending entry");
     assert_eq!(claimed.id, e1.id);
     assert_eq!(claimed.status, OutboxStatus::Inflight);
 
-    // list_pending now sees only e2.
+    // The tail is blocked behind the inflight head: a second claim returns
+    // nothing for this task even though e2 is pending + eligible.
+    assert!(
+        outbox
+            .claim_next_eligible(Timestamp::now())
+            .await
+            .unwrap()
+            .is_none(),
+        "tail must not be claimable while the head is inflight"
+    );
+
+    // list_pending now sees only e2 (e1 is inflight, not pending).
     let pending = outbox.list_pending(task.id).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, e2.id);
@@ -888,6 +1031,62 @@ async fn outbox_next_pending_claims_oldest_and_flips_to_inflight() {
     // After mark_failed, e2 is no longer in `pending`.
     let pending = outbox.list_pending(task.id).await.unwrap();
     assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn outbox_requeue_orphaned_inflight_resets_to_pending() {
+    use domain_core::Timestamp;
+    use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let workspace = Workspace::new(WorkspaceName::new("wsr").unwrap(), None, true);
+    SqliteWorkspaceRepository::new(db.clone())
+        .save(&workspace)
+        .await
+        .unwrap();
+    let task = Task::new_draft(workspace.id, None, "t1".into()).unwrap();
+    ts.save(&task, SnapshotSource::Created).await.unwrap();
+
+    let outbox = SqliteOutboxRepository::new(db);
+    let e = OutboxEntry::new(
+        task.id,
+        OutboxMutation::UpdateRemote {
+            canonical_repo: "github.com/o/r".into(),
+            remote_id: "1".into(),
+            title: None,
+            body: None,
+            closed: None,
+        },
+    );
+    outbox.enqueue(&e).await.unwrap();
+
+    // Claim it — now inflight. Simulate a crash by never resolving it.
+    let claimed = outbox
+        .claim_next_eligible(Timestamp::now())
+        .await
+        .unwrap()
+        .expect("a pending entry");
+    assert_eq!(claimed.status, OutboxStatus::Inflight);
+    // While inflight, nothing is claimable.
+    assert!(
+        outbox
+            .claim_next_eligible(Timestamp::now())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Startup recovery resets the orphaned inflight row back to pending.
+    let reset = outbox.requeue_orphaned_inflight().await.unwrap();
+    assert_eq!(reset, 1);
+    let reclaimed = outbox
+        .claim_next_eligible(Timestamp::now())
+        .await
+        .unwrap()
+        .expect("reclaimed after requeue");
+    assert_eq!(reclaimed.id, e.id);
 }
 
 #[tokio::test]
@@ -956,4 +1155,286 @@ async fn task_remote_node_id_and_project_item_id_roundtrip() {
         Some("I_kwHO_xyz")
     );
     assert_eq!(back.project_item_id.as_deref(), Some("PVTI_kwHO_item"));
+}
+
+// ---------- RFC 0001 Stage 6 (#54): claim_next_eligible + backoff ----------
+
+/// Seed a workspace + a task row (the outbox FK needs a real task) and return
+/// the SqliteOutboxRepository plus the task id.
+async fn outbox_with_task(
+    db: &infra_sqlite::Db,
+    ts: &SqliteTaskRepository,
+) -> (infra_sqlite::SqliteOutboxRepository, domain_core::TaskId) {
+    let workspace = Workspace::new(WorkspaceName::new("obx").unwrap(), None, true);
+    SqliteWorkspaceRepository::new(db.clone())
+        .save(&workspace)
+        .await
+        .unwrap();
+    let task = Task::new_draft(workspace.id, None, "t".into()).unwrap();
+    ts.save(&task, SnapshotSource::Created).await.unwrap();
+    (
+        infra_sqlite::SqliteOutboxRepository::new(db.clone()),
+        task.id,
+    )
+}
+
+#[tokio::test]
+async fn claim_respects_per_task_fifo_and_parallel_across_tasks() {
+    use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let (outbox, task_a) = outbox_with_task(&db, &ts).await;
+
+    // A second task in its own workspace.
+    let ws_b = Workspace::new(WorkspaceName::new("obx-b").unwrap(), None, true);
+    SqliteWorkspaceRepository::new(db.clone())
+        .save(&ws_b)
+        .await
+        .unwrap();
+    let task_b = Task::new_draft(ws_b.id, None, "tb".into()).unwrap();
+    ts.save(&task_b, SnapshotSource::Created).await.unwrap();
+
+    let mk = |task: domain_core::TaskId, body: &str| {
+        OutboxEntry::new(
+            task,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: Some(body.into()),
+                closed: None,
+            },
+        )
+    };
+
+    // Task A: two entries (a1 inserted first, a2 second). Task B: one entry.
+    // No `sleep()` to stagger `enqueued_at`: the claim tie-breaks on the
+    // implicit `rowid` (insertion order), so FIFO holds even at equal
+    // timestamps.
+    let a1 = mk(task_a, "a1");
+    outbox.enqueue(&a1).await.unwrap();
+    let a2 = mk(task_a, "a2");
+    outbox.enqueue(&a2).await.unwrap();
+    let b1 = mk(task_b.id, "b1");
+    outbox.enqueue(&b1).await.unwrap();
+
+    let now = domain_core::Timestamp::now();
+
+    // First claim: a1 (oldest pending overall).
+    let c1 = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    assert_eq!(c1.id, a1.id);
+    assert_eq!(c1.status, OutboxStatus::Inflight);
+
+    // Second claim: a2 is blocked (task A has an inflight head), so the claim
+    // returns b1 — parallel across tasks.
+    let c2 = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    assert_eq!(c2.id, b1.id, "task A is busy; B is claimable");
+
+    // Third claim: both A and B are inflight ⇒ nothing eligible.
+    assert!(outbox.claim_next_eligible(now).await.unwrap().is_none());
+
+    // Finish a1; now a2 becomes claimable (per-task FIFO preserved order).
+    outbox.mark_succeeded(a1.id).await.unwrap();
+    let c3 = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    assert_eq!(c3.id, a2.id);
+}
+
+#[tokio::test]
+async fn claim_tie_breaks_equal_timestamps_by_insertion_order() {
+    // `enqueued_at` is second-granular, so two same-task entries enqueued in
+    // the same second carry EQUAL timestamps. Per-task FIFO must still claim
+    // them in insertion order — guaranteed by the `rowid` tie-breaker in the
+    // sibling predicate + ORDER BY. Construct the equal-timestamp case
+    // explicitly (no reliance on wall-clock granularity) and assert the order.
+    use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let (outbox, task) = outbox_with_task(&db, &ts).await;
+
+    let shared = domain_core::Timestamp::now();
+    let mk = |body: &str| {
+        let mut e = OutboxEntry::new(
+            task,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: Some(body.into()),
+                closed: None,
+            },
+        );
+        // Force identical enqueued_at on both entries.
+        e.enqueued_at = shared;
+        e
+    };
+
+    // first inserted, then second — both with the SAME enqueued_at.
+    let first = mk("first");
+    let second = mk("second");
+    outbox.enqueue(&first).await.unwrap();
+    outbox.enqueue(&second).await.unwrap();
+
+    let now = domain_core::Timestamp::from_utc(shared.into_inner() + chrono::Duration::seconds(1));
+
+    // The head claim must return the first-inserted entry even though both
+    // share enqueued_at; the tail is then blocked while the head is inflight.
+    let head = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    assert_eq!(head.id, first.id, "equal timestamps ⇒ insertion order wins");
+    assert_eq!(head.status, OutboxStatus::Inflight);
+    assert!(
+        outbox.claim_next_eligible(now).await.unwrap().is_none(),
+        "tail blocked behind an equal-timestamped inflight head"
+    );
+
+    // After the head resolves, the second is claimable next.
+    outbox.mark_succeeded(first.id).await.unwrap();
+    let tail = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    assert_eq!(tail.id, second.id);
+}
+
+#[tokio::test]
+async fn claim_honours_next_attempt_at_eligibility_and_round_trips() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let (outbox, task) = outbox_with_task(&db, &ts).await;
+
+    let entry = OutboxEntry::new(
+        task,
+        OutboxMutation::UpdateRemote {
+            canonical_repo: "github.com/o/r".into(),
+            remote_id: "1".into(),
+            title: None,
+            body: None,
+            closed: None,
+        },
+    );
+    outbox.enqueue(&entry).await.unwrap();
+
+    let now = domain_core::Timestamp::now();
+
+    // Claim it, then reschedule with a future next_attempt_at.
+    let claimed = outbox.claim_next_eligible(now).await.unwrap().unwrap();
+    let future = domain_core::Timestamp::from_utc(now.into_inner() + chrono::Duration::hours(1));
+    outbox
+        .record_retry(claimed.id, "boom", future)
+        .await
+        .unwrap();
+
+    // Not eligible at `now` (next_attempt_at is in the future).
+    assert!(
+        outbox.claim_next_eligible(now).await.unwrap().is_none(),
+        "a rescheduled entry isn't claimable before its backoff window"
+    );
+
+    // The bumped attempts + next_attempt_at round-trip via list_pending.
+    let pending = outbox.list_pending(task).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempts, 1);
+    assert!(pending[0].next_attempt_at.is_some());
+
+    // Eligible once we claim with a `now` past the window.
+    let later =
+        domain_core::Timestamp::from_utc(future.into_inner() + chrono::Duration::seconds(1));
+    let reclaimed = outbox.claim_next_eligible(later).await.unwrap();
+    assert!(reclaimed.is_some(), "claimable after the backoff window");
+}
+
+#[tokio::test]
+async fn enqueue_if_absent_dedupes_against_non_terminal_and_failed_siblings() {
+    // Atomic dedupe + insert (#54): the startup reconcile's
+    // `enqueue_if_absent` must insert only when the task has no
+    // `pending`/`inflight`/`failed` sibling. Exercise each guard branch plus
+    // the "succeeded sibling does not block" case directly at the SQL level.
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let (outbox, task) = outbox_with_task(&db, &ts).await;
+
+    let mk = || {
+        OutboxEntry::new(
+            task,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        )
+    };
+
+    // First call: no sibling → inserts.
+    assert!(
+        outbox.enqueue_if_absent(&mk()).await.unwrap(),
+        "first enqueue_if_absent inserts (no sibling)"
+    );
+    assert_eq!(outbox.list_pending(task).await.unwrap().len(), 1);
+
+    // Second call: a pending sibling exists → no insert.
+    assert!(
+        !outbox.enqueue_if_absent(&mk()).await.unwrap(),
+        "a pending sibling blocks the insert"
+    );
+    assert_eq!(
+        outbox.list_pending(task).await.unwrap().len(),
+        1,
+        "still exactly one entry"
+    );
+
+    // Claim the pending one (→ inflight); an inflight sibling also blocks.
+    let claimed = outbox
+        .claim_next_eligible(domain_core::Timestamp::now())
+        .await
+        .unwrap()
+        .expect("a pending entry");
+    assert!(
+        !outbox.enqueue_if_absent(&mk()).await.unwrap(),
+        "an inflight sibling blocks the insert"
+    );
+
+    // Dead-letter it; a failed sibling still blocks (keeps the dead-letter
+    // terminal across restarts).
+    outbox.mark_failed(claimed.id, "boom").await.unwrap();
+    assert!(
+        !outbox.enqueue_if_absent(&mk()).await.unwrap(),
+        "a dead-lettered sibling blocks the insert"
+    );
+
+    // A second task whose ONLY sibling is succeeded → inserts (succeeded is
+    // not a blocker).
+    let ws2 = Workspace::new(WorkspaceName::new("obx-succ").unwrap(), None, true);
+    SqliteWorkspaceRepository::new(db.clone())
+        .save(&ws2)
+        .await
+        .unwrap();
+    let task2 = Task::new_draft(ws2.id, None, "t2".into()).unwrap();
+    ts.save(&task2, SnapshotSource::Created).await.unwrap();
+    let mk2 = || {
+        OutboxEntry::new(
+            task2.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "2".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        )
+    };
+    outbox.enqueue(&mk2()).await.unwrap();
+    let claimed2 = outbox
+        .claim_next_eligible(domain_core::Timestamp::now())
+        .await
+        .unwrap()
+        .expect("task2 pending entry");
+    outbox.mark_succeeded(claimed2.id).await.unwrap();
+    assert!(
+        outbox.enqueue_if_absent(&mk2()).await.unwrap(),
+        "a succeeded sibling does not block a fresh insert"
+    );
 }

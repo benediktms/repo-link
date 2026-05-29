@@ -4,23 +4,54 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use application_sync::enqueue;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
     TaskDto, UpdateTaskCmd,
 };
-use ports::{PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository};
+use ports::{
+    PortError, ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository,
+    TaskSnapshotRepository, WorkspaceRepository,
+};
 
 use crate::dto::{assemble_task_display_id, parse_enum, task_to_dto};
 use crate::error::{Result, ServiceError};
 
+/// Task CRUD + lifecycle / sync transitions.
+///
+/// **Outbox durability (atomic save + enqueue, RFC 0001 Stage 6, #54).**
+/// Lifecycle / edit verbs on a mirror task plan the appropriate
+/// [`OutboxMutation`]s and persist them together with the task in ONE atomic
+/// write via [`TaskRepository::save_with_outbox`] (CodeRabbit thread
+/// r3324166852): the mutation list is computed *first*, then exactly one
+/// combined write commits the task row + snapshot + every pending outbox entry
+/// — so a crash can never tear the saved task apart from its entries (either
+/// both persist or neither does). This closes the old save-then-enqueue gap,
+/// including the draft-only `UpdateDraftIssue` and board-only
+/// `SetProjectStatus` cases the daemon's `reconcile_dirty_into_outbox` could
+/// not re-form.
+///
+/// The daemon's startup `reconcile_dirty_into_outbox` is now a
+/// belt-and-suspenders backstop for *pre-existing / legacy* `DirtyLocal` tasks
+/// (those already dirty when the codebase upgraded to the outbox path, which
+/// never had an entry enqueued), NOT the primary durability guarantee for new
+/// transitions. `TaskService` no longer holds an `OutboxRepository` handle: it
+/// drains all outbound enqueueing through `save_with_outbox`; the standalone
+/// `OutboxRepository` port lives on in `WorkspaceService` backfill and the
+/// drainer, which don't write a task in the same breath.
 pub struct TaskService {
     repo: Arc<dyn TaskRepository>,
     snapshots: Arc<dyn TaskSnapshotRepository>,
     /// Used by the friendly-ID resolver to validate the prefix half of
     /// a composite `prefix-hash` input against the task's repo binding.
     bindings: Arc<dyn RepoBindingRepository>,
+    /// Project resolver — `task → workspace → project` — so lifecycle verbs
+    /// can compute the project Status option to enqueue.
+    workspaces: Arc<dyn WorkspaceRepository>,
+    projects: Arc<dyn ProjectRepository>,
 }
 
 impl TaskService {
@@ -28,11 +59,15 @@ impl TaskService {
         repo: Arc<dyn TaskRepository>,
         snapshots: Arc<dyn TaskSnapshotRepository>,
         bindings: Arc<dyn RepoBindingRepository>,
+        workspaces: Arc<dyn WorkspaceRepository>,
+        projects: Arc<dyn ProjectRepository>,
     ) -> Self {
         Self {
             repo,
             snapshots,
             bindings,
+            workspaces,
+            projects,
         }
     }
 
@@ -269,6 +304,14 @@ impl TaskService {
 
     pub async fn update(&self, cmd: UpdateTaskCmd) -> Result<TaskDto> {
         let mut t = self.resolve_task(&cmd.task_id).await?;
+        // Snapshot the sync state *before* the edits so we can tell whether
+        // anything remote-observable changed (the domain flips Synced →
+        // DirtyLocal on a real title/body/assignee change; priority is local
+        // metadata and never dirties). An orphan-draft gaining a repo is the
+        // ConvertDraftToIssue trigger, so capture that precondition too.
+        let was_orphan_draft = enqueue::is_draft_backed(&t) && t.repo_id.is_none();
+        let sync_before = t.sync;
+
         if let Some(title) = cmd.title {
             t.set_title(title)?;
         }
@@ -281,11 +324,95 @@ impl TaskService {
         if let Some(assignees) = cmd.assignees {
             t.set_assignees(assignees);
         }
-        if let Some(repo_id) = cmd.repo_id {
-            t.set_repo_id(Some(repo_id.parse::<RepoId>()?))?;
-        }
-        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+        let attached_repo = if let Some(repo_id) = cmd.repo_id {
+            let parsed = repo_id.parse::<RepoId>()?;
+            let changed = t.repo_id != Some(parsed);
+            t.set_repo_id(Some(parsed))?;
+            changed
+        } else {
+            false
+        };
+
+        // Plan the outbound mutations the edit owes BEFORE writing, then commit
+        // the task + its outbox entries in one atomic write (#54). For a
+        // LocalOnly task / priority-only / no-op edit the plan is empty and
+        // `save_with_outbox` behaves exactly like `save`.
+        let mutations = self
+            .plan_update_mutations(&t, sync_before, was_orphan_draft && attached_repo)
+            .await?;
+        let entries = into_entries(t.id, mutations);
+        self.repo
+            .save_with_outbox(&t, SnapshotSource::LocalEdit, &entries)
+            .await?;
         self.task_dto(&t).await
+    }
+
+    /// Plan the outbound mutations an *edit* owes. Distinct from
+    /// [`plan_mirror_mutations`](Self::plan_mirror_mutations) because edits have
+    /// two extra rules:
+    /// 1. An orphan-draft that just gained a repo graduates to a real issue —
+    ///    enqueue `ConvertDraftToIssue`. If the same edit also changed the
+    ///    draft's title/body, first enqueue an `UpdateDraftIssue` so the new
+    ///    content lands on the draft *before* the conversion (per-task FIFO
+    ///    guarantees that order). The drainer's `convert_draft_to_issue` copies
+    ///    the draft's *current* content into the new issue, so the converted
+    ///    issue carries the edited content rather than the stale pre-edit
+    ///    title/body. We push the new content via `UpdateDraftIssue` (addressed
+    ///    by the project item node id, known now) rather than a post-convert
+    ///    `UpdateRemote` (addressed by the REST issue number, which isn't known
+    ///    until a later pull).
+    /// 2. A priority-only / no-op edit leaves `sync` unchanged (the domain
+    ///    only dirties on a real remote-observable field change), so we
+    ///    enqueue nothing — preserving the reconcile no-spurious-mutation
+    ///    contract.
+    async fn plan_update_mutations(
+        &self,
+        task: &Task,
+        sync_before: SyncState,
+        converted_orphan_draft: bool,
+    ) -> Result<Vec<OutboxMutation>> {
+        if !enqueue::is_mirror(task) {
+            return Ok(Vec::new());
+        }
+
+        if converted_orphan_draft {
+            let mut out = Vec::new();
+            // A real title/body change dirties the task (Synced → DirtyLocal);
+            // a repo-only attach leaves `sync` untouched. So `sync != before`
+            // is exactly "content also changed" here.
+            let content_changed = task.sync != sync_before;
+            let item_node_id = task.project_item_id.clone().unwrap_or_default();
+            if content_changed {
+                // Land the new draft content first; FIFO runs it before the
+                // conversion, so the converted issue inherits it.
+                out.push(OutboxMutation::UpdateDraftIssue {
+                    item_node_id: item_node_id.clone(),
+                    title: Some(task.title.clone()),
+                    body: Some(task.body.clone()),
+                });
+            }
+            // The draft graduates to an issue. `repo_node_id` carries the
+            // canonical URL — the adapter resolves it to the GraphQL repo node
+            // id (canonical→node-id resolution is an adapter concern, see #54).
+            let canonical = self.canonical_for(task).await?.unwrap_or_default();
+            out.push(OutboxMutation::ConvertDraftToIssue {
+                item_node_id,
+                repo_node_id: canonical,
+            });
+            return Ok(out);
+        }
+
+        // No remote-observable change (priority-only / idempotent edit) — the
+        // domain left `sync` exactly as it was. Plan nothing.
+        if task.sync == sync_before {
+            return Ok(Vec::new());
+        }
+
+        // Reaching here on the edit path means a real title/body/assignee
+        // change dirtied the task (the domain only flips `sync` on a
+        // remote-observable field change), so a draft-backed mirror owes an
+        // `UpdateDraftIssue`: content_changed = true.
+        self.plan_mirror_mutations(task, true).await
     }
 
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
@@ -326,33 +453,35 @@ impl TaskService {
     // ---------- Sync transitions -----------------------------------------
 
     pub async fn stage_for_sync(&self, id: &str) -> Result<TaskDto> {
+        // Staging is a pure sync-state transition (LocalOnly → Staged); it
+        // changes no remote-observable field, so it enqueues nothing.
         self.transition(id, |t| t.stage_for_sync()).await
     }
 
     // ---------- Lifecycle transitions ------------------------------------
 
     pub async fn start(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.start()).await
+        self.transition_mirror(id, |t| t.start()).await
     }
 
     pub async fn complete(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.complete()).await
+        self.transition_mirror(id, |t| t.complete()).await
     }
 
     pub async fn reopen(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.reopen()).await
+        self.transition_mirror(id, |t| t.reopen()).await
     }
 
     pub async fn mark_blocked(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.mark_blocked()).await
+        self.transition_mirror(id, |t| t.mark_blocked()).await
     }
 
     pub async fn unblock(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.unblock()).await
+        self.transition_mirror(id, |t| t.unblock()).await
     }
 
     pub async fn archive(&self, id: &str) -> Result<TaskDto> {
-        self.transition(id, |t| t.archive()).await
+        self.transition_mirror(id, |t| t.archive()).await
     }
 
     pub async fn add_relation(&self, cmd: AddTaskRelationCmd) -> Result<TaskDto> {
@@ -561,6 +690,99 @@ impl TaskService {
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         self.task_dto(&t).await
     }
+
+    /// Like [`transition`](Self::transition) but, after persisting, enqueues
+    /// the outbound mutations a mirror task owes (RFC 0001 Stage 6). Used by
+    /// the lifecycle verbs (start / complete / reopen / block / unblock /
+    /// archive) where the change is remote-observable. `LocalOnly` tasks
+    /// enqueue nothing (the mirror guard short-circuits).
+    async fn transition_mirror<F>(&self, query: &str, op: F) -> Result<TaskDto>
+    where
+        F: FnOnce(&mut Task) -> domain_core::Result<()>,
+    {
+        let mut t = self.resolve_task(query).await?;
+        op(&mut t)?;
+        // Plan the outbound mutations FIRST (lifecycle-only transition — no
+        // title/body change, so a draft-backed mirror owes no `UpdateDraftIssue`;
+        // its card move rides on `SetProjectStatus`), then commit the task AND
+        // its outbox entries in one atomic write (#54). A LocalOnly task plans
+        // nothing, so `save_with_outbox` behaves like `save`.
+        let mutations = self.plan_mirror_mutations(&t, false).await?;
+        let entries = into_entries(t.id, mutations);
+        self.repo
+            .save_with_outbox(&t, SnapshotSource::LocalEdit, &entries)
+            .await?;
+        self.task_dto(&t).await
+    }
+
+    /// Plan the outbox mutations a mirror task owes. Empty for `LocalOnly`
+    /// tasks (nothing to push). Resolves the owning project (if any) so a
+    /// project mirror gets a `SetProjectStatus` card move and a not-yet-attached
+    /// mirror gets the lazy `AddItem`/`CreateDraftIssue` net. Issue-backed
+    /// mirrors additionally get an `UpdateRemote`. Delegates the routing to the
+    /// shared [`enqueue::plan_mutations`] so `WorkspaceService` and the drainer
+    /// share one decision surface. The caller folds the returned mutations into
+    /// a single atomic `save_with_outbox` (#54) rather than enqueuing inline.
+    ///
+    /// `content_changed` is `false` for lifecycle-only transitions
+    /// (start/complete/block/archive) and `true` for title/body edits — it
+    /// gates the draft-backed `UpdateDraftIssue` so a lifecycle move doesn't
+    /// enqueue a no-op draft content write (the card move via
+    /// `SetProjectStatus` carries the lifecycle change for drafts).
+    async fn plan_mirror_mutations(
+        &self,
+        task: &Task,
+        content_changed: bool,
+    ) -> Result<Vec<OutboxMutation>> {
+        if !enqueue::is_mirror(task) {
+            return Ok(Vec::new());
+        }
+        let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
+        let canonical = self.canonical_for(task).await?;
+        // An issue-backed mirror with no repo binding can't form an
+        // `UpdateRemote` (it has no canonical repo to address), so a
+        // remote-observable lifecycle change would be silently dropped if it
+        // also has no project. Make the missing binding observable rather than
+        // a silent no-op. Unreachable through `rl sync import` today (which
+        // always supplies a repo), but a future caller that constructs an
+        // unbound issue-backed mirror would otherwise lose the push without a
+        // signal.
+        if enqueue::is_issue_backed(task) && canonical.is_none() && project.is_none() {
+            tracing::warn!(
+                task_id = %task.id,
+                "mirror lifecycle change has no repo binding and no project; \
+                 no outbound mutation can be formed (push dropped)"
+            );
+        }
+        Ok(enqueue::plan_mutations(
+            task,
+            project.as_ref(),
+            canonical.as_deref(),
+            content_changed,
+        ))
+    }
+
+    /// Best-effort canonical repo lookup for the task's binding. `None` when
+    /// the task has no repo (orphan-draft) — issue-backed planning needs it;
+    /// draft/project planning doesn't.
+    async fn canonical_for(&self, task: &Task) -> Result<Option<String>> {
+        let Some(repo_id) = task.repo_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
+    }
+}
+
+/// Wrap each planned [`OutboxMutation`] in a fresh `Pending` [`OutboxEntry`]
+/// for `task_id`, preserving the plan's order (the outbox is per-task FIFO, so
+/// order is load-bearing — e.g. `UpdateDraftIssue` must precede
+/// `ConvertDraftToIssue`). The caller hands the result to
+/// [`TaskRepository::save_with_outbox`] for the single atomic write (#54).
+fn into_entries(task_id: TaskId, mutations: Vec<OutboxMutation>) -> Vec<OutboxEntry> {
+    mutations
+        .into_iter()
+        .map(|m| OutboxEntry::new(task_id, m))
+        .collect()
 }
 
 /// For a cycle-protected relation, return `(forward, inverse, x, y)` where the
@@ -598,16 +820,30 @@ mod tests {
     use super::*;
     use ports::TaskSnapshotRepository;
     use testing_fixtures::{
-        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryTaskSnapshotRepository,
+        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRepoBindingRepository,
+        InMemoryTaskRepository, InMemoryTaskSnapshotRepository, InMemoryWorkspaceRepository,
     };
 
     fn svc() -> TaskService {
-        let repo = Arc::new(InMemoryTaskRepository::new());
+        svc_with_outbox().0
+    }
+
+    /// Build a `TaskService` over all-in-memory repos and hand back the outbox
+    /// so enqueue-matrix tests can assert what (if anything) was queued. The
+    /// task repo is wired to the SAME outbox store via `with_outbox` so the
+    /// atomic `save_with_outbox` path lands its entries where the test inspects
+    /// them (#54).
+    fn svc_with_outbox() -> (TaskService, Arc<InMemoryOutboxRepository>) {
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let repo = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
         let snaps: Arc<dyn TaskSnapshotRepository> =
             Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
         let bindings: Arc<dyn RepoBindingRepository> =
             Arc::new(InMemoryRepoBindingRepository::new());
-        TaskService::new(repo, snaps, bindings)
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let projects: Arc<dyn ProjectRepository> = Arc::new(InMemoryProjectRepository::new());
+        let svc = TaskService::new(repo, snaps, bindings, workspaces, projects);
+        (svc, outbox)
     }
 
     fn ws_id() -> String {
@@ -1138,7 +1374,13 @@ mod tests {
         let repo_id = binding.id;
         bindings.save(&binding).await.unwrap();
 
-        let svc = TaskService::new(repo, snaps, bindings);
+        let svc = TaskService::new(
+            repo,
+            snaps,
+            bindings,
+            Arc::new(InMemoryWorkspaceRepository::new()),
+            Arc::new(InMemoryProjectRepository::new()),
+        );
         let dto = svc
             .create(CreateTaskCmd {
                 workspace_id: ws.to_string(),
@@ -1195,7 +1437,13 @@ mod tests {
             Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
         let bindings_repo: Arc<dyn RepoBindingRepository> =
             Arc::new(InMemoryRepoBindingRepository::new());
-        let svc = TaskService::new(repo.clone(), snaps, bindings_repo.clone());
+        let svc = TaskService::new(
+            repo.clone(),
+            snaps,
+            bindings_repo.clone(),
+            Arc::new(InMemoryWorkspaceRepository::new()),
+            Arc::new(InMemoryProjectRepository::new()),
+        );
 
         let workspace_id = WorkspaceId::new();
         // Stand up a real binding for A so the post-rollback `task_dto`
@@ -1240,7 +1488,13 @@ mod tests {
             Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
         let bindings_repo: Arc<dyn RepoBindingRepository> =
             Arc::new(InMemoryRepoBindingRepository::new());
-        let svc = TaskService::new(repo.clone(), snaps, bindings_repo);
+        let svc = TaskService::new(
+            repo.clone(),
+            snaps,
+            bindings_repo,
+            Arc::new(InMemoryWorkspaceRepository::new()),
+            Arc::new(InMemoryProjectRepository::new()),
+        );
 
         let workspace_id = WorkspaceId::new();
         let repo_b = domain_core::RepoId::new();
@@ -1259,6 +1513,669 @@ mod tests {
             "rollback must restore intentional None binding, got {:?}",
             rolled_back.repo_id
         );
+    }
+
+    // ---------- Stage 6 (#54): lifecycle enqueue matrix --------------------
+
+    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_sync::OutboxStatus;
+    use domain_workspace::{Workspace, WorkspaceName};
+
+    /// A TaskService over all-in-memory repos, with the concrete handles
+    /// exposed so a test can seed a project-attached workspace and inspect
+    /// the outbox afterwards.
+    struct RichSvc {
+        svc: TaskService,
+        repo: Arc<InMemoryTaskRepository>,
+        outbox: Arc<InMemoryOutboxRepository>,
+        workspaces: Arc<InMemoryWorkspaceRepository>,
+        projects: Arc<InMemoryProjectRepository>,
+        bindings: Arc<InMemoryRepoBindingRepository>,
+    }
+
+    fn rich_svc() -> RichSvc {
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let repo = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let svc = TaskService::new(
+            repo.clone(),
+            snaps,
+            bindings.clone(),
+            workspaces.clone(),
+            projects.clone(),
+        );
+        RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        }
+    }
+
+    fn test_project(id: &str) -> Project {
+        Project::new(
+            domain_core::ProjectId::parse(id).unwrap(),
+            "acme".into(),
+            3,
+            "Board".into(),
+            "PVTSSF_field".into(),
+            vec![
+                StatusOption {
+                    option_id: "o_backlog".into(),
+                    name: "Backlog".into(),
+                    ordinal: 0,
+                },
+                StatusOption {
+                    option_id: "o_wip".into(),
+                    name: "In progress".into(),
+                    ordinal: 1,
+                },
+                StatusOption {
+                    option_id: "o_done".into(),
+                    name: "Done".into(),
+                    ordinal: 2,
+                },
+            ],
+            vec![
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o_backlog".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::InProgress,
+                    option_id: "o_wip".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::Done,
+                    option_id: "o_done".into(),
+                },
+            ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    /// Save a synced issue-backed mirror with a node id into `repo` under `ws`.
+    async fn save_issue_mirror(
+        repo: &Arc<InMemoryTaskRepository>,
+        ws: WorkspaceId,
+        node_id: Option<&str>,
+        project_item_id: Option<&str>,
+    ) -> Task {
+        let mut t = Task::new_draft(ws, None, "mirror".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "7".into(),
+            node_id: node_id.map(str::to_owned),
+        })
+        .unwrap();
+        t.project_item_id = project_item_id.map(str::to_owned);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+        t
+    }
+
+    // ---------- Stage 6 (#54): transactional-outbox atomicity --------------
+
+    #[tokio::test]
+    async fn lifecycle_project_mirror_persists_task_change_and_set_status_together() {
+        // The atomic path (#54): a lifecycle transition on a project mirror
+        // commits BOTH the task status change AND the SetProjectStatus outbox
+        // entry. Assert both landed in the SAME store after one verb.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_atomic");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        // Task side: the status change is durable.
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(reloaded.status, TaskStatus::InProgress);
+        // Outbox side: a SetProjectStatus entry landed in the same op.
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"set_project_status"),
+            "lifecycle move persists the card move atomically: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_issue_backed_persists_task_and_update_remote_together() {
+        // An edit on an issue-backed mirror commits the title change AND the
+        // UpdateRemote entry in one atomic write.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("edited".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(reloaded.title, "edited");
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["update_remote"],
+            "edit persists task + UpdateRemote atomically: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_draft_backed_persists_task_and_update_draft_together() {
+        // A content edit on a draft-backed mirror (no REST issue, has a project
+        // item) commits the body change AND the UpdateDraftIssue entry together.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+
+        // Draft-backed: synced mirror with a project item but no remote issue.
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "old body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: Some("new body".into()),
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(reloaded.body, "new body");
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["update_draft_issue"],
+            "draft content edit persists task + UpdateDraftIssue atomically: {kinds:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_only_edit_writes_task_and_zero_entries() {
+        // A LocalOnly task plans no mutations, so `save_with_outbox` behaves
+        // like `save`: the task change is durable and zero entries are queued.
+        let RichSvc {
+            svc, repo, outbox, ..
+        } = rich_svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "local".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        // `dto.id` is a bare hash (no binding); resolve to the internal id.
+        let id = svc.resolve_task(&dto.id).await.unwrap().id;
+        svc.update(UpdateTaskCmd {
+            task_id: dto.id.clone(),
+            title: Some("local edited".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(id).await.unwrap();
+        assert_eq!(reloaded.title, "local edited");
+        assert!(
+            outbox.all().is_empty(),
+            "a LocalOnly edit writes the task and enqueues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_with_outbox_is_the_single_write_path_for_mirror_transitions() {
+        // Atomicity contract: the lifecycle / edit verbs go through ONE combined
+        // write (`save_with_outbox`), not save-then-enqueue. The in-memory
+        // fixture proves it: it appends the task AND the entries under one lock,
+        // and a non-empty enqueue with no shared outbox handle would panic. So
+        // observing the entry in the SAME outbox the fixture shares with the
+        // task repo is direct evidence the combined write fired (had the verb
+        // taken a separate enqueue port, the entry would land elsewhere / not at
+        // all). Conversely a zero-entry plan never touches the outbox handle.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        assert!(outbox.all().is_empty(), "no entries before the transition");
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        // Exactly one combined write happened: task in-progress + one
+        // UpdateRemote, in the shared store.
+        assert_eq!(repo.get(t.id).await.unwrap().status, TaskStatus::InProgress);
+        assert_eq!(outbox.all().len(), 1);
+        assert_eq!(outbox.all()[0].mutation.kind(), "update_remote");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_issue_backed_enqueues_update_remote() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        // Issue-backed task in a projectless workspace, with a repo binding so
+        // canonical_repo resolves.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        let all = outbox.all();
+        assert_eq!(all.len(), 1, "exactly one mutation enqueued");
+        assert_eq!(all[0].mutation.kind(), "update_remote");
+        assert_eq!(all[0].status, OutboxStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_project_mirror_block_enqueues_set_status_not_close() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_block");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        // BOUND issue-backed project mirror (the real-world case): it has a
+        // repo binding, so an UpdateRemote *is* formed, AND it's already a
+        // board item (project_item_id set), so a SetProjectStatus is formed
+        // too. This is the shape that actually exercises "block moves the card
+        // but does NOT close the issue".
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.mark_blocked(&t.id.to_string()).await.unwrap();
+
+        let entries = outbox.all();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"set_project_status"),
+            "block on a project mirror moves the card: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"update_remote"),
+            "a bound issue-backed mirror also enqueues UpdateRemote: {kinds:?}"
+        );
+        // No close: every enqueued UpdateRemote carries `closed: None` (the
+        // drainer re-derives Blocked → not-closed via lifecycle_to_remote_state)
+        // — never a close-the-issue `closed: Some(true)`.
+        for e in &entries {
+            if let OutboxMutation::UpdateRemote { closed, .. } = &e.mutation {
+                assert_ne!(
+                    *closed,
+                    Some(true),
+                    "block must never enqueue a close-the-issue UpdateRemote"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_local_only_enqueues_nothing() {
+        let RichSvc { svc, outbox, .. } = rich_svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "local".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        svc.start(&dto.id).await.unwrap();
+        svc.complete(&dto.id).await.unwrap();
+        assert!(outbox.all().is_empty(), "LocalOnly tasks enqueue nothing");
+    }
+
+    #[tokio::test]
+    async fn priority_only_edit_enqueues_nothing() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: Some("p0".into()),
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "priority is local metadata — no remote-observable change, no enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn relation_ops_enqueue_nothing() {
+        // Relations live in their own table and are never mirrored — adding a
+        // relation between two issue-backed mirrors must not enqueue anything.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let a = save_issue_mirror(&repo, ws.id, Some("I_a"), None).await;
+        let mut b = Task::new_draft(ws.id, None, "b".into()).unwrap();
+        b.stage_for_sync().unwrap();
+        b.promote_to_remote(RemoteRef::new("github", "8")).unwrap();
+        repo.save(&b, SnapshotSource::Promote).await.unwrap();
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(outbox.all().is_empty(), "relation ops enqueue nothing");
+    }
+
+    #[tokio::test]
+    async fn orphan_draft_edit_with_repo_enqueues_convert() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Orphan-draft mirror: a project draft with no remote + no repo.
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "b".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None; // pure draft: no REST issue
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: Some(binding.id.to_string()),
+        })
+        .await
+        .unwrap();
+
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["convert_draft_to_issue"],
+            "attaching a repo to an orphan-draft graduates it to an issue"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_draft_edit_with_repo_and_title_enqueues_update_then_convert() {
+        // Combined edit: attach a repo AND change the title in one `update`.
+        // The new content must reach the converted issue, so we enqueue an
+        // UpdateDraftIssue (carrying the new title/body, addressed by the
+        // project item node id) BEFORE the ConvertDraftToIssue — FIFO runs the
+        // draft update first, so the conversion copies the edited content. The
+        // earlier bug returned early after the convert, dropping the edit.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "old title".into(),
+            "old body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None; // pure draft
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("new title".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: Some(binding.id.to_string()),
+        })
+        .await
+        .unwrap();
+
+        let entries = outbox.all();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["update_draft_issue", "convert_draft_to_issue"],
+            "content edit lands on the draft before it converts: {kinds:?}"
+        );
+        // The UpdateDraftIssue carries the NEW title (not the stale one).
+        match &entries[0].mutation {
+            OutboxMutation::UpdateDraftIssue { title, .. } => {
+                assert_eq!(title.as_deref(), Some("new title"));
+            }
+            other => panic!("expected UpdateDraftIssue first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn project_mirror_without_item_id_enqueues_add_item() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_lazy");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Issue-backed mirror with a node id but NOT yet a project item.
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        // UpdateRemote (issue state) + AddItem (lazy net). SetProjectStatus
+        // follows via the drainer's AddItem write-back, not at enqueue time.
+        assert!(kinds.contains(&"add_item"), "lazy attach: {kinds:?}");
+        assert!(kinds.contains(&"update_remote"), "issue state: {kinds:?}");
     }
 
     #[tokio::test]
