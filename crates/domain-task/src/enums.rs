@@ -51,9 +51,61 @@ pub enum Priority {
 pub enum RelationKind {
     BlockedBy,
     Blocks,
-    DependsOn,
     Duplicates,
     ParentOf,
     ChildOf,
     RelatedTo,
+}
+
+impl RelationKind {
+    /// The reciprocal edge that should exist on the *other* task so the
+    /// relation graph reads coherently from both ends.
+    ///
+    /// Directional pairs invert (`A blocks B` ⇒ `B blocked_by A`;
+    /// `A parent_of B` ⇒ `B child_of A`). Symmetric kinds return
+    /// themselves (`A related_to B` ⇒ `B related_to A`; likewise
+    /// `duplicates`, treated as a mutual "these are the same work" link).
+    ///
+    /// Every kind has a reciprocal — there is deliberately no one-directional
+    /// kind. (`depends_on` was dropped as a redundant synonym of `blocked_by`;
+    /// see migration `…_drop_depends_on_relation`.)
+    pub fn inverse(self) -> RelationKind {
+        match self {
+            RelationKind::BlockedBy => RelationKind::Blocks,
+            RelationKind::Blocks => RelationKind::BlockedBy,
+            RelationKind::ParentOf => RelationKind::ChildOf,
+            RelationKind::ChildOf => RelationKind::ParentOf,
+            RelationKind::RelatedTo => RelationKind::RelatedTo,
+            RelationKind::Duplicates => RelationKind::Duplicates,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relation_inverse_is_an_involution() {
+        // Applying inverse twice returns the original kind for every variant,
+        // so a reciprocal edge never drifts from the edge that spawned it.
+        for kind in [
+            RelationKind::BlockedBy,
+            RelationKind::Blocks,
+            RelationKind::Duplicates,
+            RelationKind::ParentOf,
+            RelationKind::ChildOf,
+            RelationKind::RelatedTo,
+        ] {
+            assert_eq!(kind.inverse().inverse(), kind);
+        }
+    }
+
+    #[test]
+    fn directional_pairs_invert_symmetric_kinds_are_self() {
+        assert_eq!(RelationKind::BlockedBy.inverse(), RelationKind::Blocks);
+        assert_eq!(RelationKind::ParentOf.inverse(), RelationKind::ChildOf);
+        assert_eq!(RelationKind::RelatedTo.inverse(), RelationKind::RelatedTo);
+        assert_eq!(RelationKind::Duplicates.inverse(), RelationKind::Duplicates);
+    }
 }
