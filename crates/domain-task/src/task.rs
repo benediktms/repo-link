@@ -32,6 +32,18 @@ pub struct Task {
     /// yet. Like `node_id` on [`RemoteRef`], purely additive: no consumer
     /// reads it before Stage 5 wires the GraphQL surface in.
     pub project_item_id: Option<String>,
+    /// Cache of the task's *remote* GitHub Projects v2 status, as the
+    /// option's `option_id` (`47fc9ee4`-style). Written by the Stage-7
+    /// poller from the polled item's `status_option_id` (RFC 0001 Stage 8,
+    /// closes #39); `None` means "not yet polled" (NOT a mismatch).
+    ///
+    /// This is a one-way mirror of remote state on a **separate drift axis**
+    /// — it is deliberately excluded from [`Task::snapshot_view`] and
+    /// [`Task::reconcile_dirty_against_baseline`] so a board move never flips
+    /// `sync_state` (which tracks the REST open/closed + title/body axis).
+    /// Drift surfacing compares it to the option the task's local lifecycle
+    /// status maps to, independently of `sync_state`.
+    pub project_status_option_id: Option<String>,
     /// Short globally-unique hash used to assemble the friendly composite
     /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
     /// (grown by the persistence layer on collision). Empty string is the
@@ -74,6 +86,7 @@ impl Task {
             relations: Vec::new(),
             comments: Vec::new(),
             project_item_id: None,
+            project_status_option_id: None,
             // Empty until the persistence layer mints a unique base32
             // hash on first save. Domain stays agnostic to randomness
             // and DB-backed uniqueness retries.
@@ -123,6 +136,7 @@ impl Task {
             relations: Vec::new(),
             comments: Vec::new(),
             project_item_id: None,
+            project_status_option_id: None,
             hash: String::new(),
             created_at: now,
             updated_at: now,
@@ -434,6 +448,22 @@ impl Task {
             self.priority = priority;
             self.touch();
         }
+    }
+
+    /// Cache the task's remote GitHub Projects v2 status option id (written
+    /// by the Stage-7 poller from a polled item, RFC 0001 Stage 8). This is a
+    /// **separate drift axis**, not a lifecycle/sync transition: it mirrors
+    /// remote state for `rl query drift` + `rl task show` and deliberately
+    /// does NOT call `reconcile_dirty_against_baseline` or `touch` — a board
+    /// move must never flip `sync_state` nor mark the task updated. Returns
+    /// whether the cached value actually changed so the poller can skip a
+    /// redundant persist.
+    pub fn set_project_status_option_id(&mut self, option_id: Option<String>) -> bool {
+        if self.project_status_option_id == option_id {
+            return false;
+        }
+        self.project_status_option_id = option_id;
+        true
     }
 
     /// Reassign the owning repo binding. Permitted only while the task is

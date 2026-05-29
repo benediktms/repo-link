@@ -109,7 +109,28 @@ impl TaskService {
         for (rendered, source) in dto.relations.iter_mut().zip(t.relations.iter()) {
             rendered.other = self.compose_id_for(source.other).await?;
         }
+        // Overlay the cached project-board status display name (RFC 0001
+        // Stage 8, closes #39). CACHED only — resolve `task → workspace →
+        // project → option name` with NO network: `resolve_project` reads the
+        // local project repo, `option_name_for` reads the cached option list.
+        dto.project_status = self.resolve_cached_project_status(t).await?;
         Ok(dto)
+    }
+
+    /// Resolve the task's cached `project_status_option_id` to its display
+    /// name via `task → workspace → project`. `None` when the task has no
+    /// cached status, its workspace is projectless, or the cached option id is
+    /// no longer owned by the project (renamed/removed remotely). Local reads
+    /// only — never touches the network, so `rl task show` stays offline.
+    async fn resolve_cached_project_status(&self, t: &Task) -> Result<Option<String>> {
+        let Some(option_id) = t.project_status_option_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(project) = enqueue::resolve_project(&self.workspaces, &self.projects, t).await?
+        else {
+            return Ok(None);
+        };
+        Ok(project.option_name_for(option_id).map(str::to_string))
     }
 
     /// Look up a task by UUID and return its composite display ID
@@ -1620,6 +1641,97 @@ mod tests {
         t.project_item_id = project_item_id.map(str::to_owned);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
         t
+    }
+
+    // ---------- Stage 8 (#56, closes #39): task show project status --------
+
+    /// `task show` surfaces the cached project-board status as a display name,
+    /// resolved `task → workspace → project → option name` from the LOCAL
+    /// cache — no network. The InMemory repos make any I/O impossible, so a
+    /// passing test also proves the path is offline.
+    #[tokio::test]
+    async fn show_surfaces_cached_project_status_display_name() {
+        let RichSvc {
+            svc,
+            repo,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_show");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        // A project mirror whose board status was polled as "In progress".
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+        t.set_project_status_option_id(Some("o_wip".into()));
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        let dto = svc.show(&t.id.to_string()).await.unwrap();
+        assert_eq!(
+            dto.project_status.as_deref(),
+            Some("In progress"),
+            "show resolves the cached option id to its display name"
+        );
+    }
+
+    /// A projectless task → `project_status` is None even with a cached id
+    /// (no project to resolve the name against).
+    #[tokio::test]
+    async fn show_projectless_task_has_no_project_status() {
+        let RichSvc {
+            svc,
+            repo,
+            workspaces,
+            ..
+        } = rich_svc();
+        // Workspace with NO project_id.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+        t.set_project_status_option_id(Some("o_wip".into()));
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        let dto = svc.show(&t.id.to_string()).await.unwrap();
+        assert_eq!(
+            dto.project_status, None,
+            "a projectless task surfaces no board status"
+        );
+    }
+
+    /// A stale cached option id (renamed/removed remotely, so the project no
+    /// longer owns it) renders as `None` rather than an opaque id —
+    /// `option_name_for` misses and `resolve_cached_project_status` returns
+    /// `None`. The task is on a real project, so this isolates the "unknown
+    /// cached id" branch from the projectless case above (#39).
+    #[tokio::test]
+    async fn show_stale_cached_option_id_renders_none() {
+        let RichSvc {
+            svc,
+            repo,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_stale");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        // Board cached an option id the project no longer owns.
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+        t.set_project_status_option_id(Some("o_ghost".into()));
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        let dto = svc.show(&t.id.to_string()).await.unwrap();
+        assert_eq!(
+            dto.project_status, None,
+            "an unknown cached option id resolves to no display name"
+        );
     }
 
     // ---------- Stage 6 (#54): transactional-outbox atomicity --------------

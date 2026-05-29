@@ -1157,6 +1157,100 @@ async fn task_remote_node_id_and_project_item_id_roundtrip() {
     assert_eq!(back.project_item_id.as_deref(), Some("PVTI_kwHO_item"));
 }
 
+/// RFC 0001 Stage 8 (#56, closes #39): the cached `project_status_option_id`
+/// round-trips through `write_task_in_tx` + `row_to_task` on the FULL upsert
+/// lifecycle — insert (None), upsert-update to Some, reload, then upsert-update
+/// changing it again, reload. The DO-UPDATE half is the bug class: forgetting it
+/// silently never persists the change on the (existing-row) upsert path the
+/// poller always hits.
+#[tokio::test]
+async fn task_project_status_option_id_roundtrips_through_upsert() {
+    let (_dir, ws, _rb, ts) = setup().await;
+
+    let workspace = Workspace::new(WorkspaceName::new("pstatus").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    // Insert: a fresh task carries no cached project status.
+    let mut task = Task::new_draft(workspace.id, None, "cached status".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "1"))
+        .unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+    assert_eq!(
+        ts.get(task.id).await.unwrap().project_status_option_id,
+        None,
+        "fresh task has no cached project status"
+    );
+
+    // Upsert-update: the poller writes the polled option id. This hits the
+    // ON CONFLICT DO UPDATE branch (the row already exists).
+    assert!(task.set_project_status_option_id(Some("o_wip".into())));
+    ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(task.id)
+            .await
+            .unwrap()
+            .project_status_option_id
+            .as_deref(),
+        Some("o_wip"),
+        "DO UPDATE must persist the cached status on upsert"
+    );
+
+    // Upsert-update again: a later poll moved the card to a different option.
+    assert!(task.set_project_status_option_id(Some("o_done".into())));
+    ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(task.id)
+            .await
+            .unwrap()
+            .project_status_option_id
+            .as_deref(),
+        Some("o_done"),
+        "a subsequent upsert overwrites the cached status"
+    );
+}
+
+/// The same column must persist through `save_with_outbox`, which shares the
+/// `write_task_in_tx` write path with `save`.
+#[tokio::test]
+async fn save_with_outbox_persists_project_status_option_id() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+
+    let (_dir, ws, _rb, ts) = setup().await;
+    let workspace = Workspace::new(WorkspaceName::new("pstatus-obx").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    let mut task = Task::new_draft(workspace.id, None, "via outbox".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "1"))
+        .unwrap();
+    task.set_project_status_option_id(Some("o_review".into()));
+
+    let entry = OutboxEntry::new(
+        task.id,
+        OutboxMutation::UpdateRemote {
+            canonical_repo: "github.com/o/r".into(),
+            remote_id: "1".into(),
+            title: None,
+            body: Some("b".into()),
+            closed: None,
+        },
+    );
+    ts.save_with_outbox(&task, SnapshotSource::Promote, &[entry])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ts.get(task.id)
+            .await
+            .unwrap()
+            .project_status_option_id
+            .as_deref(),
+        Some("o_review"),
+        "save_with_outbox shares write_task_in_tx, so the cache column persists too"
+    );
+}
+
 // ---------- RFC 0001 Stage 6 (#54): claim_next_eligible + backoff ----------
 
 /// Seed a workspace + a task row (the outbox FK needs a real task) and return

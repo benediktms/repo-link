@@ -75,6 +75,11 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
                 created_at: c.created_at.into(),
             })
             .collect(),
+        // The cached board status is resolved to a display name in
+        // `TaskService::task_dto` (it needs a project handle this pure fn
+        // doesn't have). Default to None here so the pure conversion stays
+        // network- and repo-free. CACHED only — never a network call.
+        project_status: None,
         created_at: t.created_at.into(),
         updated_at: t.updated_at.into(),
     }

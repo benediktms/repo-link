@@ -83,6 +83,41 @@ impl Project {
             .map(|m| m.option_id.as_str())
     }
 
+    /// The canonical local-status → project-option resolver, applying the
+    /// RFC §3 absence-of-row rule: a `Blocked` task on a board with no
+    /// Blocked-like option (so no `blocked` mapping row was stored) resolves
+    /// to the `Open` option. Returns `None` only when even `Open` is unmapped
+    /// (an option-less board) — or for `Archived`, which is never mapped to a
+    /// project option (REST `close as not_planned` handles it).
+    ///
+    /// This is the single definition of the fallback shared by the outbox
+    /// enqueue/drain paths (via `application_sync::option_id_for_status_with_fallback`,
+    /// which delegates here) AND Stage 8 drift detection, so the "what option
+    /// does this status map to?" question has exactly one answer everywhere.
+    pub fn resolved_option_id_for(&self, status: TaskStatus) -> Option<&str> {
+        if let Some(opt) = self.option_id_for(status) {
+            return Some(opt);
+        }
+        if status == TaskStatus::Blocked {
+            // No row for Blocked ⇒ resolve to the Open option (app-level
+            // fallback; never stored as a row — see RFC §3).
+            return self.option_id_for(TaskStatus::Open);
+        }
+        None
+    }
+
+    /// Resolve a cached `option_id` to its human-readable display name (e.g.
+    /// `"In progress"`). `None` when the project doesn't own that option —
+    /// e.g. a stale cached id whose option was renamed/removed on GitHub.
+    /// Used by drift + `rl task show` to render the cached/expected board
+    /// status as a name rather than an opaque id.
+    pub fn option_name_for(&self, option_id: &str) -> Option<&str> {
+        self.status_options
+            .iter()
+            .find(|o| o.option_id == option_id)
+            .map(|o| o.name.as_str())
+    }
+
     fn validate_mappings(mappings: &[StatusMapping], options: &[StatusOption]) -> Result<()> {
         let mut seen_statuses = std::collections::HashSet::new();
         for m in mappings {
@@ -187,6 +222,94 @@ mod tests {
         assert_eq!(p.option_id_for(TaskStatus::Open), Some("o1"));
         assert_eq!(p.option_id_for(TaskStatus::Done), Some("o2"));
         assert_eq!(p.option_id_for(TaskStatus::InProgress), None);
+    }
+
+    #[test]
+    fn resolved_option_id_for_normal_mapping_and_blocked_fallback() {
+        // Open + Done are mapped; Blocked is intentionally NOT mapped (no
+        // Blocked-like option on the board), so it must resolve to the Open
+        // option via the §3 fallback — not None.
+        let p = Project::new(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            "PVTSSF_field".into(),
+            vec![opt("o_open", "Backlog", 0), opt("o_done", "Done", 1)],
+            vec![
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o_open".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::Done,
+                    option_id: "o_done".into(),
+                },
+            ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        // Normal mapping resolves to its own option.
+        assert_eq!(p.resolved_option_id_for(TaskStatus::Done), Some("o_done"));
+        // Blocked has no row → falls back to the Open option.
+        assert_eq!(
+            p.resolved_option_id_for(TaskStatus::Blocked),
+            Some("o_open")
+        );
+        // InProgress has no row and no fallback → None.
+        assert_eq!(p.resolved_option_id_for(TaskStatus::InProgress), None);
+        // Archived is never mapped to a project option.
+        assert_eq!(p.resolved_option_id_for(TaskStatus::Archived), None);
+    }
+
+    #[test]
+    fn resolved_option_id_for_blocked_with_explicit_mapping_uses_it() {
+        // When a Blocked row *is* stored, it wins over the Open fallback.
+        let p = Project::new(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            "PVTSSF_field".into(),
+            vec![opt("o_open", "Backlog", 0), opt("o_block", "Blocked", 1)],
+            vec![
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o_open".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::Blocked,
+                    option_id: "o_block".into(),
+                },
+            ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.resolved_option_id_for(TaskStatus::Blocked),
+            Some("o_block")
+        );
+    }
+
+    #[test]
+    fn option_name_for_hit_and_miss() {
+        let p = Project::new(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            "PVTSSF_field".into(),
+            vec![opt("o1", "In progress", 0)],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(p.option_name_for("o1"), Some("In progress"));
+        // An id the project doesn't own (e.g. renamed/removed remotely) → None.
+        assert_eq!(p.option_name_for("ghost"), None);
     }
 
     #[test]

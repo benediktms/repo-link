@@ -9,6 +9,7 @@ publish.workspace = true
 domain-core = { workspace = true }
 domain-task = { workspace = true }
 domain-repo = { workspace = true }
+domain-project = { workspace = true }
 ports = { workspace = true }
 dto-shared = { workspace = true }
 async-trait = { workspace = true }

@@ -345,8 +345,8 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             repo_id = excluded.repo_id,
@@ -360,6 +360,11 @@ async fn write_task_in_tx(
             remote_id = excluded.remote_id,
             remote_node_id = excluded.remote_node_id,
             project_item_id = excluded.project_item_id,
+            -- Stage 8 (#39): the cached project-board status must persist on
+            -- upsert too — the poller writes it via `save`, which always hits
+            -- the DO UPDATE half (the row already exists). Omitting this clause
+            -- is the silent-never-persists bug class.
+            project_status_option_id = excluded.project_status_option_id,
             hash = excluded.hash,
             updated_at = excluded.updated_at
         "#,
@@ -377,6 +382,7 @@ async fn write_task_in_tx(
     .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
     .bind(t.remote.as_ref().and_then(|r| r.node_id.clone()))
     .bind(t.project_item_id.as_deref())
+    .bind(t.project_status_option_id.as_deref())
     .bind(&t.hash)
     .bind(t.created_at.into_inner())
     .bind(t.updated_at.into_inner())
@@ -476,6 +482,9 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
     let remote_node_id: Option<String> = row.try_get("remote_node_id").map_err(map_sqlx_err)?;
     let project_item_id: Option<String> = row.try_get("project_item_id").map_err(map_sqlx_err)?;
+    let project_status_option_id: Option<String> = row
+        .try_get("project_status_option_id")
+        .map_err(map_sqlx_err)?;
     let hash: String = row.try_get("hash").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
@@ -508,6 +517,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         relations: Vec::new(),
         comments: Vec::new(),
         project_item_id,
+        project_status_option_id,
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),

@@ -99,4 +99,26 @@ pub struct DriftRow {
     pub title: String,
     pub sync_state: String,
     pub remote_id: Option<String>,
+    /// Which dimensions of this task have drifted. `"sync"` = the REST /
+    /// local snapshot axis (`sync_state` diverged); `"project_status"` = the
+    /// GitHub Projects v2 board status axis (the #39 axis). A row can carry
+    /// either or both — the project-status axis is evaluated independently of
+    /// `sync_state`, so a `Synced` task whose board moved still appears here
+    /// with `reasons = ["project_status"]` and `sync_state = "synced"`.
+    /// Additive; defaults to empty for older consumers.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// The task's CURRENT cached remote project-board status, as a display
+    /// name (e.g. `"Done"`). `None` when the task is projectless or hasn't
+    /// been polled yet. This is the "actual" side of the project-status
+    /// mismatch.
+    #[serde(default)]
+    pub project_status: Option<String>,
+    /// The board status the task's local lifecycle status maps to, as a
+    /// display name (e.g. `"In progress"`) — the "expected" side. `None` when
+    /// projectless or unmappable. Compared against [`Self::project_status`]:
+    /// when both are `Some` and differ, the project-status axis has drifted
+    /// (the #39 acceptance: expected-vs-actual is explicit).
+    #[serde(default)]
+    pub project_status_expected: Option<String>,
 }

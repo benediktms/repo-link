@@ -12,14 +12,17 @@
 //! Each returned item is correlated with its local task by
 //! `project_item_id`; what is reconcilable *now* is reconciled.
 //!
-//! # Stage seam
+//! # Project-status cache (Stage 8, closes #39)
 //!
-//! The per-task cached project-status column does **not** exist yet — it lands
-//! in Stage 8 (closes #39). So this stage's `poll_once` deliberately writes no
-//! project status; it establishes the polling loop, the project enumeration,
-//! the item↔task correlation, and the watermark/partial-page handling. The
-//! obvious reconcile point — where Stage 8 will drop the cache write — is
-//! marked inline (`// Stage 8: write project_status cache here`).
+//! Each correlated item's `status_option_id` is written into the local task's
+//! cached `project_status_option_id` column (via
+//! [`Task::set_project_status_option_id`]) and persisted. That cache is the
+//! remote-board status `rl query drift` compares — *independently* of
+//! `sync_state` — against the option the task's local lifecycle status maps to.
+//! The write is idempotent: the cache is only persisted when the polled value
+//! actually differs from what's stored, so a steady-state re-poll does no
+//! writes. Writing the cache does **not** participate in `sync_state` (a board
+//! move is a separate drift axis, not a `SyncState` transition).
 //!
 //! # Truncation / partiality
 //!
@@ -125,10 +128,12 @@ impl ProjectPoller {
         // One snapshot of the local tasks per pass, indexed by their
         // `project_item_id`. Cheaper than a per-item repository round-trip and
         // there's no project_item_id filter on `TaskFilter`. `include_archived`
-        // so a polled item whose local task is archived still correlates (the
-        // reconcile, in Stage 8, can then decide what to do with it) rather
-        // than appearing unmatched.
-        let by_item_id = self.index_tasks_by_item_id().await?;
+        // so a polled item whose local task is archived still correlates (so
+        // the cache write isn't skipped for it) rather than appearing
+        // unmatched. Held `mut` so the cache write updates the in-memory copy
+        // too — a duplicate item id later in the same pass then compares
+        // against the just-written value and stays idempotent.
+        let mut by_item_id = self.index_tasks_by_item_id().await?;
 
         for project in &projects {
             report.projects_polled += 1;
@@ -176,7 +181,8 @@ impl ProjectPoller {
                 if item.updated_at.into_inner() > max_seen.into_inner() {
                     max_seen = item.updated_at;
                 }
-                self.reconcile_item(&by_item_id, item, &mut report);
+                self.reconcile_item(&mut by_item_id, item, &mut report)
+                    .await;
             }
 
             if page.truncated {
@@ -223,17 +229,24 @@ impl ProjectPoller {
     }
 
     /// Correlate one polled item with a local task by `project_item_id` and
-    /// reconcile what's reconcilable now. In Stage 7 the only reconcilable
-    /// axis is the seam itself: there is no project-status cache column to
-    /// write yet (Stage 8). Unmatched items are logged and skipped — never a
-    /// panic.
-    fn reconcile_item(
+    /// reconcile its cached project-board status (RFC 0001 Stage 8, closes
+    /// #39). Writes `item.status_option_id` into the matched task's
+    /// `project_status_option_id` cache — the value `rl query drift` compares
+    /// against the task's mapped local status, independently of `sync_state`.
+    ///
+    /// Idempotent: persists only when the cached value actually changed (the
+    /// domain setter returns whether it differed), so a steady-state re-poll
+    /// does no writes. A local save failure for one item is logged and skipped
+    /// — never a panic and never an abort of the rest of the page (the cache
+    /// is a hint; the next poll re-attempts). Writing the cache does NOT touch
+    /// `sync_state`. Unmatched items are logged and skipped.
+    async fn reconcile_item(
         &self,
-        by_item_id: &HashMap<String, Task>,
+        by_item_id: &mut HashMap<String, Task>,
         item: &RemoteProjectItem,
         report: &mut PollReport,
     ) {
-        let Some(task) = by_item_id.get(&item.item_node_id) else {
+        let Some(task) = by_item_id.get_mut(&item.item_node_id) else {
             report.items_unmatched += 1;
             debug!(
                 item = %item.item_node_id,
@@ -243,19 +256,38 @@ impl ProjectPoller {
         };
         report.items_matched += 1;
 
-        // Stage 8: write project_status cache here.
-        //
-        // The matched `task` plus `item.status_option_id` is everything Stage
-        // 8 needs to write the cached `tasks.project_status_option_id` column
-        // (and emit a `rl query drift` row when it disagrees with the REST
-        // open/closed axis). That column does not exist yet, so this stage
-        // intentionally records the correlation and stops here.
-        debug!(
-            item = %item.item_node_id,
-            task = %task.id,
-            status_option = ?item.status_option_id,
-            "polled item correlated to local task (Stage 7: reconcile is inert pending the Stage 8 cache column)"
-        );
+        // Cache the remote board status. The setter returns false on a no-op
+        // (cached value unchanged), so we skip the persist entirely in steady
+        // state.
+        if !task.set_project_status_option_id(item.status_option_id.clone()) {
+            return;
+        }
+
+        // Persist via the standard task write. `SnapshotSource::LocalEdit` is
+        // deliberately NON-baseline: the cache column is a separate drift axis
+        // excluded from `snapshot_view`, so re-baselining here (e.g. with
+        // `Pull`) would wrongly reset dirty detection and could mark a genuine
+        // `DirtyLocal` task clean. LocalEdit leaves the diff baseline — and
+        // therefore `sync_state` — untouched.
+        if let Err(e) = self
+            .tasks
+            .save(task, domain_task::SnapshotSource::LocalEdit)
+            .await
+        {
+            warn!(
+                item = %item.item_node_id,
+                task = %task.id,
+                error = %e,
+                "failed to persist polled project-status cache; will retry next cycle"
+            );
+        } else {
+            debug!(
+                item = %item.item_node_id,
+                task = %task.id,
+                status_option = ?item.status_option_id,
+                "cached polled project status"
+            );
+        }
     }
 
     /// Snapshot of every non-`None`-`project_item_id` task, keyed by item id.
@@ -304,7 +336,7 @@ mod tests {
     use super::*;
     use domain_core::WorkspaceId;
     use domain_project::Project;
-    use domain_task::{RemoteRef, SnapshotSource, Task};
+    use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
     use ports::ProjectRepository;
     use testing_fixtures::{
         InMemoryProjectRepository, InMemoryRemoteProjectProvider, InMemoryTaskRepository,
@@ -568,10 +600,64 @@ mod tests {
         );
     }
 
+    /// Stage 8 (#39): a matched item's `status_option_id` is written into the
+    /// local task's `project_status_option_id` cache and persisted, and a
+    /// re-poll of the SAME value does NOT re-write (idempotent: the setter
+    /// no-ops on an unchanged value).
+    #[tokio::test]
+    async fn poll_once_caches_polled_status_and_is_idempotent() {
+        use ports::TaskRepository;
+
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        let proj = project("PVT_kwHO_cache");
+        projects.save(&proj).await.unwrap();
+
+        let ws = WorkspaceId::new();
+        let mut task = Task::new_draft(ws, None, "mirror".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        task.project_item_id = Some("PVTI_42".into());
+        assert_eq!(task.project_status_option_id, None);
+        let task_id = task.id;
+        tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        remote.set_poll_items("PVT_kwHO_cache", vec![item("PVTI_42", Some("o_done"))]);
+
+        let poller = poller(projects, tasks.clone(), remote.clone()).await;
+        let report = poller.poll_once().await.unwrap();
+        assert_eq!(report.items_matched, 1);
+
+        // The cache was written.
+        let reloaded = tasks.get(task_id).await.unwrap();
+        assert_eq!(
+            reloaded.project_status_option_id.as_deref(),
+            Some("o_done"),
+            "the polled status_option_id is cached on the local task"
+        );
+        // The cache write is on a SEPARATE axis: sync_state stays Synced.
+        assert_eq!(reloaded.sync, SyncState::Synced);
+
+        // Snapshot count is the persist counter: each `save` appends one row.
+        let snaps = tasks.snapshots_handle();
+        let versions_after_first = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);
+
+        // Re-poll the SAME value: the setter no-ops, so no further save (no new
+        // snapshot row appended).
+        let report2 = poller.poll_once().await.unwrap();
+        assert_eq!(report2.items_matched, 1);
+        let versions_after_second = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);
+        assert_eq!(
+            versions_after_second, versions_after_first,
+            "an unchanged re-poll must not re-persist the cache"
+        );
+    }
+
     /// No projects → an inert pass: the provider is never polled and the
-    /// report is all-zero. (The Stage-8 cache-write seam is present but inert
-    /// in every pass — proven by the matched-item test above not asserting
-    /// any status write, because there is no column to write yet.)
+    /// report is all-zero.
     #[tokio::test]
     async fn poll_once_with_no_projects_is_inert() {
         let projects = Arc::new(InMemoryProjectRepository::new());
