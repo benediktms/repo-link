@@ -7,8 +7,10 @@
 //! project via the optional `Workspace.project_id` axis; one project can
 //! parent many workspaces.
 
+mod mapping;
 mod project;
 mod status;
 
+pub use mapping::derive_status_mappings;
 pub use project::Project;
 pub use status::{StatusMapping, StatusOption};

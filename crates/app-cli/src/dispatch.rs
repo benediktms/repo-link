@@ -44,7 +44,7 @@ pub(crate) async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> 
         Cmd::Sync(c) => sync_dispatch(c, svc, cfg).await,
         Cmd::Gh(c) => gh_dispatch(c, cfg).await,
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
-        Cmd::Project(c) => project_dispatch(c, svc).await,
+        Cmd::Project(c) => project_dispatch(c, svc, cfg).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
     }
 }

@@ -1,25 +1,32 @@
-//! infra-github — GitHub adapter implementing [`ports::RemoteTaskProvider`].
+//! infra-github — GitHub adapter implementing [`ports::RemoteTaskProvider`]
+//! and [`ports::RemoteProjectProvider`].
 //!
 //! Issues are the underlying remote task object. Promotion creates an issue;
-//! push updates it; pull fetches its current state. The REST surface is
-//! driven by `octocrab`.
+//! push updates it; pull fetches its current state. Projects v2 boards layer
+//! on top: a project's Status field, draft issues, and membership are
+//! GraphQL-only (GitHub sunset the REST projects API).
 //!
 //! # Internals
 //!
 //! Protocol-specific code is split into submodules so REST and GraphQL stay
 //! distinct:
 //!
-//! - [`rest`] — issue CRUD via `octocrab`'s REST handlers (today's full
-//!   implementation). Owns the issue-model mapping, URL parsing, and the
-//!   `state_reason` enum mapping.
-//! - `graphql` *(future)* — sibling module for capabilities only exposed
-//!   via GraphQL (Projects v2 status fields, sub-issue parents, custom
-//!   fields). The wrapper struct below will compose both clients.
+//! - [`rest`] — issue CRUD via `octocrab`'s REST handlers. Owns the
+//!   issue-model mapping, URL parsing, and the `state_reason` enum mapping.
+//! - [`graphql`] — the Projects v2 surface via `octocrab.graphql()`: status
+//!   schema fetch, draft create/update/convert, item attach, status writes,
+//!   and the per-project delta poll.
+//!
+//! [`GithubAdapter`] composes both clients and routes each port method to
+//! whichever protocol supports it.
 
+mod graphql;
 mod provider;
 mod rest;
 
 #[cfg(test)]
+mod graphql_tests;
+#[cfg(test)]
 mod tests;
 
-pub use provider::GithubTaskProvider;
+pub use provider::GithubAdapter;

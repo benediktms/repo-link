@@ -51,8 +51,10 @@ pub trait RemoteProjectProvider: Send + Sync {
     async fn fetch_project(&self, owner: &str, number: u64) -> PortResult<RemoteProjectSnapshot>;
 
     /// Attach an existing issue to a project. Returns the new item's
-    /// `PVTI_…` node ID. Idempotent: re-calling for the same content
-    /// returns the existing item ID rather than creating a duplicate row.
+    /// `PVTI_…` node ID. Idempotent in practice because it relies on
+    /// GitHub's server-side idempotency of `addProjectV2ItemById` — re-adding
+    /// the same content returns the existing item rather than duplicating it;
+    /// the adapter does not itself dedupe.
     async fn add_item(&self, project_node_id: &str, issue_node_id: &str) -> PortResult<String>;
 
     /// Create a draft issue directly in the project. Returns the new item's
@@ -99,9 +101,16 @@ pub trait RemoteProjectProvider: Send + Sync {
     /// Poll a project for items changed since `since` matching `query`
     /// (e.g. `"is:open"`). Returns both issue-backed items and drafts;
     /// `RemoteProjectItem.issue_node_id` is `None` for drafts.
+    ///
+    /// `status_field_id` is the project's chosen Status field (`PVTSSF_…`, as
+    /// resolved by [`Self::fetch_project`] and persisted on the project). The
+    /// item's status option is read from *that* field by id — not by the
+    /// literal field name "Status", which would miss boards whose single-select
+    /// field is named anything else.
     async fn poll_project_items(
         &self,
         project_node_id: &str,
+        status_field_id: &str,
         since: Timestamp,
         query: &str,
     ) -> PortResult<Vec<RemoteProjectItem>>;

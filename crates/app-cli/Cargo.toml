@@ -33,6 +33,10 @@ rpassword = { workspace = true }
 assert_cmd = { workspace = true }
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
+# `rl project link` fetches a project schema over GraphQL; the CLI tests
+# point `REPO_LINK_GITHUB_API_BASE_URL` at a wiremock server to exercise the
+# online link path without touching api.github.com.
+wiremock = { workspace = true }
 
 # `src/bin/repo-link.rs` and `src/bin/rl.rs` are auto-discovered.
 # Both are thin shims around `app_cli::run()` in `src/lib.rs`.

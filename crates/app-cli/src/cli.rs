@@ -550,33 +550,14 @@ pub(crate) enum AgentsCmd {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProjectCmd {
-    /// Link a project locally with hand-entered schema. Stage 5 will
-    /// rewire this to fetch the schema from GitHub; the local model and
-    /// CLI shape stay the same either way.
-    ///
-    /// `--option` takes `<option-id>:<name>` and is repeatable; the
-    /// option's `ordinal` is the order it appears on the command line.
-    /// `--map` takes `<status>:<option-id>` and seeds initial mappings.
-    /// Many-to-one mappings (multiple statuses → one option, e.g. `open`
-    /// and `blocked` both → "Backlog") are supported and persist losslessly.
+    /// Link a project by fetching its schema from GitHub. `<target>` is
+    /// `owner/number` (e.g. `benediktms/3`). The Status field and its option
+    /// catalog are read over GraphQL, and the local-status → option mapping
+    /// is auto-derived by option name (refine it later with `rl project map`).
+    /// Requires a GitHub token (see `rl gh auth`).
     Link {
-        #[arg(long)]
-        node_id: String,
-        #[arg(long)]
-        owner: String,
-        #[arg(long)]
-        number: u64,
-        #[arg(long)]
-        title: String,
-        #[arg(long)]
-        status_field_id: String,
-        /// Status field option as `<option-id>:<name>`. Repeat per option.
-        #[arg(long = "option", value_parser = parse_option_kv)]
-        options: Vec<(String, String)>,
-        /// Initial mapping as `<status>:<option-id>`. Repeat per mapping.
-        /// `<status>` is one of `open`, `in_progress`, `blocked`, `done`.
-        #[arg(long = "map", value_parser = parse_mapping_kv)]
-        mappings: Vec<(String, String)>,
+        /// The project to link, as `owner/number` (e.g. `benediktms/3`).
+        target: String,
     },
     /// List every locally-known project (across all workspaces).
     List,
@@ -595,30 +576,4 @@ pub(crate) enum ProjectCmd {
     /// Unlink a project locally. Workspaces attached to it have their
     /// `project_id` reset to NULL via the storage cascade.
     Unlink { spec: String },
-}
-
-/// Parse `<option-id>:<name>` into a tuple for clap's `value_parser`.
-fn parse_option_kv(raw: &str) -> std::result::Result<(String, String), String> {
-    let (id, name) = raw
-        .split_once(':')
-        .ok_or_else(|| format!("expected `<option-id>:<name>`, got {raw:?}"))?;
-    if id.is_empty() || name.is_empty() {
-        return Err(format!(
-            "option-id and name must both be non-empty, got {raw:?}"
-        ));
-    }
-    Ok((id.to_string(), name.to_string()))
-}
-
-/// Parse `<status>:<option-id>` into a tuple for clap's `value_parser`.
-fn parse_mapping_kv(raw: &str) -> std::result::Result<(String, String), String> {
-    let (status, opt) = raw
-        .split_once(':')
-        .ok_or_else(|| format!("expected `<status>:<option-id>`, got {raw:?}"))?;
-    if status.is_empty() || opt.is_empty() {
-        return Err(format!(
-            "status and option-id must both be non-empty, got {raw:?}"
-        ));
-    }
-    Ok((status.to_string(), opt.to_string()))
 }
