@@ -205,7 +205,24 @@ impl WorkspaceService {
                 if task.project_item_id.is_some() {
                     continue;
                 }
-                let Some(node_id) = task.remote.as_ref().and_then(|r| r.node_id.clone()) else {
+                // No remote at all → a local-only / draft task. Skip silently:
+                // it isn't board-eligible via AddItem (it goes through
+                // CreateDraftIssue on promote), and "run `rl sync pull`" would
+                // be misleading advice for a task with nothing to pull.
+                let Some(remote) = task.remote.as_ref() else {
+                    continue;
+                };
+                let Some(node_id) = remote.node_id.clone() else {
+                    // Issue-backed but no GraphQL node id → can't AddItem.
+                    // Pre-project-sync tasks recorded a remote before node ids
+                    // were persisted; they backfill it on their next `sync
+                    // pull`. Log instead of skipping silently so a "0 added"
+                    // backfill is diagnosable (RFC 0001 §9 / §D1).
+                    tracing::warn!(
+                        task_id = %task.id,
+                        remote_id = remote.remote_id.as_str(),
+                        "set-project backfill: task has no remote node_id; skipping AddItem (run `rl sync pull` on it to backfill the node id)"
+                    );
                     continue;
                 };
                 // Dedup against a re-run / pre-drain re-attach: if this task
@@ -474,6 +491,46 @@ mod tests {
         let all = outbox.all();
         assert_eq!(all.len(), 2, "one AddItem per unattached issue");
         assert!(all.iter().all(|e| e.mutation.kind() == "add_item"));
+    }
+
+    #[tokio::test]
+    async fn set_project_skips_issue_with_no_node_id() {
+        // rpl-4ui: a pre-project-sync task carries a remote_id but no GraphQL
+        // node id, so it can't be AddItem'd. It's skipped (and logged — the
+        // skip is no longer silent), not enqueued with a bogus node id.
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+
+        let project = backfill_project("PVT_kwHO_nonode");
+        projects.save(&project).await.unwrap();
+
+        let ws_repo_dyn: Arc<dyn WorkspaceRepository> = ws_repo.clone();
+        let proj_dyn: Arc<dyn ProjectRepository> = projects.clone();
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let tasks_dyn: Arc<dyn TaskRepository> = tasks.clone();
+        let svc = WorkspaceService::with_projects(ws_repo_dyn, proj_dyn)
+            .with_outbox(outbox_dyn, tasks_dyn);
+
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws_repo.save(&ws).await.unwrap();
+
+        // One issue-backed mirror WITHOUT a node id, plus one with — only the
+        // node-id-bearing task is enqueued.
+        save_mirror(&tasks, ws.id, None, None).await;
+        save_mirror(&tasks, ws.id, Some("I_has_node"), None).await;
+
+        svc.set_project(&ws.id.to_string(), Some(project.id.as_str()))
+            .await
+            .unwrap();
+
+        let all = outbox.all();
+        assert_eq!(all.len(), 1, "only the node-id-bearing task is enqueued");
+        assert!(matches!(
+            &all[0].mutation,
+            OutboxMutation::AddItem { issue_node_id, .. } if issue_node_id == "I_has_node"
+        ));
     }
 
     #[tokio::test]

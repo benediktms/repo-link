@@ -352,6 +352,23 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(())
     }
 
+    async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()> {
+        // Targeted single-column write: mutate ONLY the remote's `node_id` on
+        // the stored task, preserving every other field — no snapshot, no
+        // version bump, no `sync` change. No-op if the task is absent or has no
+        // remote ref (nothing to hang the node id off).
+        if let Some(remote) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&task_id)
+            .and_then(|t| t.remote.as_mut())
+        {
+            remote.node_id = Some(node_id);
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())

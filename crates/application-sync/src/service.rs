@@ -72,10 +72,14 @@ impl SyncService {
             })
             .await?;
 
-        task.promote_to_remote(RemoteRef::new(
-            provider_label(&canonical),
-            snap.remote_id.clone(),
-        ))?;
+        let mut remote_ref = RemoteRef::new(provider_label(&canonical), snap.remote_id.clone());
+        // Capture the GraphQL node id the REST create response carried, so the
+        // freshly promoted task is immediately board-eligible (the §D1 AddItem
+        // path needs it). Dropping it here was the create/promote half of the
+        // bug — a promoted task landed with node_id null and never reached the
+        // board (RFC 0001 §9 / §D1).
+        remote_ref.node_id = snap.node_id.clone();
+        task.promote_to_remote(remote_ref)?;
         self.tasks.save(&task, SnapshotSource::Promote).await?;
         Ok(summary(&task, prev, SyncDecision::PushLocal))
     }
@@ -181,6 +185,22 @@ impl SyncService {
             .provider
             .fetch_remote(&canonical, &remote.remote_id)
             .await?;
+        // Backfill the GraphQL node id for a pre-project-sync task whose
+        // remote was recorded before node ids were persisted. Without it the
+        // task can never be added to a board (addProjectV2ItemById needs it),
+        // so eager backfill skips it silently. This was the fetch/pull half of
+        // the bug (RFC 0001 §9 / §D1). `node_id` is invisible to dirty
+        // detection, so capturing it here can't perturb the drift decision.
+        let node_id_backfill: Option<String> = match task.remote.as_ref() {
+            Some(r) if r.node_id.is_none() => snap.node_id.clone(),
+            _ => None,
+        };
+        if let (Some(nid), Some(r)) = (node_id_backfill.as_ref(), task.remote.as_mut()) {
+            // Keep the in-memory aggregate consistent so any whole-row save the
+            // decision below performs (PrePull / Pull) persists the node id
+            // too; the targeted update after the match covers the Noop branch.
+            r.node_id = Some(nid.clone());
+        }
         // Drift is decided on the *mirrored* content (title / body / assignees),
         // not on `updated_at`. GitHub bumps `updated_at` on any activity —
         // comments, reactions, label edits, sub-issue changes — none of which
@@ -243,6 +263,15 @@ impl SyncService {
             .await?;
         self.tasks.replace_comments(id, &comments).await?;
 
+        // Persist the node-id backfill with a targeted single-column write.
+        // Redundant after a PullRemote whole-row save (it already wrote the
+        // mutated ref) but idempotent, and it's the *only* persistence on the
+        // Noop branch — which is the common backfill case, since a
+        // pre-project-sync task with no field drift never triggers a save.
+        if let Some(nid) = node_id_backfill {
+            self.tasks.cache_remote_node_id(id, nid).await?;
+        }
+
         if let Some(tid) = manual_merge {
             return Err(SyncError::ManualMerge(tid));
         }
@@ -293,7 +322,7 @@ impl SyncService {
                 )))
             })?;
 
-        let new_remote = RemoteRef::new("github", new_remote_id.to_string());
+        let mut new_remote = RemoteRef::new("github", new_remote_id.to_string());
 
         if relink {
             // Verified relink overwrites title/body/assignees from the new
@@ -342,6 +371,10 @@ impl SyncService {
             task.title = snap.title;
             task.body = snap.body;
             task.assignees = snap.assignees;
+            // The fetched snapshot is the authoritative target, so carry its
+            // node id onto the relinked ref — a relinked task should be just as
+            // board-eligible as a freshly promoted one (RFC 0001 §9 / §D1).
+            new_remote.node_id = snap.node_id;
             task.link_to_remote(binding.id, new_remote.clone(), false)?;
             let new_comments = self
                 .provider
@@ -462,6 +495,7 @@ mod tests {
             *self.last_create.lock().unwrap() = Some(cmd.title.to_string());
             Ok(RemoteTaskSnapshot {
                 remote_id: "100".into(),
+                node_id: Some("I_kwDOfake100".into()),
                 title: cmd.title.into(),
                 body: cmd.body.into(),
                 closed: false,
@@ -480,6 +514,7 @@ mod tests {
             });
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
+                node_id: None,
                 title: cmd.title.unwrap_or("").into(),
                 body: cmd.body.unwrap_or("").into(),
                 closed: cmd.closed.unwrap_or(false),
@@ -575,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_creates_remote_and_marks_pushed() {
-        let (svc, _tasks, task, provider) = setup().await;
+        let (svc, tasks, task, provider) = setup().await;
         let s = svc.promote(&task.id.to_string()).await.unwrap();
         assert_eq!(s.previous_state, "local_only");
         assert_eq!(s.new_state, "synced");
@@ -584,6 +619,14 @@ mod tests {
         assert_eq!(
             provider.last_create.lock().unwrap().as_deref(),
             Some("ship it")
+        );
+        // The node id from the REST create response is captured onto the
+        // RemoteRef and persisted, so the promoted task is board-eligible
+        // (rpl-4ui — the create/promote half of the bug).
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            saved.remote.unwrap().node_id.as_deref(),
+            Some("I_kwDOfake100")
         );
     }
 
@@ -623,6 +666,7 @@ mod tests {
         let later = Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: "new title".into(),
             body: "remote body".into(),
             closed: false,
@@ -638,6 +682,48 @@ mod tests {
         assert_eq!(after.body, "remote body");
         assert_eq!(after.assignees, vec!["bob".to_string()]);
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn pull_backfills_missing_remote_node_id_on_noop() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Simulate a pre-project-sync task: drop the node id the promote
+        // captured, leaving a Synced task with a remote_id but no node id —
+        // exactly the row eager backfill can't add to a board.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.remote.as_mut().unwrap().node_id = None;
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        // Remote mirrors the local baseline (no field drift → Noop) but the
+        // fetched snapshot now carries the node id.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: Some("I_kwDObackfilled".into()),
+            title: t.title.clone(),
+            body: t.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: t.assignees.clone(),
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        // No title/body/assignee drift, so the snapshot axis is a noop...
+        assert_eq!(s.decision, "noop");
+        // ...yet the node id is still backfilled via the targeted column write.
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            saved.remote.unwrap().node_id.as_deref(),
+            Some("I_kwDObackfilled"),
+            "pull backfills the node id even when there's no content drift"
+        );
+        assert_eq!(
+            saved.sync,
+            SyncState::Synced,
+            "backfill must not perturb sync state"
+        );
     }
 
     #[tokio::test]
@@ -672,6 +758,7 @@ mod tests {
         let before = tasks.get(task.id).await.unwrap();
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: before.title.clone(),
             body: before.body.clone(),
             closed: false,
@@ -701,6 +788,7 @@ mod tests {
         let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: before.title.clone(),
             body: before.body.clone(),
             closed: false,
@@ -738,6 +826,7 @@ mod tests {
         let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: t.title.clone(),
             body: t.body.clone(),
             closed: false,
@@ -766,6 +855,7 @@ mod tests {
         let much_later = Timestamp::from_utc(Utc::now() + chrono::Duration::hours(1));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: before.title.clone(),
             body: before.body.clone(),
             closed: false,
@@ -807,6 +897,7 @@ mod tests {
         let later = Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            node_id: None,
             title: "remote title".into(),
             body: "remote body".into(),
             closed: false,
@@ -944,6 +1035,7 @@ mod tests {
         // Stub the new remote so the existence check inside link() succeeds.
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "999".into(),
+            node_id: None,
             title: "irrelevant".into(),
             body: "irrelevant".into(),
             closed: false,
@@ -977,6 +1069,7 @@ mod tests {
         // The post-relink fetch_remote returns the new authoritative snapshot.
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "1506".into(),
+            node_id: Some("I_kwDOtransferred1506".into()),
             title: "transferred title".into(),
             body: "transferred body".into(),
             closed: false,
@@ -995,6 +1088,12 @@ mod tests {
         let after = tasks.get(task.id).await.unwrap();
         assert_eq!(after.remote.as_ref().unwrap().remote_id, "1506");
         assert_eq!(after.title, "transferred title");
+        // The relinked ref carries the node id from the authoritative target
+        // snapshot, so a relinked task is board-eligible like a promoted one.
+        assert_eq!(
+            after.remote.as_ref().unwrap().node_id.as_deref(),
+            Some("I_kwDOtransferred1506")
+        );
         // Baseline rewritten from the new remote → reconcile sees no diff.
         assert_eq!(after.sync, SyncState::Synced);
     }

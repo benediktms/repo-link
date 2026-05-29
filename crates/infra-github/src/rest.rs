@@ -383,6 +383,10 @@ fn map_comment(c: Comment) -> RemoteComment {
 fn map_issue(issue: Issue) -> RemoteTaskSnapshot {
     RemoteTaskSnapshot {
         remote_id: issue.number.to_string(),
+        // GitHub's REST issue payload always carries the GraphQL node id; it's
+        // what `addProjectV2ItemById` needs, so we surface it on every create /
+        // fetch / update path rather than dropping it here (RFC 0001 §9 / §D1).
+        node_id: Some(issue.node_id),
         title: issue.title,
         body: issue.body.unwrap_or_default(),
         closed: matches!(issue.state, IssueState::Closed),
