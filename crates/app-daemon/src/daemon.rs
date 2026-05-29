@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use application_sync::OutboxDrainer;
+use application_sync::{OutboxDrainer, ProjectPoller};
 use application_workspace::{RepoBindingService, WorkspaceService};
 use domain_core::RepoId;
 use domain_sync::{OutboxEntry, OutboxMutation};
@@ -11,10 +11,38 @@ use domain_task::SyncState;
 use dto_shared::UnlinkWorktreeCmd;
 use ports::{FilesystemProbe, OutboxRepository, TaskFilter, TaskRepository};
 use tokio::signal;
+use tokio::sync::{Notify, watch};
 use tracing::{Instrument, error, info, info_span, warn};
 
 use crate::error::DaemonError;
 use crate::report::{TickReport, write_last_tick_atomic};
+
+/// Cadence of the poller task: project poll, worktree reconcile, grace-prune,
+/// and heartbeat all share this tick (RFC 0001 Stage 7 §7c, §D4 30–60s band).
+/// This task writes the single combined `last_tick.json`, so it stays the
+/// primary cadence `rl daemon status` measures "wedged" against. Used as the
+/// default for `--interval-secs` (which still overrides it); `run` is handed
+/// the resolved cadence so tests can shorten it.
+// TODO(config): expose via infra-config once a user actually asks.
+pub const PROJECT_POLLER_INTERVAL: Duration = Duration::from_secs(45);
+
+/// Periodic safety-net sweep for the drainer task (RFC 0001 Stage 7 §7c). The
+/// drainer's primary trigger is just-in-time via a `tokio::sync::Notify`, but
+/// that `Notify` only fires for *in-process* (daemon-originated) enqueues. A
+/// `rl task start/edit/complete` runs in a SEPARATE process and enqueues
+/// straight into the shared SQLite outbox — the daemon never sees that signal.
+/// This 5s sweep is what catches those cross-process enqueues.
+// TODO(config): expose via infra-config once a user actually asks.
+const OUTBOX_DRAINER_PERIODIC_SWEEP: Duration = Duration::from_secs(5);
+
+/// Upper bound on how long shutdown waits for a task to observe cancellation
+/// and unwind after the cancel signal is sent (Stage 7, #55). The task bodies
+/// return promptly via their `cancel` arm, but a `tick_once` / `drain_tick`
+/// stalled in network I/O (including the panic-triggered shutdown path, where
+/// the surviving task may be mid-`.await`) would otherwise make the post-cancel
+/// `JoinHandle.await` hang forever. After this grace elapses the outstanding
+/// handle is `.abort()`ed so shutdown is guaranteed to complete.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Serde-serialised form of `domain_repo::LinkStatus::MissingPath` —
 /// the enum carries `#[serde(rename_all = "snake_case")]`, so the DTO
@@ -36,6 +64,16 @@ pub struct Daemon {
     /// verbs enqueue outbox entries (in `application-task` /
     /// `application-workspace`); the daemon drains them here.
     drainer: Option<Arc<OutboxDrainer>>,
+    /// Inbound counterpart to the drainer (Stage 7, #55): polls each known
+    /// project and correlates items with local tasks. `None` when no GitHub
+    /// token is configured (same gate as the drainer) — the daemon then only
+    /// reconciles worktrees.
+    poller: Option<Arc<ProjectPoller>>,
+    /// Just-in-time wake for the drainer task. Daemon-originated enqueues
+    /// (currently the startup reconcile) call `notify_one`; CLI-originated
+    /// enqueues cross the process boundary and are caught by the periodic
+    /// sweep instead. Always present so callers needn't branch on the token.
+    drainer_notify: Arc<Notify>,
     /// Outbox handle for the one-time startup reconcile (see
     /// [`Self::reconcile_dirty_into_outbox`]). Shares the same repo the
     /// drainer reads.
@@ -57,12 +95,14 @@ pub struct Daemon {
 }
 
 impl Daemon {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspaces: WorkspaceService,
         bindings: RepoBindingService,
         tasks: Arc<dyn TaskRepository>,
         probe: Arc<dyn FilesystemProbe>,
         drainer: Option<Arc<OutboxDrainer>>,
+        poller: Option<Arc<ProjectPoller>>,
         outbox: Option<Arc<dyn OutboxRepository>>,
     ) -> Self {
         Self {
@@ -71,6 +111,8 @@ impl Daemon {
             tasks,
             probe,
             drainer,
+            poller,
+            drainer_notify: Arc::new(Notify::new()),
             outbox,
             prune: false,
             missing_grace_ticks: 3,
@@ -78,6 +120,14 @@ impl Daemon {
             state_dir: None,
             interval_secs: 60,
         }
+    }
+
+    /// Handle to the drainer's just-in-time wake. The CLI process can't reach
+    /// this (it enqueues across the process boundary), but in-process callers
+    /// — and tests — use it to nudge the drainer awake without waiting for the
+    /// periodic sweep.
+    pub fn drainer_notify(&self) -> Arc<Notify> {
+        self.drainer_notify.clone()
     }
 
     /// When true, reconcile passes also drop entries marked `MissingPath` —
@@ -123,8 +173,13 @@ impl Daemon {
         self.missing_grace_ticks
     }
 
-    /// One full reconcile + push pass. Returns counts so callers can log
-    /// progress and tests can assert.
+    /// One full reconcile pass: worktree reconcile + grace-prune (when
+    /// enabled) + project poll + heartbeat. This is the **poller task's** unit
+    /// of work in the two-task split (Stage 7, #55) — outbound draining is the
+    /// separate drainer task's job (see [`Self::drain_tick`]), so `tick_once`
+    /// no longer drains. It still writes the single combined `last_tick.json`
+    /// so `rl daemon status` keeps one primary cadence to measure against.
+    /// Returns counts so callers can log progress and tests can assert.
     pub async fn tick_once(&self) -> Result<TickReport, DaemonError> {
         let mut report = TickReport::default();
 
@@ -180,23 +235,22 @@ impl Daemon {
             .await?;
         }
 
-        // Outbound work is the drainer's job (Stage 6 cutover, #54). It runs
-        // once per tick across ALL tasks — outbox entries are enqueued by the
-        // lifecycle / edit verbs, not scanned for here. This replaces the
-        // former per-workspace `DirtyLocal → SyncService::push` loop; there is
-        // no double-write because the drainer is now the only outbound path the
-        // daemon drives (`rl task claim` keeps its own inline push for
-        // interactive feedback — a deliberate exception).
-        if let Some(drainer) = &self.drainer {
-            match drainer.drain_once().await {
-                Ok(n) => {
-                    report.pushed += n;
-                    info!(drained = n, "outbox drained");
-                }
-                Err(e) => {
-                    warn!(error = %e, "outbox drain failed");
-                    report.push_failures.push(format!("drain: {e}"));
-                }
+        // Inbound work: poll each known project and correlate items with local
+        // tasks (Stage 7, #55). Folded into this task so the poll, reconcile,
+        // and heartbeat share one cadence. A poll failure is non-fatal — it's
+        // logged and the next cycle retries; correctness lives in the poller's
+        // own per-project skip-and-continue. (Outbound draining is the separate
+        // drainer task — see `Self::drain_tick` — so it is intentionally NOT
+        // called here; doing both here would double-drive the outbox.)
+        if let Some(poller) = &self.poller {
+            match poller.poll_once().await {
+                Ok(p) => info!(
+                    projects = p.projects_polled,
+                    items = p.items_seen,
+                    matched = p.items_matched,
+                    "project poll complete"
+                ),
+                Err(e) => warn!(error = %e, "project poll failed"),
             }
         }
 
@@ -221,6 +275,31 @@ impl Daemon {
         self.write_last_tick(&report);
 
         Ok(report)
+    }
+
+    /// The **drainer task's** unit of work: one `OutboxDrainer::drain_once`
+    /// pass over ALL tasks (Stage 6 cutover, #54). Outbox entries are enqueued
+    /// by the lifecycle / edit verbs (in `application-task` /
+    /// `application-workspace`) — not scanned for here. Returns the count
+    /// drained so the loop can log; a drain error is non-fatal (logged by the
+    /// caller, then the next sweep / notify retries). No-ops when no GitHub
+    /// token is configured (`self.drainer` is `None`).
+    ///
+    /// `rl task claim` keeps its own inline synchronous push for interactive
+    /// feedback — a deliberate, documented exception to "the drainer is the
+    /// only outbound path the daemon drives."
+    pub async fn drain_tick(&self) -> Result<usize, DaemonError> {
+        let Some(drainer) = &self.drainer else {
+            return Ok(0);
+        };
+        let n = drainer
+            .drain_once()
+            .await
+            .map_err(|e| DaemonError::Sync(e.to_string()))?;
+        if n > 0 {
+            info!(drained = n, "outbox drained");
+        }
+        Ok(n)
     }
 
     /// Recover entries orphaned `inflight` by a previous run (#54). The claim
@@ -441,8 +520,47 @@ impl Daemon {
         Ok((pruned, still_valid))
     }
 
-    /// Drive `tick_once` on a fixed interval until ctrl-c.
-    pub async fn run(self, interval: Duration) -> Result<(), DaemonError> {
+    /// Drive the daemon until a shutdown signal (SIGINT / SIGTERM) or a panic
+    /// in either background task.
+    ///
+    /// Stage 7 (#55) restructures this from a single ticker into **two
+    /// concurrent `tokio::spawn`'d tasks** coordinated by a shared
+    /// `tokio::sync::watch<bool>` cancellation (no `tokio-util`):
+    ///
+    /// - **Poller task** (`PROJECT_POLLER_INTERVAL`): runs [`Self::tick_once`]
+    ///   — project poll + worktree reconcile + grace-prune + the single
+    ///   combined heartbeat. Its cadence is the one `rl daemon status` measures
+    ///   "wedged" against.
+    /// - **Drainer task**: a `select!` over (a) the just-in-time
+    ///   `drainer_notify` and (b) a `OUTBOX_DRAINER_PERIODIC_SWEEP` ticker;
+    ///   either wake runs [`Self::drain_tick`]. The notify only fires for
+    ///   in-process enqueues; the sweep is what catches CLI-originated
+    ///   (cross-process) enqueues.
+    ///
+    /// Each task does its FIRST unit of work IMMEDIATELY on startup, then
+    /// settles into its cadence — no warm-up `tick()` eats the first run (#88).
+    ///
+    /// Shutdown / join: a `tokio::select!` waits on the two `JoinHandle`s plus
+    /// the shutdown signal. A handle resolving to `Err` (a `JoinError`, i.e. a
+    /// panic) trips the shared cancellation so the *other* task also stops; a
+    /// clean return is not a panic and is allowed to complete. Per-task tick
+    /// errors stay non-fatal (logged, loop continues) — only a panic trips
+    /// global shutdown. `interval` overrides the poller cadence (used by tests
+    /// and honoured for `--interval-secs`); the drainer sweep is fixed.
+    pub async fn run(self: Arc<Self>, interval: Duration) -> Result<(), DaemonError> {
+        self.run_until(interval, shutdown_signal()).await
+    }
+
+    /// [`Self::run`] with an injectable shutdown future. Production passes
+    /// [`shutdown_signal`] (SIGINT / SIGTERM); tests pass their own future
+    /// (e.g. a `Notify::notified()`) to drive a clean shutdown deterministically
+    /// without raising real process signals. All the spawn / join / panic
+    /// semantics live here so both paths share them.
+    pub async fn run_until(
+        self: Arc<Self>,
+        interval: Duration,
+        shutdown: impl std::future::Future<Output = ()> + Send,
+    ) -> Result<(), DaemonError> {
         // Crash recovery first: reset any entries stranded `inflight` by a
         // previous run back to `pending` so they (and their blocked tail)
         // drain again (#54). Must precede the reconcile so its pending-guard
@@ -457,13 +575,81 @@ impl Daemon {
         if let Err(e) = self.reconcile_dirty_into_outbox().await {
             warn!(error = %e, "startup outbox reconcile failed");
         }
+        // The startup reconcile is a daemon-originated enqueue, so wake the
+        // drainer immediately rather than waiting for its first sweep.
+        self.drainer_notify.notify_one();
 
+        // Shared cancellation. `true` = shut down. Both tasks watch it; the
+        // join loop flips it on a panic so the surviving task stops too.
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let mut poller_task = {
+            let daemon = self.clone();
+            let mut cancel = cancel_rx.clone();
+            tokio::spawn(async move { daemon.run_poller_task(interval, &mut cancel).await })
+        };
+
+        let mut drainer_task = {
+            let daemon = self.clone();
+            let mut cancel = cancel_rx.clone();
+            tokio::spawn(async move { daemon.run_drainer_task(&mut cancel).await })
+        };
+
+        // Join + shutdown. Any of: the shutdown future resolves; OR a task ends
+        // (its `JoinHandle` resolves). The join loop treats ANY task return as
+        // "trip global shutdown", which is only correct because each task body
+        // is an infinite loop that returns ONLY via its cancel arm (see the
+        // invariant comments on `run_poller_task` / `run_drainer_task`). So a
+        // handle resolving while `*cancel_rx.borrow()` is still `false` means
+        // the task exited on its own, unexpectedly — either a panic
+        // (`Err(JoinError)`) or a clean-but-spurious `return`; both are loud
+        // `error!`s here, distinguished from the normal cancel-driven exit
+        // (cancel already `true`). The `&mut handle` arms borrow the handles so
+        // the one that *didn't* fire is still ownable below — a completed
+        // `JoinHandle` must never be awaited twice.
+        let mut poller_done = false;
+        let mut drainer_done = false;
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown requested; stopping daemon tasks");
+            }
+            res = &mut poller_task => {
+                poller_done = true;
+                report_unexpected_task_exit("poller", res, &cancel_rx);
+            }
+            res = &mut drainer_task => {
+                drainer_done = true;
+                report_unexpected_task_exit("drainer", res, &cancel_rx);
+            }
+        }
+        // Whatever woke us, signal both tasks to stop and await only the
+        // handles that haven't already resolved — but bound the wait. A task
+        // stalled in I/O (e.g. a `tick_once` / `drain_tick` mid network call,
+        // including the panic-triggered shutdown path where the surviving task
+        // is mid-`.await`) would otherwise hang this join forever. If the grace
+        // elapses, `.abort()` the outstanding handle(s) so shutdown always
+        // completes. A clean cancel-driven exit resolves well within the grace,
+        // so the abort path is a safety net, not the normal route.
+        let _ = cancel_tx.send(true);
+        join_with_grace(poller_done, poller_task, drainer_done, drainer_task).await;
+        Ok(())
+    }
+
+    /// Poller task body: tick once immediately (#88), then on every
+    /// `interval` until cancelled. A tick error is logged, not fatal.
+    ///
+    /// INVARIANT: this MUST NOT return except via the `cancel` arm. The
+    /// `run_until` join loop treats ANY return from this task as a signal to
+    /// trip global shutdown, so a stray `return` / `break` would silently take
+    /// the whole daemon down. Tick errors are therefore logged and the loop
+    /// continues — never propagated out.
+    async fn run_poller_task(&self, interval: Duration, cancel: &mut watch::Receiver<bool>) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Tick once immediately so the daemon is useful at startup, not
-        // `interval` seconds later.
-        ticker.tick().await;
-
+        // The first `tick()` on a fresh interval returns immediately, so this
+        // performs the first unit of work right away (no warm-up tick eating
+        // it — #88).
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -474,19 +660,167 @@ impl Daemon {
                             worktrees_checked = report.worktrees_checked,
                             marked_missing = report.marked_missing,
                             pruned = report.pruned,
-                            pushed = report.pushed,
-                            push_failures = report.push_failures.len(),
-                            "tick complete"
+                            "poller tick complete"
                         ),
-                        Err(e) => error!(error = %e, "tick failed"),
+                        Err(e) => error!(error = %e, "poller tick failed"),
                     }
                 }
-                _ = signal::ctrl_c() => {
-                    info!("ctrl-c received; shutting down");
-                    return Ok(());
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        info!("poller task stopping");
+                        return;
+                    }
                 }
             }
         }
+    }
+
+    /// Drainer task body: drain once immediately (#88), then on either the
+    /// just-in-time `drainer_notify` or the periodic sweep until cancelled. A
+    /// drain error is logged, not fatal.
+    ///
+    /// INVARIANT: this MUST NOT return except via the `cancel` arm. The
+    /// `run_until` join loop treats ANY return from this task as a signal to
+    /// trip global shutdown, so a stray `return` / `break` would silently take
+    /// the whole daemon down. Drain errors are therefore logged and the loop
+    /// continues — never propagated out.
+    ///
+    /// Drop-mid-drain: a cancellation that lands while a `drain_tick` /
+    /// `drain_once` future is suspended mid-`apply` simply drops that future
+    /// (the `cancel` arm wins the `select!`). The drainer claims one entry at a
+    /// time, so at most one entry is left stranded `inflight` by such a drop.
+    /// That is recovered on the next startup by
+    /// [`Self::requeue_orphaned_inflight`], which resets stranded `inflight`
+    /// rows back to `pending`. In other words graceful shutdown deliberately
+    /// shares the crash-recovery path rather than draining-to-quiescence here.
+    async fn run_drainer_task(&self, cancel: &mut watch::Receiver<bool>) {
+        let mut sweep = tokio::time::interval(OUTBOX_DRAINER_PERIODIC_SWEEP);
+        sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // First sweep `tick()` returns immediately → drain right away (#88).
+        loop {
+            tokio::select! {
+                _ = sweep.tick() => {
+                    if let Err(e) = self.drain_tick().await {
+                        error!(error = %e, "drainer sweep failed");
+                    }
+                }
+                _ = self.drainer_notify.notified() => {
+                    if let Err(e) = self.drain_tick().await {
+                        error!(error = %e, "drainer notify-driven drain failed");
+                    }
+                }
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        info!("drainer task stopping");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Await the still-outstanding task handles after cancellation, bounded by
+/// [`SHUTDOWN_GRACE`]. Each unfinished handle gets the remaining grace to
+/// unwind on its own; whatever has not resolved when the grace elapses is
+/// `.abort()`ed so `run_until` can never hang on a task stalled in I/O. Handles
+/// already resolved (their `*_done` flag set) are skipped — a completed
+/// `JoinHandle` must never be awaited twice.
+async fn join_with_grace(
+    poller_done: bool,
+    poller_task: tokio::task::JoinHandle<()>,
+    drainer_done: bool,
+    drainer_task: tokio::task::JoinHandle<()>,
+) {
+    // One shared deadline across both joins: the grace is a total budget for
+    // shutdown, not per-task, so a slow first task can't double the wait.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    join_one_with_deadline("poller", poller_done, poller_task, deadline).await;
+    join_one_with_deadline("drainer", drainer_done, drainer_task, deadline).await;
+}
+
+/// Await one outstanding handle until `deadline`, then `.abort()` it if it has
+/// not resolved. No-ops when `already_done` (the handle resolved in the
+/// `select!` and must not be awaited again).
+async fn join_one_with_deadline(
+    task: &str,
+    already_done: bool,
+    handle: tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+) {
+    if already_done {
+        return;
+    }
+    // Grab the abort handle BEFORE moving `handle` into `timeout_at`: a timeout
+    // consumes the `JoinHandle` (dropping it), and dropping a `JoinHandle` does
+    // NOT cancel the underlying `tokio::spawn`'d task — only an explicit abort
+    // does. So the abort handle is load-bearing for the wedged path.
+    let abort = handle.abort_handle();
+    if tokio::time::timeout_at(deadline, handle).await.is_err() {
+        // Grace elapsed: the task is wedged (almost certainly mid network I/O).
+        // Force it down so shutdown is guaranteed to complete.
+        warn!(
+            task,
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "daemon task did not stop within the shutdown grace; aborting"
+        );
+        abort.abort();
+    }
+}
+
+/// Loudly log when a daemon task's `JoinHandle` resolves *unexpectedly* — i.e.
+/// before cancellation was requested. Each task body is an infinite loop that
+/// must only return via its cancel arm, so a handle resolving while
+/// `*cancel_rx.borrow()` is still `false` is a bug (a panic, or a stray
+/// `return`): the join loop will trip global shutdown either way, but this
+/// distinguishes it from the normal cancel-driven exit so it shows up in logs.
+fn report_unexpected_task_exit(
+    task: &str,
+    res: Result<(), tokio::task::JoinError>,
+    cancel_rx: &watch::Receiver<bool>,
+) {
+    let cancel_requested = *cancel_rx.borrow();
+    match (res, cancel_requested) {
+        // Panic: always loud, regardless of cancel state.
+        (Err(_), _) => error!(task, "daemon task panicked; tripping shutdown"),
+        // Clean return while we never asked it to stop — it exited on its own.
+        (Ok(()), false) => error!(
+            task,
+            "daemon task returned unexpectedly (not cancel-driven); tripping shutdown"
+        ),
+        // Expected: a cancel-driven exit. Nothing to flag.
+        (Ok(()), true) => {}
+    }
+}
+
+/// Resolve when the process should stop. SIGINT (ctrl-c) everywhere; SIGTERM
+/// additionally on unix, because under launchd / systemd SIGTERM is the normal
+/// stop signal (the old ctrl-c-only handler never saw it). Whichever arrives
+/// first wins.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal as unix_signal};
+        // If installing the SIGTERM handler somehow fails, degrade to
+        // ctrl-c-only rather than aborting the daemon — a daemon that still
+        // stops on SIGINT is strictly better than one that refuses to start.
+        let mut sigterm = match unix_signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler; ctrl-c only");
+                let _ = signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = signal::ctrl_c() => info!("SIGINT received"),
+            _ = sigterm.recv() => info!("SIGTERM received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal::ctrl_c().await;
+        info!("ctrl-c received");
     }
 }
 
@@ -499,8 +833,8 @@ mod tests {
     use domain_task::{SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
-        PortResult, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot, RemoteTaskUpdate,
-        RepoBindingRepository, TaskRepository, WorkspaceRepository,
+        PortResult, ProjectRepository, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
+        RemoteTaskUpdate, RepoBindingRepository, TaskRepository, WorkspaceRepository,
     };
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -509,6 +843,21 @@ mod tests {
         InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
         StubFilesystemProbe,
     };
+
+    /// Poll `cond` until it returns true or `timeout` elapses, then return.
+    /// Replaces fixed `sleep`-then-assert in the run-loop tests: the caller
+    /// asserts the condition itself afterwards, so a never-satisfied condition
+    /// still fails (fast on success, bounded on failure) rather than flaking on
+    /// a too-short fixed sleep under slow CI.
+    async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while !cond() {
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     #[derive(Default)]
     struct CountingProvider {
@@ -632,28 +981,33 @@ mod tests {
             task_repo.clone(),
             probe.clone(),
             Some(drainer),
+            None,
             Some(outbox_dyn),
         );
 
+        // Stage-7 split: the poller task reconciles worktrees (tick_once); the
+        // drainer task drains the outbox (drain_tick). Drive both here.
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.workspaces, 1);
         assert_eq!(report.repos_checked, 1);
         assert_eq!(report.worktrees_checked, 2);
         assert_eq!(report.marked_missing, 1);
         assert_eq!(report.pruned, 0);
-        assert_eq!(report.pushed, 1, "the one outbox entry drained");
-        assert!(report.push_failures.is_empty());
+
+        let drained = daemon.drain_tick().await.unwrap();
+        assert_eq!(drained, 1, "the one outbox entry drained");
         assert_eq!(provider.updates.load(Ordering::SeqCst), 1);
 
-        // Second tick: the entry is succeeded, nothing newly missing — no
-        // duplicate remote write.
+        // Second round: reconcile finds nothing newly missing; the entry is
+        // succeeded so a second drain is a no-op — no duplicate remote write.
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.marked_missing, 0);
-        assert_eq!(report.pushed, 0);
+        let drained = daemon.drain_tick().await.unwrap();
+        assert_eq!(drained, 0);
         assert_eq!(
             provider.updates.load(Ordering::SeqCst),
             1,
-            "no duplicate remote write on the second tick"
+            "no duplicate remote write on the second drain"
         );
     }
 
@@ -724,6 +1078,7 @@ mod tests {
             bindings,
             task_repo.clone(),
             probe,
+            None,
             None,
             Some(outbox_dyn),
         );
@@ -811,7 +1166,8 @@ mod tests {
             bindings,
             task_repo.clone(),
             probe,
-            None,
+            None, // drainer
+            None, // poller
             Some(outbox_dyn),
         );
 
@@ -883,7 +1239,8 @@ mod tests {
             bindings,
             task_repo.clone(),
             probe,
-            None,
+            None, // drainer
+            None, // poller
             Some(outbox_dyn),
         );
 
@@ -907,7 +1264,7 @@ mod tests {
         let probe = Arc::new(StubFilesystemProbe::new());
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo);
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None);
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None, None);
 
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.workspaces, 1);
@@ -983,7 +1340,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None);
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None, None);
         (daemon, bind_repo, binding_id)
     }
 
@@ -1121,7 +1478,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None, None)
             .with_prune(true)
             .with_missing_grace_ticks(3);
 
@@ -1180,7 +1537,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None, None)
             .with_prune(true)
             .with_missing_grace_ticks(3);
 
@@ -1250,7 +1607,7 @@ mod tests {
         let bindings = RepoBindingService::new(ws_repo, bind_repo);
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None, None)
             .with_state_dir(tmp.path().to_path_buf())
             .with_interval_secs(42);
 
@@ -1296,5 +1653,443 @@ mod tests {
             !daemon.miss_counts.lock().unwrap().contains_key(&ghost_key),
             "ghost entry should be GC'd"
         );
+    }
+
+    // ---- Stage 7: two-task run loop --------------------------------------
+
+    /// A `RemoteProjectProvider` that counts `poll_project_items` calls (the
+    /// poller task's network touch) and no-ops every mutation. Lets the run
+    /// loop tests observe "the poller actually polled".
+    #[derive(Default)]
+    struct CountingProjectProvider {
+        polls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ports::RemoteProjectProvider for CountingProjectProvider {
+        async fn fetch_project(&self, _: &str, _: u64) -> PortResult<ports::RemoteProjectSnapshot> {
+            Err(ports::PortError::NotFound("n/a".into()))
+        }
+        async fn add_item(&self, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn create_draft_issue(&self, _: &str, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn update_draft_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> PortResult<()> {
+            Ok(())
+        }
+        async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
+            Ok(("I_x".into(), 1))
+        }
+        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
+            Ok(())
+        }
+        async fn poll_project_items(
+            &self,
+            _: &str,
+            _: &str,
+            _: domain_core::Timestamp,
+            _: &str,
+        ) -> PortResult<ports::PollPage> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Ok(ports::PollPage {
+                items: Vec::new(),
+                truncated: false,
+            })
+        }
+    }
+
+    /// A `RemoteProjectProvider` that panics on its first poll — used to prove
+    /// a panic in the poller task trips the shared cancellation and `run`
+    /// returns (taking the drainer task down with it).
+    struct PanicProjectProvider;
+
+    #[async_trait]
+    impl ports::RemoteProjectProvider for PanicProjectProvider {
+        async fn fetch_project(&self, _: &str, _: u64) -> PortResult<ports::RemoteProjectSnapshot> {
+            Err(ports::PortError::NotFound("n/a".into()))
+        }
+        async fn add_item(&self, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn create_draft_issue(&self, _: &str, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn update_draft_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> PortResult<()> {
+            Ok(())
+        }
+        async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
+            Ok(("I_x".into(), 1))
+        }
+        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
+            Ok(())
+        }
+        async fn poll_project_items(
+            &self,
+            _: &str,
+            _: &str,
+            _: domain_core::Timestamp,
+            _: &str,
+        ) -> PortResult<ports::PollPage> {
+            panic!("boom: poller task panic injection");
+        }
+    }
+
+    /// A `RemoteProjectProvider` whose `poll_project_items` never resolves —
+    /// it parks forever (simulating a wedged network I/O call). The poller
+    /// task's first immediate tick enters it and stays there, so the task body
+    /// never reaches its `cancel` arm. Used to prove the shutdown-grace abort
+    /// fallback force-stops a task that ignores cancellation.
+    struct HangingProjectProvider;
+
+    #[async_trait]
+    impl ports::RemoteProjectProvider for HangingProjectProvider {
+        async fn fetch_project(&self, _: &str, _: u64) -> PortResult<ports::RemoteProjectSnapshot> {
+            Err(ports::PortError::NotFound("n/a".into()))
+        }
+        async fn add_item(&self, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn create_draft_issue(&self, _: &str, _: &str, _: &str) -> PortResult<String> {
+            Ok("PVTI_x".into())
+        }
+        async fn update_draft_issue(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> PortResult<()> {
+            Ok(())
+        }
+        async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
+            Ok(("I_x".into(), 1))
+        }
+        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
+            Ok(())
+        }
+        async fn poll_project_items(
+            &self,
+            _: &str,
+            _: &str,
+            _: domain_core::Timestamp,
+            _: &str,
+        ) -> PortResult<ports::PollPage> {
+            // Park forever — ignores cancellation, just like a stalled I/O call.
+            std::future::pending::<()>().await;
+            unreachable!("hanging provider never resolves")
+        }
+    }
+
+    /// A minimal project for the poller to enumerate. The caller persists it
+    /// (`save` is async).
+    fn seed_project() -> domain_project::Project {
+        domain_project::Project::new(
+            domain_core::ProjectId::parse("PVT_kwHO_run").unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            "PVTSSF_field".into(),
+            vec![],
+            vec![],
+            false,
+            domain_core::Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    /// #88 regression: both tasks do their FIRST unit of work IMMEDIATELY on
+    /// startup, not after a full interval. We set the poller interval to an
+    /// hour; if the first poll were delayed a full interval the poll count
+    /// would still be 0 after a short wait. We assert it polled (and the
+    /// drainer drained its seeded entry) well before the interval elapses,
+    /// then trigger a clean shutdown.
+    #[tokio::test]
+    async fn both_tasks_do_first_work_immediately() {
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let proj_repo = Arc::new(InMemoryProjectRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let provider = Arc::new(CountingProvider::default());
+        let proj_provider = Arc::new(CountingProjectProvider::default());
+
+        // A project for the poller to poll on its first tick.
+        let project = seed_project();
+        proj_repo.save(&project).await.unwrap();
+
+        // A workspace + a dirty issue-backed task with a seeded outbox entry so
+        // the drainer's first drain calls the provider.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+        let mut task = Task::new_draft(ws.id, None, "edit".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(domain_task::RemoteRef::new("github", "1"))
+            .unwrap();
+        task_repo
+            .save(&task, SnapshotSource::Promote)
+            .await
+            .unwrap();
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        outbox.enqueue(&entry).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let remote_tasks: Arc<dyn RemoteTaskProvider> = provider.clone();
+        let remote_projects: Arc<dyn ports::RemoteProjectProvider> = proj_provider.clone();
+        let drainer = Arc::new(OutboxDrainer::new(
+            outbox_dyn.clone(),
+            task_repo.clone(),
+            ws_repo.clone(),
+            proj_repo.clone(),
+            remote_tasks,
+            remote_projects.clone(),
+        ));
+        let poller = Arc::new(ProjectPoller::new(
+            proj_repo.clone(),
+            task_repo.clone(),
+            remote_projects,
+        ));
+        let daemon = Arc::new(Daemon::new(
+            workspaces,
+            bindings,
+            task_repo,
+            Arc::new(StubFilesystemProbe::new()),
+            Some(drainer),
+            Some(poller),
+            Some(outbox_dyn),
+        ));
+
+        // Long interval: if first work waited a full interval, nothing happens.
+        let shutdown = Arc::new(Notify::new());
+        let run = {
+            let daemon = daemon.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                daemon
+                    .run_until(Duration::from_secs(3600), async move {
+                        shutdown.notified().await
+                    })
+                    .await
+            })
+        };
+
+        // Poll for the immediate first work rather than sleeping a fixed beat
+        // (a fixed sleep is flaky on slow CI). Both counters must go non-zero
+        // well before the 1h interval — proving first-work-is-immediate (#88) —
+        // so a generous timeout still fails fast if the work never happens.
+        wait_until(Duration::from_secs(5), || {
+            proj_provider.polls.load(Ordering::SeqCst) >= 1
+                && provider.updates.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        assert!(
+            proj_provider.polls.load(Ordering::SeqCst) >= 1,
+            "poller must poll immediately, not after the 1h interval (#88)"
+        );
+        assert!(
+            provider.updates.load(Ordering::SeqCst) >= 1,
+            "drainer must drain immediately, not after a sweep delay (#88)"
+        );
+
+        // Clean shutdown stops both tasks and `run` returns Ok.
+        shutdown.notify_one();
+        let res = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not return after shutdown");
+        assert!(res.unwrap().is_ok(), "clean shutdown returns Ok");
+    }
+
+    /// A panic in one spawned task trips the shared cancellation so the other
+    /// task stops too and `run` returns.
+    #[tokio::test]
+    async fn panic_in_one_task_trips_shutdown_and_run_returns() {
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let proj_repo = Arc::new(InMemoryProjectRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        // A project so the panicking provider's poll is actually invoked.
+        let project = seed_project();
+        proj_repo.save(&project).await.unwrap();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let remote_projects: Arc<dyn ports::RemoteProjectProvider> = Arc::new(PanicProjectProvider);
+        let poller = Arc::new(ProjectPoller::new(
+            proj_repo.clone(),
+            task_repo.clone(),
+            remote_projects,
+        ));
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let daemon = Arc::new(Daemon::new(
+            workspaces,
+            bindings,
+            task_repo,
+            Arc::new(StubFilesystemProbe::new()),
+            None,
+            Some(poller),
+            Some(outbox_dyn),
+        ));
+
+        // No shutdown signal is sent: run must return on its own because the
+        // poller task panics on its first immediate tick, which trips the
+        // shared cancellation and stops the drainer task too.
+        let never = std::future::pending::<()>();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            daemon.run_until(Duration::from_secs(3600), never),
+        )
+        .await
+        .expect("run did not return after a task panicked");
+        assert!(
+            res.is_ok(),
+            "run returns Ok after a task panic trips shutdown"
+        );
+    }
+
+    /// Shutdown-grace abort fallback (#55, r3325417131): a poller task wedged in
+    /// I/O that never observes cancellation is force-`.abort()`ed within
+    /// `SHUTDOWN_GRACE`, so `run_until` always returns rather than hanging on the
+    /// post-cancel join. The hanging provider parks the poller's first immediate
+    /// tick inside `tick_once`, so cancellation can't preempt it; only the
+    /// bounded join + abort can complete shutdown. Paused time advances the 5s
+    /// grace virtually, keeping the test fast and deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_task_is_force_aborted_within_shutdown_grace() {
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let proj_repo = Arc::new(InMemoryProjectRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        // A project so the hanging provider's poll is actually invoked and parks.
+        let project = seed_project();
+        proj_repo.save(&project).await.unwrap();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let remote_projects: Arc<dyn ports::RemoteProjectProvider> =
+            Arc::new(HangingProjectProvider);
+        let poller = Arc::new(ProjectPoller::new(
+            proj_repo.clone(),
+            task_repo.clone(),
+            remote_projects,
+        ));
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let daemon = Arc::new(Daemon::new(
+            workspaces,
+            bindings,
+            task_repo,
+            Arc::new(StubFilesystemProbe::new()),
+            None,
+            Some(poller),
+            Some(outbox_dyn),
+        ));
+
+        // Shut down almost immediately; the poller task is parked inside its
+        // hanging first poll and will never reach its cancel arm, so only the
+        // grace-bounded join + abort can let `run_until` return. The outer
+        // bound is comfortably larger than `SHUTDOWN_GRACE` (5s) but far smaller
+        // than the 1h poller interval — under paused time it advances virtually.
+        let shutdown = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            daemon.run_until(Duration::from_secs(3600), shutdown),
+        )
+        .await
+        .expect("run_until must return within the grace via the abort fallback");
+        assert!(
+            res.is_ok(),
+            "run_until returns Ok once the wedged task is aborted"
+        );
+    }
+
+    /// With `github_token = None` both poller and drainer are `None`: the run
+    /// loop still spins (reconcile + heartbeat) and shuts down cleanly without
+    /// panicking.
+    #[tokio::test]
+    async fn no_token_poller_and_drainer_noop_without_panic() {
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Arc::new(
+            Daemon::new(
+                workspaces,
+                bindings,
+                task_repo,
+                Arc::new(StubFilesystemProbe::new()),
+                None,
+                None,
+                None,
+            )
+            .with_state_dir(tmp.path().to_path_buf())
+            .with_interval_secs(1),
+        );
+
+        let shutdown = Arc::new(Notify::new());
+        let run = {
+            let daemon = daemon.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                daemon
+                    .run_until(Duration::from_secs(3600), async move {
+                        shutdown.notified().await
+                    })
+                    .await
+            })
+        };
+
+        // Poll for the heartbeat (the poller task's first immediate tick writes
+        // last_tick.json) instead of sleeping a fixed beat, which is flaky on
+        // slow CI. Once it lands we shut down and assert it's parseable under
+        // the new two-task structure (#55 keeps one primary cadence) — and that
+        // nothing panicked.
+        let path = tmp.path().join("last_tick.json");
+        wait_until(Duration::from_secs(5), || path.exists()).await;
+        shutdown.notify_one();
+        let res = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not return after shutdown");
+        assert!(res.unwrap().is_ok());
+
+        assert!(path.exists(), "heartbeat still written with no token");
+        let parsed: LastTick =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed.report.workspaces, 1);
     }
 }

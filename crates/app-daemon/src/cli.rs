@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use application_sync::OutboxDrainer;
+use application_sync::{OutboxDrainer, ProjectPoller};
 use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::Parser;
 use infra_config::RepoLinkConfig;
@@ -20,8 +20,12 @@ use crate::logging::LogFormat;
 #[derive(Parser, Debug)]
 #[command(name = "rld", version, about = "Background reconciler for repo-link")]
 pub struct Args {
-    /// Tick interval in seconds.
-    #[arg(long, default_value_t = 60, env = "REPO_LINK_INTERVAL_SECS")]
+    /// Poller-task tick interval in seconds: project poll, worktree reconcile,
+    /// grace-prune, and heartbeat share this cadence. Defaults to
+    /// `PROJECT_POLLER_INTERVAL` (the Stage-7 constant); override for slower or
+    /// faster reconcile. The drainer task's periodic sweep is separate and
+    /// fixed at `OUTBOX_DRAINER_PERIODIC_SWEEP`.
+    #[arg(long, default_value_t = crate::daemon::PROJECT_POLLER_INTERVAL.as_secs(), env = "REPO_LINK_INTERVAL_SECS")]
     pub interval_secs: u64,
 
     /// When set, the daemon drops worktree entries whose paths have stayed
@@ -43,7 +47,7 @@ pub struct Args {
 
     /// Number of consecutive ticks a worktree path must be missing before
     /// `--prune` actually drops it. Wall-clock grace =
-    /// `--interval-secs × --missing-grace-ticks` (defaults: 60s × 3 = 3
+    /// `--interval-secs × --missing-grace-ticks` (defaults: 45s × 3 ≈ 2¼
     /// minutes). The counter is process-local — restarting the daemon
     /// resets it to zero, so short-lived runs cannot trigger a
     /// grace-protected prune.
@@ -88,35 +92,54 @@ pub async fn run_cli() -> anyhow::Result<()> {
 
     let probe: Arc<dyn ports::FilesystemProbe> = Arc::new(TokioFilesystemProbe::new());
 
-    // The drainer is the sole outbound path (#54). Gated on github_token the
-    // same way `SyncService` used to be — no token, no outbound work, but
-    // worktree reconciliation still runs. The GithubAdapter implements both
-    // RemoteTaskProvider (issues) and RemoteProjectProvider (Projects v2).
-    let (drainer, outbox) = match cfg.github_token.clone() {
+    // The drainer (outbound) and poller (inbound) are both gated on a resolved
+    // GitHub token the same way `SyncService` used to be — no token, no network
+    // work, but worktree reconciliation still runs. Resolution goes through
+    // `RepoLinkConfig::resolve_github_token()` (the same source `app-cli` uses),
+    // so a token written only to the token file by `rl gh auth` — i.e. not set
+    // via env/inline `github_token` — still enables the daemon's network tasks
+    // rather than silently disabling them. An insecure-permissions / I/O error
+    // on the token file propagates verbatim rather than being treated as "no
+    // token". The GithubAdapter implements both RemoteTaskProvider (issues) and
+    // RemoteProjectProvider (Projects v2), so one adapter backs both. Built via
+    // the shared base-URL-aware constructor so REPO_LINK_GITHUB_API_BASE_URL is
+    // honoured exactly as in app-cli (#100 — the daemon previously called `new`
+    // and dropped the override).
+    let (drainer, poller, outbox) = match cfg.resolve_github_token()? {
         Some(token) => {
-            let adapter = Arc::new(GithubAdapter::new(token)?);
+            let adapter = Arc::new(GithubAdapter::from_env_parts(
+                token,
+                cfg.github_api_base_url.as_deref(),
+            )?);
             let remote_tasks: Arc<dyn ports::RemoteTaskProvider> = adapter.clone();
             let remote_projects: Arc<dyn ports::RemoteProjectProvider> = adapter;
             let drainer = Arc::new(OutboxDrainer::new(
                 outbox_repo.clone(),
                 tasks_repo.clone(),
                 workspaces_repo.clone(),
-                projects_repo,
+                projects_repo.clone(),
                 remote_tasks,
+                remote_projects.clone(),
+            ));
+            let poller = Arc::new(ProjectPoller::new(
+                projects_repo,
+                tasks_repo.clone(),
                 remote_projects,
             ));
-            (Some(drainer), Some(outbox_repo))
+            (Some(drainer), Some(poller), Some(outbox_repo))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
-    let daemon = Daemon::new(workspaces, bindings, tasks_repo, probe, drainer, outbox)
-        .with_prune(args.prune)
-        .with_missing_grace_ticks(args.missing_grace_ticks)
-        // Co-locate last_tick.json with the db + log so a `--db` override
-        // relocates the whole daemon state consistently.
-        .with_state_dir(log_dir.clone())
-        .with_interval_secs(args.interval_secs);
+    let daemon = Daemon::new(
+        workspaces, bindings, tasks_repo, probe, drainer, poller, outbox,
+    )
+    .with_prune(args.prune)
+    .with_missing_grace_ticks(args.missing_grace_ticks)
+    // Co-locate last_tick.json with the db + log so a `--db` override
+    // relocates the whole daemon state consistently.
+    .with_state_dir(log_dir.clone())
+    .with_interval_secs(args.interval_secs);
     // Read the coerced value back from the daemon so a run with
     // `REPO_LINK_MISSING_GRACE_TICKS=0` logs the effective `1` rather
     // than the raw input. Single source of truth lives in
@@ -129,6 +152,10 @@ pub async fn run_cli() -> anyhow::Result<()> {
         log_format = ?args.log_format,
         "daemon starting"
     );
-    daemon.run(Duration::from_secs(args.interval_secs)).await?;
+    // `run` drives two `tokio::spawn`'d tasks off `Arc<Self>` (Stage 7, #55),
+    // so the daemon must be shared.
+    Arc::new(daemon)
+        .run(Duration::from_secs(args.interval_secs))
+        .await?;
     Ok(())
 }

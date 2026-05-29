@@ -133,6 +133,7 @@ dependencies = [
  "chrono",
  "clap",
  "domain-core",
+ "domain-project",
  "domain-repo",
  "domain-sync",
  "domain-task",

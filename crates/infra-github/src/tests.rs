@@ -537,3 +537,40 @@ async fn fetch_issue_404_maps_to_not_found() {
         .unwrap_err();
     assert!(matches!(err, ports::PortError::NotFound(_)));
 }
+
+/// #100 regression: the shared `from_env_parts` constructor — which BOTH
+/// `app-cli` and `app-daemon` now build through — honours
+/// `REPO_LINK_GITHUB_API_BASE_URL` (modelled here as `Some(base_url)`). A
+/// request goes to the wiremock, NOT api.github.com: if the override were
+/// dropped (the old daemon bug, which called `GithubAdapter::new`), the mount
+/// would never be hit and the call would fail / hang against the real host.
+#[tokio::test]
+async fn from_env_parts_honours_base_url_override() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues/7"))
+        .and(header("authorization", "Bearer t0k"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(issue_payload(7, "hi", "there", "open")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The daemon's path: token + an explicit base-URL override.
+    let provider = GithubAdapter::from_env_parts("t0k", Some(&server.uri())).unwrap();
+    let snap = provider.fetch_remote("github.com/o/r", "7").await.unwrap();
+    assert_eq!(snap.remote_id, "7");
+    // `.expect(1)` on the mock asserts the request landed on the wiremock,
+    // proving the base-URL override took effect; `server` dropping here
+    // verifies the expectation.
+}
+
+/// `from_env_parts(token, None)` falls back to api.github.com — i.e. it
+/// behaves exactly like `GithubAdapter::new`. We can't hit the real host in a
+/// test, so we assert the *constructor* succeeds (the fallback branch is taken
+/// without panicking); the override branch is covered by the test above.
+#[tokio::test]
+async fn from_env_parts_none_falls_back_to_default_host() {
+    assert!(GithubAdapter::from_env_parts("t0k", None).is_ok());
+}

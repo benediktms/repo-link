@@ -8,7 +8,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use domain_core::Timestamp;
 use ports::{
-    PortError, PortResult, RemoteProjectItem, RemoteProjectProvider, RemoteProjectSnapshot,
+    PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectProvider,
+    RemoteProjectSnapshot,
 };
 
 /// One recorded mutation call, in the order it was applied. The drainer's
@@ -39,6 +40,14 @@ pub enum ProjectCall {
         status_field_id: String,
         option_id: String,
     },
+    /// One `poll_project_items` invocation. The poller's tests assert the
+    /// project node id, status field id, and query the daemon passes through
+    /// (e.g. `"is:open"`), plus that polling actually happened.
+    Poll {
+        project_node_id: String,
+        status_field_id: String,
+        query: String,
+    },
 }
 
 #[derive(Default)]
@@ -54,6 +63,14 @@ pub struct InMemoryRemoteProjectProvider {
     /// any succeed. Each failing call decrements the counter. Lets a test
     /// drive "Err under cap → reschedule" and "Err at cap → dead-letter".
     fail_next: Mutex<u32>,
+    /// Items the next `poll_project_items` returns, keyed by project node id.
+    /// The poller's reconcile tests inject a canned `RemoteProjectItem` list
+    /// per project; an absent key polls to an empty page.
+    poll_items: Mutex<std::collections::HashMap<String, Vec<RemoteProjectItem>>>,
+    /// `truncated` flag the next `poll_project_items` reports, keyed by project
+    /// node id. Lets the poller's tests drive a truncated page directly rather
+    /// than synthesising a giant item vec. Absent key → `false` (complete).
+    poll_truncated: Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl InMemoryRemoteProjectProvider {
@@ -85,6 +102,25 @@ impl InMemoryRemoteProjectProvider {
     /// Make the next `n` mutation calls fail with a transient error.
     pub fn fail_next(&self, n: u32) {
         *self.fail_next.lock().unwrap() = n;
+    }
+
+    /// Inject the items a `poll_project_items(project_node_id, ..)` call
+    /// returns. Used by the poller's reconcile tests.
+    pub fn set_poll_items(&self, project_node_id: &str, items: Vec<RemoteProjectItem>) {
+        self.poll_items
+            .lock()
+            .unwrap()
+            .insert(project_node_id.to_string(), items);
+    }
+
+    /// Inject the `truncated` flag a `poll_project_items(project_node_id, ..)`
+    /// call reports. Lets the poller's partial-page test assert the watermark
+    /// is NOT advanced on a truncated read without a giant item vec.
+    pub fn set_poll_truncated(&self, project_node_id: &str, truncated: bool) {
+        self.poll_truncated
+            .lock()
+            .unwrap()
+            .insert(project_node_id.to_string(), truncated);
     }
 
     pub fn calls(&self) -> Vec<ProjectCall> {
@@ -214,11 +250,33 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
 
     async fn poll_project_items(
         &self,
-        _project_node_id: &str,
-        _status_field_id: &str,
+        project_node_id: &str,
+        status_field_id: &str,
         _since: Timestamp,
-        _query: &str,
-    ) -> PortResult<Vec<RemoteProjectItem>> {
-        Ok(Vec::new())
+        query: &str,
+    ) -> PortResult<PollPage> {
+        if self.should_fail() {
+            return Err(PortError::Backend("stub: poll transient".into()));
+        }
+        self.calls.lock().unwrap().push(ProjectCall::Poll {
+            project_node_id: project_node_id.to_string(),
+            status_field_id: status_field_id.to_string(),
+            query: query.to_string(),
+        });
+        let items = self
+            .poll_items
+            .lock()
+            .unwrap()
+            .get(project_node_id)
+            .cloned()
+            .unwrap_or_default();
+        let truncated = self
+            .poll_truncated
+            .lock()
+            .unwrap()
+            .get(project_node_id)
+            .copied()
+            .unwrap_or(false);
+        Ok(PollPage { items, truncated })
     }
 }
