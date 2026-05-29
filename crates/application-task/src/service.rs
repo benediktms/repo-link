@@ -357,9 +357,29 @@ impl TaskService {
         let kind = parse_enum::<RelationKind>("kind", &cmd.kind)?;
         let mut t = self.resolve_task(&cmd.task_id).await?;
         // The other side of a relation is a friendly ID too.
-        let other_task = self.resolve_task(&cmd.other).await?;
+        let mut other_task = self.resolve_task(&cmd.other).await?;
+
+        // Self-relation: both the forward and reciprocal edge land on the
+        // same aggregate. Mutate one copy and save once — loading two copies
+        // and saving them in turn would clobber the first write.
+        if other_task.id == t.id {
+            t.add_relation(kind, t.id);
+            t.add_relation(kind.inverse(), t.id);
+            self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+            return self.task_dto(&t).await;
+        }
+
         t.add_relation(kind, other_task.id);
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+
+        // Mirror the reciprocal edge onto the other task so the graph reads
+        // coherently from both ends. `add_relation` is idempotent, so a
+        // pre-existing reciprocal (or a re-run) is a no-op rather than a dup.
+        other_task.add_relation(kind.inverse(), t.id);
+        self.repo
+            .save(&other_task, SnapshotSource::LocalEdit)
+            .await?;
+
         self.task_dto(&t).await
     }
 
@@ -590,6 +610,80 @@ mod tests {
         assert_eq!(updated.relations.len(), 1);
         assert_eq!(updated.relations[0].kind, "blocked_by");
         assert_eq!(updated.relations[0].other, b.id);
+
+        // The reciprocal edge is mirrored onto the other task: a blocked_by b
+        // ⇒ b blocks a.
+        let other = svc.show(&b.id).await.unwrap();
+        assert_eq!(other.relations.len(), 1);
+        assert_eq!(other.relations[0].kind, "blocks");
+        assert_eq!(other.relations[0].other, a.id);
+    }
+
+    #[tokio::test]
+    async fn add_relation_symmetric_kind_mirrors_same_kind() {
+        let svc = svc();
+        let a = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "a".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        let b = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "b".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.clone(),
+            kind: "related_to".into(),
+            other: b.id.clone(),
+        })
+        .await
+        .unwrap();
+        // related_to is symmetric: both ends carry related_to to the other.
+        let other = svc.show(&b.id).await.unwrap();
+        assert_eq!(other.relations.len(), 1);
+        assert_eq!(other.relations[0].kind, "related_to");
+        assert_eq!(other.relations[0].other, a.id);
+    }
+
+    #[tokio::test]
+    async fn add_relation_self_relation_adds_both_edges_once() {
+        let svc = svc();
+        let a = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "a".into(),
+                body: None,
+                priority: None,
+            })
+            .await
+            .unwrap();
+        // A self blocked_by edge folds both the forward and reciprocal edge
+        // onto the one aggregate without clobbering or duplicating.
+        let updated = svc
+            .add_relation(AddTaskRelationCmd {
+                task_id: a.id.clone(),
+                kind: "blocked_by".into(),
+                other: a.id.clone(),
+            })
+            .await
+            .unwrap();
+        let kinds: Vec<&str> = updated.relations.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(updated.relations.len(), 2);
+        assert!(kinds.contains(&"blocked_by"));
+        assert!(kinds.contains(&"blocks"));
+        assert!(updated.relations.iter().all(|r| r.other == a.id));
     }
 
     #[tokio::test]
