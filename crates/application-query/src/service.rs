@@ -652,15 +652,21 @@ mod tests {
         let parent = Task::new_draft(wid, None, "parent".into()).unwrap();
         // The only link is the reverse `child_of` on a child living in another
         // workspace — discovery must not be scoped to the parent's workspace.
+        // The child is `done`, so this also guards that the `done` rollup
+        // counts a cross-workspace child, not just `total`.
         let mut cross = Task::new_draft(wid2, None, "cross-repo child".into()).unwrap();
         cross.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+        cross.start().unwrap();
+        cross.complete().unwrap();
 
         ts.save(&parent, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&cross, SnapshotSource::LocalEdit).await.unwrap();
 
         let rollup = svc.children(&parent.id.to_string()).await.unwrap();
         assert_eq!(rollup.total, 1);
+        assert_eq!(rollup.done, 1);
         assert_eq!(rollup.children[0].task_id, cross.id.to_string());
+        assert_eq!(rollup.children[0].status, "done");
     }
 
     #[tokio::test]
