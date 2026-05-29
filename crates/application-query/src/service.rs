@@ -108,8 +108,12 @@ impl QueryService {
     /// Children are gathered from both directions of the parent/child pair so
     /// the view is robust against legacy rows that predate auto-reciprocal
     /// edges: the parent's own `parent_of` edges, unioned with any task that
-    /// carries a `child_of` edge back to the parent. The union is loaded by id
-    /// (a child may live in another workspace if related cross-repo).
+    /// carries a `child_of` edge back to the parent. The reverse scan is
+    /// workspace-agnostic and the union is loaded by id, so a child related
+    /// cross-repo (in another workspace) is still found.
+    ///
+    /// Archived children are omitted: a completion rollup tracks active work,
+    /// so a dropped subtask neither inflates `total` nor counts as `done`.
     pub async fn children(&self, parent_id: &str) -> Result<ChildrenRollup> {
         let parent_uuid: TaskId = parent_id.parse()?;
         let parent = self.tasks.get(parent_uuid).await?;
@@ -121,15 +125,12 @@ impl QueryService {
             .map(|r| r.other)
             .collect();
 
-        let workspace_tasks = self
-            .tasks
-            .list(TaskFilter {
-                workspace_id: Some(parent.workspace_id),
-                include_archived: true,
-                ..TaskFilter::default()
-            })
-            .await?;
-        for t in &workspace_tasks {
+        // Reverse direction: any task carrying `child_of` -> parent. Scanned
+        // across all workspaces (`workspace_id: None`) so cross-repo children
+        // aren't missed; archived rows are excluded (`include_archived` stays
+        // false in the default filter).
+        let all_tasks = self.tasks.list(TaskFilter::default()).await?;
+        for t in &all_tasks {
             if t.relations
                 .iter()
                 .any(|r| r.kind == RelationKind::ChildOf && r.other == parent.id)
@@ -141,18 +142,25 @@ impl QueryService {
         let mut children = Vec::with_capacity(child_ids.len());
         for id in child_ids {
             let c = self.tasks.get(id).await?;
+            // Children reached via the parent's `parent_of` edges are loaded
+            // unconditionally; drop archived ones here so the rollup matches
+            // the archived-excluding reverse scan above.
+            if c.status == TaskStatus::Archived {
+                continue;
+            }
             children.push(ChildTaskRow {
                 task_id: c.id.to_string(),
                 title: c.title.clone(),
                 status: enum_str(&c.status),
             });
         }
-        // Incomplete first (done/archived sink to the bottom), then by title —
-        // a stable order that puts outstanding work at the top.
+        // Outstanding work first, completed (`done`) last, then by title. The
+        // sort predicate matches the `done` count below so ordering and the
+        // rollup stay consistent.
         children.sort_by(|a, b| {
-            let done = |s: &str| s == "done" || s == "archived";
-            done(&a.status)
-                .cmp(&done(&b.status))
+            let is_done = |s: &str| s == "done";
+            is_done(&a.status)
+                .cmp(&is_done(&b.status))
                 .then_with(|| a.title.cmp(&b.title))
         });
 
@@ -600,6 +608,32 @@ mod tests {
         assert_eq!(rollup.children[0].status, "open");
         assert_eq!(rollup.children[1].task_id, child_done.id.to_string());
         assert_eq!(rollup.children[1].status, "done");
+    }
+
+    #[tokio::test]
+    async fn children_rollup_omits_archived_children() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut parent = Task::new_draft(wid, None, "parent".into()).unwrap();
+        let active = Task::new_draft(wid, None, "active child".into()).unwrap();
+        let mut archived = Task::new_draft(wid, None, "archived child".into()).unwrap();
+        archived.archive().unwrap();
+        parent.add_relation(domain_task::RelationKind::ParentOf, active.id);
+        parent.add_relation(domain_task::RelationKind::ParentOf, archived.id);
+
+        for t in [&parent, &active, &archived] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        // Archived child is dropped from a completion rollup entirely: it
+        // neither inflates `total` nor counts toward `done`.
+        let rollup = svc.children(&parent.id.to_string()).await.unwrap();
+        assert_eq!(rollup.total, 1);
+        assert_eq!(rollup.done, 0);
+        assert_eq!(rollup.children[0].task_id, active.id.to_string());
     }
 
     #[tokio::test]
