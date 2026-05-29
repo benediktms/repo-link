@@ -7,7 +7,7 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use clap::Parser;
 use infra_config::RepoLinkConfig;
 use infra_filesystem::TokioFilesystemProbe;
-use infra_github::GithubTaskProvider;
+use infra_github::GithubAdapter;
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
 };
@@ -85,8 +85,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
 
     let sync = match cfg.github_token.clone() {
         Some(token) => {
-            let provider: Arc<dyn ports::RemoteTaskProvider> =
-                Arc::new(GithubTaskProvider::new(token)?);
+            let provider: Arc<dyn ports::RemoteTaskProvider> = Arc::new(GithubAdapter::new(token)?);
             Some(SyncService::new(
                 tasks_repo.clone(),
                 bindings_repo,

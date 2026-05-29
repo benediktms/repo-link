@@ -1,9 +1,9 @@
 //! Integration-style wiremock tests — exercise the public
-//! `GithubTaskProvider` end-to-end through the trait surface. REST-
+//! `GithubAdapter` end-to-end through the trait surface. REST-
 //! internal unit tests (URL parsing, state_reason mapping) live next to
 //! their code in `rest.rs`.
 
-use crate::GithubTaskProvider;
+use crate::GithubAdapter;
 use ports::{RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate};
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -85,7 +85,7 @@ async fn create_issue_returns_snapshot() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let snap = provider
         .create_remote(RemoteTaskCreate {
             canonical_repo: "github.com/o/r",
@@ -115,7 +115,7 @@ async fn update_issue_patches_only_provided_fields() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let snap = provider
         .update_remote(RemoteTaskUpdate {
             canonical_repo: "github.com/o/r",
@@ -144,7 +144,7 @@ async fn update_issue_sends_state_reason_when_closing() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     provider
         .update_remote(RemoteTaskUpdate {
             canonical_repo: "github.com/o/r",
@@ -198,7 +198,7 @@ async fn fetch_comments_maps_and_paginates() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let comments = provider
         .fetch_comments("github.com/o/r", "1")
         .await
@@ -233,7 +233,7 @@ async fn fetch_comments_paginates_past_one_page() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let comments = provider
         .fetch_comments("github.com/o/r", "1")
         .await
@@ -256,7 +256,7 @@ async fn create_comment_posts_and_maps_response() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let c = provider
         .create_comment("github.com/o/r", "1", "looks good")
         .await
@@ -280,7 +280,7 @@ async fn fetch_sub_issues_maps_children_with_canonical_repo() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let children = provider
         .fetch_sub_issues("github.com/o/r", "1")
         .await
@@ -320,7 +320,7 @@ async fn fetch_sub_issues_paginates_past_one_page() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let children = provider
         .fetch_sub_issues("github.com/o/r", "1")
         .await
@@ -390,7 +390,7 @@ async fn discover_move_target_compares_repository_url_after_followed_redirect() 
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let target = provider
         .discover_move_target("github.com/o/r", "5788")
         .await
@@ -407,7 +407,7 @@ async fn discover_move_target_returns_none_when_unchanged() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let target = provider
         .discover_move_target("github.com/o/r", "42")
         .await
@@ -437,7 +437,7 @@ async fn fetch_remote_on_transferred_issue_surfaces_issue_moved() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let err = provider
         .fetch_remote("github.com/o/r", "5788")
         .await
@@ -474,7 +474,7 @@ async fn fetch_comments_on_transferred_parent_surfaces_issue_moved() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let err = provider
         .fetch_comments("github.com/o/r", "5788")
         .await
@@ -492,7 +492,7 @@ async fn current_user_login_returns_token_owner() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let login = provider.current_user_login().await.unwrap();
     assert_eq!(login, "benediktms");
 }
@@ -508,7 +508,7 @@ async fn current_user_login_maps_401_to_network_error() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("bad", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("bad", server.uri()).unwrap();
     let err = provider.current_user_login().await.unwrap_err();
     assert!(
         matches!(err, ports::PortError::Network(_)),
@@ -530,7 +530,7 @@ async fn fetch_issue_404_maps_to_not_found() {
         .mount(&server)
         .await;
 
-    let provider = GithubTaskProvider::with_base_url("t0k", server.uri()).unwrap();
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
     let err = provider
         .fetch_remote("github.com/o/r", "99")
         .await

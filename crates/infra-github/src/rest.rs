@@ -1,10 +1,9 @@
 //! GitHub REST adapter internals.
 //!
 //! Everything in this module is REST-specific: the `octocrab` client, the
-//! issue-model mapping, the URL parsing, the `state_reason` mapping. A future
-//! `graphql` sibling will live next to this one (for Projects v2 mutations
-//! and other capabilities not on the REST surface); the top-level
-//! `GithubTaskProvider` in `lib.rs` will compose both.
+//! issue-model mapping, the URL parsing, the `state_reason` mapping. The
+//! `graphql` sibling module handles Projects v2; the top-level
+//! [`crate::GithubAdapter`] in `lib.rs` composes both.
 
 use domain_core::Timestamp;
 use octocrab::Octocrab;
@@ -18,7 +17,7 @@ use ports::{
 pub(crate) const DEFAULT_BASE_URL: &str = "https://api.github.com";
 
 /// REST client. A thin wrapper around an `octocrab` instance bound to one
-/// token; the actual `GithubTaskProvider` wraps this and dispatches the
+/// token; [`crate::GithubAdapter`] wraps this and dispatches the
 /// [`ports::RemoteTaskProvider`] methods through it.
 pub(crate) struct RestClient {
     http: Octocrab,

@@ -1,10 +1,12 @@
 //! application-project — orchestration for `Project` aggregates and the
-//! workspace ↔ project link surface (RFC 0001 Stage 4).
+//! workspace ↔ project link surface.
 //!
-//! All operations are local-only: project schema is hand-entered through
-//! [`ProjectService::link`] and never fetched from GitHub. Stage 5 swaps
-//! the GraphQL adapter in behind the same [`LinkProjectCmd`] shape so the
-//! service surface doesn't change.
+//! `rl project link` fetches a project's schema from GitHub over GraphQL and
+//! seeds it via [`ProjectService::link_from_snapshot`], which auto-derives the
+//! local-status → option mapping (RFC 0001 §3). The remaining operations
+//! (`get` / `list` / `map_status` / `unlink`) are local reads/edits of the
+//! mirrored project. [`ProjectService::link`] is a lower-level programmatic
+//! seam taking a hand-entered schema; it is not wired to the CLI.
 
 mod dto;
 mod error;

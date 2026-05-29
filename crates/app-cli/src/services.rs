@@ -11,7 +11,7 @@ use application_sync::SyncService;
 use application_task::TaskService;
 use application_workspace::{RepoBindingService, WorkspaceService};
 use infra_config::RepoLinkConfig;
-use infra_github::GithubTaskProvider;
+use infra_github::GithubAdapter;
 use infra_sqlite::{
     SqliteProjectRepository, SqliteRepoBindingRepository, SqliteTaskRepository,
     SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
@@ -51,16 +51,16 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     })
 }
 
-/// Construct a `GithubTaskProvider`, honoring `REPO_LINK_GITHUB_API_BASE_URL`
+/// Construct a `GithubAdapter`, honoring `REPO_LINK_GITHUB_API_BASE_URL`
 /// when set (for GitHub Enterprise or integration tests pointing at a
 /// wiremock). Falls back to api.github.com.
 pub(crate) fn build_github_provider(
     token: &str,
     cfg: &RepoLinkConfig,
-) -> Result<GithubTaskProvider, ports::PortError> {
+) -> Result<GithubAdapter, ports::PortError> {
     match cfg.github_api_base_url.as_deref() {
-        Some(url) => GithubTaskProvider::with_base_url(token, url),
-        None => GithubTaskProvider::new(token),
+        Some(url) => GithubAdapter::with_base_url(token, url),
+        None => GithubAdapter::new(token),
     }
 }
 

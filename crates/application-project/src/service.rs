@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use domain_core::{ProjectId, Timestamp};
-use domain_project::{Project, StatusMapping, StatusOption};
+use domain_project::{Project, StatusMapping, StatusOption, derive_status_mappings};
 use dto_shared::{LinkProjectCmd, MapStatusCmd, ProjectDto};
-use ports::{PortError, ProjectRepository};
+use ports::{PortError, ProjectRepository, RemoteProjectSnapshot};
 
 use crate::dto::project_to_dto;
 use crate::error::{Result, ServiceError};
@@ -62,8 +62,10 @@ impl ProjectService {
         Self { repo }
     }
 
-    /// Link a project from hand-entered schema (Stage 4). Stage 5 will
-    /// rewire the CLI to fetch the same shape from GitHub.
+    /// Link a project from a hand-entered schema. This is a lower-level
+    /// programmatic seam (used by tests and available for future import
+    /// tooling); the CLI links via [`Self::link_from_snapshot`] with a
+    /// GraphQL-fetched schema instead.
     pub async fn link(&self, cmd: LinkProjectCmd) -> Result<ProjectDto> {
         let id = ProjectId::parse(cmd.node_id.clone())?;
         let status_options: Vec<StatusOption> = cmd
@@ -91,6 +93,41 @@ impl ProjectService {
             cmd.number,
             cmd.title,
             cmd.status_field_id,
+            status_options,
+            status_mappings,
+            false,
+            Timestamp::now(),
+        )?;
+        self.repo.save(&project).await?;
+        Ok(project_to_dto(&project))
+    }
+
+    /// Link a project from a freshly-fetched remote snapshot (Stage 5).
+    ///
+    /// The CLI resolves `owner/number` over GraphQL via
+    /// [`ports::RemoteProjectProvider::fetch_project`] and hands the snapshot
+    /// here; we auto-derive the local-status → option mapping by option name
+    /// (RFC 0001 §3) and persist. Re-linking an existing project refreshes
+    /// its schema and re-seeds the mapping — `save` is an upsert keyed on the
+    /// node id.
+    pub async fn link_from_snapshot(&self, snap: RemoteProjectSnapshot) -> Result<ProjectDto> {
+        let id = ProjectId::parse(snap.node_id)?;
+        let status_options: Vec<StatusOption> = snap
+            .status_options
+            .into_iter()
+            .map(|o| StatusOption {
+                option_id: o.option_id,
+                name: o.name,
+                ordinal: o.ordinal,
+            })
+            .collect();
+        let status_mappings = derive_status_mappings(&status_options);
+        let project = Project::new(
+            id,
+            snap.owner_login,
+            snap.number,
+            snap.title,
+            snap.status_field_id,
             status_options,
             status_mappings,
             false,
@@ -319,5 +356,69 @@ mod tests {
         // Sort is (owner, number) — `acme` < `zeta`.
         assert_eq!(listed[0].owner_login, "acme");
         assert_eq!(listed[1].owner_login, "zeta");
+    }
+
+    fn snapshot() -> RemoteProjectSnapshot {
+        RemoteProjectSnapshot {
+            node_id: "PVT_snap".into(),
+            number: 3,
+            title: "repo-link".into(),
+            owner_login: "benediktms".into(),
+            status_field_id: "PVTSSF_x".into(),
+            status_options: vec![
+                ports::RemoteProjectStatusOption {
+                    option_id: "f7".into(),
+                    name: "Backlog".into(),
+                    ordinal: 0,
+                },
+                ports::RemoteProjectStatusOption {
+                    option_id: "47".into(),
+                    name: "In progress".into(),
+                    ordinal: 2,
+                },
+                ports::RemoteProjectStatusOption {
+                    option_id: "98".into(),
+                    name: "Done".into(),
+                    ordinal: 4,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn link_from_snapshot_auto_derives_mappings_by_name() {
+        let svc = service();
+        let dto = svc.link_from_snapshot(snapshot()).await.unwrap();
+        assert_eq!(dto.id, "PVT_snap");
+        assert_eq!(dto.status_options.len(), 3);
+        let m = |s: &str| {
+            dto.status_mappings
+                .iter()
+                .find(|x| x.status == s)
+                .map(|x| x.option_id.as_str())
+        };
+        // Backlog→open, In progress→in_progress, Done→done; no Blocked option
+        // on this board, so blocked stays unmapped.
+        assert_eq!(m("open"), Some("f7"));
+        assert_eq!(m("in_progress"), Some("47"));
+        assert_eq!(m("done"), Some("98"));
+        assert_eq!(m("blocked"), None);
+    }
+
+    #[tokio::test]
+    async fn link_from_snapshot_is_resolvable_by_owner_number() {
+        let svc = service();
+        svc.link_from_snapshot(snapshot()).await.unwrap();
+        let dto = svc.get("benediktms/3").await.unwrap();
+        assert_eq!(dto.id, "PVT_snap");
+    }
+
+    #[tokio::test]
+    async fn link_from_snapshot_rejects_non_pvt_node_id() {
+        let svc = service();
+        let mut s = snapshot();
+        s.node_id = "not-a-node-id".into();
+        let err = svc.link_from_snapshot(s).await.unwrap_err();
+        assert!(matches!(err, ServiceError::BadProjectId(_)));
     }
 }

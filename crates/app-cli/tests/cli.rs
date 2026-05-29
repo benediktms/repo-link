@@ -1,6 +1,8 @@
 use assert_cmd::Command;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
+use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn bin(name: &str, dir: &TempDir) -> Command {
     let mut cmd = Command::cargo_bin(name).expect("bin");
@@ -2806,35 +2808,72 @@ fn task_claim_is_idempotent_when_already_claimed() {
 
 // ---------- RFC 0001 Stage 4 — `rl project` + workspace ↔ project ----------
 
-/// Helper: link a stock project named "acme/7" with two options (Backlog,
-/// Done) and the canonical open→Backlog mapping. Returns the project
-/// node id.
+/// Helper: link a stock project addressed as `acme/7` (node id
+/// `PVT_demo_abc`) with two Status options — Backlog and Done.
+///
+/// `rl project link` fetches the schema over GraphQL (Stage 5), so we stand
+/// up a wiremock server returning that schema and point the CLI at it via
+/// `REPO_LINK_GITHUB_API_BASE_URL`. Auto-derivation seeds Backlog→open and
+/// Done→done. Returns the project node id.
 fn link_demo_project(dir: &TempDir) -> String {
-    let dto = run_json(
-        &mut bin("repo-link", dir),
-        &[
-            "project",
-            "link",
-            "--node-id",
-            "PVT_demo_abc",
-            "--owner",
-            "acme",
-            "--number",
-            "7",
-            "--title",
-            "Repo Link",
-            "--status-field-id",
-            "PVTSSF_x",
-            "--option",
-            "o1:Backlog",
-            "--option",
-            "o2:Done",
-            "--map",
-            "open:o1",
-        ],
-    );
+    // A multi-thread runtime keeps the mock server serving on background
+    // worker threads while the blocking `assert_cmd` subprocess hits it.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            // Only respond once the CLI propagated the parsed `acme/7` target
+            // into the request, so the parse->fetch contract is observable here
+            // and not just in the adapter tests.
+            .and(body_partial_json(
+                json!({ "variables": { "owner": "acme", "number": 7 } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": { "projectV2": {
+                    "id": "PVT_demo_abc",
+                    "number": 7,
+                    "title": "Repo Link",
+                    "owner": { "login": "acme" },
+                    "fields": { "nodes": [
+                        { "__typename": "ProjectV2SingleSelectField",
+                          "id": "PVTSSF_x", "name": "Status", "options": [
+                            { "id": "o1", "name": "Backlog" },
+                            { "id": "o2", "name": "Done" }
+                        ] }
+                    ] }
+                } } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let dto = run_json(&mut cmd, &["project", "link", "acme/7"]);
     assert_eq!(dto["id"], "PVT_demo_abc");
+    // `rt`/`server` stay alive until the function returns — i.e. past the
+    // blocking link call above.
     dto["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn project_link_rejects_zero_project_number() {
+    // `acme/0` is rejected at parse time, before any token/network is needed.
+    let dir = TempDir::new().unwrap();
+    let output = bin("repo-link", &dir)
+        .args(["project", "link", "acme/0"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("positive integer"),
+        "expected a positive-integer rejection, got: {stderr}"
+    );
 }
 
 #[test]
@@ -2845,7 +2884,8 @@ fn project_link_show_and_list_roundtrip() {
     let shown = run_json(&mut bin("repo-link", &dir), &["project", "show", "acme/7"]);
     assert_eq!(shown["id"], "PVT_demo_abc");
     assert_eq!(shown["status_options"].as_array().unwrap().len(), 2);
-    assert_eq!(shown["status_mappings"].as_array().unwrap().len(), 1);
+    // Auto-derivation seeds two mappings by name: Backlog→open, Done→done.
+    assert_eq!(shown["status_mappings"].as_array().unwrap().len(), 2);
 
     // `default_for` should also surface inline on the matching option row
     // so a single render covers both the catalog and the mapping.
@@ -2873,7 +2913,8 @@ fn project_map_appends_then_overwrites() {
     let dir = TempDir::new().unwrap();
     link_demo_project(&dir);
 
-    // done→o2 is a new mapping (append).
+    // Auto-derivation seeds open→o1 and done→o2 (2 rows). `in_progress` has
+    // no matching option, so mapping it is a genuine append → 3 rows.
     let after_append = run_json(
         &mut bin("repo-link", &dir),
         &[
@@ -2881,14 +2922,14 @@ fn project_map_appends_then_overwrites() {
             "map",
             "acme/7",
             "--local",
-            "done",
+            "in_progress",
             "--option-id",
             "o2",
         ],
     );
-    assert_eq!(after_append["status_mappings"].as_array().unwrap().len(), 2);
+    assert_eq!(after_append["status_mappings"].as_array().unwrap().len(), 3);
 
-    // open→o2 overwrites the existing open→o1 mapping.
+    // open→o2 overwrites the existing open→o1 mapping — no new row.
     let after_overwrite = run_json(
         &mut bin("repo-link", &dir),
         &[
@@ -2906,7 +2947,7 @@ fn project_map_appends_then_overwrites() {
     assert_eq!(open_mapping["option_id"], "o2");
     assert_eq!(
         mappings.len(),
-        2,
+        3,
         "overwrite must not append a duplicate row"
     );
 }
