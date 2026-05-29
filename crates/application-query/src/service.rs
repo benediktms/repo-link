@@ -139,6 +139,11 @@ impl QueryService {
             }
         }
 
+        // A task is never its own child. The service rejects self-relations at
+        // creation, but a legacy/corrupt row pointing back at the parent must
+        // not inflate `total`/`done`.
+        child_ids.remove(&parent.id);
+
         let mut children = Vec::with_capacity(child_ids.len());
         for id in child_ids {
             let c = self.tasks.get(id).await?;
@@ -636,6 +641,24 @@ mod tests {
         assert_eq!(rollup.total, 1);
         assert_eq!(rollup.done, 0);
         assert_eq!(rollup.children[0].task_id, active.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn children_rollup_excludes_self_reference() {
+        // A corrupt self-referential edge must not make a task its own child.
+        // The service rejects self-relations at creation, but a legacy row
+        // could still carry one — the rollup must stay defensive.
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut parent = Task::new_draft(wid, None, "parent".into()).unwrap();
+        parent.add_relation(domain_task::RelationKind::ParentOf, parent.id);
+        ts.save(&parent, SnapshotSource::LocalEdit).await.unwrap();
+
+        let rollup = svc.children(&parent.id.to_string()).await.unwrap();
+        assert_eq!(rollup.total, 0, "a task must not be its own child");
     }
 
     #[tokio::test]
