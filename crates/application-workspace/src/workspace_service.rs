@@ -205,15 +205,22 @@ impl WorkspaceService {
                 if task.project_item_id.is_some() {
                     continue;
                 }
-                let Some(node_id) = task.remote.as_ref().and_then(|r| r.node_id.clone()) else {
-                    // No GraphQL node id → can't AddItem. Pre-project-sync
-                    // tasks recorded a remote before node ids were persisted;
-                    // they backfill it on their next `sync pull`. Log instead
-                    // of skipping silently so a "0 added" backfill is
-                    // diagnosable (RFC 0001 §9 / §D1).
+                // No remote at all → a local-only / draft task. Skip silently:
+                // it isn't board-eligible via AddItem (it goes through
+                // CreateDraftIssue on promote), and "run `rl sync pull`" would
+                // be misleading advice for a task with nothing to pull.
+                let Some(remote) = task.remote.as_ref() else {
+                    continue;
+                };
+                let Some(node_id) = remote.node_id.clone() else {
+                    // Issue-backed but no GraphQL node id → can't AddItem.
+                    // Pre-project-sync tasks recorded a remote before node ids
+                    // were persisted; they backfill it on their next `sync
+                    // pull`. Log instead of skipping silently so a "0 added"
+                    // backfill is diagnosable (RFC 0001 §9 / §D1).
                     tracing::warn!(
                         task_id = %task.id,
-                        remote_id = task.remote.as_ref().map(|r| r.remote_id.as_str()).unwrap_or("<none>"),
+                        remote_id = remote.remote_id.as_str(),
                         "set-project backfill: task has no remote node_id; skipping AddItem (run `rl sync pull` on it to backfill the node id)"
                     );
                     continue;

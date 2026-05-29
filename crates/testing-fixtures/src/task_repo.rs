@@ -357,10 +357,14 @@ impl TaskRepository for InMemoryTaskRepository {
         // the stored task, preserving every other field — no snapshot, no
         // version bump, no `sync` change. No-op if the task is absent or has no
         // remote ref (nothing to hang the node id off).
-        if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
-            if let Some(remote) = task.remote.as_mut() {
-                remote.node_id = Some(node_id);
-            }
+        if let Some(remote) = self
+            .inner
+            .lock()
+            .unwrap()
+            .get_mut(&task_id)
+            .and_then(|t| t.remote.as_mut())
+        {
+            remote.node_id = Some(node_id);
         }
         Ok(())
     }
