@@ -56,6 +56,9 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
     async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
         Ok(RemoteTaskSnapshot {
             remote_id: "100".into(),
+            // Mirror GitHub: a freshly created issue comes back with its
+            // GraphQL node id, so promote can persist it onto the RemoteRef.
+            node_id: Some("I_kwDOstub100".into()),
             title: cmd.title.into(),
             body: cmd.body.into(),
             closed: false,
@@ -78,6 +81,7 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
         });
         Ok(RemoteTaskSnapshot {
             remote_id: cmd.remote_id.into(),
+            node_id: None,
             title: cmd.title.unwrap_or("").into(),
             body: cmd.body.unwrap_or("").into(),
             closed: cmd.closed.unwrap_or(false),

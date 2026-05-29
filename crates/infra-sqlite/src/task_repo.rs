@@ -332,6 +332,22 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()> {
+        // Targeted single-column write — same rationale as `cache_project_status`
+        // above: `sync pull`'s Noop branch makes no aggregate write, so routing
+        // this through `write_task_in_tx` would bump the version, append a
+        // snapshot, and risk clobbering a concurrent CLI edit. `remote_node_id`
+        // is excluded from the dirty diff, so a bare column update is safe. A
+        // zero-row match (task absent) is a benign no-op.
+        sqlx::query("UPDATE tasks SET remote_node_id = ? WHERE id = ?")
+            .bind(node_id)
+            .bind(task_id.to_string())
+            .execute(&self.db.writes)
+            .await
+            .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())

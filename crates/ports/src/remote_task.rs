@@ -48,6 +48,13 @@ pub struct RemoteTaskUpdate<'a> {
 #[derive(Clone, Debug)]
 pub struct RemoteTaskSnapshot {
     pub remote_id: String,
+    /// Provider-native opaque node ID (e.g. GitHub `I_kwHO…`). GitHub's REST
+    /// issue payload carries it alongside `number`, so every create / fetch
+    /// path can surface it here. Maps onto [`domain_task::RemoteRef::node_id`];
+    /// `None` for providers (or REST responses) that don't expose one. Required
+    /// by GraphQL mutations such as `addProjectV2ItemById`, so capturing it on
+    /// the REST paths is what makes a task board-eligible (RFC 0001 §9 / §D1).
+    pub node_id: Option<String>,
     pub title: String,
     pub body: String,
     pub closed: bool,

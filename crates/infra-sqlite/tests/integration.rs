@@ -1352,6 +1352,77 @@ async fn cache_project_status_does_not_clobber_concurrent_whole_row_edit() {
     );
 }
 
+/// rpl-4ui (RFC 0001 §9 / §D1) — `cache_remote_node_id` backfills ONLY the
+/// `remote_node_id` column for a pre-project-sync task, and survives a
+/// concurrent whole-row edit just like `cache_project_status`. Promote with a
+/// bare `RemoteRef::new` (node id `None`, the pre-Stage-2 shape), confirm it
+/// round-trips as `None`, then backfill and assert it sticks without tearing a
+/// concurrent title edit.
+#[tokio::test]
+async fn cache_remote_node_id_backfills_without_clobbering_concurrent_edit() {
+    let (_dir, ws, _rb, ts) = setup().await;
+
+    let workspace = Workspace::new(WorkspaceName::new("node-id-backfill").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    let mut task = Task::new_draft(workspace.id, None, "original title".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    // Bare ref → node_id None: the row a task created before node ids were
+    // persisted looks like.
+    task.promote_to_remote(RemoteRef::new("github", "100"))
+        .unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    let before = ts.get(task.id).await.unwrap();
+    assert_eq!(
+        before.remote.as_ref().unwrap().node_id,
+        None,
+        "pre-backfill the node id round-trips as None"
+    );
+
+    // A concurrent CLI edit lands a NEW title via the whole-row save path.
+    // `set_title` flips the task Synced -> DirtyLocal via dirty detection; the
+    // backfill below must preserve THAT state, not reset it.
+    let mut concurrent = ts.get(task.id).await.unwrap();
+    concurrent
+        .set_title("edited by concurrent CLI".into())
+        .unwrap();
+    ts.save(&concurrent, SnapshotSource::LocalEdit)
+        .await
+        .unwrap();
+    let sync_before_backfill = ts.get(task.id).await.unwrap().sync;
+
+    // Targeted backfill of the node id.
+    ts.cache_remote_node_id(task.id, "I_kwDObackfilled".into())
+        .await
+        .unwrap();
+
+    let after = ts.get(task.id).await.unwrap();
+    assert_eq!(
+        after.remote.as_ref().unwrap().node_id.as_deref(),
+        Some("I_kwDObackfilled"),
+        "the node id column is set by the targeted write"
+    );
+    assert_eq!(
+        after.remote.as_ref().unwrap().remote_id,
+        "100",
+        "the remote_id is untouched"
+    );
+    assert_eq!(
+        after.title, "edited by concurrent CLI",
+        "the concurrent title edit survives the backfill (no whole-row clobber)"
+    );
+    assert_eq!(
+        after.sync, sync_before_backfill,
+        "the targeted backfill must not perturb sync_state"
+    );
+
+    // An absent id is a benign no-op Ok (zero rows matched).
+    ts.cache_remote_node_id(domain_core::TaskId::new(), "I_ghost".into())
+        .await
+        .expect("cache_remote_node_id for an absent task is a no-op Ok");
+}
+
 // ---------- RFC 0001 Stage 6 (#54): claim_next_eligible + backoff ----------
 
 /// Seed a workspace + a task row (the outbox FK needs a real task) and return

@@ -869,6 +869,7 @@ mod tests {
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
             Ok(RemoteTaskSnapshot {
                 remote_id: "777".into(),
+                node_id: Some("I_kwDOstub777".into()),
                 title: cmd.title.into(),
                 body: cmd.body.into(),
                 closed: false,
@@ -882,6 +883,7 @@ mod tests {
             self.updates.fetch_add(1, Ordering::SeqCst);
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
+                node_id: None,
                 title: cmd.title.unwrap_or("").into(),
                 body: cmd.body.unwrap_or("").into(),
                 closed: cmd.closed.unwrap_or(false),

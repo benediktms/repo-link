@@ -185,6 +185,20 @@ pub trait TaskRepository: Send + Sync {
         task_id: TaskId,
         option_id: Option<String>,
     ) -> PortResult<()>;
+    /// Backfill ONLY the `remote_node_id` column for one task — a targeted
+    /// single-column write that must NOT touch any other column, append a
+    /// snapshot, bump the `version`, or change `sync_state`. Used by `sync
+    /// pull` to capture the GraphQL node id off a fetched REST snapshot for a
+    /// pre-project-sync task whose `remote_id` was recorded before node ids
+    /// were persisted (RFC 0001 §9 / §D1 — board eligibility).
+    ///
+    /// Routed off the whole-row `save` path for the same reason as
+    /// [`cache_project_status`](Self::cache_project_status): pull's Noop branch
+    /// does no aggregate write, and a whole-row save there could clobber a
+    /// title / body / status edit a concurrent CLI made after the pull's read.
+    /// `node_id` is invisible to dirty detection, so this never perturbs sync
+    /// state. A zero-row match (task absent) is a benign no-op.
+    async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
