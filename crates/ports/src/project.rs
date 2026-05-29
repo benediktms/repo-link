@@ -44,6 +44,22 @@ pub struct RemoteProjectItem {
     pub updated_at: Timestamp,
 }
 
+/// One [`RemoteProjectProvider::poll_project_items`] result, carrying the items
+/// *and* a truthful partiality flag. `truncated` is set by the provider when it
+/// could not enumerate the whole connection (the page cap was hit), so the
+/// caller must not infer completeness from `items.len()`: an adapter that drops
+/// unmodelled nodes (PRs, hidden content) can return fewer items than a naive
+/// page-size heuristic would expect even on a truncated read. The poller relies
+/// on this flag to decide whether to advance its per-project watermark.
+#[derive(Clone, Debug)]
+pub struct PollPage {
+    pub items: Vec<RemoteProjectItem>,
+    /// `true` when the provider could not see the whole result set (e.g. it hit
+    /// its pagination cap). The poller treats such a page as partial and does
+    /// NOT advance the watermark, so the next cycle refetches the same window.
+    pub truncated: bool,
+}
+
 #[async_trait]
 pub trait RemoteProjectProvider: Send + Sync {
     /// Resolve `owner/number` → project schema. Called once per `rl project
@@ -102,8 +118,10 @@ pub trait RemoteProjectProvider: Send + Sync {
         option_id: &str,
     ) -> PortResult<()>;
 
-    /// Poll a project for items changed since `since` matching `query`
-    /// (e.g. `"is:open"`). Returns both issue-backed items and drafts;
+    /// Poll a project for items changed since `since` matching `query` (an
+    /// empty `query` means the delta `updated:>{since}` filter alone — what the
+    /// status-reconciliation poller passes, so drafts and closed/Done items are
+    /// not filtered out). Returns both issue-backed items and drafts;
     /// `RemoteProjectItem.issue_node_id` is `None` for drafts.
     ///
     /// `status_field_id` is the project's chosen Status field (`PVTSSF_…`, as
@@ -111,13 +129,18 @@ pub trait RemoteProjectProvider: Send + Sync {
     /// item's status option is read from *that* field by id — not by the
     /// literal field name "Status", which would miss boards whose single-select
     /// field is named anything else.
+    ///
+    /// Returns a [`PollPage`]: the items plus a `truncated` flag the provider
+    /// sets when it could not enumerate the whole result set. The caller must
+    /// trust that flag rather than inferring partiality from the item count —
+    /// the count is lossy because unmodelled nodes are silently dropped.
     async fn poll_project_items(
         &self,
         project_node_id: &str,
         status_field_id: &str,
         since: Timestamp,
         query: &str,
-    ) -> PortResult<Vec<RemoteProjectItem>>;
+    ) -> PortResult<PollPage>;
 }
 
 #[async_trait]

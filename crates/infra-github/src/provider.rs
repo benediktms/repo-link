@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use domain_core::Timestamp;
 use ports::{
-    PortResult, RemoteChildIssue, RemoteComment, RemoteProjectItem, RemoteProjectProvider,
+    PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteProjectProvider,
     RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
     RemoteTaskUpdate,
 };
@@ -45,6 +45,19 @@ impl GithubAdapter {
             rest: RestClient::new(token.clone(), base_url.clone())?,
             graphql: GraphqlClient::new(token, base_url)?,
         })
+    }
+
+    /// Construct from a token plus an optional base-URL override. `Some(url)`
+    /// honours `REPO_LINK_GITHUB_API_BASE_URL` (GitHub Enterprise / a wiremock
+    /// in tests); `None` falls back to `api.github.com`. This is the single
+    /// shared entry point both `app-cli` and `app-daemon` build the adapter
+    /// through, so the base-URL override is honoured identically everywhere
+    /// (fixes #100 — the daemon previously called `new`, dropping the override).
+    pub fn from_env_parts(token: impl Into<String>, base_url: Option<&str>) -> PortResult<Self> {
+        match base_url {
+            Some(url) => Self::with_base_url(token, url),
+            None => Self::new(token),
+        }
     }
 
     /// Resolve the GitHub login of the token's owner via `GET /user`. Used by
@@ -171,7 +184,7 @@ impl RemoteProjectProvider for GithubAdapter {
         status_field_id: &str,
         since: Timestamp,
         query: &str,
-    ) -> PortResult<Vec<RemoteProjectItem>> {
+    ) -> PortResult<PollPage> {
         self.graphql
             .poll_project_items(project_node_id, status_field_id, since, query)
             .await

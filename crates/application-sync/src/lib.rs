@@ -15,10 +15,16 @@
 //! Both derive the remote `(closed, state_reason)` from the same
 //! [`lifecycle_to_remote_state`] so a task closes/reopens identically no
 //! matter which path flushes it.
+//!
+//! The inbound counterpart is [`ProjectPoller`] (Stage 7, #55): it pulls
+//! project-board state back from GitHub on a cadence and correlates each
+//! polled item with its local task. The daemon drives it as its own
+//! concurrent task alongside the drainer.
 
 mod drainer;
 pub mod enqueue;
 mod error;
+mod poller;
 mod service;
 mod summary;
 
@@ -28,6 +34,7 @@ use ports::RemoteStateReason;
 
 pub use drainer::{BackoffSchedule, OutboxDrainer};
 pub use error::{Result, SyncError};
+pub use poller::{PollReport, ProjectPoller};
 pub use service::SyncService;
 
 /// Resolve a task's lifecycle status to a project Status option id, applying

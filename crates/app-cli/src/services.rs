@@ -78,10 +78,10 @@ pub(crate) fn build_github_provider(
     token: &str,
     cfg: &RepoLinkConfig,
 ) -> Result<GithubAdapter, ports::PortError> {
-    match cfg.github_api_base_url.as_deref() {
-        Some(url) => GithubAdapter::with_base_url(token, url),
-        None => GithubAdapter::new(token),
-    }
+    // Shared constructor (infra-github) so app-cli and app-daemon honour the
+    // base-URL override identically — see #100, where the daemon used to build
+    // the adapter via `new` and silently ignored REPO_LINK_GITHUB_API_BASE_URL.
+    GithubAdapter::from_env_parts(token, cfg.github_api_base_url.as_deref())
 }
 
 /// Resolve the GitHub token or fail with a command-specific "set token or

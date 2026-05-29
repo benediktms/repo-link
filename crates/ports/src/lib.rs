@@ -15,7 +15,7 @@ pub use event_sink::EventSink;
 pub use filesystem::FilesystemProbe;
 pub use outbox::OutboxRepository;
 pub use project::{
-    ProjectRepository, RemoteProjectItem, RemoteProjectProvider, RemoteProjectSnapshot,
+    PollPage, ProjectRepository, RemoteProjectItem, RemoteProjectProvider, RemoteProjectSnapshot,
     RemoteProjectStatusOption,
 };
 pub use remote_task::{

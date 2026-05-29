@@ -445,11 +445,14 @@ async fn poll_project_items_reads_option_from_matching_field_id() {
         .await;
 
     let since = Timestamp::from_utc(Utc::now());
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items("PVT_x", "PVTSSF_status", since, "is:open")
         .await
         .unwrap();
+    let items = &page.items;
 
+    // Single complete page → not truncated.
+    assert!(!page.truncated);
     // The PullRequest node is skipped — only the issue + draft map through.
     assert_eq!(items.len(), 2);
 
@@ -497,7 +500,7 @@ async fn poll_project_items_yields_none_when_status_field_absent() {
     )
     .await;
 
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items(
             "PVT_x",
             "PVTSSF_status",
@@ -506,8 +509,8 @@ async fn poll_project_items_yields_none_when_status_field_absent() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].status_option_id, None);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].status_option_id, None);
 }
 
 #[tokio::test]
@@ -532,7 +535,7 @@ async fn poll_project_items_marks_closed_issue() {
     )
     .await;
 
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items(
             "PVT_x",
             "PVTSSF_status",
@@ -541,8 +544,8 @@ async fn poll_project_items_marks_closed_issue() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert!(items[0].closed);
+    assert_eq!(page.items.len(), 1);
+    assert!(page.items[0].closed);
 }
 
 #[tokio::test]
@@ -577,7 +580,7 @@ async fn poll_project_items_follows_pagination() {
         .mount(&server)
         .await;
 
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items(
             "PVT_x",
             "PVTSSF_status",
@@ -586,9 +589,11 @@ async fn poll_project_items_follows_pagination() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].item_node_id, "PVTI_a");
-    assert_eq!(items[1].item_node_id, "PVTI_b");
+    // Last page reported `hasNextPage: false` → the read is complete.
+    assert!(!page.truncated);
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].item_node_id, "PVTI_a");
+    assert_eq!(page.items[1].item_node_id, "PVTI_b");
 }
 
 #[tokio::test]
@@ -608,7 +613,7 @@ async fn poll_project_items_stops_at_page_cap() {
         .mount(&server)
         .await;
 
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items(
             "PVT_x",
             "PVTSSF_status",
@@ -617,7 +622,11 @@ async fn poll_project_items_stops_at_page_cap() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 20, "must stop at MAX_POLL_PAGES");
+    assert_eq!(page.items.len(), 20, "must stop at MAX_POLL_PAGES");
+    assert!(
+        page.truncated,
+        "hitting the page cap with more pages available must report truncated"
+    );
 }
 
 #[tokio::test]
@@ -636,7 +645,7 @@ async fn poll_project_items_stops_on_missing_cursor() {
     )
     .await;
 
-    let items = provider(&server)
+    let page = provider(&server)
         .poll_project_items(
             "PVT_x",
             "PVTSSF_status",
@@ -645,7 +654,11 @@ async fn poll_project_items_stops_on_missing_cursor() {
         )
         .await
         .unwrap();
-    assert_eq!(items.len(), 1);
+    assert_eq!(page.items.len(), 1);
+    assert!(
+        page.truncated,
+        "hasNextPage with a null cursor is an incomplete read → truncated"
+    );
 }
 
 #[tokio::test]

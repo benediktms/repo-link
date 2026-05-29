@@ -195,6 +195,20 @@ Properties:
 
 Webhooks are not pursued — polling is the terminal mechanism (see §9).
 
+**As built (Stage 7, #55).** The poll path is realized as `application_sync::ProjectPoller::poll_once`. Per pass it:
+
+- Enumerates every locally-known project (`ProjectRepository::list_all`).
+- Calls `RemoteProjectProvider::poll_project_items(project_node_id, status_field_id, since, query = "is:open")` per project.
+- Correlates each returned item with its local task by `project_item_id` (a per-pass in-memory index, since `TaskFilter` has no `project_item_id` axis).
+
+A per-project `since` watermark lives in-process (epoch on a fresh start — re-reading is idempotent). A page the provider flags `truncated` is treated as **partial**: the watermark is *not* advanced (the next cycle refetches) and **nothing is ever marked stale from a poll** — absence from a (possibly truncated) page is not evidence of remote deletion. On a complete page the watermark advances to `max_seen - 1s` (the 1s margin re-includes same-second siblings under GitHub's strict `updated:>`), but only when something strictly newer than the current `since` was seen, and never below `since` — so an empty/nothing-newer page leaves the watermark put rather than drifting it backward.
+
+**Daemon task structure.** The poller is driven by the daemon's **poller task** (folded together with worktree reconcile + grace-prune + heartbeat — see Stage 7 "as built"), at `PROJECT_POLLER_INTERVAL`.
+
+**Stage 8 seam.** The cached per-task project-status column does **not** exist yet (it lands in Stage 8, #39); `poll_once` therefore writes no project status and carries an explicit `// Stage 8: write project_status cache here` seam at the correlation point — the matched task + `item.status_option_id` is everything Stage 8 needs there.
+
+**Cross-process `Notify`.** The drainer's just-in-time `Notify` only wakes the daemon for **in-process** enqueues; CLI-originated enqueues cross the process boundary into the shared SQLite outbox and are caught by the drainer's 5s periodic sweep instead.
+
 ## 4. Hexagonal split — crate map
 
 The repo is already cleanly layered (domain → ports ← infrastructure / application → ports). The new work fits the existing seams:
@@ -308,6 +322,15 @@ PR shape: one PR. Risk: medium-high — touches every lifecycle verb. Reviewer f
 - 7d. `infra-config` gains no fields in this stage. Config knobs are deferred until someone actually needs them — see §9 follow-ups.
 
 PR shape: one PR. Risk: medium — first real background work the daemon does beyond heartbeats.
+
+**Implementation decisions (as built — #55, also closes #88 + #100):**
+
+- **Realized two-task split (watch + Notify, no `tokio-util`).** `Daemon::run` wraps the daemon in `Arc<Self>` and spawns two `tokio::spawn`'d tasks coordinated by a `tokio::sync::watch<bool>` cancellation channel (`true` = shut down) — **not** `tokio_util::CancellationToken` (that crate is deliberately not added; `watch` is already in the enabled `tokio` `sync` feature). The realized `PROJECT_POLLER_INTERVAL` constant is `45s` (mid-band) and is also the default for `--interval-secs`, which still overrides it; `OUTBOX_DRAINER_PERIODIC_SWEEP` is `5s`. Both constants carry the `// TODO(config): expose via infra-config once a user actually asks` comment, and `infra-config` gains no fields (7d holds).
+- **Folded reconcile / heartbeat home.** The non-drain periodic work that lived in the single ticker — worktree reconcile, grace-prune, and the single combined `last_tick.json` heartbeat — is folded into the **poller task** (`Daemon::tick_once`), which also runs `ProjectPoller::poll_once`. So that task keeps one cadence and `rl daemon status`'s wedged-detection (`tick_at` older than `2 × interval_secs`) still measures one primary heartbeat. The **drainer task** (`Daemon::drain_tick`) does only `OutboxDrainer::drain_once`.
+- **Cross-process `Notify` caveat.** The drainer task `select!`s over (a) a `tokio::sync::Notify` just-in-time wake and (b) the 5s sweep. The in-process `Notify` only fires for **daemon-originated** enqueues (currently the startup dirty-reconcile). A `rl task start/edit/complete` runs in a **separate process** and enqueues straight into the shared SQLite outbox — the daemon never sees that signal, so the **5s sweep is the mechanism that catches CLI-originated enqueues**. (The §D4 "signal the drainer immediately via `Notify`" only holds within the daemon process.)
+- **Join / shutdown semantics.** The run loop `select!`s over the shutdown future plus the two `JoinHandle`s (borrowed `&mut`, so the one that didn't fire is still ownable — a completed `JoinHandle` is never awaited twice). A handle resolving to `Err(JoinError)` (a panic) trips the shared `watch` cancellation so the other task also stops; a clean return is not a panic. Per-task tick errors stay non-fatal (logged, loop continues) — only a panic trips global shutdown. The `std::sync::Mutex` guarding `miss_counts` is never held across an `.await`.
+- **#88 fixed — immediate first work.** Each spawned task does its first unit of work immediately on startup (the first `tokio::time::interval` `tick()` returns instantly; there is no warm-up `ticker.tick().await` eating the first run, which was #88), then settles into its cadence.
+- **#100 fixed + SIGTERM.** Both `app-cli` and `app-daemon` now construct the GitHub provider through one shared `infra-github` constructor, `GithubAdapter::from_env_parts(token, base_url: Option<&str>)`, so `REPO_LINK_GITHUB_API_BASE_URL` is honoured identically (the daemon previously called `GithubAdapter::new`, dropping the override — #100). The daemon also installs a real **SIGTERM** handler via `tokio::signal::unix` (gated `#[cfg(unix)]`; non-unix keeps ctrl-c only) wired into the same shutdown path, because under launchd / systemd SIGTERM is the normal stop signal.
 
 ### Stage 8 — Project status reads/writes + drift surfacing (closes #39)
 - 8a. Outbox supports `SetProjectStatus` mutations; `task start/complete/block` enqueue them when the task has a `project_item_id`.

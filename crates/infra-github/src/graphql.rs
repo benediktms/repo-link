@@ -17,7 +17,8 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use octocrab::Octocrab;
 use ports::{
-    PortError, PortResult, RemoteProjectItem, RemoteProjectSnapshot, RemoteProjectStatusOption,
+    PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectSnapshot,
+    RemoteProjectStatusOption,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -352,7 +353,7 @@ impl GraphqlClient {
         status_field_id: &str,
         since: domain_core::Timestamp,
         query: &str,
-    ) -> PortResult<Vec<RemoteProjectItem>> {
+    ) -> PortResult<PollPage> {
         // GitHub issue-search syntax: `updated:>` is the delta lever (RFC
         // §D4). Combine it with any caller-supplied filter (e.g. "is:open").
         let since_str = since.as_inner().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -403,14 +404,18 @@ impl GraphqlClient {
             // Exhausted the page cap with more pages still available. The
             // `updated:>` delta filter keeps a steady-state tick well under the
             // cap, so this signals an unusually large change set; the caller
-            // should treat the result as partial and refetch.
+            // treats the result as partial (via `PollPage.truncated`) and
+            // refetches the same window next cycle.
             tracing::warn!(
                 project = project_node_id,
                 max_pages = MAX_POLL_PAGES,
-                "poll_project_items hit the page cap; results may be truncated"
+                "poll_project_items hit the page cap; results truncated"
             );
         }
-        Ok(out)
+        Ok(PollPage {
+            items: out,
+            truncated,
+        })
     }
 }
 

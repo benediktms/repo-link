@@ -34,9 +34,19 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# Test-only `test-util` feature: the shutdown-grace abort-fallback test
+# (`wedged_task_is_force_aborted_within_shutdown_grace`) runs under paused tokio
+# time (`#[tokio::test(start_paused = true)]`) so the 5s `SHUTDOWN_GRACE`
+# advances virtually rather than wall-clock. Dev-only — the production daemon
+# never enables `test-util`.
+tokio = { workspace = true, features = ["signal", "test-util"] }
 testing-fixtures = { workspace = true }
 domain-workspace = { workspace = true }
 domain-repo = { workspace = true }
+# Test-only: the Stage-7 run-loop tests construct a `Project` to seed the
+# poller. Not a runtime dep — the daemon never touches the project domain
+# type directly (it goes through ports + application-sync).
+domain-project = { workspace = true }
 async-trait = { workspace = true }
 
 # `src/bin/rld.rs` is auto-discovered. Thin shim around `app_daemon::run_cli()`
