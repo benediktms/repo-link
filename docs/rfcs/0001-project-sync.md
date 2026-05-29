@@ -193,7 +193,7 @@ Properties:
 - **Daemon offline window.** On reconnect, run one wide-window catch-up poll (`updated:>$last_known_tick - 5m`) before resuming the normal cadence. Bounded but complete.
 - **Drift surfacing (closes #39).** Cache reconcile diffs against the cached `project_status_option_id`. A non-match emits a drift row visible to `rl query drift`.
 
-Webhooks are explicitly deferred — see §9.
+Webhooks are not pursued — polling is the terminal mechanism (see §9).
 
 ## 4. Hexagonal split — crate map
 
@@ -585,7 +585,7 @@ Other lifecycle verbs (`start/complete/block/edit` for non-`--repo` flags) gain 
 
 ## 9. Out of scope and follow-ups
 
-- **Webhooks.** GitHub exposes the right events (`issues`, `projects_v2_item` with `edited.changes.field_value`), but delivery requires either `gh webhook forward` (CLI-bound, beta transport) or a hosted relay. Polling at 30–60s is fine for human-scale workflows; webhooks are a *separate spike* once polling cadence proves insufficient. File ticket: "Spike: webhook integration for sub-second sync".
+- **Webhooks — not pursued (scrapped).** A webhook is a best-effort *notification*, not a consistency mechanism: deliveries can be dropped, arrive out of order, and have no replay (GitHub's own guidance is to reconcile missed deliveries via the API). Consistent project-state sync therefore **always** requires a reconciling poll (§D4) regardless — a webhook could only ever be a latency layer on top. Two facts remove even that layer: (1) `projects_v2_item` is an **organization-scope-only** event and GitHub has no user-account webhook surface (["You cannot create webhooks for individual user accounts"](https://github.com/orgs/community/discussions/17405)), so it is undeliverable for our user-owned boards; (2) measured delivery (~p50 28s / p95 60s) ≈ the 30–60s poll cadence, so there is no latency win even where deliverable. Polling (§D4) is the **terminal** mechanism. `gh webhook forward` (GA; `--repo`/`--org` only) and hosted relays are moot — the latter would also break the local-first, no-server stance. Spike #92 concluded **scrap** (verified against GitHub OpenAPI + discussion #17405).
 - **`rl sync pull --all`.** Doesn't exist today. Useful as the manual escape valve for archived tasks. File ticket: "feat(sync): add `rl sync pull --all`".
 - **Per-repo / per-workspace TOML preferences.** Declarative config (e.g. `repo-link.toml`) for per-repo creation preferences — for example, "in workspace `W`, tasks default to being filed in repo `acme/backend`" or "always create as a draft regardless of project link." Out of scope for v1 (the orphan-vs-anchored split in §D1 covers the common cases without config). File ticket: "Spike: TOML-based per-repo preferences for task creation."
 - **Project priority + size fields.** The live `repo-link` project has Priority (P0/P1/P2) and Size (XS-XL) single-select fields too. Same machinery as Status — punt to a follow-up RFC.
