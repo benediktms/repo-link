@@ -3,8 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_sync::OutboxEntry;
 use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use ports::{PortError, PortResult, RemoteComment, TaskFilter, TaskRepository};
+
+use crate::InMemoryOutboxRepository;
+use crate::outbox_repo::OutboxStore;
 
 // ---------- Task repository -----------------------------------------------
 
@@ -14,6 +18,12 @@ pub struct InMemoryTaskRepository {
     // Comments live in their own store (like the `task_comments` table), so
     // `save` never clobbers them and reads overlay the current set.
     comments: Mutex<HashMap<TaskId, Vec<TaskComment>>>,
+    /// Handle to the SAME append-only `Vec` the paired
+    /// [`InMemoryOutboxRepository`] uses, when the test wires the combined
+    /// transactional-outbox path via [`with_outbox`](Self::with_outbox). `None`
+    /// for plain `new()` repos that never exercise `save_with_outbox` with a
+    /// non-empty entry slice.
+    outbox: Option<OutboxStore>,
 }
 
 impl InMemoryTaskRepository {
@@ -22,6 +32,22 @@ impl InMemoryTaskRepository {
             inner: Mutex::new(HashMap::new()),
             snapshots: Arc::new(Mutex::new(HashMap::new())),
             comments: Mutex::new(HashMap::new()),
+            outbox: None,
+        }
+    }
+
+    /// Build a task repo that shares the given outbox's entry store, so
+    /// `save_with_outbox` appends the task and its outbox entries under ONE
+    /// lock — the in-memory equivalent of the SQLite single-transaction
+    /// guarantee (#54). Wire the SAME `Arc<InMemoryOutboxRepository>` into both
+    /// the task repo (here) and the `TaskService` so the combined write and the
+    /// outbox the test inspects are one and the same store.
+    pub fn with_outbox(outbox: &Arc<InMemoryOutboxRepository>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+            comments: Mutex::new(HashMap::new()),
+            outbox: Some(outbox.store_handle()),
         }
     }
 
@@ -36,9 +62,11 @@ impl Default for InMemoryTaskRepository {
     }
 }
 
-#[async_trait]
-impl TaskRepository for InMemoryTaskRepository {
-    async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()> {
+impl InMemoryTaskRepository {
+    /// Append the snapshot row + upsert the task projection, holding both locks
+    /// for the duration so a concurrent reader never sees a half-written pair.
+    /// Shared by `save` and `save_with_outbox`.
+    fn write_locked(&self, task: &Task, source: SnapshotSource) {
         let mut snaps = self.snapshots.lock().unwrap();
         let history = snaps.entry(task.id).or_default();
         let next_version = history.iter().map(|s| s.version).max().unwrap_or(0) + 1;
@@ -57,8 +85,42 @@ impl TaskRepository for InMemoryTaskRepository {
             source,
             captured_at: Timestamp::now(),
         });
-        drop(snaps);
         self.inner.lock().unwrap().insert(task.id, task.clone());
+    }
+}
+
+#[async_trait]
+impl TaskRepository for InMemoryTaskRepository {
+    async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()> {
+        self.write_locked(task, source);
+        Ok(())
+    }
+
+    async fn save_with_outbox(
+        &self,
+        task: &Task,
+        source: SnapshotSource,
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        // Empty entries → behave exactly like `save` (the LocalOnly / no-op
+        // path), so a plain `new()` repo with no outbox handle still works.
+        if entries.is_empty() {
+            self.write_locked(task, source);
+            return Ok(());
+        }
+        // Non-empty entries require the shared outbox store: append the task
+        // write AND the entries together. We take the outbox lock for the whole
+        // op so the combined write is atomic w.r.t. an `all()` reader — the
+        // in-memory analogue of the SQLite single transaction. A test that
+        // enqueues entries without wiring `with_outbox` is a wiring bug; panic
+        // loudly rather than silently drop durable outbox entries.
+        let store = self.outbox.as_ref().expect(
+            "InMemoryTaskRepository::save_with_outbox called with entries but no outbox handle; \
+             build the repo via InMemoryTaskRepository::with_outbox(&outbox)",
+        );
+        let mut guard = store.lock().unwrap();
+        self.write_locked(task, source);
+        guard.extend(entries.iter().cloned());
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_sync::OutboxEntry;
 use domain_task::{
     Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment, TaskRelation,
     TaskSnapshot, TaskStatus,
@@ -53,6 +54,33 @@ impl TaskRepository for SqliteTaskRepository {
             .map_err(map_sqlx_err)?;
         for (t, source) in tasks {
             write_task_in_tx(&mut tx, t, *source).await?;
+        }
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
+    async fn save_with_outbox(
+        &self,
+        t: &Task,
+        source: SnapshotSource,
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        // Transactional outbox (#54, thread r3324166852): the task write (row +
+        // snapshot + relations + remote mapping) AND the outbox entries land in
+        // ONE transaction, so a crash can't leave a saved mirror task with no
+        // durable outbox entry. BEGIN IMMEDIATE takes the writer lock once for
+        // the whole unit. The outbox repo wraps the SAME pool, so its
+        // `insert_outbox_in_tx` writer slots straight into this transaction —
+        // no duplicated INSERT SQL.
+        let mut tx = self
+            .db
+            .writes
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_err)?;
+        write_task_in_tx(&mut tx, t, source).await?;
+        for entry in entries {
+            crate::outbox_repo::insert_outbox_in_tx(&mut tx, entry).await?;
         }
         tx.commit().await.map_err(map_sqlx_err)?;
         Ok(())

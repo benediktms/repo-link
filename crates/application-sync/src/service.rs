@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use domain_core::TaskId;
 use domain_sync::{SyncDecision, SyncPolicy, decide};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
+use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
 use dto_shared::SyncSummaryDto;
 use ports::{
-    PortError, RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate,
-    RepoBindingRepository, TaskRepository,
+    PortError, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate, RepoBindingRepository,
+    TaskRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -112,18 +112,9 @@ impl SyncService {
 
         if snapshot_dirty {
             // Mirror the lifecycle status onto the remote issue's open/closed
-            // bit + state_reason. `Done` closes as `Completed`; `Archived`
-            // closes as `NotPlanned`. Any open status reopens (we don't
-            // currently know whether the remote was previously closed; sending
-            // `Reopened` unconditionally is harmless on GitHub when state is
-            // already open and informative otherwise).
-            let (closed, state_reason) = match task.status {
-                TaskStatus::Done => (true, Some(RemoteStateReason::Completed)),
-                TaskStatus::Archived => (true, Some(RemoteStateReason::NotPlanned)),
-                TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked => {
-                    (false, Some(RemoteStateReason::Reopened))
-                }
-            };
+            // bit + state_reason. Shared with the outbox drainer so both
+            // outbound paths derive the remote state identically (Stage 6).
+            let (closed, state_reason) = crate::lifecycle_to_remote_state(task.status);
             self.provider
                 .update_remote(RemoteTaskUpdate {
                     canonical_repo: &canonical,
@@ -422,7 +413,7 @@ mod tests {
     use domain_core::{Timestamp, WorkspaceId};
     use domain_repo::RepoBinding;
     use domain_task::Task;
-    use ports::{PortResult, RemoteComment, RemoteTaskSnapshot};
+    use ports::{PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot};
     use std::sync::Mutex;
     use testing_fixtures::{InMemoryRepoBindingRepository, InMemoryTaskRepository};
 

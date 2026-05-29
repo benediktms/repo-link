@@ -1,0 +1,15 @@
+-- RFC 0001 Stage 6 (#54) — outbox retry backoff.
+--
+-- Adds a single nullable column so the drainer can defer a failed entry's
+-- next attempt instead of dead-lettering it immediately. NULL means "eligible
+-- immediately" — which is exactly the state every existing pending row is in,
+-- so the migration needs no backfill and existing rows behave unchanged.
+--
+-- The drainer's claim query selects the oldest pending entry whose
+-- `next_attempt_at IS NULL OR next_attempt_at <= now`, skipping any task that
+-- already has an inflight entry (per-task FIFO, parallel across tasks). On a
+-- recoverable provider error under the attempt cap, the entry goes back to
+-- 'pending' with `attempts` bumped and `next_attempt_at` set to now + backoff;
+-- at the cap it dead-letters to 'failed' (terminal). See
+-- `application_sync::drainer`.
+ALTER TABLE outbox_entries ADD COLUMN next_attempt_at TEXT;

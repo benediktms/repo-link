@@ -13,8 +13,8 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use infra_config::RepoLinkConfig;
 use infra_github::GithubAdapter;
 use infra_sqlite::{
-    SqliteProjectRepository, SqliteRepoBindingRepository, SqliteTaskRepository,
-    SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
+    SqliteOutboxRepository, SqliteProjectRepository, SqliteRepoBindingRepository,
+    SqliteTaskRepository, SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
 };
 
 pub(crate) struct Services {
@@ -25,6 +25,8 @@ pub(crate) struct Services {
     pub(crate) projects: ProjectService,
     pub(crate) tasks_repo: Arc<dyn ports::TaskRepository>,
     pub(crate) bindings_repo: Arc<dyn ports::RepoBindingRepository>,
+    /// Backs `rl sync outbox` so dead-lettered entries are visible.
+    pub(crate) outbox_repo: Arc<dyn ports::OutboxRepository>,
 }
 
 pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
@@ -38,16 +40,34 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     let snapshots_repo: Arc<dyn ports::TaskSnapshotRepository> =
         Arc::new(SqliteTaskSnapshotRepository::new(db.clone()));
     let projects_repo: Arc<dyn ports::ProjectRepository> =
-        Arc::new(SqliteProjectRepository::new(db));
+        Arc::new(SqliteProjectRepository::new(db.clone()));
+    let outbox_repo: Arc<dyn ports::OutboxRepository> = Arc::new(SqliteOutboxRepository::new(db));
 
     Ok(Services {
-        workspaces: WorkspaceService::with_projects(workspaces_repo.clone(), projects_repo.clone()),
+        // `with_outbox` enables the eager set-project backfill (#54): attaching
+        // a project enqueues `AddItem` for issue-backed tasks not yet on the
+        // board.
+        workspaces: WorkspaceService::with_projects(workspaces_repo.clone(), projects_repo.clone())
+            .with_outbox(outbox_repo.clone(), tasks_repo.clone()),
         bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
-        tasks: TaskService::new(tasks_repo.clone(), snapshots_repo, bindings_repo.clone()),
+        // The TaskService enqueues lifecycle / edit mutations for mirror tasks
+        // atomically with the task write via `TaskRepository::save_with_outbox`
+        // (#54, transactional outbox); the daemon's drainer applies them. The
+        // SqliteTaskRepository wraps the shared pool, so its `save_with_outbox`
+        // folds the outbox INSERTs into the task transaction — no separate
+        // outbox handle is wired into the service.
+        tasks: TaskService::new(
+            tasks_repo.clone(),
+            snapshots_repo,
+            bindings_repo.clone(),
+            workspaces_repo.clone(),
+            projects_repo.clone(),
+        ),
         query: QueryService::new(workspaces_repo, bindings_repo.clone(), tasks_repo.clone()),
         projects: ProjectService::new(projects_repo),
         tasks_repo,
         bindings_repo,
+        outbox_repo,
     })
 }
 

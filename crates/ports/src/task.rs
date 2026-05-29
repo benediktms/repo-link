@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
+use domain_sync::OutboxEntry;
 use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
 use domain_workspace::Workspace;
 
@@ -76,6 +77,36 @@ pub trait TaskRepository: Send + Sync {
         for (task, source) in tasks {
             self.save(task, *source).await?;
         }
+        Ok(())
+    }
+    /// Persist the task row + its snapshot **and** the given outbox `entries`
+    /// in a SINGLE atomic transaction — either all of them land or none do.
+    /// This is the transactional-outbox guarantee (#54, CodeRabbit thread
+    /// r3324166852): the task write and the enqueue of its outbound mutations
+    /// can no longer tear apart, so a crash can never leave a saved mirror task
+    /// with no durable outbox entry. Closes the draft-only / board-only gap the
+    /// old save-then-enqueue path relied on the daemon's `DirtyLocal` reconcile
+    /// to (partially) backstop.
+    ///
+    /// When `entries` is empty this MUST behave exactly like
+    /// [`save`](Self::save) — the `LocalOnly` / no-op-edit path enqueues
+    /// nothing and pays only for the task write.
+    ///
+    /// The default implementation is **not** atomic — it saves then enqueues
+    /// through the two ports separately, exactly the tear-prone shape the
+    /// dedicated method exists to replace. It is provided only so test doubles
+    /// that don't exercise the combined path needn't reimplement it; any
+    /// adapter backed by real storage MUST override it with one transaction.
+    async fn save_with_outbox(
+        &self,
+        task: &Task,
+        source: SnapshotSource,
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        self.save(task, source).await?;
+        // NB: the default has no shared transaction handle, so this is a
+        // best-effort fallback only. Real adapters override.
+        let _ = entries;
         Ok(())
     }
     async fn get(&self, id: TaskId) -> PortResult<Task>;

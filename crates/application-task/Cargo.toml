@@ -9,14 +9,19 @@ publish.workspace = true
 domain-core = { workspace = true }
 domain-task = { workspace = true }
 domain-repo = { workspace = true }
+domain-sync = { workspace = true }
+application-sync = { workspace = true }
 ports = { workspace = true }
 dto-shared = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 testing-fixtures = { workspace = true }
+domain-workspace = { workspace = true }
+domain-project = { workspace = true }
 tokio = { workspace = true }
 pretty_assertions = { workspace = true }

@@ -36,6 +36,12 @@ pub(crate) async fn sync_dispatch(
     svc: &Services,
     cfg: &RepoLinkConfig,
 ) -> Result<()> {
+    // `outbox` is a local read of the dead-letter queue — no token, no
+    // network. Handle it before the token gate so it works offline.
+    if let SyncCmd::Outbox = cmd {
+        return sync_outbox(svc).await;
+    }
+
     let token = require_github_token(cfg, "sync")?;
     let provider: Arc<dyn ports::RemoteTaskProvider> =
         Arc::new(build_github_provider(&token, cfg).map_err(|e| anyhow!("{e}"))?);
@@ -80,10 +86,53 @@ pub(crate) async fn sync_dispatch(
                 .await
                 .map_err(|e| enrich_issue_moved(&task, e))?
         }
-        SyncCmd::Import { .. } => unreachable!("handled above"),
+        SyncCmd::Import { .. } | SyncCmd::Outbox => unreachable!("handled above"),
     };
     render::sync(&summary);
     Ok(())
+}
+
+/// Render the dead-letter queue as a JSON array. Minimal by design (#54):
+/// one row per failed entry with the fields a human needs to triage — the
+/// task, the mutation kind, attempt count, and last error. Polishing this
+/// into a richer `rl sync status` surface (live pending counts, per-task
+/// breakdown) is deferred.
+async fn sync_outbox(svc: &Services) -> Result<()> {
+    let dead = svc
+        .outbox_repo
+        .list_dead_lettered()
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let payload = dead_letter_json(&dead);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+    );
+    Ok(())
+}
+
+/// Shape the dead-letter queue into the `rl sync outbox` JSON payload:
+/// `{dead_lettered, entries:[{id,task_id,kind,attempts,last_error,updated_at}]}`.
+/// Pure (no I/O) so the JSON contract is unit-testable without standing up the
+/// SQLite-backed `Services`.
+fn dead_letter_json(dead: &[domain_sync::OutboxEntry]) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = dead
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id.to_string(),
+                "task_id": e.task_id.to_string(),
+                "kind": e.mutation.kind(),
+                "attempts": e.attempts,
+                "last_error": e.last_error,
+                "updated_at": e.updated_at.into_inner(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "dead_lettered": rows.len(),
+        "entries": rows,
+    })
 }
 
 /// Parse a GitHub issue URL into `(canonical "github.com/owner/repo", number)`.
@@ -276,7 +325,50 @@ async fn sync_import(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_issue_url;
+    use super::{dead_letter_json, parse_issue_url};
+
+    #[test]
+    fn dead_letter_json_shape_and_count() {
+        use domain_core::TaskId;
+        use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
+
+        let task_id = TaskId::new();
+        let mut e = OutboxEntry::new(
+            task_id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "42".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        // Shape it like a dead-lettered row.
+        e.status = OutboxStatus::Failed;
+        e.attempts = 5;
+        e.last_error = Some("graphql 5xx".into());
+
+        let v = dead_letter_json(std::slice::from_ref(&e));
+
+        assert_eq!(v["dead_lettered"], 1);
+        let entries = v["entries"].as_array().expect("entries is an array");
+        assert_eq!(entries.len(), 1);
+        let row = &entries[0];
+        // All documented keys are present with the expected values.
+        assert_eq!(row["id"], e.id.to_string());
+        assert_eq!(row["task_id"], task_id.to_string());
+        assert_eq!(row["kind"], "update_remote");
+        assert_eq!(row["attempts"], 5);
+        assert_eq!(row["last_error"], "graphql 5xx");
+        assert!(row.get("updated_at").is_some(), "updated_at key present");
+    }
+
+    #[test]
+    fn dead_letter_json_empty_is_zero_count() {
+        let v = dead_letter_json(&[]);
+        assert_eq!(v["dead_lettered"], 0);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 0);
+    }
 
     #[test]
     fn parses_standard_issue_url() {

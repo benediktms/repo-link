@@ -134,7 +134,7 @@ This is the conceptual cleanup the spike circled to. A *synced* task is a mirror
 **Principles:**
 - A task's lifecycle is owned by **whoever the source of truth is**. For `LocalOnly` tasks, that's us. For tasks with a remote ID, it's GitHub.
 - The local SQLite row for a mirror task is a **write-through cache** of GitHub's last-known state.
-- Outbound mutations go through an **outbox**: any `rl task start / complete / block / edit` on a mirror task enqueues a pending mutation and (when online) drains it immediately.
+- Outbound mutations go through an **outbox**: any `rl task start / complete / block / edit` on a mirror task enqueues a pending mutation and (when online) drains it immediately. The enqueue is **atomic with the task write** — they commit in one transaction (`TaskRepository::save_with_outbox`, #54), so a crash can never leave a saved mirror task with no durable outbox entry (see the transactional-outbox decision in §5 Stage 6).
 - The "mirror vs local" distinction is **derived**, not encoded as a new column or status. `task.sync_state != LocalOnly` ⇒ mirror. Draft-backed mirrors additionally have `remote_id IS NULL AND project_item_id IS NOT NULL` (drafts have no REST issue number); issue-backed mirrors have `remote_id IS NOT NULL` regardless of project membership.
 
 **This is the rebranding of existing dirty/clean machinery.** `DirtyLocal` today already means "local moved, remote hasn't caught up." Calling that an outbox entry makes the model honest about what it is — and closes one gap: a task created offline, edited offline, then synced should drain N outbox entries in order, not flatten them into one "current state pushed."
@@ -283,12 +283,21 @@ PR shape: one PR. Risk: low — exercise the new code paths through the CLI befo
 PR shape: one PR. Risk: medium — first GraphQL surface in the codebase. Live smoke test against this account's project #3 before merge.
 
 ### Stage 6 — Outbox refactor + lifecycle wiring
-- 6a. `application-sync` gains the outbox drainer.
-- 6b. `OutboxMutation` enum covers `UpdateRemote` (REST), `CreateDraft`, `UpdateDraft`, `ConvertDraft`, `AddItem`, `SetProjectStatus`.
-- 6c. `application-task` lifecycle verbs (`start/complete/block/edit`) enqueue the appropriate variant when the task is a mirror, instead of direct-mutating synchronously. `task edit --repo` on an orphan-draft enqueues `ConvertDraft`.
+- 6a. `application-sync` gains the outbox drainer (`OutboxDrainer`, `crates/application-sync/src/drainer.rs`).
+- 6b. `OutboxMutation` enum covers `UpdateRemote` (REST), `CreateDraftIssue`, `UpdateDraftIssue`, `ConvertDraftToIssue`, `AddItem`, `SetProjectStatus`.
+- 6c. `application-task` lifecycle verbs (`start/complete/reopen/block/unblock/archive` + `edit`) enqueue the appropriate variant when the task is a mirror, instead of direct-mutating synchronously. `task edit --repo` on an orphan-draft enqueues `ConvertDraftToIssue`.
 - 6d. Drainer runs the existing REST mutations for `UpdateRemote`-class entries (no behavior change for projectless workspaces).
 
 PR shape: one PR. Risk: medium-high — touches every lifecycle verb. Reviewer focus: invariant preservation around `sync_state` transitions.
+
+**Implementation decisions (as built):**
+
+- **Drainer policy: per-task FIFO + parallel-across-tasks + capped exponential backoff + dead-letter.** The outbox grows a nullable `next_attempt_at` column (additive migration `20260529000002_outbox_retry_backoff.sql`; `NULL` = eligible immediately). `OutboxRepository::claim_next_eligible(now)` selects the oldest eligible-now pending entry (`next_attempt_at IS NULL OR next_attempt_at <= now`) whose task has **no earlier-enqueued non-terminal sibling** — neither an `inflight` entry NOR an *older* `pending` one — and flips it to `inflight` in one transaction. That sibling guard is the per-task-FIFO lever, while leaving other tasks claimable. The older-pending half is load-bearing: when a head fails recoverably it returns to `pending` with a *future* `next_attempt_at` (not eligible), and its tail (eligible now) must not overtake it — excluding candidates with an older pending sibling keeps the head ahead of its tail. A companion partial index (`idx_outbox_task_active` on `task_id` over non-terminal rows, migration `20260529000003_outbox_inflight_index.sql`) serves that correlated subquery. On a recoverable provider error the drainer reschedules via `record_retry` (`attempts += 1`, `last_error`, `next_attempt_at = now + backoff(attempts)`, back to `pending`) while `attempts + 1 < max_attempts`; at the cap it dead-letters via `mark_failed` (terminal `status = 'failed'`). Default schedule: `5s, 30s, 2m, 10m`, cap `N = 5`. **Crash recovery:** the claim flips an entry to `inflight` in a committed transaction *before* applying it, so a daemon crash between that commit and the resolving write would strand the entry `inflight` forever (blocking its task's tail). `Daemon::requeue_orphaned_inflight` (`OutboxRepository::requeue_orphaned_inflight`) runs once on startup — *before* the dirty reconcile — and resets every `inflight` row back to `pending` (clearing `next_attempt_at`); safe because the daemon is single-instance, so at startup nothing is legitimately inflight. The `lifecycle → (closed, state_reason)` mapping is extracted into `application_sync::lifecycle_to_remote_state`, shared by `SyncService::push` and the drainer; the drainer re-derives `(closed, state_reason)` **and** title/body from the *loaded* task at drain time (matching `push`, which sends the live title/body), so a stale enqueued snapshot can't desync. `AddItem`/`CreateDraftIssue` write the returned item id back onto `task.project_item_id` and enqueue a follow-up `SetProjectStatus`; `ConvertDraftToIssue` writes back a fully-populated `RemoteRef` — both the returned issue node id (`task.remote.node_id`, for GraphQL mutations) AND the issue's REST `number` (`task.remote.remote_id`, for `UpdateRemote`) — so no issue-backed mirror is ever persisted with an empty `remote_id`.
+
+- **Cutover: drainer is the sole outbound path the daemon drives.** Stage 6 removes the daemon's `DirtyLocal → SyncService::push` loop from `tick_once` and replaces it with one `OutboxDrainer::drain_once` per tick. Two one-time startup passes run before the run-loop, in order: (1) `Daemon::requeue_orphaned_inflight` resets any `inflight` rows stranded by a previous crash back to `pending`; (2) `Daemon::reconcile_dirty_into_outbox` enqueues an `UpdateRemote` for every `DirtyLocal` mirror task that has neither a pending (`list_pending`) **nor a dead-lettered (`list_failed`)** outbox entry, so tasks already dirty at upgrade time still drain. The failed-entry blocker is load-bearing: a task whose entry already dead-lettered is still `DirtyLocal`, so a pending-only skip-guard would re-enqueue it on every restart — silently bypassing the attempt cap and retrying forever. Skipping tasks with a `failed` entry keeps a dead-letter terminal across restarts. Running the requeue first matters too: it guarantees no `inflight` rows survive into the reconcile, so the reconcile's skip-guard is exhaustive and won't double-enqueue a task whose entry was inflight at restart. `rl task claim` **keeps** its inline synchronous `SyncService::push` for interactive feedback — a deliberate, documented exception to "drainer is the only path."
+
+- **Lifecycle enqueue routing (`application-task`).** A mirror task enqueues: issue-backed → `UpdateRemote`; draft-backed content edit → `UpdateDraftIssue`; a project mirror's lifecycle move → `SetProjectStatus` (the card moves; block/unblock never enqueues a close); `edit --repo` on an orphan-draft → `ConvertDraftToIssue`; a mirror whose workspace has a project but `project_item_id IS NULL` → `AddItem` (lazy net; the drainer's write-back enqueues the `SetProjectStatus` follow-up). The `SetProjectStatus` option is resolved via `Project::option_id_for` with the Blocked-with-no-matching-option → Open fallback applied at enqueue time (`application_sync::option_id_for_status_with_fallback`, the §3 absence-of-row rule). **Nothing** is enqueued for `LocalOnly` tasks, priority-only edits, relation add/remove/clear, rollback, or idempotent/no-op edits (the edit path gates on the domain's `Synced → DirtyLocal` transition to preserve the reconcile no-spurious-mutation contract). The routing decision is factored into `application_sync::enqueue::plan_mutations` so `WorkspaceService` and the drainer share one surface.
+- **Transactional outbox: the task write and its enqueue are atomic (#54, CodeRabbit thread r3324166852).** The lifecycle / edit verbs do **not** `repo.save` then enqueue separately — that save-then-enqueue shape could tear apart on a crash, leaving a saved mirror task with no durable outbox entry (and the dirty-reconcile only ever re-formed the issue-backed `UpdateRemote`, never a draft-only `UpdateDraftIssue` or board-only `SetProjectStatus`). Instead they compute the mutation list **first**, then commit the task row + snapshot + every pending outbox entry in **one** transaction via `TaskRepository::save_with_outbox(task, source, entries)` — either all land or none do. The SQLite adapter wraps the writer pool in a single `BEGIN IMMEDIATE`, reusing the in-tx task writer plus a shared `insert_outbox_in_tx` (also used by `OutboxRepository::enqueue`, so the INSERT lives in one place); an empty `entries` slice behaves exactly like `save`. This makes `reconcile_dirty_into_outbox` (§5 Stage 6 cutover) a belt-and-suspenders backstop for *legacy* `DirtyLocal` tasks already dirty at upgrade time — no longer the primary durability guarantee — and closes the previously-documented draft-only / board-only reconcile gap.
 
 ### Stage 7 — Polling loop
 - 7a. `application-sync` gains the project poller.
@@ -424,11 +433,47 @@ pub trait ProjectRepository: Send + Sync {
 #[async_trait]
 pub trait OutboxRepository: Send + Sync {
     async fn enqueue(&self, entry: &OutboxEntry) -> PortResult<()>;
-    async fn next_pending(&self) -> PortResult<Option<OutboxEntry>>;
+    /// Per-task-FIFO claim with backoff eligibility: the oldest `pending` entry
+    /// eligible *now* (`next_attempt_at IS NULL OR next_attempt_at <= now`)
+    /// whose task has no earlier-enqueued non-terminal sibling (no `inflight`
+    /// entry and no older `pending` one), flipped to `inflight` in one
+    /// transaction. Ties on equal (second-granular) `enqueued_at` break on the
+    /// implicit `rowid` (insertion order), so per-task FIFO holds without a
+    /// migration.
+    async fn claim_next_eligible(&self, now: Timestamp) -> PortResult<Option<OutboxEntry>>;
+    /// Recoverable failure under the attempt cap: bump `attempts`, record
+    /// `last_error`, set `next_attempt_at = now + backoff`, flip back to
+    /// `pending`.
+    async fn record_retry(
+        &self,
+        id: OutboxEntryId,
+        error: &str,
+        next_attempt_at: Timestamp,
+    ) -> PortResult<()>;
     async fn mark_succeeded(&self, id: OutboxEntryId) -> PortResult<()>;
+    /// Terminal dead-letter (`status = 'failed'`): never re-claimed, kept for
+    /// `rl sync outbox` visibility.
     async fn mark_failed(&self, id: OutboxEntryId, error: &str) -> PortResult<()>;
+    /// Crash recovery: reset every `inflight` row back to `pending` (clearing
+    /// `next_attempt_at`). Run once on daemon startup before the dirty
+    /// reconcile — safe because the daemon is single-instance.
+    async fn requeue_orphaned_inflight(&self) -> PortResult<usize>;
     async fn list_pending(&self, task_id: TaskId) -> PortResult<Vec<OutboxEntry>>;
+    /// Every dead-lettered (`status = 'failed'`) entry for one task, newest
+    /// update first. The startup dirty-reconcile uses this alongside
+    /// `list_pending` as a re-enqueue blocker: a task that already
+    /// dead-lettered is still `DirtyLocal`, but re-enqueuing it would silently
+    /// bypass the attempt cap and retry forever across restarts.
+    async fn list_failed(&self, task_id: TaskId) -> PortResult<Vec<OutboxEntry>>;
+    /// Every dead-lettered entry, newest update first (backs `rl sync outbox`).
+    async fn list_dead_lettered(&self) -> PortResult<Vec<OutboxEntry>>;
 }
+// Implemented in Stage 6 (#54). Migrations: `next_attempt_at` (nullable, NULL =
+// eligible now) via `20260529000002_outbox_retry_backoff.sql`; the partial
+// per-task-FIFO index `idx_outbox_task_active(task_id, enqueued_at) WHERE
+// status IN ('pending','inflight')` via `20260529000003_outbox_inflight_index.sql`.
+// Together these back the per-task-FIFO + exponential-backoff + dead-letter
+// behaviour described in the Stage 6 amendment block in §5.
 
 // On the existing trait:
 #[async_trait]
@@ -540,8 +585,20 @@ rl project show <project-spec>
 rl project map <project-spec> --local in_progress --option-id 47fc9ee4
 
 # Attach a workspace to a project (or detach with --none).
+# Eager backfill (Stage 6, #54): attaching a project enqueues an `AddItem` for
+# every *active* issue-backed task in the workspace that isn't already a board
+# item (`remote_id IS NOT NULL AND project_item_id IS NULL`). Terminal tasks
+# (Done / Archived) are excluded — attach back-fills active work, not closed
+# history (and Done/Archived map to no option on a default board). The follow-up
+# `SetProjectStatus` lands via the drainer's `AddItem` write-back (two-phase:
+# AddItem-now / SetProjectStatus-after). Tasks already on the board are skipped;
+# `--none` (detach) enqueues nothing.
 rl workspace set-project <workspace> <project-spec>
 rl workspace set-project <workspace> --none
+
+# Inspect the outbox dead-letter queue (Stage 6, #54) — outbound mutations that
+# exhausted their retries and were permanently parked. Local read; no token.
+rl sync outbox
 
 # Create a workspace already attached to a project.
 rl workspace create <name> --project <project-spec>
@@ -599,7 +656,7 @@ Other lifecycle verbs (`start/complete/block/edit` for non-`--repo` flags) gain 
 These don't block Stage 1 (REST → octocrab swap) — they only need to be answered before Stage 4.
 
 1. **Where does `application-project` register `ProjectService`?** Same composition root as `TaskService` (the daemon and CLI both wire it). No real choice — calling out for symmetry.
-2. **Outbox ordering guarantees.** FIFO per task? Strict global FIFO? Lean: FIFO per task (a single-task `start → edit → complete` sequence must apply in order), but parallel across tasks (a stuck mutation on task A shouldn't block task B). Stage 6 makes this concrete.
+2. **Outbox ordering guarantees.** ✅ **Settled in Stage 6 (#54).** FIFO per task — a single-task `start → edit → complete` sequence applies in order — but parallel across tasks: a stuck mutation on task A never blocks task B. Enforced by `OutboxRepository::claim_next_eligible`, which skips any task with an earlier-enqueued non-terminal sibling (an `inflight` entry *or* an older `pending` one — so a recoverably-failed, backed-off head still holds its tail back) and reschedules failures with exponential backoff (`5s, 30s, 2m, 10m`, cap `N = 5`) before dead-lettering. Entries stranded `inflight` by a crash are recovered on startup (`requeue_orphaned_inflight`). See the Stage 6 implementation-decisions block in §5.
 3. **Many-to-one mappings** in `project_status_mappings`. If two `TaskStatus` values end up *explicitly* mapped to one option — for example, the user running `rl project map` twice (auto-derivation can't, given the anchored/disjoint regexes; only a future rule change would) — what happens? The schema represents this natively (two `(project_id, status)` rows sharing one `option_id`), so we store both as-is, surface a note on `rl project show`, and let the user re-target via `rl project map`. (The earlier scalar `default_for` column couldn't store this and silently dropped the second mapping; see #80.) Note this is *not* the Blocked-with-no-matching-option case in §3 — that one is left unmapped and resolved to `Open` at lookup time, not stored as a collision row.
 4. **Project archival semantics.** A GitHub project can be closed/archived from the UI. **Decision: archival is cosmetic only — no cascade.** We mirror the `archived` flag on the local `projects` row and surface it on `rl project show` / `rl workspace show`, but: child workspaces are unaffected, polling continues (the user may un-archive), and existing outbox entries still drain. The flag is purely a hint for the human reader.
 5. **Unlinking a project with active orphan-drafts.** If a user runs `rl project unlink <p>` while orphan tasks (`repo_id = NULL`, `project_item_id IS NOT NULL`) exist under workspaces attached to that project, the drafts on GitHub aren't affected — but the local task loses its only sync anchor (no repo, no project to track via). Options: (a) refuse the unlink until those tasks are resolved, (b) auto-detach drafts (keep them locally as orphan + projectless, no further sync), (c) prompt per task. Lean: (b), with a `rl project unlink --force` to skip prompting and a summary of affected tasks. Decide before Stage 8.

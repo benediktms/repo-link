@@ -123,7 +123,7 @@ mutation($input: UpdateProjectV2DraftIssueInput!) {
 const CONVERT_DRAFT: &str = r#"
 mutation($input: ConvertProjectV2DraftIssueItemToIssueInput!) {
   convertProjectV2DraftIssueItemToIssue(input: $input) {
-    item { content { ... on Issue { id } } }
+    item { content { ... on Issue { id number } } }
   }
 }"#;
 
@@ -291,22 +291,38 @@ impl GraphqlClient {
         &self,
         item_node_id: &str,
         repo_node_id: &str,
-    ) -> PortResult<String> {
+    ) -> PortResult<(String, u64)> {
         let data: ConvertDraftData = self
             .run(
                 CONVERT_DRAFT,
                 json!({ "input": { "itemId": item_node_id, "repositoryId": repo_node_id } }),
             )
             .await?;
-        data.convert_project_v2_draft_issue_item_to_issue
+        // Capture BOTH the new issue's node id AND its REST `number`. The
+        // number is what addresses the issue for REST/`UpdateRemote`; without
+        // it the write-back would persist an issue-backed `RemoteRef` with an
+        // empty `remote_id`, which `plan_mutations` would later try to push to
+        // an unaddressable issue (#54).
+        let content = data
+            .convert_project_v2_draft_issue_item_to_issue
             .item
             .content
-            .and_then(|c| c.id)
             .ok_or_else(|| {
                 PortError::Backend(format!(
-                    "convert of item {item_node_id} returned no issue node id"
+                    "convert of item {item_node_id} returned no issue content"
                 ))
-            })
+            })?;
+        let node_id = content.id.ok_or_else(|| {
+            PortError::Backend(format!(
+                "convert of item {item_node_id} returned no issue node id"
+            ))
+        })?;
+        let number = content.number.ok_or_else(|| {
+            PortError::Backend(format!(
+                "convert of item {item_node_id} returned no issue number"
+            ))
+        })?;
+        Ok((node_id, number))
     }
 
     pub(crate) async fn set_status(
@@ -581,7 +597,17 @@ struct ConvertItemWrap {
 }
 #[derive(Deserialize)]
 struct ConvertItem {
-    content: Option<OptionalIdNode>,
+    content: Option<ConvertIssueContent>,
+}
+/// The new issue's id + REST `number`, projected inline from the convert
+/// mutation. `number` is load-bearing: it becomes the task's `remote_id`
+/// (#54).
+#[derive(Deserialize)]
+struct ConvertIssueContent {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    number: Option<u64>,
 }
 
 #[derive(Deserialize)]

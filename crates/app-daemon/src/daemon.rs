@@ -3,12 +3,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use application_sync::SyncService;
+use application_sync::OutboxDrainer;
 use application_workspace::{RepoBindingService, WorkspaceService};
 use domain_core::RepoId;
+use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::SyncState;
 use dto_shared::UnlinkWorktreeCmd;
-use ports::{FilesystemProbe, TaskFilter, TaskRepository};
+use ports::{FilesystemProbe, OutboxRepository, TaskFilter, TaskRepository};
 use tokio::signal;
 use tracing::{Instrument, error, info, info_span, warn};
 
@@ -29,7 +30,16 @@ pub struct Daemon {
     bindings: RepoBindingService,
     tasks: Arc<dyn TaskRepository>,
     probe: Arc<dyn FilesystemProbe>,
-    sync: Option<SyncService>,
+    /// The sole outbound path (RFC 0001 Stage 6 cutover, #54). `None` when no
+    /// GitHub token is configured — the daemon then only reconciles worktrees.
+    /// Replaces the former direct `SyncService::push` loop: lifecycle / edit
+    /// verbs enqueue outbox entries (in `application-task` /
+    /// `application-workspace`); the daemon drains them here.
+    drainer: Option<Arc<OutboxDrainer>>,
+    /// Outbox handle for the one-time startup reconcile (see
+    /// [`Self::reconcile_dirty_into_outbox`]). Shares the same repo the
+    /// drainer reads.
+    outbox: Option<Arc<dyn OutboxRepository>>,
     prune: bool,
     missing_grace_ticks: u32,
     // Process-local grace counter. Keyed on (repo binding id, worktree path);
@@ -52,14 +62,16 @@ impl Daemon {
         bindings: RepoBindingService,
         tasks: Arc<dyn TaskRepository>,
         probe: Arc<dyn FilesystemProbe>,
-        sync: Option<SyncService>,
+        drainer: Option<Arc<OutboxDrainer>>,
+        outbox: Option<Arc<dyn OutboxRepository>>,
     ) -> Self {
         Self {
             workspaces,
             bindings,
             tasks,
             probe,
-            sync,
+            drainer,
+            outbox,
             prune: false,
             missing_grace_ticks: 3,
             miss_counts: Mutex::new(HashMap::new()),
@@ -162,37 +174,30 @@ impl Daemon {
                     "reconcile complete"
                 );
 
-                if let Some(sync) = &self.sync {
-                    let id: domain_core::WorkspaceId = ws
-                        .id
-                        .parse()
-                        .map_err(|e: domain_core::IdParseError| DaemonError::Sync(e.to_string()))?;
-                    let dirty = self
-                        .tasks
-                        .list(TaskFilter {
-                            workspace_id: Some(id),
-                            sync_state: Some(SyncState::DirtyLocal),
-                            ..TaskFilter::default()
-                        })
-                        .await?;
-                    for t in dirty {
-                        match sync.push(&t.id.to_string()).await {
-                            Ok(_) => {
-                                report.pushed += 1;
-                                info!(task_id = %t.id, "pushed dirty task");
-                            }
-                            Err(e) => {
-                                let msg = format!("{}: {e}", t.id);
-                                warn!(task_id = %t.id, error = %e, "push failed");
-                                report.push_failures.push(msg);
-                            }
-                        }
-                    }
-                }
                 Ok::<(), DaemonError>(())
             }
             .instrument(info_span!("workspace_tick", workspace_id = %ws.id, name = %ws.name))
             .await?;
+        }
+
+        // Outbound work is the drainer's job (Stage 6 cutover, #54). It runs
+        // once per tick across ALL tasks — outbox entries are enqueued by the
+        // lifecycle / edit verbs, not scanned for here. This replaces the
+        // former per-workspace `DirtyLocal → SyncService::push` loop; there is
+        // no double-write because the drainer is now the only outbound path the
+        // daemon drives (`rl task claim` keeps its own inline push for
+        // interactive feedback — a deliberate exception).
+        if let Some(drainer) = &self.drainer {
+            match drainer.drain_once().await {
+                Ok(n) => {
+                    report.pushed += n;
+                    info!(drained = n, "outbox drained");
+                }
+                Err(e) => {
+                    warn!(error = %e, "outbox drain failed");
+                    report.push_failures.push(format!("drain: {e}"));
+                }
+            }
         }
 
         // Single GC pass across the union of all workspaces' valid-this-tick
@@ -216,6 +221,122 @@ impl Daemon {
         self.write_last_tick(&report);
 
         Ok(report)
+    }
+
+    /// Recover entries orphaned `inflight` by a previous run (#54). The claim
+    /// flips an entry to `inflight` in a committed transaction *before* the
+    /// drainer applies it and resolves it to succeeded / pending / failed. If
+    /// the daemon crashed / was killed / OOM'd in that window, the entry is
+    /// stranded `inflight`: no reaper ever resolves it, and because the
+    /// per-task-FIFO guard keys on inflight rows, the task's whole pending tail
+    /// is blocked forever. Reset every such row back to `pending` (eligible
+    /// immediately) on startup. Safe because the daemon is single-instance — at
+    /// startup nothing is legitimately inflight. Runs once before the run-loop
+    /// AND before [`Self::reconcile_dirty_into_outbox`], so the reconcile's
+    /// pending-guard sees the recovered rows and doesn't double-enqueue.
+    pub async fn requeue_orphaned_inflight(&self) -> Result<usize, DaemonError> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(0);
+        };
+        let reset = outbox
+            .requeue_orphaned_inflight()
+            .await
+            .map_err(|e| DaemonError::Sync(e.to_string()))?;
+        if reset > 0 {
+            info!(reset, "startup: requeued orphaned inflight outbox entries");
+        }
+        Ok(reset)
+    }
+
+    /// One-time startup reconcile (#54). Tasks that were already `DirtyLocal`
+    /// at the moment the daemon upgraded to the outbox path never had an entry
+    /// enqueued (the lifecycle verbs only enqueue going forward). Without this,
+    /// they'd never drain. So on startup, for every `DirtyLocal` mirror task
+    /// that has **no** unresolved (pending *or* inflight) outbox entry **and no
+    /// dead-lettered one**, enqueue an `UpdateRemote`.
+    ///
+    /// Skips tasks that already have an unresolved entry (the common forward
+    /// path) so it never double-enqueues; a task with no remote / repo can't
+    /// form an `UpdateRemote` so it's skipped too. A dead-lettered (`failed`)
+    /// entry is *also* a blocker: such a task stays `DirtyLocal`, so without
+    /// this guard the next restart would enqueue a brand-new `UpdateRemote`,
+    /// silently bypassing the attempt cap and retrying forever across restarts.
+    /// Runs once before the run-loop, after [`Self::requeue_orphaned_inflight`]
+    /// has reset any stranded inflight rows back to pending — so by the time
+    /// this runs there are no inflight rows, and the dedupe guard below is
+    /// exhaustive. Not per tick.
+    ///
+    /// The dedupe check + enqueue is atomic: it goes through
+    /// [`OutboxRepository::enqueue_if_absent`], which evaluates the
+    /// `pending`/`inflight`/`failed` guard and inserts under one transaction,
+    /// so a concurrent CLI edit can't enqueue a `pending` row in the window
+    /// between a separate check and a separate insert (which would produce a
+    /// duplicate `UpdateRemote` for the task) (#54).
+    pub async fn reconcile_dirty_into_outbox(&self) -> Result<usize, DaemonError> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(0);
+        };
+        let dirty = self
+            .tasks
+            .list(TaskFilter {
+                sync_state: Some(SyncState::DirtyLocal),
+                include_archived: true,
+                ..TaskFilter::default()
+            })
+            .await?;
+        let mut enqueued = 0usize;
+        for t in dirty {
+            // A task with no remote / repo can't form an `UpdateRemote`, so
+            // skip it before touching the outbox.
+            let Some(remote) = t.remote.as_ref() else {
+                continue;
+            };
+            let Some(repo_id) = t.repo_id else {
+                continue;
+            };
+            let canonical = match self.bindings.show(&repo_id.to_string()).await {
+                Ok(b) => b.canonical_url,
+                Err(e) => {
+                    warn!(task_id = %t.id, error = %e, "startup reconcile: binding lookup failed");
+                    continue;
+                }
+            };
+            let entry = OutboxEntry::new(
+                t.id,
+                OutboxMutation::UpdateRemote {
+                    canonical_repo: canonical,
+                    remote_id: remote.remote_id.clone(),
+                    title: Some(t.title.clone()),
+                    body: Some(t.body.clone()),
+                    closed: None,
+                },
+            );
+            // Atomic dedupe + enqueue (#54): the insert lands only if the task
+            // has no non-terminal (`pending` / `inflight`) and no dead-lettered
+            // (`failed`) sibling — collapsing the former `list_pending` +
+            // `list_failed` + `enqueue` round-trips into ONE transaction so a
+            // concurrent CLI edit can't slip a `pending` row in between the
+            // checks and the insert. The pending/inflight guard is the common
+            // forward-path skip; the failed guard keeps a dead-letter terminal
+            // (re-enqueuing would silently bypass the attempt cap and retry
+            // forever across restarts). Inflight rows were reset to pending by
+            // the requeue pass that runs first, so the guard is exhaustive at
+            // startup.
+            let inserted = outbox
+                .enqueue_if_absent(&entry)
+                .await
+                .map_err(|e| DaemonError::Sync(e.to_string()))?;
+            if inserted {
+                enqueued += 1;
+            }
+        }
+        if enqueued > 0 {
+            info!(
+                enqueued,
+                "startup reconcile enqueued dirty tasks into outbox"
+            );
+        }
+        Ok(enqueued)
     }
 
     fn write_last_tick(&self, report: &TickReport) {
@@ -322,6 +443,21 @@ impl Daemon {
 
     /// Drive `tick_once` on a fixed interval until ctrl-c.
     pub async fn run(self, interval: Duration) -> Result<(), DaemonError> {
+        // Crash recovery first: reset any entries stranded `inflight` by a
+        // previous run back to `pending` so they (and their blocked tail)
+        // drain again (#54). Must precede the reconcile so its pending-guard
+        // sees the recovered rows. A failure here is logged, not fatal.
+        if let Err(e) = self.requeue_orphaned_inflight().await {
+            warn!(error = %e, "startup inflight requeue failed");
+        }
+
+        // One-time upgrade reconcile: drain any tasks that were already
+        // DirtyLocal before the outbox path existed (#54). A failure here is
+        // logged but doesn't abort startup — the next forward edit re-enqueues.
+        if let Err(e) = self.reconcile_dirty_into_outbox().await {
+            warn!(error = %e, "startup outbox reconcile failed");
+        }
+
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Tick once immediately so the daemon is useful at startup, not
@@ -369,22 +505,19 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use testing_fixtures::{
+        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRemoteProjectProvider,
         InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
         StubFilesystemProbe,
     };
 
     #[derive(Default)]
     struct CountingProvider {
-        creates: AtomicUsize,
         updates: AtomicUsize,
-        last_remote_id: Mutex<Option<String>>,
     }
 
     #[async_trait]
     impl RemoteTaskProvider for CountingProvider {
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
-            self.creates.fetch_add(1, Ordering::SeqCst);
-            *self.last_remote_id.lock().unwrap() = Some("777".into());
             Ok(RemoteTaskSnapshot {
                 remote_id: "777".into(),
                 title: cmd.title.into(),
@@ -424,11 +557,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_reconciles_and_pushes_dirty() {
+    async fn tick_reconciles_and_drains_outbox_without_double_write() {
+        // Stage-6 cutover (#54): the daemon's outbound path is the drainer.
+        // A single enqueued UpdateRemote drains exactly once; a second tick
+        // does NOT re-fire it (the entry is now `succeeded`, not pending) —
+        // so there's no duplicate DirtyLocal push.
         let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
         let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
         let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let proj_repo = Arc::new(InMemoryProjectRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
         let provider = Arc::new(CountingProvider::default());
+        let projects_provider = Arc::new(InMemoryRemoteProjectProvider::new());
 
         // Seed a workspace + repo binding with a missing worktree + a dirty task.
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
@@ -447,13 +587,11 @@ mod tests {
         // Probe sees only /tmp/exists.
         let probe = Arc::new(StubFilesystemProbe::new().with_path("/tmp/exists"));
 
-        // A task that was synced + then locally edited.
+        // A task that was synced + then locally edited (DirtyLocal mirror).
         let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
-        // promote_to_remote already lands on Synced — go straight to DirtyLocal
-        // to simulate a post-sync local edit.
         task.mark_dirty_local().unwrap();
         task.set_body("new body".into());
         task_repo
@@ -461,16 +599,40 @@ mod tests {
             .await
             .unwrap();
 
+        // The forward path would have enqueued this on the local edit; seed it
+        // directly here since the test mutates the task aggregate by hand.
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "777".into(),
+                title: Some(task.title.clone()),
+                body: Some(task.body.clone()),
+                closed: None,
+            },
+        );
+        outbox.enqueue(&entry).await.unwrap();
+
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
-        let provider_dyn: Arc<dyn RemoteTaskProvider> = provider.clone();
-        let sync = SyncService::new(task_repo.clone(), bind_repo.clone(), provider_dyn);
+        let remote_tasks: Arc<dyn RemoteTaskProvider> = provider.clone();
+        let remote_projects: Arc<dyn ports::RemoteProjectProvider> = projects_provider.clone();
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let drainer = Arc::new(OutboxDrainer::new(
+            outbox_dyn.clone(),
+            task_repo.clone(),
+            ws_repo.clone(),
+            proj_repo.clone(),
+            remote_tasks,
+            remote_projects,
+        ));
         let daemon = Daemon::new(
             workspaces,
             bindings,
             task_repo.clone(),
             probe.clone(),
-            Some(sync),
+            Some(drainer),
+            Some(outbox_dyn),
         );
 
         let report = daemon.tick_once().await.unwrap();
@@ -479,14 +641,258 @@ mod tests {
         assert_eq!(report.worktrees_checked, 2);
         assert_eq!(report.marked_missing, 1);
         assert_eq!(report.pruned, 0);
-        assert_eq!(report.pushed, 1);
+        assert_eq!(report.pushed, 1, "the one outbox entry drained");
         assert!(report.push_failures.is_empty());
         assert_eq!(provider.updates.load(Ordering::SeqCst), 1);
 
-        // Second tick: nothing dirty, nothing newly missing.
+        // Second tick: the entry is succeeded, nothing newly missing — no
+        // duplicate remote write.
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.marked_missing, 0);
         assert_eq!(report.pushed, 0);
+        assert_eq!(
+            provider.updates.load(Ordering::SeqCst),
+            1,
+            "no duplicate remote write on the second tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_requeues_orphaned_inflight_then_reconcile_does_not_double_enqueue() {
+        // A previous run crashed with an entry stranded `inflight`. On startup
+        // `requeue_orphaned_inflight` resets it to pending; the subsequent
+        // dirty reconcile then sees a pending entry for that task and does NOT
+        // enqueue a duplicate. Net: exactly one outbox entry survives.
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+        let mut binding = RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save(&binding).await.unwrap();
+
+        // A DirtyLocal issue-backed mirror.
+        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
+            .unwrap();
+        task.mark_dirty_local().unwrap();
+        task.set_body("new body".into());
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        // Its outbox entry is stranded `inflight` (claimed but never resolved
+        // before the crash).
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "777".into(),
+                title: Some(task.title.clone()),
+                body: Some(task.body.clone()),
+                closed: None,
+            },
+        );
+        outbox.enqueue(&entry).await.unwrap();
+        let _ = outbox
+            .claim_next_eligible(domain_core::Timestamp::now())
+            .await
+            .unwrap()
+            .expect("claimed → now inflight");
+        assert_eq!(
+            outbox.all()[0].status,
+            domain_sync::OutboxStatus::Inflight,
+            "precondition: entry is inflight"
+        );
+
+        let probe = Arc::new(StubFilesystemProbe::new().with_path("/tmp/exists"));
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let daemon = Daemon::new(
+            workspaces,
+            bindings,
+            task_repo.clone(),
+            probe,
+            None,
+            Some(outbox_dyn),
+        );
+
+        // Startup recovery resets the inflight row to pending.
+        let reset = daemon.requeue_orphaned_inflight().await.unwrap();
+        assert_eq!(reset, 1, "the orphaned inflight entry was requeued");
+        assert_eq!(
+            outbox.all()[0].status,
+            domain_sync::OutboxStatus::Pending,
+            "entry is pending again, eligible immediately"
+        );
+
+        // The dirty reconcile now finds a pending entry and skips → no dup.
+        let enqueued = daemon.reconcile_dirty_into_outbox().await.unwrap();
+        assert_eq!(enqueued, 0, "reconcile must not double-enqueue");
+        assert_eq!(outbox.all().len(), 1, "exactly one outbox entry survives");
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_skips_a_dead_lettered_task() {
+        // Regression (#54): a task whose outbox entry already dead-lettered
+        // (`failed`) is still DirtyLocal. The startup reconcile must NOT
+        // enqueue a brand-new UpdateRemote for it — doing so would silently
+        // bypass the attempt cap and retry forever across restarts.
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+        let mut binding = RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save(&binding).await.unwrap();
+
+        // A DirtyLocal issue-backed mirror.
+        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
+            .unwrap();
+        task.mark_dirty_local().unwrap();
+        task.set_body("new body".into());
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        // Its outbox entry dead-letters: enqueue, claim (→ inflight), then
+        // mark_failed (the drainer's terminal dead-letter at the attempt cap).
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "777".into(),
+                title: Some(task.title.clone()),
+                body: Some(task.body.clone()),
+                closed: None,
+            },
+        );
+        outbox.enqueue(&entry).await.unwrap();
+        let claimed = outbox
+            .claim_next_eligible(domain_core::Timestamp::now())
+            .await
+            .unwrap()
+            .expect("claimed → inflight");
+        outbox.mark_failed(claimed.id, "boom").await.unwrap();
+        assert_eq!(
+            outbox.all()[0].status,
+            domain_sync::OutboxStatus::Failed,
+            "precondition: entry is dead-lettered"
+        );
+
+        let probe = Arc::new(StubFilesystemProbe::new().with_path("/tmp/exists"));
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let daemon = Daemon::new(
+            workspaces,
+            bindings,
+            task_repo.clone(),
+            probe,
+            None,
+            Some(outbox_dyn),
+        );
+
+        // The reconcile must skip the dead-lettered task: no new entry.
+        let enqueued = daemon.reconcile_dirty_into_outbox().await.unwrap();
+        assert_eq!(enqueued, 0, "a dead-lettered task is not re-enqueued");
+        assert_eq!(
+            outbox.all().len(),
+            1,
+            "only the dead-lettered entry exists; no new UpdateRemote"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_does_not_duplicate_when_pending_entry_exists() {
+        // Atomic dedupe (#54): a DirtyLocal task that already carries a pending
+        // outbox entry must NOT get a second one from the startup reconcile.
+        // The reconcile now routes through `enqueue_if_absent`, which checks the
+        // pending/inflight/failed guard and inserts in one transaction — so even
+        // the forward-path skip can't be raced into a duplicate. Assert exactly
+        // one entry survives.
+        let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());
+        let bind_repo = Arc::new(InMemoryRepoBindingRepository::new());
+        let task_repo = Arc::new(InMemoryTaskRepository::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
+        ws_repo.save(&ws).await.unwrap();
+        let mut binding = RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save(&binding).await.unwrap();
+
+        // A DirtyLocal issue-backed mirror with an already-pending outbox entry
+        // (the forward path enqueued it on the local edit).
+        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
+            .unwrap();
+        task.mark_dirty_local().unwrap();
+        task.set_body("new body".into());
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "777".into(),
+                title: Some(task.title.clone()),
+                body: Some(task.body.clone()),
+                closed: None,
+            },
+        );
+        outbox.enqueue(&entry).await.unwrap();
+
+        let probe = Arc::new(StubFilesystemProbe::new().with_path("/tmp/exists"));
+        let workspaces = WorkspaceService::new(ws_repo.clone());
+        let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
+        let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let daemon = Daemon::new(
+            workspaces,
+            bindings,
+            task_repo.clone(),
+            probe,
+            None,
+            Some(outbox_dyn),
+        );
+
+        let enqueued = daemon.reconcile_dirty_into_outbox().await.unwrap();
+        assert_eq!(
+            enqueued, 0,
+            "an existing pending entry must not be duplicated"
+        );
+        assert_eq!(outbox.all().len(), 1, "exactly one outbox entry survives");
     }
 
     #[tokio::test]
@@ -501,7 +907,7 @@ mod tests {
         let probe = Arc::new(StubFilesystemProbe::new());
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo);
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None);
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None);
 
         let report = daemon.tick_once().await.unwrap();
         assert_eq!(report.workspaces, 1);
@@ -577,7 +983,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None);
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None);
         (daemon, bind_repo, binding_id)
     }
 
@@ -715,7 +1121,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None)
             .with_prune(true)
             .with_missing_grace_ticks(3);
 
@@ -774,7 +1180,7 @@ mod tests {
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
         let probe_dyn: Arc<dyn FilesystemProbe> = probe;
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe_dyn, None, None)
             .with_prune(true)
             .with_missing_grace_ticks(3);
 
@@ -844,7 +1250,7 @@ mod tests {
         let bindings = RepoBindingService::new(ws_repo, bind_repo);
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None)
+        let daemon = Daemon::new(workspaces, bindings, task_repo, probe, None, None)
             .with_state_dir(tmp.path().to_path_buf())
             .with_interval_secs(42);
 
