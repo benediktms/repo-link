@@ -719,7 +719,11 @@ mod tests {
             Some("I_kwDObackfilled"),
             "pull backfills the node id even when there's no content drift"
         );
-        assert_eq!(saved.sync, SyncState::Synced, "backfill must not perturb sync state");
+        assert_eq!(
+            saved.sync,
+            SyncState::Synced,
+            "backfill must not perturb sync state"
+        );
     }
 
     #[tokio::test]
