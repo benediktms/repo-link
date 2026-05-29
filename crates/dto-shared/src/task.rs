@@ -94,6 +94,16 @@ pub struct AddTaskRelationCmd {
     pub other: String,
 }
 
+/// Remove a single relation edge. The service strips the reciprocal edge
+/// from the other task too. For clearing *all* relations, the service
+/// exposes a separate `clear_relations` entry point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveTaskRelationCmd {
+    pub task_id: String,
+    pub kind: String,
+    pub other: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListTasksQuery {
     pub workspace_id: Option<String>,

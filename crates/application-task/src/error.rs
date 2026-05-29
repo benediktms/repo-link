@@ -14,6 +14,18 @@ pub enum ServiceError {
     BadId(String),
     #[error("invalid enum value for {field}: {value}")]
     BadEnum { field: &'static str, value: String },
+    /// A task cannot hold a relation to itself.
+    #[error("a task cannot be related to itself")]
+    SelfRelation,
+    /// Adding this relation would close a loop in a kind that must stay
+    /// acyclic (`blocked_by`/`blocks` deadlock, or `parent_of`/`child_of`
+    /// ancestry loop).
+    #[error("relation '{kind}' from {from} to {to} would create a cycle")]
+    RelationCycle {
+        kind: String,
+        from: String,
+        to: String,
+    },
     /// Composite ID input named one prefix but the task's repo carries
     /// a different one. The bare hash is unique, so we *could* resolve
     /// it silently; the spec explicitly rejects that path because the

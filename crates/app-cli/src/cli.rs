@@ -434,14 +434,21 @@ pub(crate) enum TaskCmd {
         #[arg(long, short = 'r')]
         relink: bool,
     },
-    /// Relate two tasks. The reciprocal edge is added to `--other`
+    /// Relate two tasks — the reciprocal edge is added to `--other`
     /// automatically (e.g. `blocks` ⇒ `blocked_by` on the other task).
+    /// Self-relations and cycles in `blocked_by`/`parent_of` are rejected.
+    ///
+    /// Pass `--remove` to delete instead: with `--kind`+`--other` it drops
+    /// that one edge (and its reciprocal); with neither it drops ALL
+    /// relations on the task.
     Relate {
         id: String,
         #[arg(long)]
-        kind: RelationKindArg,
+        kind: Option<RelationKindArg>,
         #[arg(long)]
-        other: String,
+        other: Option<String>,
+        #[arg(long, short = 'r')]
+        remove: bool,
     },
     /// List the full snapshot history for a task.
     Snapshots {

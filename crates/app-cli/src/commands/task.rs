@@ -3,7 +3,9 @@
 
 use anyhow::{Result, anyhow};
 use application_sync::SyncService;
-use dto_shared::{AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, UpdateTaskCmd};
+use dto_shared::{
+    AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoveTaskRelationCmd, UpdateTaskCmd,
+};
 use infra_config::RepoLinkConfig;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
@@ -338,15 +340,46 @@ pub(crate) async fn task_dispatch(
             let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
             render::sync(&summary);
         }
-        TaskCmd::Relate { id, kind, other } => {
-            let dto = svc
-                .tasks
-                .add_relation(AddTaskRelationCmd {
-                    task_id: id,
-                    kind: kind.as_kind_str().to_string(),
-                    other,
-                })
-                .await?;
+        TaskCmd::Relate {
+            id,
+            kind,
+            other,
+            remove,
+        } => {
+            let dto = match (remove, kind, other) {
+                // Add a single edge (the default).
+                (false, Some(k), Some(o)) => {
+                    svc.tasks
+                        .add_relation(AddTaskRelationCmd {
+                            task_id: id,
+                            kind: k.as_kind_str().to_string(),
+                            other: o,
+                        })
+                        .await?
+                }
+                (false, _, _) => {
+                    return Err(anyhow!(
+                        "relate requires --kind and --other (or pass --remove to delete)"
+                    ));
+                }
+                // Remove a single edge.
+                (true, Some(k), Some(o)) => {
+                    svc.tasks
+                        .remove_relation(RemoveTaskRelationCmd {
+                            task_id: id,
+                            kind: k.as_kind_str().to_string(),
+                            other: o,
+                        })
+                        .await?
+                }
+                // Remove all relations on the task.
+                (true, None, None) => svc.tasks.clear_relations(&id).await?,
+                (true, _, _) => {
+                    return Err(anyhow!(
+                        "--remove takes either both --kind and --other (one edge) or neither (all relations)"
+                    ));
+                }
+            };
             render::task(&dto);
         }
         TaskCmd::Snapshots { id } => {

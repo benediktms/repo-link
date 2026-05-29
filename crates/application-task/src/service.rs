@@ -1,12 +1,14 @@
 //! [`TaskService`] — task CRUD, lifecycle/sync transitions, friendly-ID
 //! resolution, rollback, and snapshot listing.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{
-    AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, TaskDto, UpdateTaskCmd,
+    AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
+    TaskDto, UpdateTaskCmd,
 };
 use ports::{PortError, RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository};
 
@@ -359,14 +361,24 @@ impl TaskService {
         // The other side of a relation is a friendly ID too.
         let mut other_task = self.resolve_task(&cmd.other).await?;
 
-        // Self-relation: both the forward and reciprocal edge land on the
-        // same aggregate. Mutate one copy and save once — loading two copies
-        // and saving them in turn would clobber the first write.
+        // A task relating to itself is nonsensical (and the trivial cycle).
         if other_task.id == t.id {
-            t.add_relation(kind, t.id);
-            t.add_relation(kind.inverse(), t.id);
-            self.repo.save(&t, SnapshotSource::LocalEdit).await?;
-            return self.task_dto(&t).await;
+            return Err(ServiceError::SelfRelation);
+        }
+
+        // Cycle guard for the acyclic kinds: blocked_by/blocks (deadlock) and
+        // parent_of/child_of (ancestry loop). The new edge reads as `x
+        // depends-on / is-under y`; it closes a loop iff `y` can already reach
+        // `x` along that axis. Symmetric kinds (related_to/duplicates) have no
+        // axis and are never restricted.
+        if let Some((via, x, y)) = cycle_axis(kind, t.id, other_task.id)
+            && self.reaches(y, x, via).await?
+        {
+            return Err(ServiceError::RelationCycle {
+                kind: cmd.kind.clone(),
+                from: cmd.task_id.clone(),
+                to: cmd.other.clone(),
+            });
         }
 
         t.add_relation(kind, other_task.id);
@@ -381,6 +393,81 @@ impl TaskService {
             .await?;
 
         self.task_dto(&t).await
+    }
+
+    /// Remove a single `(kind, other)` edge and its reciprocal. Idempotent:
+    /// removing an absent edge is a no-op that still returns the task.
+    pub async fn remove_relation(&self, cmd: RemoveTaskRelationCmd) -> Result<TaskDto> {
+        let kind = parse_enum::<RelationKind>("kind", &cmd.kind)?;
+        let mut t = self.resolve_task(&cmd.task_id).await?;
+        let mut other_task = self.resolve_task(&cmd.other).await?;
+        if other_task.id == t.id {
+            return Err(ServiceError::SelfRelation);
+        }
+
+        if t.remove_relation(kind, other_task.id) {
+            self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+        }
+        if other_task.remove_relation(kind.inverse(), t.id) {
+            self.repo
+                .save(&other_task, SnapshotSource::LocalEdit)
+                .await?;
+        }
+        self.task_dto(&t).await
+    }
+
+    /// Drop every relation on a task, stripping the matching reciprocal from
+    /// each distinct other task so no dangling back-edges remain.
+    pub async fn clear_relations(&self, task_id: &str) -> Result<TaskDto> {
+        let mut t = self.resolve_task(task_id).await?;
+        let removed = t.clear_relations();
+        if removed.is_empty() {
+            return self.task_dto(&t).await;
+        }
+        self.repo.save(&t, SnapshotSource::LocalEdit).await?;
+
+        // Collect the reciprocal edges to strip, grouped by the other task so
+        // each is loaded and saved at most once.
+        let mut by_other: HashMap<TaskId, Vec<RelationKind>> = HashMap::new();
+        for r in &removed {
+            if r.other != t.id {
+                by_other.entry(r.other).or_default().push(r.kind.inverse());
+            }
+        }
+        for (other_id, inv_kinds) in by_other {
+            let mut other = self.repo.get(other_id).await?;
+            let mut changed = false;
+            for k in inv_kinds {
+                changed |= other.remove_relation(k, t.id);
+            }
+            if changed {
+                self.repo.save(&other, SnapshotSource::LocalEdit).await?;
+            }
+        }
+        self.task_dto(&t).await
+    }
+
+    /// Whether `target` is reachable from `start` by following `via` edges.
+    /// DFS bounded by a visited set, so pre-existing cycles in the data don't
+    /// loop forever. Used by the cycle guard in [`add_relation`].
+    async fn reaches(&self, start: TaskId, target: TaskId, via: RelationKind) -> Result<bool> {
+        let mut stack = vec![start];
+        let mut visited: HashSet<TaskId> = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let task = self.repo.get(id).await?;
+            for r in &task.relations {
+                if r.kind == via {
+                    if r.other == target {
+                        return Ok(true);
+                    }
+                    stack.push(r.other);
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
@@ -416,6 +503,27 @@ impl TaskService {
         op(&mut t)?;
         self.repo.save(&t, SnapshotSource::LocalEdit).await?;
         self.task_dto(&t).await
+    }
+}
+
+/// For a cycle-protected relation, return the `(via, x, y)` triple where the
+/// new edge reads as "x depends-on / is-under y" along axis `via`. Adding it
+/// closes a cycle iff `y` can already reach `x` over `via` edges.
+///
+/// Normalises each directional kind onto a single canonical axis so the guard
+/// only has to traverse one edge kind per family:
+/// - blocking family → `blocked_by` axis (`blocks(a,b)` ≡ `b blocked_by a`)
+/// - hierarchy family → `child_of` axis (`parent_of(a,b)` ≡ `b child_of a`)
+///
+/// Symmetric kinds (`related_to`, `duplicates`) return `None` — they have no
+/// direction, so there is nothing to keep acyclic.
+fn cycle_axis(kind: RelationKind, a: TaskId, b: TaskId) -> Option<(RelationKind, TaskId, TaskId)> {
+    match kind {
+        RelationKind::BlockedBy => Some((RelationKind::BlockedBy, a, b)),
+        RelationKind::Blocks => Some((RelationKind::BlockedBy, b, a)),
+        RelationKind::ChildOf => Some((RelationKind::ChildOf, a, b)),
+        RelationKind::ParentOf => Some((RelationKind::ChildOf, b, a)),
+        RelationKind::RelatedTo | RelationKind::Duplicates => None,
     }
 }
 
@@ -656,34 +764,173 @@ mod tests {
         assert_eq!(other.relations[0].other, a.id);
     }
 
+    /// Helper: create N bare tasks and return their ids.
+    async fn make_tasks(svc: &TaskService, titles: &[&str]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for title in titles {
+            let t = svc
+                .create(CreateTaskCmd {
+                    workspace_id: ws_id(),
+                    repo_id: None,
+                    title: (*title).into(),
+                    body: None,
+                    priority: None,
+                })
+                .await
+                .unwrap();
+            ids.push(t.id);
+        }
+        ids
+    }
+
     #[tokio::test]
-    async fn add_relation_self_relation_adds_both_edges_once() {
+    async fn add_relation_rejects_self() {
         let svc = svc();
-        let a = svc
-            .create(CreateTaskCmd {
-                workspace_id: ws_id(),
-                repo_id: None,
-                title: "a".into(),
-                body: None,
-                priority: None,
-            })
-            .await
-            .unwrap();
-        // A self blocked_by edge folds both the forward and reciprocal edge
-        // onto the one aggregate without clobbering or duplicating.
-        let updated = svc
+        let ids = make_tasks(&svc, &["a"]).await;
+        let err = svc
             .add_relation(AddTaskRelationCmd {
-                task_id: a.id.clone(),
+                task_id: ids[0].clone(),
+                kind: "related_to".into(),
+                other: ids[0].clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::SelfRelation));
+    }
+
+    #[tokio::test]
+    async fn add_relation_rejects_direct_cycle() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b"]).await;
+        // a blocked_by b is fine.
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[0].clone(),
+            kind: "blocked_by".into(),
+            other: ids[1].clone(),
+        })
+        .await
+        .unwrap();
+        // b blocked_by a would deadlock — rejected.
+        let err = svc
+            .add_relation(AddTaskRelationCmd {
+                task_id: ids[1].clone(),
                 kind: "blocked_by".into(),
-                other: a.id.clone(),
+                other: ids[0].clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RelationCycle { .. }));
+    }
+
+    #[tokio::test]
+    async fn add_relation_rejects_transitive_cycle_across_axes() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b", "c"]).await;
+        // a blocked_by b, b blocked_by c.
+        for (t, o) in [(0, 1), (1, 2)] {
+            svc.add_relation(AddTaskRelationCmd {
+                task_id: ids[t].clone(),
+                kind: "blocked_by".into(),
+                other: ids[o].clone(),
             })
             .await
             .unwrap();
-        let kinds: Vec<&str> = updated.relations.iter().map(|r| r.kind.as_str()).collect();
-        assert_eq!(updated.relations.len(), 2);
-        assert!(kinds.contains(&"blocked_by"));
-        assert!(kinds.contains(&"blocks"));
-        assert!(updated.relations.iter().all(|r| r.other == a.id));
+        }
+        // c blocked_by a closes the a→b→c→a loop — rejected.
+        let err = svc
+            .add_relation(AddTaskRelationCmd {
+                task_id: ids[2].clone(),
+                kind: "blocked_by".into(),
+                other: ids[0].clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RelationCycle { .. }));
+
+        // The reciprocal `blocks` direction is the same axis: a blocks c
+        // (≡ c blocked_by a, i.e. c depends on a) also closes the loop.
+        let err = svc
+            .add_relation(AddTaskRelationCmd {
+                task_id: ids[0].clone(),
+                kind: "blocks".into(),
+                other: ids[2].clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RelationCycle { .. }));
+    }
+
+    #[tokio::test]
+    async fn related_to_is_never_cycle_checked() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b"]).await;
+        // related_to is symmetric; the auto-reciprocal is not a "cycle".
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[0].clone(),
+            kind: "related_to".into(),
+            other: ids[1].clone(),
+        })
+        .await
+        .unwrap();
+        // Adding the reverse explicitly is just a dedup no-op, not an error.
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[1].clone(),
+            kind: "related_to".into(),
+            other: ids[0].clone(),
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_relation_drops_edge_and_reciprocal() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b"]).await;
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[0].clone(),
+            kind: "blocked_by".into(),
+            other: ids[1].clone(),
+        })
+        .await
+        .unwrap();
+        let updated = svc
+            .remove_relation(RemoveTaskRelationCmd {
+                task_id: ids[0].clone(),
+                kind: "blocked_by".into(),
+                other: ids[1].clone(),
+            })
+            .await
+            .unwrap();
+        assert!(updated.relations.is_empty());
+        // The reciprocal `blocks` edge on b is gone too.
+        assert!(svc.show(&ids[1]).await.unwrap().relations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_relations_strips_all_edges_and_back_edges() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b", "c"]).await;
+        // a blocked_by b, a related_to c.
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[0].clone(),
+            kind: "blocked_by".into(),
+            other: ids[1].clone(),
+        })
+        .await
+        .unwrap();
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: ids[0].clone(),
+            kind: "related_to".into(),
+            other: ids[2].clone(),
+        })
+        .await
+        .unwrap();
+
+        let cleared = svc.clear_relations(&ids[0]).await.unwrap();
+        assert!(cleared.relations.is_empty());
+        // Both back-edges (b: blocks→a, c: related_to→a) are stripped.
+        assert!(svc.show(&ids[1]).await.unwrap().relations.is_empty());
+        assert!(svc.show(&ids[2]).await.unwrap().relations.is_empty());
     }
 
     #[tokio::test]
