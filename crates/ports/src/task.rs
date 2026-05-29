@@ -62,6 +62,22 @@ pub trait TaskRepository: Send + Sync {
     /// tagged with `source`. The adapter assigns the next monotonic
     /// `version`. Both writes are committed in a single transaction.
     async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()>;
+    /// Persist several tasks (each with its own snapshot `source`) as a
+    /// single atomic unit: either all of them land or none do. Callers use
+    /// this when one logical change touches more than one task and a partial
+    /// write would corrupt an invariant — e.g. the two sides of a reciprocal
+    /// relation edge, where a half-written pair leaves the graph asymmetric.
+    ///
+    /// The default implementation loops over [`save`](Self::save) and is **not**
+    /// atomic — it exists only so test doubles needn't reimplement it. Any
+    /// adapter backed by real storage MUST override this with a single
+    /// transaction wrapping every task's writes.
+    async fn save_many(&self, tasks: &[(&Task, SnapshotSource)]) -> PortResult<()> {
+        for (task, source) in tasks {
+            self.save(task, *source).await?;
+        }
+        Ok(())
+    }
     async fn get(&self, id: TaskId) -> PortResult<Task>;
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>>;
     /// Look up a task by its globally-unique `hash`. Used by the
