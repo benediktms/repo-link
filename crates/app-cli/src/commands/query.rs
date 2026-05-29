@@ -75,6 +75,13 @@ pub(crate) async fn query_dispatch(
             let v = svc.query.assigned_to(&workspace, &assignee).await?;
             render::assigned(&v);
         }
+        QueryCmd::Children { id } => {
+            // Friendly-ID resolution lives in TaskService; the query layer is
+            // UUID-only, so resolve here before handing it the canonical id.
+            let parent_uuid = svc.tasks.resolve_id(&id).await?;
+            let v = svc.query.children(&parent_uuid).await?;
+            render::children(&v);
+        }
     }
     Ok(())
 }

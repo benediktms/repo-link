@@ -21,6 +21,6 @@ pub use repo::{
 pub use sync::{PromoteTaskCmd, PullTaskCmd, PushTaskCmd, SyncSummaryDto};
 pub use task::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto,
-    TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,
+    RemoveTaskRelationCmd, TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,
 };
 pub use workspace::{CreateWorkspaceCmd, ListWorkspacesQuery, WorkspaceDto};

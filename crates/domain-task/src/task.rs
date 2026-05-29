@@ -403,6 +403,30 @@ impl Task {
         }
     }
 
+    /// Remove the `(kind, other)` edge if present. Returns whether anything
+    /// was removed (so callers can skip a redundant save / reciprocal walk).
+    pub fn remove_relation(&mut self, kind: RelationKind, other: TaskId) -> bool {
+        let before = self.relations.len();
+        self.relations
+            .retain(|r| !(r.kind == kind && r.other == other));
+        let removed = self.relations.len() != before;
+        if removed {
+            self.touch();
+        }
+        removed
+    }
+
+    /// Drop every relation on this task, returning the removed edges so the
+    /// caller can strip the matching reciprocals from the other tasks.
+    pub fn clear_relations(&mut self) -> Vec<TaskRelation> {
+        if self.relations.is_empty() {
+            return Vec::new();
+        }
+        let taken = std::mem::take(&mut self.relations);
+        self.touch();
+        taken
+    }
+
     /// Priority is **local-only metadata**: GitHub doesn't model it, so a
     /// priority change does NOT flip sync state.
     pub fn set_priority(&mut self, priority: Priority) {

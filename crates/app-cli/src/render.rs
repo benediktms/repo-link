@@ -2,8 +2,8 @@
 //! predictable, parseable shape. Human reading is via `jq` / `fx` / etc.
 
 use application_query::{
-    AssignedTaskRow, BlockedTaskRow, ContributorRow, DriftRow, ReadyTaskRow, StaleWorktreeRow,
-    UnsyncedTaskRow, WorkspaceOverview,
+    AssignedTaskRow, BlockedTaskRow, ChildrenRollup, ContributorRow, DriftRow, ReadyTaskRow,
+    StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
@@ -102,6 +102,10 @@ pub fn ready(rows: &[ReadyTaskRow]) {
 
 pub fn assigned(rows: &[AssignedTaskRow]) {
     print_json(&rows);
+}
+
+pub fn children(rollup: &ChildrenRollup) {
+    print_json(rollup);
 }
 
 // ---------- Sync / reconcile --------------------------------------------

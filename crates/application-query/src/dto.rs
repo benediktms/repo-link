@@ -27,6 +27,25 @@ pub struct BlockedTaskRow {
     pub blocked_by: Vec<String>,
 }
 
+/// One child of a parent task, as surfaced by `rl query children`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildTaskRow {
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// Completion rollup for a parent task's children. The `done`/`total` counts
+/// are the aggregate the command exists to provide; `children` carries the
+/// per-child detail (incomplete first, then by title).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildrenRollup {
+    pub parent_id: String,
+    pub total: usize,
+    pub done: usize,
+    pub children: Vec<ChildTaskRow>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StaleWorktreeRow {
     pub repo_id: String,
