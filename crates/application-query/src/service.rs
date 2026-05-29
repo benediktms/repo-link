@@ -154,14 +154,16 @@ impl QueryService {
                 status: enum_str(&c.status),
             });
         }
-        // Outstanding work first, completed (`done`) last, then by title. The
-        // sort predicate matches the `done` count below so ordering and the
-        // rollup stay consistent.
+        // Outstanding work first, completed (`done`) last, then by title, with
+        // task_id as a final tie-breaker so the order is fully deterministic
+        // (the source `child_ids` is a HashSet). The `done` predicate matches
+        // the `done` count below so ordering and the rollup stay consistent.
         children.sort_by(|a, b| {
             let is_done = |s: &str| s == "done";
             is_done(&a.status)
                 .cmp(&is_done(&b.status))
                 .then_with(|| a.title.cmp(&b.title))
+                .then_with(|| a.task_id.cmp(&b.task_id))
         });
 
         let total = children.len();
@@ -634,6 +636,31 @@ mod tests {
         assert_eq!(rollup.total, 1);
         assert_eq!(rollup.done, 0);
         assert_eq!(rollup.children[0].task_id, active.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn children_rollup_finds_cross_workspace_child() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        // A second workspace — the parent does not know about its child here.
+        let workspace2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+        let wid2 = workspace2.id;
+        ws.save(&workspace2).await.unwrap();
+
+        let parent = Task::new_draft(wid, None, "parent".into()).unwrap();
+        // The only link is the reverse `child_of` on a child living in another
+        // workspace — discovery must not be scoped to the parent's workspace.
+        let mut cross = Task::new_draft(wid2, None, "cross-repo child".into()).unwrap();
+        cross.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+
+        ts.save(&parent, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&cross, SnapshotSource::LocalEdit).await.unwrap();
+
+        let rollup = svc.children(&parent.id.to_string()).await.unwrap();
+        assert_eq!(rollup.total, 1);
+        assert_eq!(rollup.children[0].task_id, cross.id.to_string());
     }
 
     #[tokio::test]
