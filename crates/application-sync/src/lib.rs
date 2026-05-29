@@ -45,16 +45,14 @@ pub use service::SyncService;
 ///
 /// Shared by the drainer's `AddItem` follow-up and the lifecycle / set-project
 /// enqueue helpers so the fallback is applied identically at enqueue time.
+///
+/// Delegates to the canonical [`Project::resolved_option_id_for`] so the
+/// outbox enqueue/drain paths and Stage 8 drift detection (which calls the
+/// domain resolver directly) can never diverge on the fallback definition —
+/// there is exactly ONE Blocked→Open rule, and it lives in `domain-project`.
+/// Keeps the `Option<String>` shape its callers expect by mapping the `&str`.
 pub fn option_id_for_status_with_fallback(project: &Project, status: TaskStatus) -> Option<String> {
-    if let Some(opt) = project.option_id_for(status) {
-        return Some(opt.to_string());
-    }
-    if status == TaskStatus::Blocked {
-        // No row for Blocked ⇒ resolve to the Open option (app-level
-        // fallback; never stored as a row — see RFC §3).
-        return project.option_id_for(TaskStatus::Open).map(str::to_string);
-    }
-    None
+    project.resolved_option_id_for(status).map(str::to_string)
 }
 
 /// Map a local lifecycle status onto the remote issue's open/closed bit plus

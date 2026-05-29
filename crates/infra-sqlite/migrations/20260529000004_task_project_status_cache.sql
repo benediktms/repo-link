@@ -1,0 +1,15 @@
+-- RFC 0001 Stage 8 (#56, closes #39) — cache the remote project-board status
+-- per task so drift detection and `rl task show` can see the GitHub Projects v2
+-- status axis without any network I/O.
+--
+-- The Stage-7 poller writes the polled item's `status_option_id` into this
+-- column at the per-item reconcile seam; drift compares it (resolved to the
+-- project's option) against the option the task's *local* lifecycle status maps
+-- to, INDEPENDENTLY of `sync_state`. That is the #39 scenario: REST/local says
+-- open while the board moved the card to Done.
+--
+-- Nullable, NO backfill: NULL means "not yet polled" — explicitly NOT a
+-- mismatch (an unpolled task must never be flagged as drift). A plain
+-- ADD COLUMN (no CHECK, no NOT NULL, no table rebuild) keeps the migration
+-- additive and existing rows unchanged.
+ALTER TABLE tasks ADD COLUMN project_status_option_id TEXT;

@@ -337,6 +337,21 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(out)
     }
 
+    async fn cache_project_status(
+        &self,
+        task_id: TaskId,
+        option_id: Option<String>,
+    ) -> PortResult<()> {
+        // Targeted single-column write (#56, thread r3325841752): mutate ONLY
+        // the `project_status_option_id` field on the stored task, under the
+        // existing lock, preserving every other field — no snapshot, no version
+        // bump, no `sync` change. An absent id is a benign no-op.
+        if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
+            task.project_status_option_id = option_id;
+        }
+        Ok(())
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())

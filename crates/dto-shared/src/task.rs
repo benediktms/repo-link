@@ -42,6 +42,15 @@ pub struct TaskDto {
     /// Mirrored issue comments (oldest first). Populated for `task show`;
     /// empty in list views to avoid a per-row fetch.
     pub comments: Vec<TaskCommentDto>,
+    /// Cached GitHub Projects v2 board status as a display name (e.g.
+    /// `"In progress"`), resolved from the task's cached
+    /// `project_status_option_id` via its workspace's project (RFC 0001
+    /// Stage 8, closes #39). `None` when the task is projectless, hasn't been
+    /// polled yet, or its cached option id is no longer owned by the project.
+    /// Read from the local cache only — `rl task show` does ZERO network I/O.
+    /// Additive; defaults to null for older consumers.
+    #[serde(default)]
+    pub project_status: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

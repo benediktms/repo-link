@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use domain_core::{TaskId, WorkspaceId};
+use domain_project::Project;
 use domain_repo::LinkStatus;
-use domain_task::{RelationKind, SyncState, TaskStatus};
-use ports::{RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
+use domain_task::{RelationKind, SyncState, Task, TaskStatus};
+use ports::{
+    ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
+};
 
 use crate::dto::{
     AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow, DriftRow,
@@ -17,6 +20,9 @@ pub struct QueryService {
     workspaces: Arc<dyn WorkspaceRepository>,
     bindings: Arc<dyn RepoBindingRepository>,
     tasks: Arc<dyn TaskRepository>,
+    /// Resolves `task → workspace → project` so [`Self::drift`] can surface the
+    /// GitHub Projects v2 status axis (RFC 0001 Stage 8, closes #39).
+    projects: Arc<dyn ProjectRepository>,
 }
 
 impl QueryService {
@@ -24,11 +30,13 @@ impl QueryService {
         workspaces: Arc<dyn WorkspaceRepository>,
         bindings: Arc<dyn RepoBindingRepository>,
         tasks: Arc<dyn TaskRepository>,
+        projects: Arc<dyn ProjectRepository>,
     ) -> Self {
         Self {
             workspaces,
             bindings,
             tasks,
+            projects,
         }
     }
 
@@ -345,7 +353,23 @@ impl QueryService {
         Ok(rows)
     }
 
-    /// Tasks whose local sync state has diverged from the remote.
+    /// Tasks whose local state has diverged from the remote, across two
+    /// independent axes:
+    ///
+    /// 1. **Sync axis** — `sync_state ∈ {DirtyLocal, DirtyRemote, Conflict}`
+    ///    (the REST / local snapshot diverged). Unchanged from before.
+    /// 2. **Project-status axis (closes #39)** — the cached remote
+    ///    GitHub Projects v2 board status disagrees with the option the task's
+    ///    local lifecycle status maps to. This is evaluated **independently of
+    ///    `sync_state`**, so a `Synced` task whose board card moved to "Done"
+    ///    while REST still says open surfaces here.
+    ///
+    /// A task surfaces if either axis drifted; `reasons` names which. The
+    /// project axis is only a mismatch when BOTH the cached actual
+    /// (`project_status_option_id`) and the resolved expected option are
+    /// `Some` and differ: a NULL cache means "not yet polled" (never flagged),
+    /// a projectless task has no expected option (never flagged), and
+    /// `Archived` is excluded from project mappings (never flagged).
     pub async fn drift(&self, workspace_id: &str) -> Result<Vec<DriftRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
@@ -355,21 +379,55 @@ impl QueryService {
                 ..TaskFilter::default()
             })
             .await?;
-        Ok(tasks
-            .iter()
-            .filter(|t| {
-                matches!(
-                    t.sync,
-                    SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
-                )
-            })
-            .map(|t| DriftRow {
+
+        // One workspace per query, so its project (if any) resolves once.
+        let project = self.resolve_workspace_project(id).await?;
+
+        let mut rows = Vec::new();
+        for t in &tasks {
+            let sync_drift = matches!(
+                t.sync,
+                SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
+            );
+
+            // Project-status axis, independent of sync_state.
+            let (project_status, project_status_expected, project_drift) =
+                project_axis(project.as_ref(), t);
+
+            if !sync_drift && !project_drift {
+                continue;
+            }
+
+            let mut reasons = Vec::new();
+            if sync_drift {
+                reasons.push("sync".to_string());
+            }
+            if project_drift {
+                reasons.push("project_status".to_string());
+            }
+
+            rows.push(DriftRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
                 sync_state: enum_str(&t.sync),
                 remote_id: t.remote.as_ref().map(|r| r.remote_id.clone()),
-            })
-            .collect())
+                reasons,
+                project_status,
+                project_status_expected,
+            });
+        }
+        Ok(rows)
+    }
+
+    /// Resolve the workspace's parent project, if any. `None` for projectless
+    /// workspaces (the common path) — the project-status drift axis is then
+    /// inert for every task in the workspace.
+    async fn resolve_workspace_project(&self, id: WorkspaceId) -> Result<Option<Project>> {
+        let ws = self.workspaces.get(id).await?;
+        let Some(project_id) = ws.project_id.clone() else {
+            return Ok(None);
+        };
+        Ok(Some(self.projects.get(project_id).await?))
     }
 
     pub async fn unsynced_tasks(&self, workspace_id: &str) -> Result<Vec<UnsyncedTaskRow>> {
@@ -413,6 +471,39 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
 
 fn is_unsynced(sync: SyncState) -> bool {
     !matches!(sync, SyncState::Synced)
+}
+
+/// Evaluate the project-status drift axis for one task (RFC 0001 Stage 8,
+/// closes #39). Returns `(actual_name, expected_name, is_drift)`:
+///
+/// - `actual_name`: the cached remote board status (`task.project_status_option_id`)
+///   resolved to a display name. `None` when projectless or unpolled.
+/// - `expected_name`: the option the task's local lifecycle status maps to
+///   (via [`Project::resolved_option_id_for`], the SAME Blocked→Open fallback
+///   the outbox enqueue path uses), resolved to a display name.
+/// - `is_drift`: `true` only when BOTH the actual and expected option ids are
+///   `Some` and differ. A NULL cache (`None` actual) is "not yet polled" — not
+///   a mismatch. `Archived` resolves to no expected option, so it's never
+///   flagged.
+fn project_axis(project: Option<&Project>, task: &Task) -> (Option<String>, Option<String>, bool) {
+    let Some(project) = project else {
+        return (None, None, false);
+    };
+
+    let actual_id = task.project_status_option_id.as_deref();
+    let expected_id = project.resolved_option_id_for(task.status);
+
+    let actual_name = actual_id.and_then(|id| project.option_name_for(id).map(str::to_string));
+    let expected_name = expected_id.and_then(|id| project.option_name_for(id).map(str::to_string));
+
+    // Mismatch only when both sides are known and differ. A NULL cache
+    // (`actual_id` None) is unpolled — never a mismatch.
+    let is_drift = match (actual_id, expected_id) {
+        (Some(a), Some(e)) => a != e,
+        _ => false,
+    };
+
+    (actual_name, expected_name, is_drift)
 }
 
 fn is_done_or_archived(status: TaskStatus) -> bool {
@@ -475,7 +566,8 @@ mod tests {
     use domain_workspace::{Workspace, WorkspaceName};
     use std::path::PathBuf;
     use testing_fixtures::{
-        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
+        InMemoryProjectRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
+        InMemoryWorkspaceRepository,
     };
 
     fn svc() -> (
@@ -484,11 +576,25 @@ mod tests {
         Arc<InMemoryRepoBindingRepository>,
         Arc<InMemoryTaskRepository>,
     ) {
+        let (svc, w, b, t, _p) = svc_with_projects();
+        (svc, w, b, t)
+    }
+
+    /// Like [`svc`] but also hands back the project repo so the Stage-8
+    /// project-status drift tests can attach a project to a workspace.
+    fn svc_with_projects() -> (
+        QueryService,
+        Arc<InMemoryWorkspaceRepository>,
+        Arc<InMemoryRepoBindingRepository>,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryProjectRepository>,
+    ) {
         let w = Arc::new(InMemoryWorkspaceRepository::new());
         let b = Arc::new(InMemoryRepoBindingRepository::new());
         let t = Arc::new(InMemoryTaskRepository::new());
-        let svc = QueryService::new(w.clone(), b.clone(), t.clone());
-        (svc, w, b, t)
+        let p = Arc::new(InMemoryProjectRepository::new());
+        let svc = QueryService::new(w.clone(), b.clone(), t.clone(), p.clone());
+        (svc, w, b, t, p)
     }
 
     #[tokio::test]
@@ -927,6 +1033,315 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sync_state, "dirty_local");
         assert_eq!(rows[0].remote_id.as_deref(), Some("42"));
+        // Projectless workspace → the project-status axis is inert: only the
+        // sync reason is present and both project fields stay None.
+        assert_eq!(rows[0].reasons, vec!["sync".to_string()]);
+        assert_eq!(rows[0].project_status, None);
+        assert_eq!(rows[0].project_status_expected, None);
+    }
+
+    /// Build a project attached to `ws` with a Backlog/In progress/Done option
+    /// set and the standard Open→Backlog, InProgress→In progress, Done→Done
+    /// mapping (Blocked intentionally unmapped, so it falls back to Open per
+    /// §3). Saves it and wires `workspace.project_id`.
+    async fn attach_project(
+        ws: &mut Workspace,
+        ws_repo: &Arc<InMemoryWorkspaceRepository>,
+        projects: &Arc<InMemoryProjectRepository>,
+    ) -> domain_project::Project {
+        use domain_core::ProjectId;
+        use domain_project::{Project, StatusMapping, StatusOption};
+        let pid = ProjectId::parse("PVT_drift_test").unwrap();
+        let opt = |id: &str, name: &str, ord: u32| StatusOption {
+            option_id: id.into(),
+            name: name.into(),
+            ordinal: ord,
+        };
+        let project = Project::new(
+            pid.clone(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            "PVTSSF_field".into(),
+            vec![
+                opt("o_backlog", "Backlog", 0),
+                opt("o_wip", "In progress", 1),
+                opt("o_done", "Done", 2),
+            ],
+            vec![
+                StatusMapping {
+                    status: TaskStatus::Open,
+                    option_id: "o_backlog".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::InProgress,
+                    option_id: "o_wip".into(),
+                },
+                StatusMapping {
+                    status: TaskStatus::Done,
+                    option_id: "o_done".into(),
+                },
+            ],
+            false,
+            domain_core::Timestamp::now(),
+        )
+        .unwrap();
+        projects.save(&project).await.unwrap();
+        ws.project_id = Some(pid);
+        ws_repo.save(ws).await.unwrap();
+        project
+    }
+
+    /// #39 case (a): a SYNCED task whose cached board status maps to a
+    /// different option than its local status surfaces as project-status
+    /// drift, even though `sync_state == synced`. Local says Open (→ Backlog);
+    /// the board moved the card to Done.
+    #[tokio::test]
+    async fn drift_surfaces_synced_task_with_board_moved_to_done() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        // A fully-Synced, Open task whose board card was polled as "Done".
+        let mut t = Task::new_draft(wid, None, "card moved on the board".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "7")).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        t.set_project_status_option_id(Some("o_done".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1, "the synced-but-board-moved task surfaces");
+        let row = &rows[0];
+        assert_eq!(row.sync_state, "synced", "sync axis is clean");
+        assert_eq!(row.reasons, vec!["project_status".to_string()]);
+        assert_eq!(row.project_status.as_deref(), Some("Done"));
+        assert_eq!(row.project_status_expected.as_deref(), Some("Backlog"));
+    }
+
+    /// #39 case (b), reverse direction: REST/local says Done (→ Done option)
+    /// but the board still shows "In progress".
+    #[tokio::test]
+    async fn drift_surfaces_board_behind_local_done() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        let mut t = Task::new_draft(wid, None, "local done, board lagging".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "8")).unwrap();
+        t.start().unwrap();
+        t.complete().unwrap();
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert_eq!(t.status, TaskStatus::Done);
+        t.set_project_status_option_id(Some("o_wip".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].project_status.as_deref(), Some("In progress"));
+        assert_eq!(rows[0].project_status_expected.as_deref(), Some("Done"));
+        assert_eq!(rows[0].reasons, vec!["project_status".to_string()]);
+    }
+
+    /// #39 case (c): cached == expected → no project drift row.
+    #[tokio::test]
+    async fn drift_no_row_when_board_matches_local() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        // Open task, board cached as Backlog (= Open's mapped option). Agreement.
+        let mut t = Task::new_draft(wid, None, "in agreement".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "9")).unwrap();
+        t.set_project_status_option_id(Some("o_backlog".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert!(rows.is_empty(), "no drift when board agrees with local");
+    }
+
+    /// #39 case (d): a projectless task → project_status None, not flagged.
+    #[tokio::test]
+    async fn drift_projectless_task_has_no_project_axis() {
+        let (svc, ws, _bs, ts, _ps) = svc_with_projects();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        // A Synced task with a cached option id but NO project on the workspace.
+        let mut t = Task::new_draft(wid, None, "no project".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "10")).unwrap();
+        t.set_project_status_option_id(Some("o_done".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert!(rows.is_empty(), "projectless workspace → no project drift");
+    }
+
+    /// #39 case (e): NULL cache (unpolled) → not flagged.
+    #[tokio::test]
+    async fn drift_null_cache_is_not_a_mismatch() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        // Open + Synced, project attached, but never polled (cache is None).
+        let mut t = Task::new_draft(wid, None, "unpolled".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "11")).unwrap();
+        assert_eq!(t.project_status_option_id, None);
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert!(rows.is_empty(), "a NULL cache is unpolled, not a mismatch");
+    }
+
+    /// #39 case (f): a Blocked task with no Blocked option resolves to Open's
+    /// option via the §3 fallback — so a board cached at that same Open option
+    /// must NOT report phantom drift.
+    #[tokio::test]
+    async fn drift_blocked_with_no_blocked_option_no_phantom_drift() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        // The board has NO Blocked option (only Backlog/In progress/Done), so
+        // Blocked falls back to Open → "Backlog".
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        let mut t = Task::new_draft(wid, None, "blocked, board at backlog".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "12")).unwrap();
+        t.mark_blocked().unwrap();
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        // Board card is at the Open/Backlog option — matches the fallback.
+        t.set_project_status_option_id(Some("o_backlog".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "Blocked→Open fallback must agree with a board cached at the Open option (no phantom drift)"
+        );
+    }
+
+    /// A stale cached option id (the board option was renamed/removed remotely,
+    /// so the project no longer owns it) must STILL flag drift — `is_drift` is
+    /// computed from the raw option *ids* (`o_ghost != o_backlog`), not the
+    /// resolved names. The actual status renders as `None` (no name to resolve)
+    /// while the expected name resolves normally. This guards that a renamed
+    /// remote option doesn't silently suppress the project axis (#39).
+    #[tokio::test]
+    async fn drift_stale_cached_option_id_still_flags_with_no_name() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        // Open task (expected → "Backlog"), but the board cached an option id
+        // the project no longer owns (renamed/removed remotely).
+        let mut t = Task::new_draft(wid, None, "stale cached option".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "14")).unwrap();
+        t.set_project_status_option_id(Some("o_ghost".into()));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1, "a stale cached id still flags drift");
+        let row = &rows[0];
+        assert_eq!(row.reasons, vec!["project_status".to_string()]);
+        // No name for the unknown id; expected resolves normally.
+        assert_eq!(row.project_status, None);
+        assert_eq!(row.project_status_expected.as_deref(), Some("Backlog"));
+    }
+
+    /// #39 case: an `Archived` task with a cached project option is never
+    /// flagged by the project axis. Two layers protect this and this test
+    /// pins BOTH:
+    ///
+    /// 1. **Integration layer** — `drift()` lists with `include_archived:
+    ///    false`, so an archived task never even reaches the axis (asserted via
+    ///    `svc.drift` returning empty).
+    /// 2. **Axis layer** — even if an archived task *did* reach it,
+    ///    `project_axis` returns `is_drift == false` because
+    ///    `resolved_option_id_for(Archived)` is `None` (no expected option).
+    ///    Asserted by calling `project_axis` directly with a cached option id,
+    ///    which the list filter would otherwise hide.
+    #[tokio::test]
+    async fn drift_archived_task_not_flagged() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        let project = attach_project(&mut workspace, &ws, &ps).await;
+
+        let mut t = Task::new_draft(wid, None, "archived with cached option".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "15")).unwrap();
+        t.set_project_status_option_id(Some("o_done".into()));
+        t.archive().unwrap();
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        // Layer 1: the archived task is filtered out of the drift list entirely.
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert!(
+            rows.is_empty(),
+            "an Archived task is excluded from the drift list"
+        );
+
+        // Layer 2: even reaching the axis directly, Archived has no expected
+        // option (`resolved_option_id_for(Archived) == None`) → no drift.
+        let (actual, expected, is_drift) = project_axis(Some(&project), &t);
+        assert!(
+            !is_drift,
+            "Archived → no expected option → never a mismatch"
+        );
+        assert_eq!(expected, None, "Archived maps to no project option");
+        assert_eq!(
+            actual.as_deref(),
+            Some("Done"),
+            "the cached actual name still resolves; only the expected side is None"
+        );
+    }
+
+    /// A task that is BOTH sync-dirty AND project-status-drifted reports both
+    /// reasons.
+    #[tokio::test]
+    async fn drift_reports_both_axes() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        let mut t = Task::new_draft(wid, None, "both axes".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "13")).unwrap();
+        t.mark_dirty_local().unwrap(); // sync axis dirty
+        t.set_project_status_option_id(Some("o_done".into())); // board moved
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].reasons,
+            vec!["sync".to_string(), "project_status".to_string()]
+        );
+        assert_eq!(rows[0].project_status.as_deref(), Some("Done"));
+        assert_eq!(rows[0].project_status_expected.as_deref(), Some("Backlog"));
     }
 
     #[tokio::test]

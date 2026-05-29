@@ -141,7 +141,7 @@ This is the conceptual cleanup the spike circled to. A *synced* task is a mirror
 
 **`TaskStatus` does not change.** Adding `ExternalSync` as a status value would collapse two orthogonal axes (lifecycle vs. ownership). They stay separate: `status` is lifecycle, `sync_state` is ownership.
 
-**Reads stay cache-first.** `rl task show` returns the cache. Drift detection (the polling loop, §D4) invalidates entries; the next read pulls fresh.
+**Reads stay cache-first.** `rl task show` returns the cache. Drift detection (the polling loop, §D4) invalidates entries; the next read pulls fresh. **As built (Stage 8, #39):** the project-board status is itself part of that cache — `tasks.project_status_option_id` is written by the poller and read (resolved to a display name) by both `rl task show` and `rl query drift` with **zero** network I/O. The drift view compares the cached board status against the option the task's local lifecycle status maps to, on a drift axis **independent of `sync_state`**, so a `Synced` task whose card moved on the board still surfaces.
 
 **Workflow opacity caveat.** When we `addProjectV2ItemById`, GitHub's own "Item added to project" workflow may set status to e.g. "Backlog." Our follow-up `set_status` overwrites it. Race-free because both calls are sequential from our side — but we always issue the explicit `set_status` rather than relying on the workflow default (which is unintrospectable, see §2.7).
 
@@ -242,7 +242,7 @@ The repo is already cleanly layered (domain → ports ← infrastructure / appli
 | `infra-github` | + `graphql` submodule implementing `RemoteProjectProvider`. Swap REST internals to `octocrab`. Capture `issue.node_id` from REST responses into `RemoteRef.node_id`. Rename `GithubTaskProvider` → `GithubAdapter` (no longer task-only). |
 | `application-sync` | + outbox drainer task. + project poller task (calls `RemoteProjectProvider::poll_project_items`, reconciles cache). |
 | `application-task` | Lifecycle verbs enqueue outbox entries when the task is a mirror; no behavior change for `LocalOnly` tasks. |
-| `application-query` | + `rl query drift` includes `project_status` axis. |
+| `application-query` | + `rl query drift` includes the `project_status` axis (Stage 8, #39): `DriftRow` gains `reasons` + `project_status` + `project_status_expected`; `QueryService::new` takes `Arc<dyn ProjectRepository>` to resolve `task → workspace → project`. The project axis is evaluated independently of `sync_state`. |
 | `app-cli` | + `rl project link/show/unlink/map`. + `rl workspace set-project <workspace> <project-spec>`. + `--project <project-spec>` flag on `rl workspace create`. + `rl sync pull --all` (separate follow-up ticket but called out here). |
 | `app-daemon` | + restructure `Daemon::run` from one ticker to two concurrent background tasks (poller + outbox drainer) with shared cancellation. Cadences hardcoded as constants in v1; see Stage 7. |
 | `testing-fixtures` | + in-memory `ProjectRepository`, `RemoteProjectProvider`, `OutboxRepository`. Follow the existing `Mutex<HashMap<Id, T>>` pattern from `InMemoryWorkspaceRepository`. |
@@ -339,6 +339,15 @@ PR shape: one PR. Risk: medium — first real background work the daemon does be
 - 8d. `rl query drift` shows mismatches.
 
 PR shape: one PR. Closes #39. Risk: low if 6 and 7 are solid — Stage 8 is the consumer.
+
+**Implementation decisions (as built — #56, closes #39):**
+
+- **Cached remote project status: a new per-task column, a separate drift axis.** `tasks` gains `project_status_option_id TEXT` (nullable, no backfill — migration `20260529000004_task_project_status_cache.sql`). `NULL` means "not yet polled" and is **explicitly not a mismatch**. The column is threaded through `write_task_in_tx` (INSERT column list **and** the `ON CONFLICT DO UPDATE SET` clause — the DO-UPDATE half is load-bearing: the poller always writes via the upsert path, so omitting it would silently never persist) plus `row_to_task`. `Task` gains `project_status_option_id: Option<String>` initialized `None` in every constructor, a `set_project_status_option_id` setter (returns whether the value changed, so the poller skips redundant writes), and is deliberately excluded from `snapshot_view` / `reconcile_dirty_against_baseline` — a board move is a separate axis and must never flip `sync_state`.
+- **One fallback definition, shared.** `Project::resolved_option_id_for(status)` is the canonical local-status → option resolver with the §3 Blocked-with-no-matching-option → Open fallback. `application_sync::option_id_for_status_with_fallback` now **delegates** to it (mapping `&str` → `String` for its existing callers), so the outbox enqueue/drain paths and Stage 8 drift detection share exactly one Blocked→Open rule. `Project::option_name_for(option_id)` resolves a cached option id to its display name (drift + `rl task show`).
+- **Population path: the Stage-7 poller.** At the poller's per-item reconcile seam, a matched item's `status_option_id` is written into the local task's cache via the setter and persisted with `SnapshotSource::LocalEdit` (a **non-baseline** source — re-baselining here would wrongly reset dirty detection). The write is idempotent (skip on unchanged) and never participates in `sync_state`. A single item's save failure is logged and skipped, not fatal to the pass.
+- **Drift compares independently of `sync_state` (the #39 fix).** `QueryService::new` now takes `Arc<dyn ProjectRepository>`. `drift()` resolves the workspace's project once, then for each task evaluates two axes: the existing **sync axis** (`DirtyLocal`/`DirtyRemote`/`Conflict`) and the **project-status axis** — `expected = Project::resolved_option_id_for(task.status)` vs `actual = task.project_status_option_id`. A project mismatch (both `Some`, differing) surfaces **even when `sync_state == Synced`** — the exact #39 scenario (REST/local says open, the board moved to Done). `DriftRow` gains `reasons: Vec<String>` (`"sync"` / `"project_status"`, either or both), `project_status` (cached actual display name), and `project_status_expected` (expected display name) — all additive, Option/serde-clean. A NULL cache, a projectless task, and `Archived` are never flagged.
+- **`rl task show` stays offline.** `TaskDto` gains `project_status: Option<String>`. The pure `task_to_dto` leaves it `None`; `TaskService::task_dto` overlays the resolved display name from the LOCAL cache (`task → workspace → project → option_name_for`), no network — mirroring the existing relation-id overlay pattern.
+- **§10.5 (`rl project unlink --force` auto-detach) deferred.** Out of scope for the #39 headline; tracked as a follow-up (open question §10.5 stands at lean (b)).
 
 **Why this order:**
 - Stages 1–3 are scaffolding — adapters and types without semantics. Cheap to review.
@@ -575,6 +584,14 @@ CREATE INDEX idx_tasks_project_item_id ON tasks(project_item_id)
 -- to translate one to the other on the hot path.
 ALTER TABLE tasks ADD COLUMN remote_node_id TEXT;  -- I_… (the GitHub issue node ID)
 
+-- Stage 8 (#56, closes #39): cache the remote Projects v2 board status per
+-- task so drift + `rl task show` can read the project status axis offline.
+-- Nullable, NO backfill — NULL = "not yet polled" (explicitly NOT a mismatch).
+-- Written by the poller; compared against the option the task's local status
+-- maps to, independently of sync_state. Migration
+-- `20260529000004_task_project_status_cache.sql`.
+ALTER TABLE tasks ADD COLUMN project_status_option_id TEXT;  -- option id (e.g. 47fc9ee4)
+
 CREATE TABLE outbox_entries (
   id                TEXT PRIMARY KEY,
   task_id           TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -682,7 +699,7 @@ These don't block Stage 1 (REST → octocrab swap) — they only need to be answ
 2. **Outbox ordering guarantees.** ✅ **Settled in Stage 6 (#54).** FIFO per task — a single-task `start → edit → complete` sequence applies in order — but parallel across tasks: a stuck mutation on task A never blocks task B. Enforced by `OutboxRepository::claim_next_eligible`, which skips any task with an earlier-enqueued non-terminal sibling (an `inflight` entry *or* an older `pending` one — so a recoverably-failed, backed-off head still holds its tail back) and reschedules failures with exponential backoff (`5s, 30s, 2m, 10m`, cap `N = 5`) before dead-lettering. Entries stranded `inflight` by a crash are recovered on startup (`requeue_orphaned_inflight`). See the Stage 6 implementation-decisions block in §5.
 3. **Many-to-one mappings** in `project_status_mappings`. If two `TaskStatus` values end up *explicitly* mapped to one option — for example, the user running `rl project map` twice (auto-derivation can't, given the anchored/disjoint regexes; only a future rule change would) — what happens? The schema represents this natively (two `(project_id, status)` rows sharing one `option_id`), so we store both as-is, surface a note on `rl project show`, and let the user re-target via `rl project map`. (The earlier scalar `default_for` column couldn't store this and silently dropped the second mapping; see #80.) Note this is *not* the Blocked-with-no-matching-option case in §3 — that one is left unmapped and resolved to `Open` at lookup time, not stored as a collision row.
 4. **Project archival semantics.** A GitHub project can be closed/archived from the UI. **Decision: archival is cosmetic only — no cascade.** We mirror the `archived` flag on the local `projects` row and surface it on `rl project show` / `rl workspace show`, but: child workspaces are unaffected, polling continues (the user may un-archive), and existing outbox entries still drain. The flag is purely a hint for the human reader.
-5. **Unlinking a project with active orphan-drafts.** If a user runs `rl project unlink <p>` while orphan tasks (`repo_id = NULL`, `project_item_id IS NOT NULL`) exist under workspaces attached to that project, the drafts on GitHub aren't affected — but the local task loses its only sync anchor (no repo, no project to track via). Options: (a) refuse the unlink until those tasks are resolved, (b) auto-detach drafts (keep them locally as orphan + projectless, no further sync), (c) prompt per task. Lean: (b), with a `rl project unlink --force` to skip prompting and a summary of affected tasks. Decide before Stage 8.
+5. **Unlinking a project with active orphan-drafts.** If a user runs `rl project unlink <p>` while orphan tasks (`repo_id = NULL`, `project_item_id IS NOT NULL`) exist under workspaces attached to that project, the drafts on GitHub aren't affected — but the local task loses its only sync anchor (no repo, no project to track via). Options: (a) refuse the unlink until those tasks are resolved, (b) auto-detach drafts (keep them locally as orphan + projectless, no further sync), (c) prompt per task. Lean: (b), with a `rl project unlink --force` to skip prompting and a summary of affected tasks. **Deferred past Stage 8 (#56):** the #39 headline (the project-status drift axis) shipped without it; the lean stays (b). Tracked as a follow-up — it's orthogonal to the drift/read work Stage 8 delivered.
 
 ## Appendix A: GraphQL shapes we care about
 

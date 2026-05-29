@@ -178,6 +178,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "domain-core",
+ "domain-project",
  "domain-repo",
  "domain-task",
  "domain-workspace",
