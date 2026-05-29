@@ -343,7 +343,7 @@ pub(crate) async fn task_dispatch(
                 .tasks
                 .add_relation(AddTaskRelationCmd {
                     task_id: id,
-                    kind,
+                    kind: kind.as_kind_str().to_string(),
                     other,
                 })
                 .await?;

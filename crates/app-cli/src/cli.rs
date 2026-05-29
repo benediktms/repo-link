@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::daemon;
 
@@ -434,10 +434,12 @@ pub(crate) enum TaskCmd {
         #[arg(long, short = 'r')]
         relink: bool,
     },
+    /// Relate two tasks. The reciprocal edge is added to `--other`
+    /// automatically (e.g. `blocks` ⇒ `blocked_by` on the other task).
     Relate {
         id: String,
         #[arg(long)]
-        kind: String,
+        kind: RelationKindArg,
         #[arg(long)]
         other: String,
     },
@@ -491,6 +493,9 @@ pub(crate) enum QueryCmd {
         #[arg(long, env = "REPO_LINK_USER")]
         assignee: Option<String>,
     },
+    /// Completion rollup of a parent task's children (done/total + per-child
+    /// detail). Accepts a UUID, bare hash, or `prefix-hash` composite.
+    Children { id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -576,4 +581,42 @@ pub(crate) enum ProjectCmd {
     /// Unlink a project locally. Workspaces attached to it have their
     /// `project_id` reset to NULL via the storage cascade.
     Unlink { spec: String },
+}
+
+/// CLI surface for `domain_task::RelationKind`. Kept as a clap-local mirror so
+/// the domain crate stays free of a clap dependency. The `value(name = …)`
+/// tokens are the canonical `snake_case` strings the application layer parses
+/// back into `RelationKind`, so the JSON `kind` echoes the input verbatim.
+///
+/// `depends_on` is intentionally absent — it was dropped as a redundant
+/// synonym of `blocked_by`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RelationKindArg {
+    #[value(name = "blocked_by")]
+    BlockedBy,
+    #[value(name = "blocks")]
+    Blocks,
+    #[value(name = "duplicates")]
+    Duplicates,
+    #[value(name = "parent_of")]
+    ParentOf,
+    #[value(name = "child_of")]
+    ChildOf,
+    #[value(name = "related_to")]
+    RelatedTo,
+}
+
+impl RelationKindArg {
+    /// The canonical `snake_case` string accepted by the application layer's
+    /// `parse_enum::<RelationKind>`.
+    pub(crate) fn as_kind_str(self) -> &'static str {
+        match self {
+            RelationKindArg::BlockedBy => "blocked_by",
+            RelationKindArg::Blocks => "blocks",
+            RelationKindArg::Duplicates => "duplicates",
+            RelationKindArg::ParentOf => "parent_of",
+            RelationKindArg::ChildOf => "child_of",
+            RelationKindArg::RelatedTo => "related_to",
+        }
+    }
 }
