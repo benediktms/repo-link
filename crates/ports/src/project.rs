@@ -118,8 +118,10 @@ pub trait RemoteProjectProvider: Send + Sync {
         option_id: &str,
     ) -> PortResult<()>;
 
-    /// Poll a project for items changed since `since` matching `query`
-    /// (e.g. `"is:open"`). Returns both issue-backed items and drafts;
+    /// Poll a project for items changed since `since` matching `query` (an
+    /// empty `query` means the delta `updated:>{since}` filter alone — what the
+    /// status-reconciliation poller passes, so drafts and closed/Done items are
+    /// not filtered out). Returns both issue-backed items and drafts;
     /// `RemoteProjectItem.issue_node_id` is `None` for drafts.
     ///
     /// `status_field_id` is the project's chosen Status field (`PVTSSF_…`, as

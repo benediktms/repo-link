@@ -7,7 +7,8 @@
 //! GitHub, the poller pulls *remote* project state back. Once per cadence it
 //! enumerates every locally-known project and asks the
 //! [`RemoteProjectProvider`] for the items that changed since the last poll
-//! (`query = "is:open"`, per §D4 — `is:open` excludes Done/Archived churn).
+//! (per §D4 the delta lever is `updated:>{since}` alone — see [`POLL_QUERY`];
+//! the older `is:open` filter wrongly dropped drafts and closed/Done items).
 //! Each returned item is correlated with its local task by
 //! `project_item_id`; what is reconcilable *now* is reconciled.
 //!
@@ -49,9 +50,18 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use crate::error::Result;
 
 /// The GitHub `project.items(query:)` filter the poller sends every cycle
-/// (RFC §D4). `is:open` keeps the payload proportional to the open-task
-/// change rate; reopening a Done task is a manual `rl sync pull` escape.
-const POLL_QUERY: &str = "is:open";
+/// (RFC §D4). Empty on purpose: the graphql layer composes it into just
+/// `updated:>{since}`, so the per-project `since` watermark is the *only*
+/// delta lever and the page already stays proportional to the change rate.
+///
+/// It used to be `"is:open"`, but that was an over-restriction (issue
+/// r3325531902): GitHub Projects `is:open` matches open issues/PRs only, so it
+/// silently dropped **draft items** (draft-backed mirror tasks were never
+/// polled or reconciled) and **items that moved to a closed/Done state** — the
+/// exact status transitions a reconciliation poller must observe. Space-joining
+/// `is:open is:draft` would AND (match nothing), so the fix is to drop the
+/// `is:` filter entirely and lean on `updated:>{since}` alone.
+const POLL_QUERY: &str = "";
 
 /// Outcome of one [`ProjectPoller::poll_once`] pass. Returned so the daemon
 /// loop can log progress and tests can assert reconcile counts.
@@ -343,8 +353,8 @@ mod tests {
 
     /// A polled item whose `item_node_id` matches a local task's
     /// `project_item_id` is correlated (matched, not unmatched), and the
-    /// project is polled with the §D4 `is:open` query against its own
-    /// status_field_id.
+    /// project is polled with the §D4 empty query (delta-only — see
+    /// [`POLL_QUERY`]) against its own status_field_id.
     #[tokio::test]
     async fn poll_once_reconciles_a_matched_item() {
         let projects = Arc::new(InMemoryProjectRepository::new());
@@ -374,14 +384,15 @@ mod tests {
         assert_eq!(report.items_unmatched, 0);
         assert_eq!(report.partial_projects, 0);
 
-        // Polled with the right project + field + the §D4 query.
+        // Polled with the right project + field + the §D4 delta-only query
+        // (empty, so the graphql layer sends just `updated:>{since}`).
         let calls = remote.calls();
         assert!(calls.iter().any(|c| matches!(
             c,
             ProjectCall::Poll { project_node_id, status_field_id, query }
                 if project_node_id == "PVT_kwHO_match"
                     && status_field_id == "PVTSSF_field"
-                    && query == "is:open"
+                    && query.is_empty()
         )));
     }
 

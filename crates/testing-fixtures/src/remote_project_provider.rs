@@ -42,7 +42,7 @@ pub enum ProjectCall {
     },
     /// One `poll_project_items` invocation. The poller's tests assert the
     /// project node id, status field id, and query the daemon passes through
-    /// (e.g. `"is:open"`), plus that polling actually happened.
+    /// (empty — delta-only `updated:>{since}`), plus that polling happened.
     Poll {
         project_node_id: String,
         status_field_id: String,

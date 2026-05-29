@@ -25,7 +25,13 @@ pub struct Args {
     /// `PROJECT_POLLER_INTERVAL` (the Stage-7 constant); override for slower or
     /// faster reconcile. The drainer task's periodic sweep is separate and
     /// fixed at `OUTBOX_DRAINER_PERIODIC_SWEEP`.
-    #[arg(long, default_value_t = crate::daemon::PROJECT_POLLER_INTERVAL.as_secs(), env = "REPO_LINK_INTERVAL_SECS")]
+    ///
+    /// Must be `>= 1`: `run_poller_task` builds a `tokio::time::interval`, which
+    /// panics on a zero period. The `range(1..)` parser rejects `0` at clap
+    /// parse time — and clap applies the same parser to the
+    /// `REPO_LINK_INTERVAL_SECS` env value, so neither the flag nor the env can
+    /// smuggle a zero through.
+    #[arg(long, default_value_t = crate::daemon::PROJECT_POLLER_INTERVAL.as_secs(), value_parser = clap::value_parser!(u64).range(1..), env = "REPO_LINK_INTERVAL_SECS")]
     pub interval_secs: u64,
 
     /// When set, the daemon drops worktree entries whose paths have stayed
@@ -158,4 +164,28 @@ pub async fn run_cli() -> anyhow::Result<()> {
         .run(Duration::from_secs(args.interval_secs))
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--interval-secs 0` is rejected at clap parse time: a zero period would
+    /// panic `tokio::time::interval` in `run_poller_task`. The `range(1..)`
+    /// parser is what guards it (and, since clap applies the same parser to the
+    /// `REPO_LINK_INTERVAL_SECS` env value, that path is guarded too).
+    #[test]
+    fn rejects_zero_interval_secs() {
+        let err =
+            Args::try_parse_from(["rld", "--interval-secs", "0"]).expect_err("0 must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// A positive interval parses and round-trips unchanged.
+    #[test]
+    fn accepts_positive_interval_secs() {
+        let args =
+            Args::try_parse_from(["rld", "--interval-secs", "1"]).expect("1 is a valid interval");
+        assert_eq!(args.interval_secs, 1);
+    }
 }
