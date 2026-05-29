@@ -9,6 +9,16 @@ use sqlx::Row;
 use crate::Db;
 use crate::mapping::{enum_from_str, enum_to_str, map_sqlx_err};
 
+const PROJECT_COLS: &str =
+    "id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at";
+
+// Same column set as `PROJECT_COLS`, qualified to the `projects` table for use
+// in joins where bare names like `id` / `created_at` / `updated_at` collide
+// with the joined table (e.g. `workspaces`). Pinning the projection (rather
+// than `SELECT projects.*`) keeps `column_count()` constant across a
+// cross-process `ALTER TABLE projects ADD COLUMN`, which is the #110 fix.
+const PROJECT_COLS_QUALIFIED: &str = "projects.id, projects.provider, projects.owner_login, projects.number, projects.title, projects.status_field_id, projects.archived, projects.created_at, projects.updated_at";
+
 pub struct SqliteProjectRepository {
     db: Db,
 }
@@ -130,7 +140,7 @@ impl ProjectRepository for SqliteProjectRepository {
         // torn state (project metadata from snapshot A, options from snapshot
         // B). SQLite WAL gives the transaction a single consistent snapshot.
         let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
-        let row = sqlx::query("SELECT * FROM projects WHERE id = ?")
+        let row = sqlx::query(&format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?"))
             .bind(id.as_str())
             .fetch_optional(&mut *tx)
             .await
@@ -143,14 +153,14 @@ impl ProjectRepository for SqliteProjectRepository {
 
     async fn list_by_workspace(&self, ws: WorkspaceId) -> PortResult<Vec<Project>> {
         let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             r#"
-            SELECT projects.*
+            SELECT {PROJECT_COLS_QUALIFIED}
               FROM projects
               JOIN workspaces ON workspaces.project_id = projects.id
              WHERE workspaces.id = ?
-            "#,
-        )
+            "#
+        ))
         .bind(ws.to_string())
         .fetch_all(&mut *tx)
         .await
@@ -166,10 +176,12 @@ impl ProjectRepository for SqliteProjectRepository {
 
     async fn list_all(&self) -> PortResult<Vec<Project>> {
         let mut tx = self.db.reads.begin().await.map_err(map_sqlx_err)?;
-        let rows = sqlx::query("SELECT * FROM projects ORDER BY owner_login, number")
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {PROJECT_COLS} FROM projects ORDER BY owner_login, number"
+        ))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows.iter() {
             out.push(row_to_project(row, &mut tx).await?);

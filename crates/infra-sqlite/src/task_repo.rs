@@ -24,6 +24,8 @@ impl SqliteTaskRepository {
     }
 }
 
+const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id";
+
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
     async fn save(&self, t: &Task, source: SnapshotSource) -> PortResult<()> {
@@ -87,7 +89,7 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     async fn get(&self, id: TaskId) -> PortResult<Task> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+        let row = sqlx::query(&format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?"))
             .bind(id.to_string())
             .fetch_optional(&self.db.reads)
             .await
@@ -101,7 +103,8 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>> {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT * FROM tasks WHERE 1=1");
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(format!("SELECT {TASK_COLS} FROM tasks WHERE 1=1"));
         if let Some(w) = filter.workspace_id {
             qb.push(" AND workspace_id = ").push_bind(w.to_string());
         }
@@ -140,7 +143,7 @@ impl TaskRepository for SqliteTaskRepository {
         if hash.is_empty() {
             return Ok(None);
         }
-        let row = sqlx::query("SELECT * FROM tasks WHERE hash = ?")
+        let row = sqlx::query(&format!("SELECT {TASK_COLS} FROM tasks WHERE hash = ?"))
             .bind(hash)
             .fetch_optional(&self.db.reads)
             .await
@@ -161,9 +164,9 @@ impl TaskRepository for SqliteTaskRepository {
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>> {
-        let row = sqlx::query(
-            "SELECT * FROM tasks WHERE repo_id = ? AND remote_provider = ? AND remote_id = ?",
-        )
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_COLS} FROM tasks WHERE repo_id = ? AND remote_provider = ? AND remote_id = ?"
+        ))
         .bind(repo_id.to_string())
         .bind(provider)
         .bind(remote_id)
