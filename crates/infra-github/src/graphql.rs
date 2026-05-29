@@ -373,7 +373,9 @@ impl GraphqlClient {
             if items.page_info.has_next_page {
                 after = items.page_info.end_cursor;
                 if after.is_none() {
-                    truncated = false; // defensive: hasNextPage but no cursor
+                    // Broken pagination metadata: more pages claimed but no
+                    // cursor to fetch them. Leave `truncated` set so the
+                    // warning below fires — this result IS incomplete.
                     break;
                 }
             } else {

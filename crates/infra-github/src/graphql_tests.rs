@@ -595,6 +595,34 @@ async fn poll_project_items_stops_at_page_cap() {
 }
 
 #[tokio::test]
+async fn poll_project_items_stops_on_missing_cursor() {
+    let server = MockServer::start().await;
+    // Broken pagination metadata: hasNextPage=true but endCursor=null. The
+    // loop must stop after this page (not spin, not error) and return what it
+    // has — the truncation warning covers the incompleteness.
+    mount_graphql(
+        &server,
+        "items(first:",
+        serde_json::json!({ "node": { "items": {
+            "pageInfo": { "hasNextPage": true, "endCursor": null },
+            "nodes": [ poll_node("PVTI_x", "Issue", "PVTSSF_status", "f75ad846") ]
+        } } }),
+    )
+    .await;
+
+    let items = provider(&server)
+        .poll_project_items(
+            "PVT_x",
+            "PVTSSF_status",
+            Timestamp::from_utc(Utc::now()),
+            "",
+        )
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 1);
+}
+
+#[tokio::test]
 async fn graphql_errors_map_to_backend() {
     let server = MockServer::start().await;
     // A GraphQL `errors` array (no usable `data`) → backend failure.

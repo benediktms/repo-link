@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn bin(name: &str, dir: &TempDir) -> Command {
@@ -2823,6 +2823,12 @@ fn link_demo_project(dir: &TempDir) -> String {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
+            // Only respond once the CLI propagated the parsed `acme/7` target
+            // into the request, so the parse->fetch contract is observable here
+            // and not just in the adapter tests.
+            .and(body_partial_json(
+                json!({ "variables": { "owner": "acme", "number": 7 } }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "repositoryOwner": { "projectV2": {
                     "id": "PVT_demo_abc",
@@ -2851,6 +2857,23 @@ fn link_demo_project(dir: &TempDir) -> String {
     // `rt`/`server` stay alive until the function returns — i.e. past the
     // blocking link call above.
     dto["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn project_link_rejects_zero_project_number() {
+    // `acme/0` is rejected at parse time, before any token/network is needed.
+    let dir = TempDir::new().unwrap();
+    let output = bin("repo-link", &dir)
+        .args(["project", "link", "acme/0"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("positive integer"),
+        "expected a positive-integer rejection, got: {stderr}"
+    );
 }
 
 #[test]

@@ -79,5 +79,12 @@ fn parse_owner_number(target: &str) -> Result<(String, u64)> {
     let number: u64 = number_str.parse().map_err(|_| {
         anyhow!("invalid project number in {target:?}: expected a positive integer")
     })?;
+    // `parse::<u64>()` accepts 0, but GitHub project numbers start at 1 —
+    // fast-fail locally rather than round-trip a guaranteed miss.
+    if number == 0 {
+        return Err(anyhow!(
+            "invalid project number in {target:?}: expected a positive integer"
+        ));
+    }
     Ok((owner.to_string(), number))
 }
