@@ -1423,6 +1423,32 @@ async fn cache_remote_node_id_backfills_without_clobbering_concurrent_edit() {
         .expect("cache_remote_node_id for an absent task is a no-op Ok");
 }
 
+/// rpl-4ui (Greptile review on #109) — `cache_remote_node_id` must NOT strand a
+/// node id on a remote-less (local-only / draft) task. The SQLite write is
+/// guarded by `remote_id IS NOT NULL`, matching the in-memory fixture's no-op,
+/// so the two implementations can't diverge.
+#[tokio::test]
+async fn cache_remote_node_id_is_a_noop_for_a_remote_less_task() {
+    let (_dir, ws, _rb, ts) = setup().await;
+
+    let workspace = Workspace::new(WorkspaceName::new("no-remote").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    // A local-only task — never promoted, so `remote` (and remote_id) is None.
+    let task = Task::new_draft(workspace.id, None, "local only".into()).unwrap();
+    ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+    assert!(ts.get(task.id).await.unwrap().remote.is_none());
+
+    ts.cache_remote_node_id(task.id, "I_dangling".into())
+        .await
+        .expect("a remote-less task is a benign no-op");
+
+    assert!(
+        ts.get(task.id).await.unwrap().remote.is_none(),
+        "must not strand a node id on a task with no remote"
+    );
+}
+
 // ---------- RFC 0001 Stage 6 (#54): claim_next_eligible + backoff ----------
 
 /// Seed a workspace + a task row (the outbox FK needs a real task) and return

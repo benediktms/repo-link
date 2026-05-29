@@ -197,7 +197,12 @@ pub trait TaskRepository: Send + Sync {
     /// does no aggregate write, and a whole-row save there could clobber a
     /// title / body / status edit a concurrent CLI made after the pull's read.
     /// `node_id` is invisible to dirty detection, so this never perturbs sync
-    /// state. A zero-row match (task absent) is a benign no-op.
+    /// state.
+    ///
+    /// A node id only makes sense alongside a remote, so a remote-less
+    /// (local-only / draft) task is a no-op — implementations must NOT strand a
+    /// `node_id` on a row that has no remote. A zero-row match (task absent OR
+    /// remote-less) is therefore benign.
     async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }

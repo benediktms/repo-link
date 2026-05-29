@@ -337,9 +337,14 @@ impl TaskRepository for SqliteTaskRepository {
         // above: `sync pull`'s Noop branch makes no aggregate write, so routing
         // this through `write_task_in_tx` would bump the version, append a
         // snapshot, and risk clobbering a concurrent CLI edit. `remote_node_id`
-        // is excluded from the dirty diff, so a bare column update is safe. A
-        // zero-row match (task absent) is a benign no-op.
-        sqlx::query("UPDATE tasks SET remote_node_id = ? WHERE id = ?")
+        // is excluded from the dirty diff, so a bare column update is safe.
+        //
+        // `AND remote_id IS NOT NULL` enforces the invariant that a node id only
+        // exists alongside a remote: a remote-less (local-only / draft) row is a
+        // no-op, so we never strand a dangling `remote_node_id`. This mirrors the
+        // in-memory fixture, which no-ops when `task.remote` is None. A zero-row
+        // match (task absent OR remote-less) is benign.
+        sqlx::query("UPDATE tasks SET remote_node_id = ? WHERE id = ? AND remote_id IS NOT NULL")
             .bind(node_id)
             .bind(task_id.to_string())
             .execute(&self.db.writes)
