@@ -369,10 +369,10 @@ impl TaskService {
         // Cycle guard for the acyclic kinds: blocked_by/blocks (deadlock) and
         // parent_of/child_of (ancestry loop). The new edge reads as `x
         // depends-on / is-under y`; it closes a loop iff `y` can already reach
-        // `x` along that axis. Symmetric kinds (related_to/duplicates) have no
-        // axis and are never restricted.
-        if let Some((via, x, y)) = cycle_axis(kind, t.id, other_task.id)
-            && self.reaches(y, x, via).await?
+        // `x` going upstream along that family. Symmetric kinds
+        // (related_to/duplicates) have no axis and are never restricted.
+        if let Some((forward, inverse, x, y)) = cycle_axis(kind, t.id, other_task.id)
+            && self.would_create_cycle(forward, inverse, x, y).await?
         {
             return Err(ServiceError::RelationCycle {
                 kind: cmd.kind.clone(),
@@ -447,23 +447,58 @@ impl TaskService {
         self.task_dto(&t).await
     }
 
-    /// Whether `target` is reachable from `start` by following `via` edges.
-    /// DFS bounded by a visited set, so pre-existing cycles in the data don't
-    /// loop forever. Used by the cycle guard in [`add_relation`].
-    async fn reaches(&self, start: TaskId, target: TaskId, via: RelationKind) -> Result<bool> {
-        let mut stack = vec![start];
+    /// Whether adding the edge `x -> y` (x downstream of y) within a relation
+    /// family would close a cycle — i.e. whether `y` can already reach `x`
+    /// going *upstream*.
+    ///
+    /// The upstream adjacency is built from **both** stored directions of the
+    /// family (`forward` and its `inverse`), so a one-sided legacy row — a
+    /// `forward` edge with no reciprocal, or vice-versa — is still honoured.
+    /// That keeps the guard correct even when the reciprocal invariant hasn't
+    /// been backfilled. DFS is bounded by a visited set, so a pre-existing
+    /// cycle in the data can't loop forever.
+    async fn would_create_cycle(
+        &self,
+        forward: RelationKind,
+        inverse: RelationKind,
+        x: TaskId,
+        y: TaskId,
+    ) -> Result<bool> {
+        let all = self
+            .repo
+            .list(TaskFilter {
+                include_archived: true,
+                ..TaskFilter::default()
+            })
+            .await?;
+
+        // up[n] = nodes immediately upstream of n. `n forward m` puts m
+        // upstream of n; `n inverse m` is the reciprocal, so it puts n
+        // upstream of m. Reading both means a missing reciprocal can't hide an
+        // edge from the walk.
+        let mut up: HashMap<TaskId, Vec<TaskId>> = HashMap::new();
+        for task in &all {
+            for r in &task.relations {
+                if r.kind == forward {
+                    up.entry(task.id).or_default().push(r.other);
+                } else if r.kind == inverse {
+                    up.entry(r.other).or_default().push(task.id);
+                }
+            }
+        }
+
+        let mut stack = vec![y];
         let mut visited: HashSet<TaskId> = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if !visited.insert(id) {
+        while let Some(n) = stack.pop() {
+            if !visited.insert(n) {
                 continue;
             }
-            let task = self.repo.get(id).await?;
-            for r in &task.relations {
-                if r.kind == via {
-                    if r.other == target {
+            if let Some(parents) = up.get(&n) {
+                for &p in parents {
+                    if p == x {
                         return Ok(true);
                     }
-                    stack.push(r.other);
+                    stack.push(p);
                 }
             }
         }
@@ -506,23 +541,32 @@ impl TaskService {
     }
 }
 
-/// For a cycle-protected relation, return the `(via, x, y)` triple where the
-/// new edge reads as "x depends-on / is-under y" along axis `via`. Adding it
-/// closes a cycle iff `y` can already reach `x` over `via` edges.
+/// For a cycle-protected relation, return `(forward, inverse, x, y)` where the
+/// new edge reads as "x is downstream of y" within a family, and the family's
+/// upstream direction is represented by `forward` edges (with `inverse` the
+/// reciprocal). Adding the edge closes a cycle iff `y` can already reach `x`
+/// going upstream.
 ///
-/// Normalises each directional kind onto a single canonical axis so the guard
-/// only has to traverse one edge kind per family:
-/// - blocking family → `blocked_by` axis (`blocks(a,b)` ≡ `b blocked_by a`)
-/// - hierarchy family → `child_of` axis (`parent_of(a,b)` ≡ `b child_of a`)
+/// Normalises each directional kind onto one family:
+/// - blocking → `forward = blocked_by`, `inverse = blocks`
+///   (`blocks(a,b)` ≡ `b blocked_by a`)
+/// - hierarchy → `forward = child_of`, `inverse = parent_of`
+///   (`parent_of(a,b)` ≡ `b child_of a`)
 ///
-/// Symmetric kinds (`related_to`, `duplicates`) return `None` — they have no
-/// direction, so there is nothing to keep acyclic.
-fn cycle_axis(kind: RelationKind, a: TaskId, b: TaskId) -> Option<(RelationKind, TaskId, TaskId)> {
+/// Both representations are returned so the guard can walk one-sided legacy
+/// rows. Symmetric kinds (`related_to`, `duplicates`) return `None` — they have
+/// no direction, so there is nothing to keep acyclic.
+fn cycle_axis(
+    kind: RelationKind,
+    a: TaskId,
+    b: TaskId,
+) -> Option<(RelationKind, RelationKind, TaskId, TaskId)> {
+    use RelationKind::{BlockedBy, Blocks, ChildOf, ParentOf};
     match kind {
-        RelationKind::BlockedBy => Some((RelationKind::BlockedBy, a, b)),
-        RelationKind::Blocks => Some((RelationKind::BlockedBy, b, a)),
-        RelationKind::ChildOf => Some((RelationKind::ChildOf, a, b)),
-        RelationKind::ParentOf => Some((RelationKind::ChildOf, b, a)),
+        RelationKind::BlockedBy => Some((BlockedBy, Blocks, a, b)),
+        RelationKind::Blocks => Some((BlockedBy, Blocks, b, a)),
+        RelationKind::ChildOf => Some((ChildOf, ParentOf, a, b)),
+        RelationKind::ParentOf => Some((ChildOf, ParentOf, b, a)),
         RelationKind::RelatedTo | RelationKind::Duplicates => None,
     }
 }
@@ -880,6 +924,32 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cycle_guard_catches_one_sided_legacy_edge() {
+        let svc = svc();
+        let ids = make_tasks(&svc, &["a", "b"]).await;
+
+        // Seed a ONE-SIDED legacy hierarchy edge: `a parent_of b` with no
+        // reciprocal `child_of` on b, as a pre-reciprocal binary would write.
+        let mut a = svc.resolve_task(&ids[0]).await.unwrap();
+        let b_id = svc.resolve_task(&ids[1]).await.unwrap().id;
+        a.add_relation(RelationKind::ParentOf, b_id);
+        svc.repo.save(&a, SnapshotSource::LocalEdit).await.unwrap();
+
+        // `b parent_of a` would make a both parent and child of b. The guard
+        // reads both stored directions, so it rejects this even though the
+        // reciprocal `child_of` row was never written.
+        let err = svc
+            .add_relation(AddTaskRelationCmd {
+                task_id: ids[1].clone(),
+                kind: "parent_of".into(),
+                other: ids[0].clone(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::RelationCycle { .. }));
     }
 
     #[tokio::test]
