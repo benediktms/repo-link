@@ -12,8 +12,8 @@ mod error;
 mod service;
 
 pub use dto::{
-    AssignedTaskRow, BlockedTaskRow, ContributorRow, DriftRow, ReadyTaskRow, StaleWorktreeRow,
-    UnsyncedTaskRow, WorkspaceOverview,
+    AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow, DriftRow,
+    ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 pub use error::{QueryError, Result};
 pub use service::QueryService;

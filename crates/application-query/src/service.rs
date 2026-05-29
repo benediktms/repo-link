@@ -1,15 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use domain_core::WorkspaceId;
+use domain_core::{TaskId, WorkspaceId};
 use domain_repo::LinkStatus;
-use domain_task::{SyncState, TaskStatus};
+use domain_task::{RelationKind, SyncState, TaskStatus};
 use ports::{RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository};
 
 use crate::dto::{
-    AssignedTaskRow, BlockedTaskRow, ContributorRow, DriftRow, ReadyTaskRow, StaleWorktreeRow,
-    UnsyncedTaskRow, WorkspaceOverview,
+    AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow, DriftRow,
+    ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use crate::error::Result;
 
@@ -98,6 +98,72 @@ impl QueryService {
                     .collect(),
             })
             .collect())
+    }
+
+    /// Completion rollup for a parent task's children.
+    ///
+    /// `parent_id` must already be a canonical task UUID — friendly-ID
+    /// resolution lives in `TaskService`, so the CLI resolves before calling.
+    ///
+    /// Children are gathered from both directions of the parent/child pair so
+    /// the view is robust against legacy rows that predate auto-reciprocal
+    /// edges: the parent's own `parent_of` edges, unioned with any task that
+    /// carries a `child_of` edge back to the parent. The union is loaded by id
+    /// (a child may live in another workspace if related cross-repo).
+    pub async fn children(&self, parent_id: &str) -> Result<ChildrenRollup> {
+        let parent_uuid: TaskId = parent_id.parse()?;
+        let parent = self.tasks.get(parent_uuid).await?;
+
+        let mut child_ids: HashSet<TaskId> = parent
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::ParentOf)
+            .map(|r| r.other)
+            .collect();
+
+        let workspace_tasks = self
+            .tasks
+            .list(TaskFilter {
+                workspace_id: Some(parent.workspace_id),
+                include_archived: true,
+                ..TaskFilter::default()
+            })
+            .await?;
+        for t in &workspace_tasks {
+            if t.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == parent.id)
+            {
+                child_ids.insert(t.id);
+            }
+        }
+
+        let mut children = Vec::with_capacity(child_ids.len());
+        for id in child_ids {
+            let c = self.tasks.get(id).await?;
+            children.push(ChildTaskRow {
+                task_id: c.id.to_string(),
+                title: c.title.clone(),
+                status: enum_str(&c.status),
+            });
+        }
+        // Incomplete first (done/archived sink to the bottom), then by title —
+        // a stable order that puts outstanding work at the top.
+        children.sort_by(|a, b| {
+            let done = |s: &str| s == "done" || s == "archived";
+            done(&a.status)
+                .cmp(&done(&b.status))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+
+        let total = children.len();
+        let done = children.iter().filter(|c| c.status == "done").count();
+        Ok(ChildrenRollup {
+            parent_id: parent.id.to_string(),
+            total,
+            done,
+            children,
+        })
     }
 
     pub async fn stale_worktrees(&self, workspace_id: &str) -> Result<Vec<StaleWorktreeRow>> {
@@ -497,6 +563,43 @@ mod tests {
         let rows = svc.blocked_tasks(&wid.to_string()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].blocked_by, vec![other.id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn children_rollup_unions_both_directions_and_counts_done() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut parent = Task::new_draft(wid, None, "parent".into()).unwrap();
+
+        // Direction 1: parent's own `parent_of` edge points to an open child.
+        let child_open = Task::new_draft(wid, None, "open child".into()).unwrap();
+        parent.add_relation(domain_task::RelationKind::ParentOf, child_open.id);
+
+        // Direction 2: a *done* child points back via `child_of`, with no
+        // matching `parent_of` on the parent — exercises the union scan.
+        let mut child_done = Task::new_draft(wid, None, "done child".into()).unwrap();
+        child_done.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+        child_done.start().unwrap();
+        child_done.complete().unwrap();
+
+        // An unrelated task in the same workspace must not leak in.
+        let unrelated = Task::new_draft(wid, None, "unrelated".into()).unwrap();
+
+        for t in [&parent, &child_open, &child_done, &unrelated] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let rollup = svc.children(&parent.id.to_string()).await.unwrap();
+        assert_eq!(rollup.total, 2);
+        assert_eq!(rollup.done, 1);
+        // Incomplete sorts first, done sinks to the bottom.
+        assert_eq!(rollup.children[0].task_id, child_open.id.to_string());
+        assert_eq!(rollup.children[0].status, "open");
+        assert_eq!(rollup.children[1].task_id, child_done.id.to_string());
+        assert_eq!(rollup.children[1].status, "done");
     }
 
     #[tokio::test]
