@@ -15,14 +15,22 @@
 //! # Project-status cache (Stage 8, closes #39)
 //!
 //! Each correlated item's `status_option_id` is written into the local task's
-//! cached `project_status_option_id` column (via
-//! [`Task::set_project_status_option_id`]) and persisted. That cache is the
-//! remote-board status `rl query drift` compares — *independently* of
-//! `sync_state` — against the option the task's local lifecycle status maps to.
-//! The write is idempotent: the cache is only persisted when the polled value
-//! actually differs from what's stored, so a steady-state re-poll does no
-//! writes. Writing the cache does **not** participate in `sync_state` (a board
-//! move is a separate drift axis, not a `SyncState` transition).
+//! cached `project_status_option_id` column. That cache is the remote-board
+//! status `rl query drift` compares — *independently* of `sync_state` —
+//! against the option the task's local lifecycle status maps to.
+//!
+//! The cache is persisted via a **targeted single-column update**
+//! ([`TaskRepository::cache_project_status`]), never the whole-row `save`
+//! aggregate path (#56, CodeRabbit thread r3325841752). The poller snapshots
+//! every task once per pass; routing the cache write through `save` would
+//! re-emit that stale snapshot and clobber any title / body / status /
+//! `sync_state` edit a concurrent CLI made after the snapshot — a data-loss
+//! race for what is only a write-through cache column. The targeted update
+//! touches that one column and nothing else, so it can't tear newer fields,
+//! writes no snapshot, and never changes `sync_state` (a board move is a
+//! separate drift axis, not a `SyncState` transition). The write is
+//! idempotent: the cache is only persisted when the polled value actually
+//! differs from what's indexed, so a steady-state re-poll does no writes.
 //!
 //! # Truncation / partiality
 //!
@@ -234,12 +242,19 @@ impl ProjectPoller {
     /// `project_status_option_id` cache — the value `rl query drift` compares
     /// against the task's mapped local status, independently of `sync_state`.
     ///
-    /// Idempotent: persists only when the cached value actually changed (the
-    /// domain setter returns whether it differed), so a steady-state re-poll
-    /// does no writes. A local save failure for one item is logged and skipped
-    /// — never a panic and never an abort of the rest of the page (the cache
-    /// is a hint; the next poll re-attempts). Writing the cache does NOT touch
-    /// `sync_state`. Unmatched items are logged and skipped.
+    /// The cache is persisted via a **targeted single-column update**
+    /// ([`TaskRepository::cache_project_status`]), never the whole-row `save`
+    /// aggregate path (#56, thread r3325841752). The per-pass task index is a
+    /// stale snapshot; saving the full row would clobber any concurrent CLI
+    /// edit to title / body / status / `sync_state` made after the snapshot.
+    /// The targeted update can't tear those fields, writes no snapshot, and
+    /// never changes `sync_state`.
+    ///
+    /// Idempotent: persists only when the polled value differs from the
+    /// indexed task's cached value, so a steady-state re-poll does no writes. A
+    /// persist failure for one item is logged and skipped — never a panic and
+    /// never an abort of the rest of the page (the cache is a hint; the next
+    /// poll re-attempts). Unmatched items are logged and skipped.
     async fn reconcile_item(
         &self,
         by_item_id: &mut HashMap<String, Task>,
@@ -256,22 +271,20 @@ impl ProjectPoller {
         };
         report.items_matched += 1;
 
-        // Cache the remote board status. The setter returns false on a no-op
-        // (cached value unchanged), so we skip the persist entirely in steady
-        // state.
-        if !task.set_project_status_option_id(item.status_option_id.clone()) {
+        // Cheap no-op skip: the polled value already matches what's cached on
+        // the indexed task, so steady-state re-polls do no writes at all.
+        if task.project_status_option_id == item.status_option_id {
             return;
         }
 
-        // Persist via the standard task write. `SnapshotSource::LocalEdit` is
-        // deliberately NON-baseline: the cache column is a separate drift axis
-        // excluded from `snapshot_view`, so re-baselining here (e.g. with
-        // `Pull`) would wrongly reset dirty detection and could mark a genuine
-        // `DirtyLocal` task clean. LocalEdit leaves the diff baseline — and
-        // therefore `sync_state` — untouched.
+        // Persist the cache via a targeted single-column update — NOT the
+        // whole-row `save`. The per-pass index is a stale snapshot; a full-row
+        // write would clobber a concurrent CLI edit to other columns. The
+        // targeted write touches only `project_status_option_id`, leaves
+        // `sync_state` untouched, and appends no snapshot.
         if let Err(e) = self
             .tasks
-            .save(task, domain_task::SnapshotSource::LocalEdit)
+            .cache_project_status(task.id, item.status_option_id.clone())
             .await
         {
             warn!(
@@ -281,11 +294,16 @@ impl ProjectPoller {
                 "failed to persist polled project-status cache; will retry next cycle"
             );
         } else {
+            // Update the in-memory index copy so a duplicate item id later in
+            // the same pass compares against the just-written value and stays
+            // idempotent. Per-pass scratch only — never read back as the
+            // aggregate.
+            task.project_status_option_id = item.status_option_id.clone();
             debug!(
                 item = %item.item_node_id,
                 task = %task.id,
                 status_option = ?item.status_option_id,
-                "cached polled project status"
+                "cached polled project status via targeted column update"
             );
         }
     }
@@ -600,10 +618,11 @@ mod tests {
         );
     }
 
-    /// Stage 8 (#39): a matched item's `status_option_id` is written into the
-    /// local task's `project_status_option_id` cache and persisted, and a
-    /// re-poll of the SAME value does NOT re-write (idempotent: the setter
-    /// no-ops on an unchanged value).
+    /// Stage 8 (#39, #56): a matched item's `status_option_id` is written into
+    /// the local task's `project_status_option_id` cache via the targeted
+    /// single-column update path (not the whole-row `save`), so the cache write
+    /// appends NO snapshot and leaves `sync_state` untouched. A re-poll of the
+    /// SAME value is idempotent (the no-op skip fires) and still writes nothing.
     #[tokio::test]
     async fn poll_once_caches_polled_status_and_is_idempotent() {
         use ports::TaskRepository;
@@ -625,13 +644,18 @@ mod tests {
         let task_id = task.id;
         tasks.save(&task, SnapshotSource::Promote).await.unwrap();
 
+        // Snapshot count is the whole-row-persist counter: each `save` appends
+        // a row, but the targeted cache write must NOT. Capture the baseline.
+        let snaps = tasks.snapshots_handle();
+        let versions_after_promote = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);
+
         remote.set_poll_items("PVT_kwHO_cache", vec![item("PVTI_42", Some("o_done"))]);
 
         let poller = poller(projects, tasks.clone(), remote.clone()).await;
         let report = poller.poll_once().await.unwrap();
         assert_eq!(report.items_matched, 1);
 
-        // The cache was written.
+        // The cache was written via the targeted column update.
         let reloaded = tasks.get(task_id).await.unwrap();
         assert_eq!(
             reloaded.project_status_option_id.as_deref(),
@@ -640,13 +664,16 @@ mod tests {
         );
         // The cache write is on a SEPARATE axis: sync_state stays Synced.
         assert_eq!(reloaded.sync, SyncState::Synced);
-
-        // Snapshot count is the persist counter: each `save` appends one row.
-        let snaps = tasks.snapshots_handle();
+        // The targeted column write appends NO snapshot — the whole-row counter
+        // is unchanged from the promote baseline.
         let versions_after_first = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);
+        assert_eq!(
+            versions_after_first, versions_after_promote,
+            "the targeted cache write must not append a snapshot"
+        );
 
-        // Re-poll the SAME value: the setter no-ops, so no further save (no new
-        // snapshot row appended).
+        // Re-poll the SAME value: the no-op skip fires, so nothing is persisted
+        // (still no new snapshot row).
         let report2 = poller.poll_once().await.unwrap();
         assert_eq!(report2.items_matched, 1);
         let versions_after_second = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);

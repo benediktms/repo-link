@@ -312,6 +312,26 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(out)
     }
 
+    async fn cache_project_status(
+        &self,
+        task_id: TaskId,
+        option_id: Option<String>,
+    ) -> PortResult<()> {
+        // Targeted single-column write (#56, thread r3325841752): the cached
+        // project-board status is orthogonal to the task aggregate, so it must
+        // NOT go through `write_task_in_tx` — no version bump, no snapshot, no
+        // `sync_state` change, and crucially no whole-row overwrite that would
+        // clobber a concurrent CLI edit to title/body/status. A zero-row match
+        // (task absent) is a benign no-op: the statement simply updates nothing.
+        sqlx::query("UPDATE tasks SET project_status_option_id = ? WHERE id = ?")
+            .bind(option_id)
+            .bind(task_id.to_string())
+            .execute(&self.db.writes)
+            .await
+            .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())

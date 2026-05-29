@@ -164,6 +164,27 @@ pub trait TaskRepository: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
     ) -> PortResult<std::collections::HashMap<TaskId, usize>>;
+    /// Persist ONLY the `project_status_option_id` cache column for one task —
+    /// a targeted single-column write that must NOT touch any other column,
+    /// append a snapshot, bump the `version`, or change `sync_state`. The
+    /// cached project-board status is a write-through hint orthogonal to the
+    /// task aggregate (it's excluded from snapshots and the dirty diff), so it
+    /// deliberately bypasses the whole-row `save`/aggregate path.
+    ///
+    /// Used by the poller's status reconcile (#56, closes #39, CodeRabbit
+    /// thread r3325841752): the poller snapshots all tasks once per pass, so
+    /// routing the cache write through `save` would clobber any title / body /
+    /// status / sync_state edit a concurrent CLI made after that snapshot. A
+    /// targeted column write can't tear those newer fields.
+    ///
+    /// Binding `option_id` as `None` clears the cache (writes SQL `NULL`). If
+    /// no row matches `task_id` (task absent) this is a benign no-op — return
+    /// `Ok` (the poller accounts for unmatched items separately).
+    async fn cache_project_status(
+        &self,
+        task_id: TaskId,
+        option_id: Option<String>,
+    ) -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
