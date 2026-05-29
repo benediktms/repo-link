@@ -13,5 +13,9 @@
 -- target `blocked_by` edge already exists, and the trailing DELETE clears
 -- those now-redundant `depends_on` leftovers.
 
-UPDATE OR IGNORE task_relations SET kind = 'blocked_by' WHERE kind = 'depends_on';
-DELETE FROM task_relations WHERE kind = 'depends_on';
+UPDATE OR IGNORE task_relations
+SET kind = 'blocked_by'
+WHERE kind = 'depends_on';
+
+DELETE FROM task_relations
+WHERE kind = 'depends_on';
