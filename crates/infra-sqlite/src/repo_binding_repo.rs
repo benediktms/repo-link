@@ -20,6 +20,21 @@ impl SqliteRepoBindingRepository {
     }
 }
 
+// Explicit, fixed column lists pin `column_count()` to a constant so the
+// long-lived read pool's cached prepared statements survive a concurrent
+// `ALTER TABLE ... ADD COLUMN` from another process (#110). A bare `SELECT *`
+// caches the column metadata at prepare time but re-reads the live column
+// count from the re-prepared bytecode at row-decode time; after an ADD COLUMN
+// the live count outruns the cached vec and `columns[len]` panics on a sqlx
+// worker, crashing the daemon. Decoding is by name (`row.try_get`), so order
+// is irrelevant — only completeness matters. Each const is the table's full
+// current column set as of the latest migration. The `schema_const_consistency`
+// test in `lib.rs` enforces that against `PRAGMA table_info`, so a future
+// migration that forgets to update a const fails in CI rather than silently
+// dropping the new column from every read.
+pub(crate) const REPO_COLS: &str = "id, workspace_id, remote_url, canonical_url, tracked_branch, created_at, updated_at, name, aliases, prefix";
+pub(crate) const WORKTREE_LINK_COLS: &str = "repo_id, path, branch, status, last_seen_at";
+
 #[async_trait]
 impl RepoBindingRepository for SqliteRepoBindingRepository {
     async fn save(&self, b: &RepoBinding) -> PortResult<()> {
@@ -89,7 +104,7 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
     }
 
     async fn get(&self, id: RepoId) -> PortResult<RepoBinding> {
-        let row = sqlx::query("SELECT * FROM repos WHERE id = ?")
+        let row = sqlx::query(&format!("SELECT {REPO_COLS} FROM repos WHERE id = ?"))
             .bind(id.to_string())
             .fetch_optional(&self.db.reads)
             .await
@@ -101,11 +116,13 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
     }
 
     async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> PortResult<Vec<RepoBinding>> {
-        let rows = sqlx::query("SELECT * FROM repos WHERE workspace_id = ? ORDER BY created_at")
-            .bind(workspace_id.to_string())
-            .fetch_all(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {REPO_COLS} FROM repos WHERE workspace_id = ? ORDER BY created_at"
+        ))
+        .bind(workspace_id.to_string())
+        .fetch_all(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let mut binding = row_to_binding(row)?;
@@ -120,12 +137,14 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         workspace_id: WorkspaceId,
         canonical_url: &str,
     ) -> PortResult<Option<RepoBinding>> {
-        let row = sqlx::query("SELECT * FROM repos WHERE workspace_id = ? AND canonical_url = ?")
-            .bind(workspace_id.to_string())
-            .bind(canonical_url)
-            .fetch_optional(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {REPO_COLS} FROM repos WHERE workspace_id = ? AND canonical_url = ?"
+        ))
+        .bind(workspace_id.to_string())
+        .bind(canonical_url)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
         match row {
             Some(row) => {
                 let mut binding = row_to_binding(&row)?;
@@ -143,7 +162,7 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         if prefix.is_empty() {
             return Ok(None);
         }
-        let row = sqlx::query("SELECT * FROM repos WHERE prefix = ?")
+        let row = sqlx::query(&format!("SELECT {REPO_COLS} FROM repos WHERE prefix = ?"))
             .bind(prefix)
             .fetch_optional(&self.db.reads)
             .await
@@ -213,11 +232,13 @@ fn row_to_binding(row: &sqlx::sqlite::SqliteRow) -> PortResult<RepoBinding> {
 }
 
 async fn load_worktrees(pool: &SqlitePool, repo_id: RepoId) -> PortResult<Vec<WorktreeLink>> {
-    let rows = sqlx::query("SELECT * FROM worktree_links WHERE repo_id = ? ORDER BY path")
-        .bind(repo_id.to_string())
-        .fetch_all(pool)
-        .await
-        .map_err(map_sqlx_err)?;
+    let rows = sqlx::query(&format!(
+        "SELECT {WORKTREE_LINK_COLS} FROM worktree_links WHERE repo_id = ? ORDER BY path"
+    ))
+    .bind(repo_id.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx_err)?;
     rows.iter()
         .map(|row| {
             let path: String = row.try_get("path").map_err(map_sqlx_err)?;
@@ -232,4 +253,124 @@ async fn load_worktrees(pool: &SqlitePool, repo_id: RepoId) -> PortResult<Vec<Wo
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod stale_statement_regression {
+    //! Regression for the #110 daemon crash: a long-lived sqlx-sqlite read
+    //! pool caches a prepared statement's column *metadata* at prepare time,
+    //! but `SqliteRow` re-reads the live `column_count()` from the re-prepared
+    //! bytecode at decode time. When another process runs
+    //! `ALTER TABLE ... ADD COLUMN` on the shared DB file, the live count
+    //! outruns the cached column vec and `columns[len]` panics
+    //! ("index out of bounds") on a sqlx worker thread, crashing the tick.
+    //!
+    //! The fix pins the projection to [`REPO_COLS`], so `column_count()` stays
+    //! constant regardless of any future ADD COLUMN. This test reproduces the
+    //! cross-process race in-process and proves the fixed projection survives:
+    //!
+    //! - The cached side uses a **dedicated** connection with statement
+    //!   caching left **ON** (sqlx's default). We do NOT reuse the production
+    //!   read pool, because a separate defense-in-depth change disables the
+    //!   cache there — that would mask the bug. Keeping caching on here is what
+    //!   gives the test teeth: it exercises the exact path that panicked.
+    //! - The `ALTER TABLE` runs through a **separate** connection to the same
+    //!   file, simulating the other process: it must not invalidate the cached
+    //!   side's prepared statement, just as a cross-process DDL cannot.
+    //!
+    //! With the bare `SELECT *` this file used to issue, step (5) would panic;
+    //! pinned to `REPO_COLS` it returns the row cleanly. The test uses the real
+    //! private `REPO_COLS` const directly, so reverting the projection to `*`
+    //! re-breaks it.
+
+    use std::str::FromStr;
+
+    use sqlx::Row;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use tempfile::TempDir;
+
+    use super::REPO_COLS;
+
+    #[tokio::test]
+    async fn repo_cols_survives_cross_connection_add_column() {
+        // (1) Fresh migrated DB in a TempDir; insert a workspace then a repo
+        // row (the repos.workspace_id FK requires the parent to exist first).
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("repo-link.db");
+        let db = crate::open_from_path(&db_path).await.expect("open db");
+
+        let now = "2026-05-30T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, status, local_only, created_at, updated_at) \
+             VALUES (?, ?, 'active', 1, ?, ?)",
+        )
+        .bind("11111111-1111-1111-1111-111111111111")
+        .bind("regression-ws")
+        .bind(now)
+        .bind(now)
+        .execute(&db.writes)
+        .await
+        .expect("insert workspace");
+
+        sqlx::query(
+            "INSERT INTO repos \
+             (id, workspace_id, remote_url, canonical_url, tracked_branch, created_at, updated_at, name, aliases, prefix) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?, '[]', ?)",
+        )
+        .bind("22222222-2222-2222-2222-222222222222")
+        .bind("11111111-1111-1111-1111-111111111111")
+        .bind("git@github.com:o/r.git")
+        .bind("github.com/o/r")
+        .bind(now)
+        .bind(now)
+        .bind("r")
+        .bind("rr")
+        .execute(&db.writes)
+        .await
+        .expect("insert repo");
+
+        let url = format!("sqlite://{}", db_path.display());
+
+        // (2) Dedicated connection with statement caching ON (sqlx default),
+        // independent of the production read pool's cache setting.
+        let cached = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&url).expect("connect opts"))
+            .await
+            .expect("dedicated cached connection");
+
+        // (3) Run the SELECT once to cache the prepared statement + its column
+        // metadata on the dedicated connection.
+        let before = sqlx::query(&format!("SELECT {REPO_COLS} FROM repos"))
+            .fetch_all(&cached)
+            .await
+            .expect("initial select caches the statement");
+        assert_eq!(before.len(), 1, "expected the one seeded repo row");
+
+        // (4) Through a SEPARATE connection to the same file (cross-process
+        // simulation), add a column. This re-shapes the table bytecode that
+        // the cached connection's statement will re-prepare against.
+        let other = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&url).expect("connect opts"))
+            .await
+            .expect("separate ALTER connection");
+        sqlx::query("ALTER TABLE repos ADD COLUMN regression_probe_110 TEXT")
+            .execute(&other)
+            .await
+            .expect("add column from a separate connection");
+
+        // (5) Re-run the SAME SELECT on the cached connection. With a fixed
+        // projection the column count is pinned, so this is Ok; a bare
+        // `SELECT *` would panic here with index-out-of-bounds.
+        let after = sqlx::query(&format!("SELECT {REPO_COLS} FROM repos"))
+            .fetch_all(&cached)
+            .await
+            .expect("select after cross-connection ADD COLUMN must not panic");
+        assert_eq!(after.len(), 1, "row count unchanged after ADD COLUMN");
+
+        // Decoding still works by name on the pinned columns.
+        let id: String = after[0].try_get("id").expect("id decodes");
+        assert_eq!(id, "22222222-2222-2222-2222-222222222222");
+    }
 }

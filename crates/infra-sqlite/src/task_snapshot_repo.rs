@@ -18,15 +18,18 @@ impl SqliteTaskSnapshotRepository {
     }
 }
 
+pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at";
+
 #[async_trait]
 impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
     async fn list(&self, task_id: TaskId) -> PortResult<Vec<TaskSnapshot>> {
-        let rows =
-            sqlx::query("SELECT * FROM task_snapshots WHERE task_id = ? ORDER BY version ASC")
-                .bind(task_id.to_string())
-                .fetch_all(&self.db.reads)
-                .await
-                .map_err(map_sqlx_err)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {TASK_SNAPSHOT_COLS} FROM task_snapshots WHERE task_id = ? ORDER BY version ASC"
+        ))
+        .bind(task_id.to_string())
+        .fetch_all(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
 
         rows.iter()
             .map(|row| row_to_snapshot(task_id, row))
@@ -36,13 +39,15 @@ impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
     async fn get(&self, task_id: TaskId, version: u64) -> PortResult<TaskSnapshot> {
         let version_i64 = i64::try_from(version)
             .map_err(|e| PortError::Backend(format!("snapshot version overflow: {e}")))?;
-        let row = sqlx::query("SELECT * FROM task_snapshots WHERE task_id = ? AND version = ?")
-            .bind(task_id.to_string())
-            .bind(version_i64)
-            .fetch_optional(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?
-            .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))?;
+        let row = sqlx::query(&format!(
+            "SELECT {TASK_SNAPSHOT_COLS} FROM task_snapshots WHERE task_id = ? AND version = ?"
+        ))
+        .bind(task_id.to_string())
+        .bind(version_i64)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?
+        .ok_or_else(|| PortError::NotFound(format!("task {task_id} version {version}")))?;
 
         row_to_snapshot(task_id, &row)
     }

@@ -18,6 +18,9 @@ impl SqliteWorkspaceRepository {
     }
 }
 
+pub(crate) const WORKSPACE_COLS: &str =
+    "id, name, description, status, local_only, created_at, updated_at, project_id";
+
 #[async_trait]
 impl WorkspaceRepository for SqliteWorkspaceRepository {
     async fn save(&self, w: &Workspace) -> PortResult<()> {
@@ -49,31 +52,37 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     }
 
     async fn get(&self, id: WorkspaceId) -> PortResult<Workspace> {
-        let row = sqlx::query("SELECT * FROM workspaces WHERE id = ?")
-            .bind(id.to_string())
-            .fetch_optional(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?
-            .ok_or_else(|| PortError::NotFound(format!("workspace {id}")))?;
+        let row = sqlx::query(&format!(
+            "SELECT {WORKSPACE_COLS} FROM workspaces WHERE id = ?"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?
+        .ok_or_else(|| PortError::NotFound(format!("workspace {id}")))?;
         row_to_workspace(&row)
     }
 
     async fn find_by_name(&self, name: &str) -> PortResult<Option<Workspace>> {
-        let row = sqlx::query("SELECT * FROM workspaces WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.db.reads)
-            .await
-            .map_err(map_sqlx_err)?;
+        let row = sqlx::query(&format!(
+            "SELECT {WORKSPACE_COLS} FROM workspaces WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
         row.as_ref().map(row_to_workspace).transpose()
     }
 
     async fn list(&self, include_archived: bool) -> PortResult<Vec<Workspace>> {
         let sql = if include_archived {
-            "SELECT * FROM workspaces ORDER BY created_at"
+            format!("SELECT {WORKSPACE_COLS} FROM workspaces ORDER BY created_at")
         } else {
-            "SELECT * FROM workspaces WHERE status NOT IN ('archived','deleted') ORDER BY created_at"
+            format!(
+                "SELECT {WORKSPACE_COLS} FROM workspaces WHERE status NOT IN ('archived','deleted') ORDER BY created_at"
+            )
         };
-        let rows = sqlx::query(sql)
+        let rows = sqlx::query(&sql)
             .fetch_all(&self.db.reads)
             .await
             .map_err(map_sqlx_err)?;

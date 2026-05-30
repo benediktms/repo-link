@@ -50,6 +50,16 @@ pub async fn open_read_pool(database_url: &str) -> Result<SqlitePool, PoolError>
     let opts = SqliteConnectOptions::from_str(database_url)?
         .read_only(true)
         .foreign_keys(true)
+        // Belt-and-suspenders for #110: disable prepared-statement caching on
+        // the long-lived read pool. The primary fix pins every read query to an
+        // explicit column list so `column_count()` is constant, but caching a
+        // statement here is what let a stale `SELECT *` plan outlive a
+        // cross-process `ALTER TABLE ... ADD COLUMN` — the live re-prepared
+        // column count then overran sqlx's cached column metadata and panicked
+        // a worker thread (index out of bounds), crashing the daemon tick. With
+        // a zero-capacity cache every read re-prepares against the current
+        // schema, so no future `SELECT *` regression can resurrect the panic.
+        .statement_cache_capacity(0)
         .busy_timeout(Duration::from_secs(10));
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
