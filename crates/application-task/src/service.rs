@@ -750,6 +750,10 @@ impl TaskService {
     /// gates the draft-backed `UpdateDraftIssue` so a lifecycle move doesn't
     /// enqueue a no-op draft content write (the card move via
     /// `SetProjectStatus` carries the lifecycle change for drafts).
+    ///
+    /// The `canonical` it resolves is the task's **logical** repo URL — also
+    /// where the issue is filed today, until RFC 0002 splits the filing repo
+    /// out as its own axis.
     async fn plan_mirror_mutations(
         &self,
         task: &Task,
@@ -783,9 +787,10 @@ impl TaskService {
         ))
     }
 
-    /// Best-effort canonical repo lookup for the task's binding. `None` when
-    /// the task has no repo (orphan-draft) — issue-backed planning needs it;
-    /// draft/project planning doesn't.
+    /// Best-effort canonical-URL lookup for the task's **logical** repo binding
+    /// — today also the repo the issue is filed in (until RFC 0002). `None`
+    /// when the task has no logical repo (orphan-draft) — issue-backed planning
+    /// needs it; draft/project planning doesn't.
     async fn canonical_for(&self, task: &Task) -> Result<Option<String>> {
         let Some(repo_id) = task.repo_id else {
             return Ok(None);

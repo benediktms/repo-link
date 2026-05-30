@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutboxMutation {
-    /// REST `PATCH /repos/{o}/{r}/issues/{number}`. Carries the canonical
-    /// repo so the drainer doesn't have to re-resolve the binding.
+    /// REST `PATCH /repos/{o}/{r}/issues/{number}`. Carries the canonical URL
+    /// of the repo the issue lives in — the task's filing repo, which today is
+    /// always its logical repo (until RFC 0002) — so the drainer doesn't have
+    /// to re-resolve the binding.
     UpdateRemote {
         canonical_repo: String,
         remote_id: String,
@@ -35,7 +37,9 @@ pub enum OutboxMutation {
         issue_node_id: String,
     },
     /// GraphQL `addProjectV2DraftIssue` — create a draft directly in a
-    /// project. Used when promoting an orphan task (no `repo_id`).
+    /// project. Used when promoting an orphan task (no logical `repo_id`, so
+    /// no repo to file an issue in): the draft lives only on the board until a
+    /// repo is attached and it converts to a real issue.
     CreateDraftIssue {
         project_node_id: String,
         title: String,
@@ -51,6 +55,8 @@ pub enum OutboxMutation {
     /// GraphQL `convertProjectV2DraftIssueItemToIssue` — fires when an
     /// orphan task gets `--repo` attached and graduates from draft to issue.
     /// The project item retains its node ID; only the content union shifts.
+    /// `repo_node_id` is the repo the issue is filed in — today the task's
+    /// logical repo, until RFC 0002 lets a separate filing repo decide this.
     ConvertDraftToIssue {
         item_node_id: String,
         repo_node_id: String,

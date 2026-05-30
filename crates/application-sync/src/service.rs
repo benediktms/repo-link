@@ -43,8 +43,10 @@ impl SyncService {
     }
 
     /// Stage (if needed) and promote a `LocalOnly`/`Staged` task to a remote
-    /// issue. `previous_state` / `new_state` in the summary describe the
-    /// **sync** state — lifecycle stays untouched.
+    /// issue. The issue is created in the task's logical repo — which is also
+    /// its filing repo today, until RFC 0002 lets the filing repo differ.
+    /// `previous_state` / `new_state` in the summary describe the **sync**
+    /// state — lifecycle stays untouched.
     pub async fn promote(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
@@ -431,6 +433,9 @@ impl SyncService {
         ))
     }
 
+    /// Canonical URL of the task's **logical** repo — also the repo the issue
+    /// is filed in today (until RFC 0002). Errors with `NoRepo` for an orphan
+    /// task, since there is no repo to address.
     async fn canonical_for(&self, task: &Task) -> Result<String> {
         let repo_id = task.repo_id.ok_or(SyncError::NoRepo)?;
         let binding = self.bindings.get(repo_id).await?;

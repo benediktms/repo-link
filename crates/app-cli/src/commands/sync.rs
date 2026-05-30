@@ -165,9 +165,11 @@ pub(crate) fn parse_issue_url(url: &str) -> Option<(String, String)> {
 }
 
 /// Import a GitHub issue (and optionally its sub-issue tree) into local mirror
-/// tasks. The whole tree lands under the root issue's repo binding; sub-issues
-/// in a different repo are skipped. Idempotent: issues already tracked locally
-/// are reported, not re-created. Emits a `batch_task_op`-style JSON array.
+/// tasks. The whole tree lands under the root issue's repo binding as their
+/// logical repo (which, for an imported issue, is also the repo it is filed in
+/// — they coincide until RFC 0002); sub-issues in a different repo are skipped.
+/// Idempotent: issues already tracked locally are reported, not re-created.
+/// Emits a `batch_task_op`-style JSON array.
 async fn sync_import(
     provider: &dyn ports::RemoteTaskProvider,
     svc: &Services,
