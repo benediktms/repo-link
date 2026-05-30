@@ -52,8 +52,13 @@ The team's consensus is workspace/project-wide ("file in `team-eng`"), so the fi
 
 1. explicit per-task override (the `--filing-repo` flag), else
 2. the workspace's filing-repo default, else
-3. the logical `repo_id` (**today's behaviour** — issue lands in the logical repo), else
-4. project workspace with no repo at all → board draft (RFC 0001 path 1, unchanged).
+3. the logical `repo_id` **if it is non-NULL** (**today's behaviour** — issue lands in the logical repo), else
+4. (`repo_id IS NULL`, no override, no workspace default) → board draft (RFC 0001 path 1, unchanged).
+
+Two edge cases the chain must make explicit:
+
+- **Orphan task + workspace filing default.** When `repo_id IS NULL` (orphan) but a workspace filing default is set, step 2 resolves: a **real GitHub issue is created in the filing repo** and added to the board — the filing repo substitutes for the missing logical repo as the issue's home (the same substitution D3 relies on for `convertProjectV2DraftIssueItemToIssue`). The orphan does **not** stay a board draft.
+- **NULL fall-through.** Step 3 applies only when `repo_id IS NOT NULL`; a NULL `repo_id` is a *failing* resolution that falls through to step 4, not an empty-but-passing one. Board draft (step 4) is therefore reached only when steps 1–3 all miss.
 
 The **resolved** filing repo is recorded on the task at promote time (stable, like `project_item_id`) so that later changes to the workspace default never silently move an already-filed issue.
 
@@ -71,11 +76,18 @@ Friendly task IDs keep using the **logical** repo's prefix, so a task about serv
 
 The filing repo is a sync/persistence detail, not part of a task's public shape. `Task.repo_id` (logical) remains the only repo on the task DTO/JSON; `filing_repo_id` lives in the DB and on the domain `Task`, consumed internally by the promote/sync path. The only public surface for *setting* it is the additive `--filing-repo` CLI flag. Consequence: **zero consumer-contract churn** — every existing `repo_id` reader (the rl-tasks skill, `jq '.repo_id'`) keeps working untouched, and the split stays fully additive at the boundary.
 
+The one place the filing repo is *shown* is `rl task show` (§4). To avoid contradicting the above, `show` reads the value from the domain object / DB on its own display path rather than through the shared `task_to_dto`; the task DTO is **not** extended with a `filing_repo_id` field. This is a deliberate trade — a hair more CLI code in exchange for an unchanged DTO contract.
+
+### D6 — Remote-identity key moves to the filing repo
+
+The remote-task uniqueness key is `(repo_id, provider, remote_id)` — it assumes the *logical* repo scopes a remote issue's identity. That is a structural casualty of this split, not an open question: the issue lives in the **filing** repo, so once `filing ≠ logical` the existing key correlates the same issue against the wrong repo in `TaskRepository::get_remote`, producing false-duplicate errors or missed dedup. **Decision:** the key becomes `(filing_repo_id, provider, remote_id)`. **Release constraint:** this migration (the `tasks` unique index + `get_remote`) must land in the *same* change that first allows `filing ≠ logical` in production data — never after.
+
 ## 3. Schema sketch
 
 - `workspaces` gains `filing_repo_id` (nullable FK → repo binding) — the workspace's **default** filing repo. This **repurposes / replaces** RFC 0001's deferred `creation_default_repo_id`.
 - `tasks` gains `filing_repo_id` (nullable) — the **resolved** filing repo, set on promote. `repo_id` is unchanged (logical).
-- Migration is additive. Existing rows get `filing_repo_id = NULL`, which resolves to `repo_id` — preserving current behaviour with no data movement.
+- Migration is additive, but **not** a blanket NULL. For every already-promoted task (remote-backed — `remote_id` or `project_item_id` non-NULL) the migration **backfills `tasks.filing_repo_id = repo_id`**, because historically filing == logical, so that is provably where the issue lives. This makes the recorded target authoritative and immune to a later workspace-default change silently retargeting an existing issue. Purely-local tasks (never promoted) stay NULL and resolve via the D2 chain at promote time.
+- **Authoritative lookup.** Once a task is promoted, sync/update logic consults `tasks.filing_repo_id` **first** and never re-resolves from the workspace default. The D2 chain runs only at create/promote, never for an already-filed issue.
 
 Both columns share the name `filing_repo_id`: same concept (where the issue is filed), differing only in scope — the workspace row is the *default*, the task row is the *resolved-and-recorded* value.
 
@@ -85,7 +97,7 @@ Both columns share the name `filing_repo_id`: same concept (where the issue is f
 
 - Set the workspace filing repo — either a verb (`rl workspace set-filing-repo <repo>`) or, preferably, declared in `repo-link.toml` (RFC 0001 §9 / issue #91).
 - `rl task create --repo <logical> [--filing-repo <filing>]`.
-- `rl task show` surfaces both axes so the divergence is legible.
+- `rl task show` surfaces both axes for legibility via a **`show`-specific display path that reads the domain object / DB directly** — it does **not** add `filing_repo_id` to the shared task DTO/JSON (see D5). `list` / `query` and every other DTO consumer keep the unchanged shape.
 
 ## 5. Relationship to existing work
 
@@ -100,6 +112,6 @@ Both columns share the name `filing_repo_id`: same concept (where the issue is f
 - **Per-task override UX** — exact shape of `--filing-repo` and whether it accepts the same handle forms (prefix/name/alias/UUID) as `--repo`.
 - **Filing repo not checked out locally** — `team-eng` may have no worktree on disk. Filing needs only its `canonical_url`, not a checkout, so this is fine; confirm `repo attach` can register a binding without a worktree.
 - **Multiple filing repos per workspace** — out of scope; one default + per-task override covers the exceptions.
-- **Remote-identity scope** — the existing remote-task uniqueness key is `(repo_id, provider, remote_id)`, which assumes the *logical* repo scopes a remote issue's identity. Once filing ≠ logical, the issue actually lives in the **filing** repo, so this key should almost certainly become `(filing_repo_id, provider, remote_id)`. Confirm and migrate during implementation (touches the `tasks` unique index and `TaskRepository::get_remote`).
+- **Remote-identity scope** — now a firm decision; see **D6**.
 - **D4 prefix question** — confirm logical-repo prefix is the desired identity for cross-filed tasks.
 - **Synced transfer** (`transferIssue`) — defer to #71 once this lands.
