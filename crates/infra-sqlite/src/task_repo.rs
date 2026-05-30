@@ -24,7 +24,11 @@ impl SqliteTaskRepository {
     }
 }
 
-pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id";
+// `filing_repo_id` is listed here to satisfy the schema-consistency contract
+// (the const must name every live column, see #110) but is NOT yet read by
+// `row_to_task` — the domain `Task` gains the field in #116. Selecting an
+// unmapped column is harmless: `row_to_task` extracts by name and ignores it.
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
