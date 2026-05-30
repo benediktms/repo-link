@@ -1,6 +1,6 @@
 # RFC 0002 — Task repo axes: logical repo vs. filing repo
 
-Status: Draft
+Status: Accepted (2026-05-30)
 Tracking epic: **#113**
 Supersedes: RFC 0001 §D1 "Configurability deferred" (the `creation_default_repo_id` note)
 Prerequisite: **#112** — the logical/filing terminology pass — must land **before any implementation work in this RFC begins.** Its goal is to kill the ambiguity that appears the moment a *filing* repo exists: a bare `repo` / `canonical` variable no longer says *which* repo it means. #112 adopts the logical/filing vocabulary in doc-comments, clap help, and internal locals/params — renaming a bare `repo`/`canonical` to `logical_*` / `filing_*` only where it would otherwise be ambiguous. `repo_id` itself stays (it is the logical repo, correctly named); no DB, DTO/JSON, or CLI-flag renames. All behaviour-preserving. Doing #112 first keeps this RFC's structural diff small. See §5.
