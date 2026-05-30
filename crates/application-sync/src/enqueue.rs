@@ -91,6 +91,10 @@ pub async fn enqueue(
 ///   open/closed bit + title/body track the local task.
 /// - Draft-backed mirror content edit → `UpdateDraftIssue`.
 ///
+/// `canonical_repo` is the canonical URL of the repo the issue lives in — the
+/// task's logical repo, which is also its filing repo today (until RFC 0002
+/// makes the filing repo a separate axis).
+///
 /// `content_changed` indicates a title/body edit happened (so issue/draft
 /// content is pushed); lifecycle-only changes still push the open/closed bit
 /// via `UpdateRemote` for issue-backed tasks because GitHub's issue state is

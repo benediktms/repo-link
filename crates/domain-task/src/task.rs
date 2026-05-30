@@ -11,6 +11,11 @@ use crate::snapshot::{SnapshotSource, TaskSnapshot};
 pub struct Task {
     pub id: TaskId,
     pub workspace_id: WorkspaceId,
+    /// The task's **logical repo**: where the code/worktrees live and the
+    /// source of the friendly-ID prefix. Today the backing GitHub issue is
+    /// also filed in this repo — logical and filing repo are the same until
+    /// RFC 0002 introduces a separate filing-repo axis. `None` for an orphan
+    /// task (a project-board draft with no repo).
     pub repo_id: Option<RepoId>,
     pub title: String,
     pub body: String,
@@ -466,12 +471,13 @@ impl Task {
         true
     }
 
-    /// Reassign the owning repo binding. Permitted only while the task is
-    /// not yet remote-backed: once promoted, the remote issue lives in a
-    /// specific GitHub repo, so moving the local task to a different
-    /// binding would orphan that issue. Repo ownership is local metadata
-    /// (it selects the promote target), so — like `priority` — changing
-    /// it does NOT flip sync state.
+    /// Reassign the task's **logical repo** binding (code/worktrees/prefix).
+    /// Permitted only while the task is not yet remote-backed: once promoted,
+    /// the backing issue lives in a specific GitHub repo (today the logical
+    /// repo, until RFC 0002 splits out a separate filing repo), so moving the
+    /// local task to a different binding would orphan that issue. Logical-repo
+    /// ownership is local metadata (it selects the promote/filing target), so
+    /// — like `priority` — changing it does NOT flip sync state.
     pub fn set_repo_id(&mut self, repo_id: Option<RepoId>) -> Result<()> {
         // Idempotent no-op: setting the same value is always fine, even on
         // a remote-backed task — only an actual *change* is rejected.

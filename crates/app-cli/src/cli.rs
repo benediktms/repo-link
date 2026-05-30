@@ -294,8 +294,10 @@ pub(crate) enum TaskCmd {
     Create {
         #[command(flatten)]
         ws: WorkspaceArg,
-        /// Owning repo binding, by UUID / prefix / name / alias (same forms
-        /// as `rl repo show`).
+        /// Logical repo binding — where the code/worktrees live and the source
+        /// of the task's ID prefix. Today the issue is also filed in this repo
+        /// on promote (logical == filing repo until RFC 0002). By UUID / prefix
+        /// / name / alias (same forms as `rl repo show`).
         #[arg(short = 'r', long)]
         repo: Option<String>,
         #[arg(long)]
@@ -327,12 +329,13 @@ pub(crate) enum TaskCmd {
         /// (matches the spec).
         #[arg(long = "assignee")]
         assignees: Vec<String>,
-        /// Reassign the task's owning repo binding, by UUID / prefix / name /
-        /// alias (same forms as `rl repo show`). Use this to attach a repo to
-        /// a task created without one — required before `sync promote`, which
-        /// needs a repo to know which GitHub repo to open the issue in. Only
-        /// valid while the task is not yet synced to a remote issue;
-        /// reassigning a synced task is rejected.
+        /// Reassign the task's logical repo binding (code/worktrees/prefix), by
+        /// UUID / prefix / name / alias (same forms as `rl repo show`). Use
+        /// this to attach a repo to a task created without one — required
+        /// before `sync promote`, which needs a logical repo to know which
+        /// GitHub repo to open the issue in (the logical repo is also the
+        /// filing repo today, until RFC 0002). Only valid while the task is not
+        /// yet synced to a remote issue; reassigning a synced task is rejected.
         #[arg(short = 'r', long)]
         repo: Option<String>,
     },

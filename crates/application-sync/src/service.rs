@@ -43,13 +43,15 @@ impl SyncService {
     }
 
     /// Stage (if needed) and promote a `LocalOnly`/`Staged` task to a remote
-    /// issue. `previous_state` / `new_state` in the summary describe the
-    /// **sync** state — lifecycle stays untouched.
+    /// issue. The issue is created in the task's logical repo — which is also
+    /// its filing repo today, until RFC 0002 lets the filing repo differ.
+    /// `previous_state` / `new_state` in the summary describe the **sync**
+    /// state — lifecycle stays untouched.
     pub async fn promote(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        let canonical = self.canonical_for(&task).await?;
+        let logical_canonical = self.logical_canonical_for(&task).await?;
         let prev = task.sync;
 
         if task.sync == SyncState::LocalOnly {
@@ -64,7 +66,7 @@ impl SyncService {
         let snap = self
             .provider
             .create_remote(RemoteTaskCreate {
-                canonical_repo: &canonical,
+                canonical_repo: &logical_canonical,
                 title: &task.title,
                 body: &task.body,
                 assignees: &task.assignees,
@@ -72,7 +74,8 @@ impl SyncService {
             })
             .await?;
 
-        let mut remote_ref = RemoteRef::new(provider_label(&canonical), snap.remote_id.clone());
+        let mut remote_ref =
+            RemoteRef::new(provider_label(&logical_canonical), snap.remote_id.clone());
         // Capture the GraphQL node id the REST create response carried, so the
         // freshly promoted task is immediately board-eligible (the §D1 AddItem
         // path needs it). Dropping it here was the create/promote half of the
@@ -96,7 +99,7 @@ impl SyncService {
     pub async fn push(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
-        let canonical = self.canonical_for(&task).await?;
+        let logical_canonical = self.logical_canonical_for(&task).await?;
         let prev = task.sync;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
 
@@ -121,7 +124,7 @@ impl SyncService {
             let (closed, state_reason) = crate::lifecycle_to_remote_state(task.status);
             self.provider
                 .update_remote(RemoteTaskUpdate {
-                    canonical_repo: &canonical,
+                    canonical_repo: &logical_canonical,
                     remote_id: &remote.remote_id,
                     title: Some(&task.title),
                     body: Some(&task.body),
@@ -154,7 +157,7 @@ impl SyncService {
                 };
                 pushed.push(
                     self.provider
-                        .create_comment(&canonical, &remote.remote_id, &comment.body)
+                        .create_comment(&logical_canonical, &remote.remote_id, &comment.body)
                         .await?,
                 );
                 drained_local_ids.push(local_id);
@@ -177,13 +180,13 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        let canonical = self.canonical_for(&task).await?;
+        let logical_canonical = self.logical_canonical_for(&task).await?;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
         let prev = task.sync;
 
         let snap = self
             .provider
-            .fetch_remote(&canonical, &remote.remote_id)
+            .fetch_remote(&logical_canonical, &remote.remote_id)
             .await?;
         // Backfill the GraphQL node id for a pre-project-sync task whose
         // remote was recorded before node ids were persisted. Without it the
@@ -259,7 +262,7 @@ impl SyncService {
         // the cosmetic-refresh churn the field-level pull guards against.
         let comments = self
             .provider
-            .fetch_comments(&canonical, &remote.remote_id)
+            .fetch_comments(&logical_canonical, &remote.remote_id)
             .await?;
         self.tasks.replace_comments(id, &comments).await?;
 
@@ -302,7 +305,7 @@ impl SyncService {
             .as_ref()
             .is_some_and(|r| r.provider == "github" && r.remote_id == new_remote_id);
         if already_pointing
-            && self.canonical_for(&task).await.ok().as_deref() == Some(new_canonical)
+            && self.logical_canonical_for(&task).await.ok().as_deref() == Some(new_canonical)
         {
             return Ok(link_summary(&task, prev, "noop", None));
         }
@@ -341,7 +344,7 @@ impl SyncService {
             }
             // Need a current remote to verify the redirect against.
             let current_remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
-            let current_canonical = self.canonical_for(&task).await?;
+            let current_canonical = self.logical_canonical_for(&task).await?;
             let target = self
                 .provider
                 .discover_move_target(&current_canonical, &current_remote.remote_id)
@@ -431,7 +434,10 @@ impl SyncService {
         ))
     }
 
-    async fn canonical_for(&self, task: &Task) -> Result<String> {
+    /// Canonical URL of the task's **logical** repo — also the repo the issue
+    /// is filed in today (until RFC 0002). Errors with `NoRepo` for an orphan
+    /// task, since there is no repo to address.
+    async fn logical_canonical_for(&self, task: &Task) -> Result<String> {
         let repo_id = task.repo_id.ok_or(SyncError::NoRepo)?;
         let binding = self.bindings.get(repo_id).await?;
         Ok(binding.canonical_url)

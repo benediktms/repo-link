@@ -415,10 +415,10 @@ impl TaskService {
             // The draft graduates to an issue. `repo_node_id` carries the
             // canonical URL — the adapter resolves it to the GraphQL repo node
             // id (canonical→node-id resolution is an adapter concern, see #54).
-            let canonical = self.canonical_for(task).await?.unwrap_or_default();
+            let logical_canonical = self.logical_canonical_for(task).await?.unwrap_or_default();
             out.push(OutboxMutation::ConvertDraftToIssue {
                 item_node_id,
-                repo_node_id: canonical,
+                repo_node_id: logical_canonical,
             });
             return Ok(out);
         }
@@ -750,6 +750,10 @@ impl TaskService {
     /// gates the draft-backed `UpdateDraftIssue` so a lifecycle move doesn't
     /// enqueue a no-op draft content write (the card move via
     /// `SetProjectStatus` carries the lifecycle change for drafts).
+    ///
+    /// The `logical_canonical` it resolves is the task's **logical** repo URL
+    /// — also where the issue is filed today, until RFC 0002 splits the filing
+    /// repo out as its own axis.
     async fn plan_mirror_mutations(
         &self,
         task: &Task,
@@ -759,7 +763,7 @@ impl TaskService {
             return Ok(Vec::new());
         }
         let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
-        let canonical = self.canonical_for(task).await?;
+        let logical_canonical = self.logical_canonical_for(task).await?;
         // An issue-backed mirror with no repo binding can't form an
         // `UpdateRemote` (it has no canonical repo to address), so a
         // remote-observable lifecycle change would be silently dropped if it
@@ -768,7 +772,7 @@ impl TaskService {
         // always supplies a repo), but a future caller that constructs an
         // unbound issue-backed mirror would otherwise lose the push without a
         // signal.
-        if enqueue::is_issue_backed(task) && canonical.is_none() && project.is_none() {
+        if enqueue::is_issue_backed(task) && logical_canonical.is_none() && project.is_none() {
             tracing::warn!(
                 task_id = %task.id,
                 "mirror lifecycle change has no repo binding and no project; \
@@ -778,15 +782,16 @@ impl TaskService {
         Ok(enqueue::plan_mutations(
             task,
             project.as_ref(),
-            canonical.as_deref(),
+            logical_canonical.as_deref(),
             content_changed,
         ))
     }
 
-    /// Best-effort canonical repo lookup for the task's binding. `None` when
-    /// the task has no repo (orphan-draft) — issue-backed planning needs it;
-    /// draft/project planning doesn't.
-    async fn canonical_for(&self, task: &Task) -> Result<Option<String>> {
+    /// Best-effort canonical-URL lookup for the task's **logical** repo binding
+    /// — today also the repo the issue is filed in (until RFC 0002). `None`
+    /// when the task has no logical repo (orphan-draft) — issue-backed planning
+    /// needs it; draft/project planning doesn't.
+    async fn logical_canonical_for(&self, task: &Task) -> Result<Option<String>> {
         let Some(repo_id) = task.repo_id else {
             return Ok(None);
         };

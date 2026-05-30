@@ -58,6 +58,10 @@ pub struct TaskDto {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateTaskCmd {
     pub workspace_id: String,
+    /// The task's **logical repo** binding (a repo UUID): where the code lives
+    /// and the source of the friendly-ID prefix. Today the issue is also filed
+    /// here on promote (logical == filing repo until RFC 0002). `None` creates
+    /// an orphan task (a project-board draft).
     pub repo_id: Option<String>,
     pub title: String,
     pub body: Option<String>,
@@ -71,19 +75,22 @@ pub struct UpdateTaskCmd {
     pub body: Option<String>,
     pub priority: Option<String>,
     pub assignees: Option<Vec<String>>,
-    /// Reassign the owning repo binding (a repo UUID). `None` leaves the
-    /// current repo untouched. Only valid while the task is not yet
-    /// remote-backed — the service rejects reassigning a synced task.
-    /// There is no way to *clear* the repo via update (matches the
-    /// assignees gap).
+    /// Reassign the task's **logical repo** binding (a repo UUID): where the
+    /// code/worktrees live and the prefix source — today also the filing repo
+    /// on promote (until RFC 0002). `None` leaves the current logical repo
+    /// untouched. Only valid while the task is not yet remote-backed — the
+    /// service rejects reassigning a synced task. There is no way to *clear*
+    /// the repo via update (matches the assignees gap).
     pub repo_id: Option<String>,
 }
 
 /// Materialise a remote issue as a local mirror task (`sync import`). The
 /// CLI fetches the issue + resolves the binding, then hands the application
 /// layer everything needed to construct a `Synced` task with a `Pull`
-/// baseline. `repo_id` is the resolved binding UUID; `closed` maps to the
-/// initial lifecycle status (open→Open, closed→Done).
+/// baseline. `repo_id` is the resolved **logical repo** binding UUID — the
+/// repo the imported issue lives in, which is also that task's logical repo
+/// (logical == filing repo until RFC 0002). `closed` maps to the initial
+/// lifecycle status (open→Open, closed→Done).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportMirrorCmd {
     pub workspace_id: String,
