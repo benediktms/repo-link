@@ -3,9 +3,9 @@
 //!
 //! Issues are the underlying remote task object. Promotion creates an issue in
 //! the task's filing repo (today always its logical repo, until RFC 0002 lets
-//! the two diverge); push updates it; pull fetches its current state. Projects
-//! v2 boards layer
-//! on top: a project's Status field, draft issues, and membership are
+//! the two diverge); push updates it; pull fetches its current state.
+//! Projects v2 boards layer on top: a project's Status field, draft issues,
+//! and membership are
 //! GraphQL-only (GitHub sunset the REST projects API).
 //!
 //! # Internals
