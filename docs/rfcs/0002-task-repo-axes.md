@@ -60,13 +60,15 @@ Two edge cases the chain must make explicit:
 - **Orphan task + workspace filing default.** When `repo_id IS NULL` (orphan) but a workspace filing default is set, step 2 resolves: a **real GitHub issue is created in the filing repo** and added to the board — the filing repo substitutes for the missing logical repo as the issue's home (the same substitution D3 relies on for `convertProjectV2DraftIssueItemToIssue`). The orphan does **not** stay a board draft.
 - **NULL fall-through.** Step 3 applies only when `repo_id IS NOT NULL`; a NULL `repo_id` is a *failing* resolution that falls through to step 4, not an empty-but-passing one. Board draft (step 4) is therefore reached only when steps 1–3 all miss.
 
-The **resolved** filing repo is recorded on the task at promote time (stable, like `project_item_id`) so that later changes to the workspace default never silently move an already-filed issue.
+The **resolved** filing repo is recorded on the task at promote time (stable, like `project_item_id`) so that later changes to the workspace default never silently move an already-filed issue. Once recorded, it is authoritative: sync/update logic consults `tasks.filing_repo_id` first and never re-resolves from the workspace default (the full migration/lookup rules are in §3).
 
 This keeps RFC 0001 behaviour intact: with no workspace default and no override, the filing repo resolves to `repo_id` exactly as today. The new axis only diverges when a workspace opts into a dedicated issues repo. The split is therefore **additive**, not an inversion of `repo_id`'s meaning.
 
 ### D3 — Interaction with the project axis (RFC 0001)
 
 The **project** remains the primary sync target for *board membership*; the **filing repo** decides only *where the backing issue lives*. RFC 0001's orphan-draft and `convertProjectV2DraftIssueItemToIssue` paths still apply — except "convert to issue" now targets the resolved **filing repo**, not the logical repo.
+
+**Draft conversion is a promote, not a sync.** A board draft reached D2 step 4, so its `tasks.filing_repo_id` is NULL — no filing repo was ever resolved. Converting it to a real issue is therefore treated as a (first) promote: the **D2 chain re-runs at conversion time**, picking up any explicit `--repo`/`--filing-repo` and any workspace default added since the draft was created, and records the resolved filing repo. This is the one case where "convert to issue" must resolve rather than read a recorded value — it does *not* contradict the "never re-resolve after promote" rule in §3, because a draft has not yet been promoted to an issue.
 
 ### D4 — Identity stays logical
 
@@ -86,7 +88,7 @@ The remote-task uniqueness key is `(repo_id, provider, remote_id)` — it assume
 
 - `workspaces` gains `filing_repo_id` (nullable FK → repo binding) — the workspace's **default** filing repo. This **repurposes / replaces** RFC 0001's deferred `creation_default_repo_id`.
 - `tasks` gains `filing_repo_id` (nullable) — the **resolved** filing repo, set on promote. `repo_id` is unchanged (logical).
-- Migration is additive, but **not** a blanket NULL. For every already-promoted task (remote-backed — `remote_id` or `project_item_id` non-NULL) the migration **backfills `tasks.filing_repo_id = repo_id`**, because historically filing == logical, so that is provably where the issue lives. This makes the recorded target authoritative and immune to a later workspace-default change silently retargeting an existing issue. Purely-local tasks (never promoted) stay NULL and resolve via the D2 chain at promote time.
+- Migration is additive, but **not** a blanket NULL. For every task with a **real issue** (`remote_id` non-NULL) the migration **backfills `tasks.filing_repo_id = repo_id`**, because historically filing == logical, so that is provably where the issue lives. This makes the recorded target authoritative and immune to a later workspace-default change silently retargeting an existing issue. Two other classes stay NULL on purpose: purely-local tasks (never promoted) resolve via the D2 chain at promote time; **board drafts** (`project_item_id` non-NULL but `remote_id` NULL) have no filed issue yet, so their filing repo is genuinely undefined until conversion re-runs D2 (D3). Note an orphan draft's `repo_id` is NULL anyway, so backfilling it would be a no-op — the `remote_id` condition is the meaningful one.
 - **Authoritative lookup.** Once a task is promoted, sync/update logic consults `tasks.filing_repo_id` **first** and never re-resolves from the workspace default. The D2 chain runs only at create/promote, never for an already-filed issue.
 
 Both columns share the name `filing_repo_id`: same concept (where the issue is filed), differing only in scope — the workspace row is the *default*, the task row is the *resolved-and-recorded* value.
