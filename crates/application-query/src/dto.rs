@@ -122,3 +122,141 @@ pub struct DriftRow {
     #[serde(default)]
     pub project_status_expected: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RFC 0002 D5 / #119: the filing repo is an INTERNAL axis. None of the
+    /// `QueryService` read-model rows are allowed to expose `filing_repo_id` —
+    /// they stay on the logical axis only, so `jq` consumers and the rl-tasks
+    /// skill keep working untouched. This asserts strictly the ABSENCE of the
+    /// `filing_repo_id` key (most rows are task-id keyed and carry no repo
+    /// column at all; only `StaleWorktreeRow` carries a logical `repo_id`).
+    /// Adding a future row is a one-line addition to the `rows` array.
+    #[test]
+    fn read_models_json_omit_filing_repo_id() {
+        let rows: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "DriftRow",
+                serde_json::to_value(DriftRow {
+                    task_id: "rpl-1".into(),
+                    title: "t".into(),
+                    sync_state: "synced".into(),
+                    remote_id: Some("1".into()),
+                    reasons: vec!["sync".into()],
+                    project_status: None,
+                    project_status_expected: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "ReadyTaskRow",
+                serde_json::to_value(ReadyTaskRow {
+                    task_id: "rpl-2".into(),
+                    title: "t".into(),
+                    status: "open".into(),
+                    sync_state: "local_only".into(),
+                    priority: "p3".into(),
+                    assignees: vec![],
+                })
+                .unwrap(),
+            ),
+            (
+                "AssignedTaskRow",
+                serde_json::to_value(AssignedTaskRow {
+                    task_id: "rpl-3".into(),
+                    title: "t".into(),
+                    status: "open".into(),
+                    sync_state: "synced".into(),
+                    priority: "p3".into(),
+                    blocked: false,
+                    remote_id: None,
+                })
+                .unwrap(),
+            ),
+            (
+                "UnsyncedTaskRow",
+                serde_json::to_value(UnsyncedTaskRow {
+                    task_id: "rpl-4".into(),
+                    title: "t".into(),
+                    sync_state: "dirty_local".into(),
+                    pending_comments: 0,
+                })
+                .unwrap(),
+            ),
+            (
+                "BlockedTaskRow",
+                serde_json::to_value(BlockedTaskRow {
+                    task_id: "rpl-5".into(),
+                    title: "t".into(),
+                    priority: "p3".into(),
+                    blocked_by: vec![],
+                })
+                .unwrap(),
+            ),
+            (
+                "ChildTaskRow",
+                serde_json::to_value(ChildTaskRow {
+                    task_id: "rpl-6".into(),
+                    title: "t".into(),
+                    status: "open".into(),
+                })
+                .unwrap(),
+            ),
+            (
+                "ChildrenRollup",
+                serde_json::to_value(ChildrenRollup {
+                    parent_id: "rpl-7".into(),
+                    total: 0,
+                    done: 0,
+                    children: vec![],
+                })
+                .unwrap(),
+            ),
+            (
+                "ContributorRow",
+                serde_json::to_value(ContributorRow {
+                    assignee: "alice".into(),
+                    total: 0,
+                    by_status: BTreeMap::new(),
+                })
+                .unwrap(),
+            ),
+            (
+                "StaleWorktreeRow",
+                serde_json::to_value(StaleWorktreeRow {
+                    repo_id: "repo-1".into(),
+                    canonical_url: "https://example/repo".into(),
+                    path: "/tmp/wt".into(),
+                    status: "missing".into(),
+                })
+                .unwrap(),
+            ),
+            (
+                "WorkspaceOverview",
+                serde_json::to_value(WorkspaceOverview {
+                    workspace_id: "ws-1".into(),
+                    workspace_name: "ws".into(),
+                    workspace_status: "active".into(),
+                    repo_count: 0,
+                    worktree_count: 0,
+                    stale_worktree_count: 0,
+                    by_status: BTreeMap::new(),
+                    by_sync: BTreeMap::new(),
+                    unsynced_task_count: 0,
+                    generated_at: Utc::now(),
+                })
+                .unwrap(),
+            ),
+        ];
+
+        for (name, v) in rows {
+            let obj = v.as_object().expect("read-model row is a JSON object");
+            assert!(
+                !obj.contains_key("filing_repo_id"),
+                "{name} JSON must NOT carry the internal filing_repo_id axis (RFC 0002 D5, #119)"
+            );
+        }
+    }
+}
