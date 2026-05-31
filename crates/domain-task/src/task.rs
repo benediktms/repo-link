@@ -531,7 +531,7 @@ impl Task {
         // set (currently `None`) is always allowed, even once remote-backed.
         if self.filing_repo_id.is_some() {
             return Err(DomainError::validation(
-                "cannot change the filing repo of a task once it has been recorded",
+                "cannot change or clear the filing repo of a task once it has been recorded",
             ));
         }
         self.filing_repo_id = filing_repo_id;
