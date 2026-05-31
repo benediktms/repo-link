@@ -1,7 +1,7 @@
 //! `Workspace` aggregate + lifecycle transitions.
 
 use crate::{WorkspaceName, WorkspaceStatus};
-use domain_core::{Aggregate, DomainError, ProjectId, Result, Timestamp, WorkspaceId};
+use domain_core::{Aggregate, DomainError, ProjectId, RepoId, Result, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,6 +17,15 @@ pub struct Workspace {
     /// workspaces stay valid because the field is purely additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<ProjectId>,
+    /// The workspace's **default filing repo** (RFC 0002): where a task's
+    /// backing GitHub issue is filed when nothing more specific applies. New
+    /// and additive — supersedes RFC 0001's deferred `creation_default_repo_id`.
+    /// `None` means "no default", and the D2 resolution chain falls through to
+    /// the task's logical `repo_id`, so behaviour is unchanged. Internal: this
+    /// is consumed by the promote/sync path, not surfaced on the workspace DTO.
+    /// Set via the `workspace set-filing-repo` CLI (#121, gated behind D6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filing_repo_id: Option<RepoId>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -31,6 +40,7 @@ impl Workspace {
             status: WorkspaceStatus::Created,
             local_only,
             project_id: None,
+            filing_repo_id: None,
             created_at: now,
             updated_at: now,
         }

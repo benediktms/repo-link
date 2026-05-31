@@ -393,11 +393,12 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tasks (id, workspace_id, repo_id, filing_repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             repo_id = excluded.repo_id,
+            filing_repo_id = excluded.filing_repo_id,
             title = excluded.title,
             body = excluded.body,
             status = excluded.status,
@@ -420,6 +421,7 @@ async fn write_task_in_tx(
     .bind(t.id.to_string())
     .bind(t.workspace_id.to_string())
     .bind(t.repo_id.map(|r| r.to_string()))
+    .bind(t.filing_repo_id.map(|r| r.to_string()))
     .bind(&t.title)
     .bind(&t.body)
     .bind(enum_to_str(&t.status)?)
@@ -542,6 +544,14 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         .map(|s| parse_uuid::<RepoId>("repo_id", s))
         .transpose()?;
 
+    // RFC 0002 filing repo (internal, #116). NULL until resolved at promote.
+    let filing_repo_id = row
+        .try_get::<Option<String>, _>("filing_repo_id")
+        .map_err(map_sqlx_err)?
+        .as_deref()
+        .map(|s| parse_uuid::<RepoId>("filing_repo_id", s))
+        .transpose()?;
+
     let remote = match (remote_provider, remote_id) {
         (Some(provider), Some(remote_id)) => Some(RemoteRef {
             provider,
@@ -555,6 +565,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         id: parse_uuid::<TaskId>("task_id", &id_str)?,
         workspace_id: parse_uuid::<WorkspaceId>("workspace_id", &workspace_id_str)?,
         repo_id,
+        filing_repo_id,
         title,
         body,
         status: enum_from_str::<TaskStatus>("task status", &status)?,
