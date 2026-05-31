@@ -48,10 +48,12 @@ impl SyncService {
     }
 
     /// Stage (if needed) and promote a `LocalOnly`/`Staged` task to a remote
-    /// issue. The issue is created in the task's logical repo — which is also
-    /// its filing repo today, until RFC 0002 lets the filing repo differ.
-    /// `previous_state` / `new_state` in the summary describe the **sync**
-    /// state — lifecycle stays untouched.
+    /// issue. The issue is filed in the RFC 0002 D2 resolved filing repo
+    /// (per-task override → workspace default → logical `repo_id`), which is
+    /// recorded on the task before the remote is created. With no override or
+    /// workspace default the chain collapses to the logical repo, so filing is
+    /// unchanged from before RFC 0002. `previous_state` / `new_state` in the
+    /// summary describe the **sync** state — lifecycle stays untouched.
     pub async fn promote(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
