@@ -57,7 +57,12 @@ pub(crate) async fn sync_dispatch(
         return sync_import(provider.as_ref(), svc, &workspace, &url, cascade).await;
     }
 
-    let sync = SyncService::new(svc.tasks_repo.clone(), svc.bindings_repo.clone(), provider);
+    let sync = SyncService::new(
+        svc.tasks_repo.clone(),
+        svc.bindings_repo.clone(),
+        svc.workspaces_repo.clone(),
+        provider,
+    );
     // Resolve the friendly task reference (UUID / bare hash / prefix-hash)
     // to a UUID here, at the CLI boundary, so `sync` accepts the same id
     // forms as every other task command. `SyncService` stays UUID-only.

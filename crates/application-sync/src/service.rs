@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use domain_core::TaskId;
-use domain_sync::{SyncDecision, SyncPolicy, decide};
+use domain_sync::{SyncDecision, SyncPolicy, decide, resolve_filing_repo};
 use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
 use dto_shared::SyncSummaryDto;
 use ports::{
     PortError, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate, RepoBindingRepository,
-    TaskRepository,
+    TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -19,6 +19,9 @@ use crate::summary::{
 pub struct SyncService {
     tasks: Arc<dyn TaskRepository>,
     bindings: Arc<dyn RepoBindingRepository>,
+    // Needed to read the workspace default filing repo (`filing_repo_id`) for
+    // step 2 of the RFC 0002 D2 chain when resolving where to file at promote.
+    workspaces: Arc<dyn WorkspaceRepository>,
     provider: Arc<dyn RemoteTaskProvider>,
     policy: SyncPolicy,
 }
@@ -27,11 +30,13 @@ impl SyncService {
     pub fn new(
         tasks: Arc<dyn TaskRepository>,
         bindings: Arc<dyn RepoBindingRepository>,
+        workspaces: Arc<dyn WorkspaceRepository>,
         provider: Arc<dyn RemoteTaskProvider>,
     ) -> Self {
         Self {
             tasks,
             bindings,
+            workspaces,
             provider,
             policy: SyncPolicy::ManualMerge,
         }
@@ -51,7 +56,6 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        let logical_canonical = self.logical_canonical_for(&task).await?;
         let prev = task.sync;
 
         if task.sync == SyncState::LocalOnly {
@@ -63,10 +67,23 @@ impl SyncService {
             )));
         }
 
+        // RFC 0002 D2: promote is a first-filing transition, so resolve the
+        // filing repo and record it on the task before creating the remote.
+        // The per-task override is carried on the draft, not resolved here
+        // (CLI lands in #122); step 2 reads the workspace default. With both
+        // absent the chain collapses to the logical `repo_id`, so the issue is
+        // filed exactly where it is today. `set_filing_repo_id(None)` is a
+        // no-op when nothing resolved (orphan with no default), preserving the
+        // existing "promote needs a repo" error via `filing_canonical_for`.
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
+        task.set_filing_repo_id(filing)?;
+        let filing_canonical = self.filing_canonical_for(&task).await?;
+
         let snap = self
             .provider
             .create_remote(RemoteTaskCreate {
-                canonical_repo: &logical_canonical,
+                canonical_repo: &filing_canonical,
                 title: &task.title,
                 body: &task.body,
                 assignees: &task.assignees,
@@ -75,7 +92,7 @@ impl SyncService {
             .await?;
 
         let mut remote_ref =
-            RemoteRef::new(provider_label(&logical_canonical), snap.remote_id.clone());
+            RemoteRef::new(provider_label(&filing_canonical), snap.remote_id.clone());
         // Capture the GraphQL node id the REST create response carried, so the
         // freshly promoted task is immediately board-eligible (the §D1 AddItem
         // path needs it). Dropping it here was the create/promote half of the
@@ -99,7 +116,7 @@ impl SyncService {
     pub async fn push(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
-        let logical_canonical = self.logical_canonical_for(&task).await?;
+        let filing_canonical = self.filing_canonical_for(&task).await?;
         let prev = task.sync;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
 
@@ -124,7 +141,7 @@ impl SyncService {
             let (closed, state_reason) = crate::lifecycle_to_remote_state(task.status);
             self.provider
                 .update_remote(RemoteTaskUpdate {
-                    canonical_repo: &logical_canonical,
+                    canonical_repo: &filing_canonical,
                     remote_id: &remote.remote_id,
                     title: Some(&task.title),
                     body: Some(&task.body),
@@ -157,7 +174,7 @@ impl SyncService {
                 };
                 pushed.push(
                     self.provider
-                        .create_comment(&logical_canonical, &remote.remote_id, &comment.body)
+                        .create_comment(&filing_canonical, &remote.remote_id, &comment.body)
                         .await?,
                 );
                 drained_local_ids.push(local_id);
@@ -180,13 +197,13 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        let logical_canonical = self.logical_canonical_for(&task).await?;
+        let filing_canonical = self.filing_canonical_for(&task).await?;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
         let prev = task.sync;
 
         let snap = self
             .provider
-            .fetch_remote(&logical_canonical, &remote.remote_id)
+            .fetch_remote(&filing_canonical, &remote.remote_id)
             .await?;
         // Backfill the GraphQL node id for a pre-project-sync task whose
         // remote was recorded before node ids were persisted. Without it the
@@ -262,7 +279,7 @@ impl SyncService {
         // the cosmetic-refresh churn the field-level pull guards against.
         let comments = self
             .provider
-            .fetch_comments(&logical_canonical, &remote.remote_id)
+            .fetch_comments(&filing_canonical, &remote.remote_id)
             .await?;
         self.tasks.replace_comments(id, &comments).await?;
 
@@ -442,6 +459,22 @@ impl SyncService {
         let binding = self.bindings.get(repo_id).await?;
         Ok(binding.canonical_url)
     }
+
+    /// Canonical URL of the repo the task's backing issue is *filed* in (RFC
+    /// 0002). Prefers the recorded `filing_repo_id`, falling back to the
+    /// logical `repo_id` when it is NULL — so pre-resolution tasks and rows
+    /// migrated before the filing axis existed still resolve to the same repo
+    /// they always did. Used for every remote-issue address (create / update /
+    /// fetch / comment); the logical lookup stays for logical-binding ops
+    /// (prefix / worktree / relink).
+    async fn filing_canonical_for(&self, task: &Task) -> Result<String> {
+        let repo_id = task
+            .filing_repo_id
+            .or(task.repo_id)
+            .ok_or(SyncError::NoRepo)?;
+        let binding = self.bindings.get(repo_id).await?;
+        Ok(binding.canonical_url)
+    }
 }
 
 #[cfg(test)]
@@ -452,9 +485,12 @@ mod tests {
     use domain_core::{Timestamp, WorkspaceId};
     use domain_repo::RepoBinding;
     use domain_task::Task;
+    use domain_workspace::{Workspace, WorkspaceName};
     use ports::{PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot};
     use std::sync::Mutex;
-    use testing_fixtures::{InMemoryRepoBindingRepository, InMemoryTaskRepository};
+    use testing_fixtures::{
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
+    };
 
     #[derive(Clone)]
     struct RecordedUpdate {
@@ -467,6 +503,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProvider {
         last_create: Mutex<Option<String>>,
+        last_create_canonical: Mutex<Option<String>>,
         last_update: Mutex<Option<RecordedUpdate>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
         comments: Mutex<Vec<RemoteComment>>,
@@ -499,6 +536,7 @@ mod tests {
     impl RemoteTaskProvider for FakeProvider {
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
             *self.last_create.lock().unwrap() = Some(cmd.title.to_string());
+            *self.last_create_canonical.lock().unwrap() = Some(cmd.canonical_repo.to_string());
             Ok(RemoteTaskSnapshot {
                 remote_id: "100".into(),
                 node_id: Some("I_kwDOfake100".into()),
@@ -595,9 +633,16 @@ mod tests {
     ) {
         let tasks = Arc::new(InMemoryTaskRepository::new());
         let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
         let provider = Arc::new(FakeProvider::default());
 
-        let workspace_id = WorkspaceId::new();
+        // Seed the workspace so promote's D2 step-2 lookup
+        // (`workspaces.get(task.workspace_id)`) resolves. No filing default
+        // here, so resolution falls through to the logical repo as today.
+        let workspace = Workspace::new(WorkspaceName::new("sync-ws").unwrap(), None, true);
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+
         let binding = RepoBinding::new(
             workspace_id,
             "git@github.com:o/r.git".into(),
@@ -610,7 +655,12 @@ mod tests {
         let task = Task::new_draft(workspace_id, Some(repo_id), "ship it".into()).unwrap();
         tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
 
-        let svc = SyncService::new(tasks.clone(), bindings.clone(), provider.clone());
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+        );
         (svc, tasks, bindings, task, provider)
     }
 
@@ -637,9 +687,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promote_records_filing_repo_as_logical_with_no_default() {
+        // RFC 0002 D2: no per-task override, no workspace default ⇒ the chain
+        // collapses to the logical repo, so promote records filing == logical
+        // and files at the same canonical as today.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let saved = tasks.get(task.id).await.unwrap();
+        assert!(saved.repo_id.is_some());
+        assert_eq!(saved.filing_repo_id, saved.repo_id);
+        assert_eq!(
+            provider.last_create_canonical.lock().unwrap().as_deref(),
+            Some("github.com/o/r")
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_orphan_with_workspace_default_files_in_default_repo() {
+        // RFC 0002 D2 step-2 edge case: an orphan task (no logical repo) whose
+        // workspace has a filing default resolves to that default — a REAL
+        // issue in the default repo, NOT a board draft. The resolved filing
+        // repo is recorded and the issue is filed at the default's canonical.
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("orphan-ws").unwrap(), None, true);
+        let default_binding = RepoBinding::new(
+            workspace.id,
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+        workspace.filing_repo_id = Some(default_binding.id);
+        workspaces.save(&workspace).await.unwrap();
+
+        // Orphan: no logical repo at all.
+        let task = Task::new_draft(workspace.id, None, "orphan".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+        );
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(saved.repo_id, None, "still an orphan on the logical axis");
+        assert_eq!(
+            saved.filing_repo_id,
+            Some(default_binding.id),
+            "filing resolved to the workspace default and was recorded"
+        );
+        assert_eq!(
+            provider.last_create_canonical.lock().unwrap().as_deref(),
+            Some("github.com/o/filing"),
+            "the issue was filed in the workspace default repo"
+        );
+    }
+
+    #[tokio::test]
     async fn promote_requires_repo_binding() {
-        let (svc, tasks, _, _) = setup().await;
-        let mut t = Task::new_draft(WorkspaceId::new(), None, "rogue".into()).unwrap();
+        let (svc, tasks, task, _) = setup().await;
+        // Reuse the seeded workspace (which has no filing default) so D2 step 2
+        // misses and resolution reaches the orphan case: no logical repo and no
+        // default ⇒ filing stays None ⇒ NoRepo, not a workspace-not-found error.
+        let mut t = Task::new_draft(task.workspace_id, None, "rogue".into()).unwrap();
         t.repo_id = None;
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
         let err = svc.promote(&t.id.to_string()).await.unwrap_err();

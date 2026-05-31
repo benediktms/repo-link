@@ -25,6 +25,9 @@ pub(crate) struct Services {
     pub(crate) projects: ProjectService,
     pub(crate) tasks_repo: Arc<dyn ports::TaskRepository>,
     pub(crate) bindings_repo: Arc<dyn ports::RepoBindingRepository>,
+    /// Raw workspace repo — `build_sync_service` needs it for the RFC 0002 D2
+    /// step-2 lookup (workspace default filing repo) at promote.
+    pub(crate) workspaces_repo: Arc<dyn ports::WorkspaceRepository>,
     /// Backs `rl sync outbox` so dead-lettered entries are visible.
     pub(crate) outbox_repo: Arc<dyn ports::OutboxRepository>,
 }
@@ -64,7 +67,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             projects_repo.clone(),
         ),
         query: QueryService::new(
-            workspaces_repo,
+            workspaces_repo.clone(),
             bindings_repo.clone(),
             tasks_repo.clone(),
             projects_repo.clone(),
@@ -72,6 +75,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
         projects: ProjectService::new(projects_repo),
         tasks_repo,
         bindings_repo,
+        workspaces_repo,
         outbox_repo,
     })
 }
@@ -119,6 +123,7 @@ pub(crate) fn build_sync_service(
     Ok(SyncService::new(
         svc.tasks_repo.clone(),
         svc.bindings_repo.clone(),
+        svc.workspaces_repo.clone(),
         provider,
     ))
 }
