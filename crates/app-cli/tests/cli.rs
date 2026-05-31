@@ -1520,6 +1520,33 @@ fn daemon_install_is_idempotent() {
     );
 }
 
+/// Regression for #132: `install` must `enable` the label BEFORE `bootstrap`.
+/// A unit left *disabled* (e.g. by an external `launchctl bootout`/disable)
+/// makes `bootstrap` fail with errno 5, so without enabling first neither
+/// `rl daemon install` nor `just install` can recover it. macOS-only: the
+/// Linux systemd sequence has no `bootstrap` step.
+#[test]
+#[cfg(target_os = "macos")]
+fn daemon_install_enables_before_bootstrap() {
+    let env = daemon_env();
+    run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+
+    let log = std::fs::read_to_string(&env.launcher_log).unwrap();
+    let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    let enable_idx = lines
+        .iter()
+        .position(|l| l.contains("\"enable\""))
+        .expect("install issues launchctl enable");
+    let bootstrap_idx = lines
+        .iter()
+        .position(|l| l.contains("\"bootstrap\""))
+        .expect("install issues launchctl bootstrap");
+    assert!(
+        enable_idx < bootstrap_idx,
+        "enable must precede bootstrap so a disabled unit can be re-bootstrapped; log:\n{log}"
+    );
+}
+
 #[test]
 fn daemon_install_then_status_is_loaded_no_tick() {
     let env = daemon_env();
