@@ -1285,6 +1285,120 @@ async fn task_filing_repo_id_roundtrips_through_upsert() {
     );
 }
 
+/// RFC 0002 #118: the resolved filing repo round-trips into snapshot history
+/// and reads back via `SqliteTaskSnapshotRepository::get` / `list`.
+#[tokio::test]
+async fn snapshot_filing_repo_id_roundtrips() {
+    use infra_sqlite::SqliteTaskSnapshotRepository;
+    use ports::TaskSnapshotRepository;
+
+    let (_dir, db, ws, rb, ts) = setup_with_db().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-filing").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    // Promote then record the filing repo, then write a Promote snapshot
+    // carrying it.
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "snap".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "7"))
+        .unwrap();
+    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    let snaps = SqliteTaskSnapshotRepository::new(db);
+    let listed = snaps.list(task.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].filing_repo_id,
+        Some(binding.id),
+        "list must read back the captured filing repo"
+    );
+    let got = snaps.get(task.id, listed[0].version).await.unwrap();
+    assert_eq!(
+        got.filing_repo_id,
+        Some(binding.id),
+        "get must read back the captured filing repo"
+    );
+}
+
+/// RFC 0002 #118: the second read path — baseline hydration via
+/// `load_latest_baseline` (exercised by `SqliteTaskRepository::get`) — must
+/// also carry the filing repo.
+#[tokio::test]
+async fn load_latest_baseline_carries_filing_repo_id() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-baseline").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "baseline".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "8"))
+        .unwrap();
+    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    // Promote IS baseline-eligible, so this snapshot becomes the baseline.
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    let reloaded = ts.get(task.id).await.unwrap();
+    assert_eq!(
+        reloaded.synced_baseline.unwrap().filing_repo_id,
+        Some(binding.id),
+        "the hydrated baseline must carry the filing repo"
+    );
+}
+
+/// RFC 0002 #118: snapshot rows pre-dating the `filing_repo_id` column (or with
+/// an empty value) must read back as `None` gracefully — the same tolerance the
+/// `repo_id` non-empty/parse path established. We simulate a pre-column row by
+/// inserting one with a NULL `filing_repo_id` directly.
+#[tokio::test]
+async fn pre_column_snapshot_filing_reads_null() {
+    use infra_sqlite::SqliteTaskSnapshotRepository;
+    use ports::TaskSnapshotRepository;
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-precolumn").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    // A real task to satisfy the FK from task_snapshots.task_id → tasks.id.
+    let task = Task::new_draft(workspace.id, None, "precolumn".into()).unwrap();
+    ts.save(&task, SnapshotSource::Created).await.unwrap();
+
+    // Insert a raw snapshot row with NULL filing_repo_id, as a pre-column row
+    // would look after the additive migration backfilled it NULL.
+    sqlx::query(
+        "INSERT INTO task_snapshots \
+         (task_id, version, title, body, status, sync_state, priority, assignees_json, \
+          remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at) \
+         VALUES (?, 99, 'old', '', 'open', 'local_only', 'p3', '[]', NULL, NULL, NULL, 0, NULL, 'local_edit', ?)",
+    )
+    .bind(task.id.to_string())
+    .bind(domain_core::Timestamp::now().into_inner())
+    .execute(&db.writes)
+    .await
+    .unwrap();
+
+    let snaps = SqliteTaskSnapshotRepository::new(db);
+    let got = snaps.get(task.id, 99).await.unwrap();
+    assert_eq!(
+        got.filing_repo_id, None,
+        "a NULL/pre-column filing_repo_id must read back as None"
+    );
+}
+
 /// The same column must persist through `save_with_outbox`, which shares the
 /// `write_task_in_tx` write path with `save`.
 #[tokio::test]

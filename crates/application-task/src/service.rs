@@ -679,6 +679,16 @@ impl TaskService {
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
         let mut task = self.resolve_task(id).await?;
+        // Capture the live filing repo up front for the no-mismatch invariant
+        // (RFC 0002 #118/#120): rollback must NOT retarget it, so this value
+        // must survive the rollback unchanged (asserted below).
+        let task_filing_repo_id_before = task.filing_repo_id;
+        // Capture remote-backed state BEFORE `task.remote` is overwritten by the
+        // snapshot below. The invariant is about whether the task *was* remote-
+        // backed; using post-rollback `task.remote` would let a pre-promote
+        // target (remote = None) vacuously satisfy the assert and mask a future
+        // regression that retargets the filing repo.
+        let task_had_remote_before = task.remote.is_some();
         let snapshot = self.snapshots.get(task.id, to_version).await?;
         task.title = snapshot.title;
         task.body = snapshot.body;
@@ -697,6 +707,30 @@ impl TaskService {
         if snapshot.repo_id_recorded {
             task.repo_id = snapshot.repo_id;
         }
+        // RFC 0002 #118/#120 — chosen rollback rule: do NOT retarget
+        // `filing_repo_id` from the snapshot. The filing repo of a remote-backed
+        // task is IMMUTABLE post-promote, and D6 (#120) keys remote identity on
+        // `filing_repo_id` (it is the dedup key into `remote_mappings`).
+        // Restoring it from a possibly-pre-column snapshot could leave the live
+        // `filing_repo_id` disagreeing with the task's remote_mappings key —
+        // exactly the desync D6 forbids. So we deliberately leave the live
+        // `filing_repo_id` untouched on rollback (the inverse of the
+        // `repo_id_recorded`-guarded `repo_id` restore above). This is why the
+        // snapshot column has no `filing_repo_id_recorded` flag: nothing reads
+        // the snapshot's filing repo on the rollback path, so there is no
+        // pre-column ambiguity to disambiguate. (The documented-but-unimplemented
+        // alternative is to restore it AND add a `filing_repo_id_recorded`
+        // tolerance mirroring `repo_id_recorded`.)
+        //
+        // Invariant: a rollback must never leave a remote-backed task whose
+        // `filing_repo_id` disagrees with its remote identity. Since we don't
+        // touch `filing_repo_id` here, and a remote-backed task's filing repo is
+        // immutable, the live value still agrees with whatever it agreed with
+        // before the rollback.
+        debug_assert!(
+            !task_had_remote_before || task.filing_repo_id == task_filing_repo_id_before,
+            "rollback must not retarget the filing repo of a remote-backed task"
+        );
         task.reconcile_dirty_against_baseline();
         self.repo.save(&task, SnapshotSource::Rollback).await?;
         self.task_dto(&task).await
@@ -1539,6 +1573,76 @@ mod tests {
             "rollback must restore intentional None binding, got {:?}",
             rolled_back.repo_id
         );
+    }
+
+    #[tokio::test]
+    async fn rollback_does_not_retarget_filing_repo_id() {
+        // RFC 0002 #118/#120: the inverse of the repo_id precedent. A
+        // remote-backed task's filing repo is immutable post-promote and D6
+        // keys remote identity on it, so a rollback to an earlier snapshot
+        // (whose filing_repo_id differs / is NULL) must leave the LIVE
+        // filing_repo_id untouched — never desyncing it from the remote.
+        let repo: Arc<InMemoryTaskRepository> = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings_repo: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let svc = TaskService::new(
+            repo.clone(),
+            snaps,
+            bindings_repo.clone(),
+            Arc::new(InMemoryWorkspaceRepository::new()),
+            Arc::new(InMemoryProjectRepository::new()),
+        );
+
+        let workspace_id = WorkspaceId::new();
+        // Stand up a real binding so the post-rollback `task_dto` prefix lookup
+        // succeeds (the task stays bound to this repo throughout).
+        let binding = domain_repo::RepoBinding::new(
+            workspace_id,
+            "git@github.com:o/a.git".into(),
+            "github.com/o/a".into(),
+        )
+        .unwrap();
+        let logical_repo = binding.id;
+        bindings_repo.save(&binding).await.unwrap();
+        let filing_repo = domain_core::RepoId::new();
+
+        // v1: fresh draft, filing repo NOT yet resolved (None).
+        let mut task =
+            domain_task::Task::new_draft(workspace_id, Some(logical_repo), "tracked".into())
+                .unwrap();
+        repo.save(&task, SnapshotSource::Created).await.unwrap();
+
+        // v2: promote — the task becomes remote-backed, but the filing repo is
+        // still UNrecorded at this capture, so v2's snapshot has
+        // filing_repo_id = None (the "differs / NULL" rollback target that
+        // keeps the task remote-backed).
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        repo.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        // v3: record the filing repo on the live (remote-backed) task. The live
+        // filing_repo_id is now Some(filing_repo); v2's snapshot still has None.
+        task.set_filing_repo_id(Some(filing_repo)).unwrap();
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        // Rollback to v2 (snapshot filing_repo_id = None, task remote-backed).
+        // The live filing_repo_id must NOT be retargeted to None.
+        svc.rollback(&task.id.to_string(), 2).await.unwrap();
+        // Reload the persisted aggregate by its stable UUID and assert the live
+        // filing repo survived the rollback unchanged.
+        let reloaded = repo.get(task.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(filing_repo),
+            "rollback must NOT retarget the filing repo of a remote-backed task"
+        );
+        // And it still agrees with the remote-backed identity: the task is
+        // still remote-backed (v2 captured the remote) and its filing repo is
+        // the one recorded at promote — no desync from remote_mappings (D6).
+        assert!(reloaded.is_remote_backed());
     }
 
     // ---------- Stage 6 (#54): lifecycle enqueue matrix --------------------

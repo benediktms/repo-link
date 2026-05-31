@@ -82,6 +82,9 @@ impl InMemoryTaskRepository {
             remote: task.remote.clone(),
             repo_id: task.repo_id,
             repo_id_recorded: true,
+            // RFC 0002 #118: capture the filing repo for history/audit, matching
+            // the SQLite snapshot write. Not restored on rollback.
+            filing_repo_id: task.filing_repo_id,
             source,
             captured_at: Timestamp::now(),
         });

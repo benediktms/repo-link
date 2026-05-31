@@ -198,6 +198,11 @@ impl Task {
             repo_id: self.repo_id,
             // Fresh snapshots always record the binding (even if it's None).
             repo_id_recorded: true,
+            // Capture the resolved filing repo for history/audit (RFC 0002
+            // #118). It is NOT a dirty-detection input —
+            // `reconcile_dirty_against_baseline` never reads it — so recording
+            // it here can't flip sync state.
+            filing_repo_id: self.filing_repo_id,
             source,
             captured_at: Timestamp::now(),
         }
@@ -1038,6 +1043,49 @@ mod tests {
         let before = t.updated_at;
         t.set_filing_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
         assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn snapshot_view_captures_filing_repo_id() {
+        // RFC 0002 #118: a baseline-eligible snapshot carries the resolved
+        // filing repo so promote/push/pull/conflict/link history records it.
+        let mut t = draft();
+        // Fresh draft: filing repo unresolved → snapshot records None.
+        assert_eq!(
+            t.snapshot_view(SnapshotSource::Created).filing_repo_id,
+            None
+        );
+
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        let repo = RepoId::new();
+        t.set_filing_repo_id(Some(repo)).unwrap();
+        assert_eq!(
+            t.snapshot_view(SnapshotSource::Promote).filing_repo_id,
+            Some(repo),
+            "snapshot_view must capture the resolved filing repo"
+        );
+    }
+
+    #[test]
+    fn filing_repo_id_not_in_dirty_diff() {
+        // RFC 0002 #118: filing repo is history/audit only — recording it must
+        // NOT mark a Synced task DirtyLocal (it is excluded from
+        // reconcile_dirty_against_baseline).
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        t.set_filing_repo_id(Some(RepoId::new())).unwrap();
+        // A reconcile (driven here by a no-op body set) must leave it Synced.
+        let body = t.body.clone();
+        t.set_body(body);
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "recording the filing repo must not flip the task DirtyLocal"
+        );
     }
 
     #[test]

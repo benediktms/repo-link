@@ -86,6 +86,19 @@ pub struct TaskSnapshot {
     /// current binding). Always `true` for snapshots written after the
     /// column landed.
     pub repo_id_recorded: bool,
+    /// The task's **filing repo** (RFC 0002 #118) at the time of the snapshot —
+    /// where its backing GitHub issue is filed. History / audit only: captured
+    /// so promote / push / pull / conflict-resolve / link snapshots carry the
+    /// resolved filing repo. Deliberately EXCLUDED from dirty detection
+    /// (`Task::reconcile_dirty_against_baseline` never reads it) and NOT
+    /// restored on rollback — the filing repo of a remote-backed task is
+    /// immutable post-promote and D6 / #120 keys remote identity on it, so
+    /// `TaskService::rollback` leaves the live `filing_repo_id` untouched.
+    /// Because rollback never restores it, there is no rollback ambiguity to
+    /// disambiguate, so there is NO `filing_repo_id_recorded` companion flag
+    /// (unlike `repo_id_recorded`). Pre-column snapshot rows read back as
+    /// `None`.
+    pub filing_repo_id: Option<RepoId>,
     pub source: SnapshotSource,
     pub captured_at: Timestamp,
 }

@@ -18,7 +18,7 @@ impl SqliteTaskSnapshotRepository {
     }
 }
 
-pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, source, captured_at";
+pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at";
 
 #[async_trait]
 impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
@@ -66,6 +66,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
     let repo_id_raw: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
     let repo_id_recorded_raw: i64 = row.try_get("repo_id_recorded").map_err(map_sqlx_err)?;
+    let filing_repo_id_raw: Option<String> = row.try_get("filing_repo_id").map_err(map_sqlx_err)?;
     let source: String = row.try_get("source").map_err(map_sqlx_err)?;
     let captured_at: DateTime<Utc> = row.try_get("captured_at").map_err(map_sqlx_err)?;
 
@@ -76,6 +77,14 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         _ => None,
     };
     let repo_id = repo_id_raw
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<RepoId>())
+        .transpose()
+        .map_err(|e: domain_core::IdParseError| PortError::Backend(e.to_string()))?;
+    // RFC 0002 #118: history/audit only, NOT restored on rollback. Pre-column
+    // rows (added by 20260531000001) read back NULL/empty → None, tolerated via
+    // the same non-empty/parse path as `repo_id`.
+    let filing_repo_id = filing_repo_id_raw
         .filter(|s| !s.is_empty())
         .map(|s| s.parse::<RepoId>())
         .transpose()
@@ -96,6 +105,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         remote,
         repo_id,
         repo_id_recorded: repo_id_recorded_raw != 0,
+        filing_repo_id,
         source: enum_from_str::<SnapshotSource>("snapshot source", &source)?,
         captured_at: Timestamp::from_utc(captured_at),
     })
