@@ -17,6 +17,15 @@ pub struct Task {
     /// RFC 0002 introduces a separate filing-repo axis. `None` for an orphan
     /// task (a project-board draft with no repo).
     pub repo_id: Option<RepoId>,
+    /// The task's **filing repo** (RFC 0002): where its backing GitHub issue
+    /// is actually filed. Resolved and recorded at promote; `None` until then,
+    /// in which case the D2 resolution chain falls through to logical `repo_id`
+    /// so behaviour is unchanged. Distinct from `repo_id` (logical, where the
+    /// code lives) so the two can diverge. Internal axis (RFC 0002 D1/D5):
+    /// persisted and on the aggregate, but deliberately NOT on the task
+    /// DTO/JSON (the DTO guard is its own ticket, #119) and NOT a
+    /// dirty-detection input (excluded from `snapshot_view`, added in #118).
+    pub filing_repo_id: Option<RepoId>,
     pub title: String,
     pub body: String,
     pub status: TaskStatus,
@@ -81,6 +90,8 @@ impl Task {
             id: TaskId::new(),
             workspace_id,
             repo_id,
+            // Local draft: filing repo is unresolved until promote (D2).
+            filing_repo_id: None,
             title,
             body: String::new(),
             status: TaskStatus::Open,
@@ -127,6 +138,10 @@ impl Task {
             id: TaskId::new(),
             workspace_id,
             repo_id,
+            // An imported mirror already has a remote issue, and historically
+            // filing == logical, so record the filing repo as the logical one.
+            // This makes the written row agree with the D6 dedup lookup (#120).
+            filing_repo_id: repo_id,
             title,
             body,
             status: if closed {
@@ -490,6 +505,36 @@ impl Task {
             ));
         }
         self.repo_id = repo_id;
+        self.touch();
+        Ok(())
+    }
+
+    /// Record the task's **filing repo** (RFC 0002) — where its backing GitHub
+    /// issue is filed. Resolved at promote, i.e. set at the very moment the
+    /// task becomes remote-backed, so unlike [`Task::set_repo_id`] this must
+    /// permit the initial set even when `remote.is_some()`: a naive
+    /// reject-once-remote guard would reject the recording write itself.
+    ///
+    /// Contract: the initial set is allowed whenever `filing_repo_id` is
+    /// currently `None` (remote-backed or not); only a *change* of an
+    /// already-recorded value is rejected, because the backing issue already
+    /// lives in that repo and re-pointing it would orphan it. Setting the same
+    /// value is an idempotent no-op. Like the logical repo, the filing repo is
+    /// local sync/persistence metadata, NOT a mirrored field, so this does not
+    /// call [`Task::reconcile_dirty_against_baseline`].
+    pub fn set_filing_repo_id(&mut self, filing_repo_id: Option<RepoId>) -> Result<()> {
+        // Idempotent no-op, including re-recording the same value at promote.
+        if self.filing_repo_id == filing_repo_id {
+            return Ok(());
+        }
+        // Reject only a change of an already-recorded filing repo; the initial
+        // set (currently `None`) is always allowed, even once remote-backed.
+        if self.filing_repo_id.is_some() {
+            return Err(DomainError::validation(
+                "cannot change the filing repo of a task once it has been recorded",
+            ));
+        }
+        self.filing_repo_id = filing_repo_id;
         self.touch();
         Ok(())
     }
@@ -945,6 +990,74 @@ mod tests {
         let before = t.updated_at;
         t.set_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
         assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn set_filing_repo_id_records_on_local_task_without_dirtying() {
+        let mut t = draft();
+        assert_eq!(t.filing_repo_id, None);
+        let repo = RepoId::new();
+        t.set_filing_repo_id(Some(repo)).unwrap();
+        assert_eq!(t.filing_repo_id, Some(repo));
+        // Filing repo is local sync metadata, not a mirrored field.
+        assert_eq!(t.sync, SyncState::LocalOnly);
+    }
+
+    #[test]
+    fn set_filing_repo_id_allows_initial_set_when_remote_backed() {
+        // The load-bearing case: the filing repo is resolved and recorded AT
+        // promote, i.e. once the task is already remote-backed. The initial
+        // set (currently None) must therefore be allowed, and must not flip
+        // sync state — it isn't a remote-observable edit.
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert_eq!(t.filing_repo_id, None);
+        let repo = RepoId::new();
+        t.set_filing_repo_id(Some(repo)).unwrap();
+        assert_eq!(t.filing_repo_id, Some(repo));
+        assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn set_filing_repo_id_rejects_change_of_recorded_value() {
+        // Once recorded, the backing issue lives in that filing repo; changing
+        // it would orphan the issue, so a *change* is rejected.
+        let mut t = draft();
+        t.set_filing_repo_id(Some(RepoId::new())).unwrap();
+        let err = t.set_filing_repo_id(Some(RepoId::new())).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn set_filing_repo_id_idempotent_no_op() {
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_filing_repo_id(Some(repo)).unwrap();
+        let before = t.updated_at;
+        t.set_filing_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
+        assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn import_mirror_records_filing_repo_as_logical() {
+        // An imported mirror already has a remote issue and historically
+        // filing == logical, so the constructor records the filing repo as
+        // the logical one (keeps the written row in step with the D6 dedup).
+        let repo = RepoId::new();
+        let t = Task::import_mirror(
+            WorkspaceId::new(),
+            Some(repo),
+            remote_ref(),
+            "imported".into(),
+            String::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert_eq!(t.repo_id, Some(repo));
+        assert_eq!(t.filing_repo_id, Some(repo));
     }
 
     /// Mutating a `DirtyRemote` task is the textbook conflict case: remote

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use domain_core::{ProjectId, Timestamp, WorkspaceId};
+use domain_core::{ProjectId, RepoId, Timestamp, WorkspaceId};
 use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
 use ports::{PortError, PortResult, WorkspaceRepository};
 use sqlx::Row;
@@ -18,10 +18,8 @@ impl SqliteWorkspaceRepository {
     }
 }
 
-// `filing_repo_id` is listed here to satisfy the schema-consistency contract
-// (the const must name every live column, see #110) but is NOT yet read by
-// `row_to_workspace` — the domain `Workspace` gains the field in #116.
-// Selecting an unmapped column is harmless: extraction is by name.
+// Must name every live column (schema-consistency contract, see #110).
+// `filing_repo_id` is the RFC 0002 workspace default filing repo (#116).
 pub(crate) const WORKSPACE_COLS: &str =
     "id, name, description, status, local_only, created_at, updated_at, project_id, filing_repo_id";
 
@@ -30,14 +28,15 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     async fn save(&self, w: &Workspace) -> PortResult<()> {
         sqlx::query(
             r#"
-            INSERT INTO workspaces (id, name, description, status, local_only, project_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO workspaces (id, name, description, status, local_only, project_id, filing_repo_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
                 status = excluded.status,
                 local_only = excluded.local_only,
                 project_id = excluded.project_id,
+                filing_repo_id = excluded.filing_repo_id,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -47,6 +46,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         .bind(enum_to_str(&w.status)?)
         .bind(w.local_only as i64)
         .bind(w.project_id.as_ref().map(|p| p.as_str()))
+        .bind(w.filing_repo_id.map(|r| r.to_string()))
         .bind(w.created_at.into_inner())
         .bind(w.updated_at.into_inner())
         .execute(&self.db.writes)
@@ -118,6 +118,14 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         .transpose()
         .map_err(|e| PortError::Backend(format!("decode workspace.project_id: {e}")))?;
 
+    // RFC 0002 default filing repo (internal, #116). NULL = no default.
+    let filing_repo_id = row
+        .try_get::<Option<String>, _>("filing_repo_id")
+        .map_err(map_sqlx_err)?
+        .as_deref()
+        .map(|s| parse_uuid::<RepoId>("filing_repo_id", s))
+        .transpose()?;
+
     Ok(Workspace {
         id: parse_uuid::<WorkspaceId>("workspace_id", &id_str)?,
         name: WorkspaceName::new(&name_str)
@@ -126,6 +134,7 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         status: enum_from_str::<WorkspaceStatus>("workspace status", &status_str)?,
         local_only: local_only != 0,
         project_id,
+        filing_repo_id,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),
     })

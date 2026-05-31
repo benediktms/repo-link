@@ -1127,6 +1127,40 @@ async fn workspace_project_id_roundtrips() {
     );
 }
 
+/// RFC 0002 (#116): the workspace default `filing_repo_id` round-trips through
+/// `save` (insert) and the upsert DO-UPDATE half. NULL until set, then a repo
+/// id sticks.
+#[tokio::test]
+async fn workspace_filing_repo_id_roundtrips() {
+    let (_dir, ws, rb, _ts) = setup().await;
+
+    let mut workspace = Workspace::new(WorkspaceName::new("filing-ws").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    // Insert path: no default filing repo yet.
+    assert_eq!(
+        ws.get(workspace.id).await.unwrap().filing_repo_id,
+        None,
+        "no workspace default filing repo until one is set"
+    );
+
+    // Upsert path: set the default and re-save; the DO UPDATE must persist it.
+    workspace.filing_repo_id = Some(binding.id);
+    ws.save(&workspace).await.unwrap();
+    assert_eq!(
+        ws.get(workspace.id).await.unwrap().filing_repo_id,
+        Some(binding.id),
+        "workspace default filing repo round-trips through the upsert"
+    );
+}
+
 #[tokio::test]
 async fn task_remote_node_id_and_project_item_id_roundtrip() {
     let (_dir, ws, rb, ts) = setup().await;
@@ -1207,6 +1241,47 @@ async fn task_project_status_option_id_roundtrips_through_upsert() {
             .as_deref(),
         Some("o_done"),
         "a subsequent upsert overwrites the cached status"
+    );
+}
+
+/// RFC 0002 (#116): `filing_repo_id` round-trips through `write_task_in_tx` +
+/// `row_to_task` across the full upsert lifecycle — insert (None), then the
+/// promote-time recording write (None → Some, allowed even though the task is
+/// already remote-backed) through the DO-UPDATE half, then reload.
+#[tokio::test]
+async fn task_filing_repo_id_roundtrips_through_upsert() {
+    let (_dir, ws, rb, ts) = setup().await;
+
+    let workspace = Workspace::new(WorkspaceName::new("filing-task").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    // Insert: a fresh task has no resolved filing repo.
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "filing".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "1"))
+        .unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+    assert_eq!(
+        ts.get(task.id).await.unwrap().filing_repo_id,
+        None,
+        "fresh task has no resolved filing repo"
+    );
+
+    // Record the filing repo (the promote-time write: None → Some is allowed
+    // even once remote-backed) and upsert; the DO UPDATE must persist it.
+    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(task.id).await.unwrap().filing_repo_id,
+        Some(binding.id),
+        "DO UPDATE must persist the recorded filing repo on upsert"
     );
 }
 
