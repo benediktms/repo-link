@@ -84,3 +84,97 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
         updated_at: t.updated_at.into(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain_core::{RepoId, WorkspaceId};
+    use dto_shared::{CreateTaskCmd, ImportMirrorCmd, UpdateTaskCmd};
+
+    /// RFC 0002 D5 / #119: the filing repo is an INTERNAL axis. `task_to_dto`
+    /// is the single funnel for [`TaskDto`], so it must never leak
+    /// `filing_repo_id` onto the serialized DTO — only `repo_id` (the logical
+    /// axis) crosses the boundary. The test populates the domain task's
+    /// filing repo so it genuinely proves the mapping DROPS a *set* value,
+    /// not merely that it is `None`. A future contributor adding the field
+    /// "for symmetry" trips this guard.
+    #[test]
+    fn task_dto_json_omits_filing_repo_id_and_keeps_repo_id() {
+        let logical = RepoId::new();
+        let mut t = Task::new_draft(
+            WorkspaceId::new(),
+            Some(logical),
+            "guard the boundary".into(),
+        )
+        .unwrap();
+        // Set the INTERNAL axis to a *different* repo so the assertion proves
+        // task_to_dto drops a populated filing repo, not just a None.
+        t.set_filing_repo_id(Some(RepoId::new())).unwrap();
+
+        let dto = task_to_dto(&t, Some("rpl"));
+        let v = serde_json::to_value(&dto).unwrap();
+        let obj = v.as_object().expect("TaskDto serializes to a JSON object");
+
+        assert!(
+            !obj.contains_key("filing_repo_id"),
+            "TaskDto JSON must NOT carry the internal filing_repo_id axis (RFC 0002 D5, #119)"
+        );
+        assert_eq!(
+            obj.get("repo_id").and_then(|r| r.as_str()),
+            Some(logical.to_string().as_str()),
+            "TaskDto must still carry the logical repo_id"
+        );
+    }
+
+    /// RFC 0002 D5 / #119: the create/update/import command DTOs are part of
+    /// the consumer contract and must not carry the internal `filing_repo_id`
+    /// axis either. NOTE for the later CLI ticket: the per-task `--filing-repo`
+    /// override lands on [`CreateTaskCmd`] as its OWN distinct input field — it
+    /// is NEVER named `filing_repo_id`, so this guard stays valid; when that
+    /// ticket lands it should only revisit the CreateTaskCmd line below if it
+    /// chooses that key name (it must not).
+    #[test]
+    fn cmd_dtos_json_omit_filing_repo_id() {
+        let create = CreateTaskCmd {
+            workspace_id: WorkspaceId::new().to_string(),
+            repo_id: Some(RepoId::new().to_string()),
+            title: "t".into(),
+            body: None,
+            priority: None,
+        };
+        let update = UpdateTaskCmd {
+            task_id: "rpl-abc".into(),
+            title: Some("t".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: Some(RepoId::new().to_string()),
+        };
+        let import = ImportMirrorCmd {
+            workspace_id: WorkspaceId::new().to_string(),
+            repo_id: Some(RepoId::new().to_string()),
+            provider: "github".into(),
+            remote_id: "org/repo#1".into(),
+            title: "t".into(),
+            body: String::new(),
+            assignees: vec![],
+            closed: false,
+        };
+
+        for (name, v) in [
+            ("CreateTaskCmd", serde_json::to_value(&create).unwrap()),
+            ("UpdateTaskCmd", serde_json::to_value(&update).unwrap()),
+            ("ImportMirrorCmd", serde_json::to_value(&import).unwrap()),
+        ] {
+            let obj = v.as_object().expect("command DTO is a JSON object");
+            assert!(
+                !obj.contains_key("filing_repo_id"),
+                "{name} JSON must NOT carry the internal filing_repo_id axis (RFC 0002 D5, #119)"
+            );
+            assert!(
+                obj.contains_key("repo_id"),
+                "{name} must still carry the logical repo_id"
+            );
+        }
+    }
+}
