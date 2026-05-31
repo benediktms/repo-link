@@ -683,6 +683,12 @@ impl TaskService {
         // (RFC 0002 #118/#120): rollback must NOT retarget it, so this value
         // must survive the rollback unchanged (asserted below).
         let task_filing_repo_id_before = task.filing_repo_id;
+        // Capture remote-backed state BEFORE `task.remote` is overwritten by the
+        // snapshot below. The invariant is about whether the task *was* remote-
+        // backed; using post-rollback `task.remote` would let a pre-promote
+        // target (remote = None) vacuously satisfy the assert and mask a future
+        // regression that retargets the filing repo.
+        let task_had_remote_before = task.remote.is_some();
         let snapshot = self.snapshots.get(task.id, to_version).await?;
         task.title = snapshot.title;
         task.body = snapshot.body;
@@ -722,7 +728,7 @@ impl TaskService {
         // immutable, the live value still agrees with whatever it agreed with
         // before the rollback.
         debug_assert!(
-            task.remote.is_none() || task.filing_repo_id == task_filing_repo_id_before,
+            !task_had_remote_before || task.filing_repo_id == task_filing_repo_id_before,
             "rollback must not retarget the filing repo of a remote-backed task"
         );
         task.reconcile_dirty_against_baseline();
