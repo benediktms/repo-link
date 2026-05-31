@@ -4,8 +4,11 @@
 //!
 //! Idempotency contract (matches plan §"Idempotency contract"):
 //! - `install`: write the plist only when bytes differ from what's on disk;
-//!   then `bootout` (tolerating "not loaded") + `bootstrap` + `enable`. So
-//!   re-running install picks up template changes without producing errors.
+//!   then `bootout` (tolerating "not loaded") + `enable` + `bootstrap`. enable
+//!   must precede bootstrap: a label left *disabled* (e.g. by a prior
+//!   `launchctl bootout`/disable) makes bootstrap fail with errno 5, so we
+//!   clear the disabled state first. So re-running install picks up template
+//!   changes — and repairs a disabled unit — without producing errors.
 //! - `uninstall`: `bootout` (tolerating "not loaded") + delete the plist
 //!   (tolerating "not present"). Safe on a fresh checkout.
 
@@ -44,10 +47,17 @@ pub(super) fn install(
     if let LaunchOutcome::Failed { code, stderr } = &bootout {
         return Err(anyhow!("launchctl bootout failed (exit {code}): {stderr}"));
     }
-    let bootstrap = launcher.run(&["launchctl", "bootstrap", &domain, &manifest_str])?;
-    require_success("launchctl bootstrap", &bootstrap)?;
+    // enable BEFORE bootstrap. A label left *disabled* — by a prior
+    // `launchctl bootout`/disable, or a crashed earlier unit — makes
+    // `bootstrap` fail with errno 5 ("Input/output error" / "unit is not
+    // registered"). `enable` clears the disabled-state override and is safe
+    // regardless of load state, so it must run first; otherwise `install`
+    // (and `just install`) can't recover a disabled unit. Mirrors `start`,
+    // which already enables before bootstrap.
     let enable = launcher.run(&["launchctl", "enable", &label_target])?;
     require_success("launchctl enable", &enable)?;
+    let bootstrap = launcher.run(&["launchctl", "bootstrap", &domain, &manifest_str])?;
+    require_success("launchctl bootstrap", &bootstrap)?;
 
     Ok(InstallOutcome {
         label: DAEMON_LABEL,
