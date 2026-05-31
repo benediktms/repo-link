@@ -1,0 +1,35 @@
+-- RFC 0002 #118 — capture the resolved *filing* repo in snapshot history so
+-- promote / push / pull / conflict-resolve / link snapshots carry the filing
+-- repo alongside the logical `repo_id` already recorded by
+-- 20260528000002_snapshot_add_repo_id.sql. History/audit only: NOT a
+-- dirty-detection input and (unlike `repo_id`) NOT restored on rollback.
+--
+-- PLAIN ADDITIVE NULLABLE COLUMN ON THE LEAF `task_snapshots` TABLE — no FK,
+-- no rebuild. We would prefer a real FK with ON DELETE SET NULL, but SQLite
+-- cannot `ALTER TABLE ... ADD COLUMN ... REFERENCES`, so an FK would force the
+-- rename-copy-drop table rebuild. That rebuild is UNSAFE here: sqlx-sqlite
+-- ALWAYS wraps a migration in a transaction and IGNORES the `-- no-transaction`
+-- marker (honored only by the Postgres/MySQL drivers), so `PRAGMA
+-- foreign_keys = OFF` is a no-op inside the forced transaction. With
+-- foreign_keys = ON (set on the pool in pool.rs), dropping a PARENT table
+-- CASCADE-deletes its children. `task_snapshots` is a LEAF (only `tasks`
+-- references it; nothing references `task_snapshots`), so a plain ADD COLUMN is
+-- additive, non-destructive, preserves every row / index / constraint, and runs
+-- cleanly inside the forced transaction.
+--
+-- Existing rows read back NULL — the filing repo was not recorded at capture
+-- time. `row_to_snapshot` and `load_latest_baseline` tolerate that via the same
+-- non-empty / parse path they use for `repo_id` (NULL/empty → None).
+--
+-- NO `_recorded` FLAG (deliberately unlike `repo_id_recorded`): the
+-- `repo_id_recorded` flag exists only because rollback RESTORES `repo_id` and
+-- must tell "intentionally unbound" from "pre-column / unknown". Rollback does
+-- NOT restore `filing_repo_id` (TaskService::rollback leaves it untouched —
+-- the filing repo of a remote-backed task is immutable post-promote and D6 /
+-- #120 keys remote identity on it), so there is no rollback ambiguity to
+-- disambiguate and no flag is needed.
+--
+-- Do NOT edit the shipped 20260530000001_add_filing_repo_id.sql (that targets
+-- tasks + workspaces); this is a separate forward file targeting task_snapshots.
+
+ALTER TABLE task_snapshots ADD COLUMN filing_repo_id TEXT;
