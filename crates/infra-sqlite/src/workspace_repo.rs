@@ -18,8 +18,12 @@ impl SqliteWorkspaceRepository {
     }
 }
 
+// `filing_repo_id` is listed here to satisfy the schema-consistency contract
+// (the const must name every live column, see #110) but is NOT yet read by
+// `row_to_workspace` — the domain `Workspace` gains the field in #116.
+// Selecting an unmapped column is harmless: extraction is by name.
 pub(crate) const WORKSPACE_COLS: &str =
-    "id, name, description, status, local_only, created_at, updated_at, project_id";
+    "id, name, description, status, local_only, created_at, updated_at, project_id, filing_repo_id";
 
 #[async_trait]
 impl WorkspaceRepository for SqliteWorkspaceRepository {

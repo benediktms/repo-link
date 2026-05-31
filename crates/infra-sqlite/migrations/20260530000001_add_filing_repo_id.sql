@@ -1,0 +1,51 @@
+-- RFC 0002 §3 — split the single repo axis into a *logical* repo (`repo_id`,
+-- unchanged) and a *filing* repo (`filing_repo_id`, new). Adds the column to
+-- two tables:
+--
+--   * `workspaces.filing_repo_id` — the workspace's DEFAULT filing repo. New
+--     column; supersedes RFC 0001's deferred-and-never-shipped
+--     `creation_default_repo_id` (nothing to repurpose in place — that column
+--     was never created).
+--   * `tasks.filing_repo_id` — the RESOLVED filing repo, recorded on promote.
+--     `repo_id` (logical) is untouched.
+--
+-- Scope is deliberately NARROW (see the #115 ticket): both columns ship
+-- NULLABLE and UN-BACKFILLED. RFC §3's backfill of `filing_repo_id = repo_id`
+-- for already-synced tasks (`remote_id` non-NULL) is split into the D6 ticket
+-- (#120) so it lands atomically with the remote-identity re-key. With both
+-- columns NULL, the D2 resolution chain falls through to `repo_id` (step 3),
+-- so runtime behaviour is byte-for-byte identical to today. `remote_mappings`
+-- is intentionally NOT touched here (also D6).
+--
+-- NO FOREIGN KEY — WHY THE PLAIN ADD COLUMN, not a rebuild:
+-- We would prefer a real FK with ON DELETE SET NULL (matching `tasks.repo_id`),
+-- but SQLite cannot `ALTER TABLE ... ADD COLUMN ... REFERENCES`, so a real FK
+-- would force the rename-copy-drop table rebuild. That rebuild is UNSAFE under
+-- sqlx-sqlite on a populated DB, and not in a way we can work around:
+--
+--   * `tasks` and `workspaces` are PARENT tables. With foreign_keys = ON (set
+--     on the pool in pool.rs), `DROP TABLE` does an implicit DELETE that
+--     CASCADES to every child (task_snapshots, task_relations, task_comments,
+--     remote_mappings, outbox_entries — and, via workspaces, tasks itself).
+--   * The usual escape — `PRAGMA foreign_keys = OFF` around the rebuild — is a
+--     no-op inside a transaction, and sqlx-sqlite 0.8.x ALWAYS wraps a
+--     migration in a transaction: its `Migrate::apply` calls `self.begin()`
+--     unconditionally and ignores the `-- no-transaction` marker (that marker
+--     is honored only by the Postgres/MySQL drivers). So the PRAGMA can never
+--     take hold during a migration, and a parent-table DROP always cascades.
+--
+-- A plain ADD COLUMN sidesteps all of this: it is additive, non-destructive,
+-- preserves every child row / index / constraint, and runs cleanly inside the
+-- forced transaction. The ON DELETE SET NULL semantics RFC §3 wants are instead
+-- enforced in application code at the repo-unbind / repo-delete sites (the
+-- handful of places that detach a binding null out any `filing_repo_id` that
+-- pointed at it). Both columns are plain nullable TEXT holding a repo id.
+
+-- workspaces.filing_repo_id — workspace default filing repo. NULL = no default;
+-- resolution falls through to the task's logical repo (D2 step 3).
+ALTER TABLE workspaces ADD COLUMN filing_repo_id TEXT;
+
+-- tasks.filing_repo_id — resolved filing repo, recorded on promote. NULL for
+-- every existing row here (no backfill — that is D6 / #120). NULL means
+-- "not yet resolved", so the D2 chain resolves it at promote time.
+ALTER TABLE tasks ADD COLUMN filing_repo_id TEXT;
