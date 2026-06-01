@@ -73,6 +73,12 @@ rl query unsynced -w $WS    # local changes not yet pushed to GitHub
 - **Repo binding** — a GitHub repo attached to a workspace, with a short
   cosmetic **prefix** (e.g. `rpl`) and optional human-friendly **aliases**.
   The prefix doubles as a globally-unique repo locator.
+- **Logical vs filing repo** — a task's **logical repo** (`repo_id`) owns its
+  worktrees, prefix, and friendly-ID identity; its **filing repo** is where the
+  backing GitHub issue is created. Usually identical, but a workspace can file
+  issues in a dedicated issues-repo (`rl workspace set-filing-repo`). The filing
+  repo is resolved and recorded at promote; only `repo_id` is exposed on task
+  JSON. See [`0002-task-repo-axes.md`](docs/rfcs/0002-task-repo-axes.md).
 - **Worktree link** — a filesystem path linked to a repo binding so `rl`
   commands can resolve workspace context from `cwd`.
 - **Task** — a unit of work owned by a workspace. Its `id` renders as a
