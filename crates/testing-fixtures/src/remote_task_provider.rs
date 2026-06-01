@@ -14,6 +14,7 @@ use ports::{
 /// One recorded `update_remote`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordedUpdate {
+    pub canonical_repo: String,
     pub remote_id: String,
     pub title: Option<String>,
     pub body: Option<String>,
@@ -73,6 +74,7 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
             return Err(PortError::Backend("stub: update_remote transient".into()));
         }
         self.updates.lock().unwrap().push(RecordedUpdate {
+            canonical_repo: cmd.canonical_repo.into(),
             remote_id: cmd.remote_id.into(),
             title: cmd.title.map(str::to_owned),
             body: cmd.body.map(str::to_owned),
