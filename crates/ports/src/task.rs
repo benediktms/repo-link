@@ -123,10 +123,14 @@ pub trait TaskRepository: Send + Sync {
     /// [`save_many`]: Self::save_many
     /// [`save_with_outbox`]: Self::save_with_outbox
     ///
-    /// The default implementation is **not** atomic — it loops `save` then
-    /// enqueues separately, the tear-prone shape the dedicated method exists to
-    /// replace. Provided only so test doubles needn't reimplement it; any
-    /// adapter backed by real storage MUST override it with one transaction.
+    /// The default implementation is **not** atomic and, having no outbox
+    /// handle, **drops `entries` entirely** — it persists the task rows and
+    /// returns `Ok(())` without enqueuing anything (the same best-effort
+    /// fallback as the [`save_with_outbox`] default). It exists ONLY so test
+    /// doubles that never exercise the combined path needn't reimplement it; any
+    /// adapter backed by real storage MUST override it with one transaction that
+    /// writes the tasks AND the entries, or relation-sync mutations are silently
+    /// lost (they have no dirty-detection backstop to re-enqueue them).
     async fn save_many_with_outbox(
         &self,
         tasks: &[(&Task, SnapshotSource)],
@@ -135,7 +139,7 @@ pub trait TaskRepository: Send + Sync {
         for (task, source) in tasks {
             self.save(task, *source).await?;
         }
-        let _ = entries;
+        let _ = entries; // dropped: no outbox handle here — real adapters override
         Ok(())
     }
     async fn get(&self, id: TaskId) -> PortResult<Task>;

@@ -165,6 +165,11 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
         child_canonical: &str,
         child_remote_id: &str,
     ) -> PortResult<()> {
+        if self.should_fail() {
+            return Err(PortError::Backend(
+                "stub: remove_sub_issue transient".into(),
+            ));
+        }
         self.record_relation(
             "remove_sub_issue",
             parent_canonical,
@@ -202,6 +207,11 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
         blocker_canonical: &str,
         blocker_remote_id: &str,
     ) -> PortResult<()> {
+        if self.should_fail() {
+            return Err(PortError::Backend(
+                "stub: remove_blocked_by transient".into(),
+            ));
+        }
         self.record_relation(
             "remove_blocked_by",
             blocked_canonical,
