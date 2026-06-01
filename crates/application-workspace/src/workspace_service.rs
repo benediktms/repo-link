@@ -260,6 +260,37 @@ impl WorkspaceService {
         Ok(workspace_to_dto(&w))
     }
 
+    /// Attach (`Some`) or clear (`None`) the workspace's default filing repo.
+    ///
+    /// `repo_id` is the **pre-resolved binding UUID string** (resolved in the
+    /// CLI dispatch layer via `resolve_repo_handle_required`, exactly as
+    /// `task create` / `task edit` resolve `--repo`). This keeps
+    /// `WorkspaceService` free of a `RepoBindingRepository` dependency and
+    /// inherits the ambiguous-candidates + exit-2 UX for free.
+    ///
+    /// **Deliberate divergences from `set_project`:**
+    ///
+    /// * Reassignment of an already-set default **is allowed** — the default is
+    ///   forward-looking: only tasks resolved *after* the change are affected.
+    ///   Already-recorded `tasks.filing_repo_id` values are authoritative (D2
+    ///   never re-resolves), so there is no stale-id problem and no need for a
+    ///   reassignment guard.
+    /// * **No eager backfill** — filing is recorded on promote, not eagerly like
+    ///   `set_project`'s board backfill. So this method is a plain
+    ///   load-flip-save and works on a bare `WorkspaceService::new` (no
+    ///   outbox / tasks / projects handles required).
+    pub async fn set_filing_repo(
+        &self,
+        workspace_id: &str,
+        repo_id: Option<&str>,
+    ) -> Result<WorkspaceDto> {
+        let id: WorkspaceId = workspace_id.parse()?;
+        let mut w = self.repo.get(id).await?;
+        w.filing_repo_id = repo_id.map(str::parse).transpose()?;
+        self.repo.save(&w).await?;
+        Ok(workspace_to_dto(&w))
+    }
+
     /// Resolve a `<project-spec>` to a `ProjectId`. Centralised here so the
     /// CLI and service share one form. `owner/number` falls through to a
     /// `list_all` scan because projects have no `UNIQUE(owner, number)` —
@@ -810,6 +841,93 @@ mod tests {
             1,
             "only the active (Open) task is back-filled; Done/Archived skipped"
         );
+    }
+
+    // ---------- set_filing_repo (RFC 0002 §4 / GitHub #121) ----------------
+
+    #[tokio::test]
+    async fn set_filing_repo_records_default_and_surfaces_on_dto() {
+        // A bare WorkspaceService::new suffices — no projects/outbox wired.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let svc = WorkspaceService::new(workspaces.clone());
+
+        let ws = Workspace::new(WorkspaceName::new("r").unwrap(), None, true);
+        let ws_id = ws.id.to_string();
+        workspaces.save(&ws).await.unwrap();
+
+        // Use a valid UUID as the pre-resolved binding id.
+        let repo_uuid = domain_core::RepoId::new().to_string();
+        let dto = svc.set_filing_repo(&ws_id, Some(&repo_uuid)).await.unwrap();
+        assert_eq!(
+            dto.filing_repo_id.as_deref(),
+            Some(repo_uuid.as_str()),
+            "filing_repo_id must appear on the returned WorkspaceDto"
+        );
+
+        // Reload and verify persistence.
+        let reloaded = svc.show(&ws_id).await.unwrap();
+        assert_eq!(reloaded.filing_repo_id, dto.filing_repo_id);
+    }
+
+    #[tokio::test]
+    async fn set_filing_repo_none_clears_the_default() {
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let svc = WorkspaceService::new(workspaces.clone());
+
+        let ws = Workspace::new(WorkspaceName::new("r2").unwrap(), None, true);
+        let ws_id = ws.id.to_string();
+        workspaces.save(&ws).await.unwrap();
+
+        let repo_uuid = domain_core::RepoId::new().to_string();
+        svc.set_filing_repo(&ws_id, Some(&repo_uuid)).await.unwrap();
+
+        let cleared = svc.set_filing_repo(&ws_id, None).await.unwrap();
+        assert!(
+            cleared.filing_repo_id.is_none(),
+            "passing None must clear the default"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_filing_repo_reassignment_succeeds() {
+        // Unlike set_project, reassigning Some(a) -> Some(b) is ALLOWED.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let svc = WorkspaceService::new(workspaces.clone());
+
+        let ws = Workspace::new(WorkspaceName::new("r3").unwrap(), None, true);
+        let ws_id = ws.id.to_string();
+        workspaces.save(&ws).await.unwrap();
+
+        let repo_a = domain_core::RepoId::new().to_string();
+        let repo_b = domain_core::RepoId::new().to_string();
+
+        svc.set_filing_repo(&ws_id, Some(&repo_a)).await.unwrap();
+        let dto = svc
+            .set_filing_repo(&ws_id, Some(&repo_b))
+            .await
+            .expect("reassignment of an already-set default must succeed");
+        assert_eq!(
+            dto.filing_repo_id.as_deref(),
+            Some(repo_b.as_str()),
+            "dto must reflect the new (B) binding after reassignment"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_filing_repo_works_on_bare_service_without_projects_or_outbox() {
+        // Filing needs no projects / outbox / tasks — WorkspaceService::new suffices.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let svc = WorkspaceService::new(workspaces.clone());
+
+        let ws = Workspace::new(WorkspaceName::new("r4").unwrap(), None, true);
+        let ws_id = ws.id.to_string();
+        workspaces.save(&ws).await.unwrap();
+
+        let repo_uuid = domain_core::RepoId::new().to_string();
+        // Must not panic or return an error because projects/outbox are None.
+        svc.set_filing_repo(&ws_id, Some(&repo_uuid))
+            .await
+            .expect("set_filing_repo must work on a bare WorkspaceService::new");
     }
 
     #[tokio::test]

@@ -15,6 +15,12 @@ pub struct WorkspaceDto {
     /// the existing local-only shape unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// The workspace's default filing repo binding UUID (RFC 0002 D2 step-2).
+    /// Workspace config — distinct from the D5-protected per-TASK filing axis
+    /// which is never surfaced. Omitted from JSON when unset so existing
+    /// workspaces serialise unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filing_repo_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

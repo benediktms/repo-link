@@ -21,9 +21,10 @@ pub struct Workspace {
     /// backing GitHub issue is filed when nothing more specific applies. New
     /// and additive — supersedes RFC 0001's deferred `creation_default_repo_id`.
     /// `None` means "no default", and the D2 resolution chain falls through to
-    /// the task's logical `repo_id`, so behaviour is unchanged. Internal: this
-    /// is consumed by the promote/sync path, not surfaced on the workspace DTO.
-    /// Set via the `workspace set-filing-repo` CLI (#121, gated behind D6).
+    /// the task's logical `repo_id`, so behaviour is unchanged. Surfaced on
+    /// `WorkspaceDto` as workspace config (set via `rl workspace set-filing-repo`
+    /// per RFC 0002 §4, GitHub #121); distinct from the D5-protected per-TASK
+    /// filing axis which is never surfaced on the task boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filing_repo_id: Option<RepoId>,
     pub created_at: Timestamp,

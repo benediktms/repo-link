@@ -135,6 +135,27 @@ pub(crate) enum WorkspaceCmd {
         #[arg(long)]
         none: bool,
     },
+    /// Set (or clear) the workspace's default filing repo — where a task's
+    /// backing GitHub issue is filed when no per-task override applies
+    /// (RFC 0002 §4 / D2 step-2). The final home for this setting is
+    /// `repo-link.toml` (GitHub #91, blocked by the epic); this verb is
+    /// the interim CLI surface.
+    ///
+    /// `<repo>` resolves the same way `--repo` does: UUID, short prefix,
+    /// name, or alias. Ambiguous matches exit 2 with a candidate list.
+    /// Reassigning an already-set default is permitted (forward-looking;
+    /// per-task `filing_repo_id` values are never retargeted).
+    SetFilingRepo {
+        workspace: String,
+        /// Repo binding handle (UUID / prefix / name / alias).
+        /// Mutually exclusive with `--none`.
+        #[arg(long, conflicts_with = "none")]
+        repo: Option<String>,
+        /// Clear the workspace filing-repo default. Mutually exclusive with
+        /// `--repo`.
+        #[arg(long)]
+        none: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
