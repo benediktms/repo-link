@@ -2016,3 +2016,237 @@ async fn enqueue_if_absent_dedupes_against_non_terminal_and_failed_siblings() {
         "a succeeded sibling does not block a fresh insert"
     );
 }
+
+// ---- RFC 0002 migration-sequence integrity (#126) ---------------------------
+//
+// Ticket #126 owns the cross-cutting verification for the three RFC 0002
+// migrations: 20260530000001 (add_filing_repo_id), 20260531000001
+// (snapshot_add_filing_repo_id), and 20260601000001 (remote_mappings_rekey_filing
+// — the D6 leaf-table rebuild + the section-3 backfill).
+//
+// The load-bearing hazard is the D6 rebuild's data-copy:
+//
+//     INSERT INTO remote_mappings_new (...)
+//     SELECT m.task_id, COALESCE(t.filing_repo_id, t.repo_id, ''), ...
+//     FROM remote_mappings m JOIN tasks t ON t.id = m.task_id;
+//
+// To exercise it, rows must already exist in `remote_mappings` BEFORE D6 runs.
+// `setup_with_db()` / `open_from_path` apply ALL migrations (including D6)
+// before any seed is possible, so a seed there is copied through an empty
+// table: the rebuild's SELECT runs against zero rows and the test would pass
+// even if the rebuild dropped everything (an earlier post-seed version of this
+// test did exactly that — it still passed with `WHERE 1=0` injected into the
+// data-copy). Instead we drive the embedded migrator manually: apply every
+// migration with version < D6, seed `remote_mappings` against the pre-D6
+// (repo_id-keyed) schema, then apply D6 and assert the rows survived the
+// rebuild with the correct re-keyed value. A regression that drops or mis-keys
+// the copy fails this test.
+
+/// Column names of `table` via PRAGMA — used to assert schema shape.
+async fn column_names(pool: &sqlx::SqlitePool, table: &str) -> Vec<String> {
+    sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "name"))
+        .collect()
+}
+
+/// RFC 0002 #126 — D6 rebuild data-integrity, exercised ACROSS the rebuild.
+///
+/// Seeds two remote-backed tasks BEFORE the D6 migration applies: one filed in
+/// its own logical repo, and one CROSS-FILED (logical `repo-1`, filing
+/// `repo-2`). After D6 runs, both `remote_mappings` rows must survive the
+/// `INSERT...SELECT...JOIN` data-copy, the cross-filed row's key must be the
+/// FILING repo (`COALESCE(filing_repo_id, repo_id)`), and `tasks.filing_repo_id`
+/// must be backfilled for the row that had none. Also asserts the re-keyed
+/// UNIQUE shape, the additive #115/#118 columns, and FK integrity.
+#[tokio::test]
+async fn rfc0002_migration_sequence_data_integrity() {
+    // The D6 migration version (filename prefix 20260601000001).
+    const D6_VERSION: i64 = 20260601000001;
+    const TS: &str = "2026-01-01T00:00:00Z";
+
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("d6-audit.db").display());
+    let pool = infra_sqlite::open_write_pool(&url)
+        .await
+        .expect("open write pool (no migrations yet)");
+
+    let migrator = sqlx::migrate!("./migrations");
+
+    // (1) Apply every migration up to — but NOT including — the D6 rebuild.
+    // remote_mappings is still keyed on repo_id (the 20260527 schema) and
+    // tasks.filing_repo_id exists (added by #115) but is unset.
+    for m in migrator.iter() {
+        if m.version < D6_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("pre-D6 migration {} failed: {e}", m.version));
+        }
+    }
+
+    // Sanity: we really are on the PRE-D6 schema (mapping keyed on repo_id), so
+    // the survival assertions below genuinely test the rebuild's data-copy.
+    let pre = column_names(&pool, "remote_mappings").await;
+    assert!(
+        pre.contains(&"repo_id".to_string()) && !pre.contains(&"filing_repo_id".to_string()),
+        "pre-D6 remote_mappings must be keyed on repo_id; got {pre:?}"
+    );
+
+    // (2) Seed against the pre-D6 schema with raw SQL — the repositories write
+    // the post-D6 remote_mappings shape, so they cannot seed the old columns.
+    // task-a: filed in its logical repo, filing_repo_id NULL (backfill target).
+    // task-b: CROSS-FILED — logical repo-1, filing repo-2 already recorded.
+    // task-c: local-only, no remote mapping — exists purely so the UNIQUE
+    //   subtest below has a valid FK target (see that assertion for why).
+    sqlx::raw_sql(&format!(
+        "INSERT INTO workspaces (id, name, status, local_only, created_at, updated_at)
+           VALUES ('ws-1', 'd6-audit', 'created', 1, '{TS}', '{TS}');
+         INSERT INTO repos (id, workspace_id, remote_url, canonical_url, created_at, updated_at)
+           VALUES ('repo-1', 'ws-1', 'git@github.com:o/logical.git', 'github.com/o/logical', '{TS}', '{TS}'),
+                  ('repo-2', 'ws-1', 'git@github.com:o/filing.git',  'github.com/o/filing',  '{TS}', '{TS}');
+         INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, remote_provider, remote_id, filing_repo_id, created_at, updated_at)
+           VALUES ('task-a', 'ws-1', 'repo-1', 'same-filed',  '', 'done', 'synced',     'p2', 'github', '42', NULL,     '{TS}', '{TS}'),
+                  ('task-b', 'ws-1', 'repo-1', 'cross-filed', '', 'done', 'synced',     'p2', 'github', '77', 'repo-2', '{TS}', '{TS}'),
+                  ('task-c', 'ws-1', 'repo-1', 'no-mapping',  '', 'open', 'local_only', 'p2', NULL,     NULL, NULL,     '{TS}', '{TS}');
+         INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id)
+           VALUES ('task-a', 'repo-1', 'github', '42'),
+                  ('task-b', 'repo-1', 'github', '77');"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed pre-D6 workspace/repos/tasks/remote_mappings");
+
+    // (3) Apply D6 and anything after it, leaving the schema current.
+    for m in migrator.iter() {
+        if m.version >= D6_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("D6+ migration {} failed: {e}", m.version));
+        }
+    }
+
+    // --- (a) Both rows survived the rebuild's INSERT...SELECT...JOIN. The old
+    // post-seed test could not make this assertion: a data-copy that drops or
+    // fails to carry rows (e.g. `WHERE 1=0`) fails HERE.
+    let (mapping_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM remote_mappings")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        mapping_count, 2,
+        "both pre-D6 remote_mappings rows must survive the D6 rebuild"
+    );
+
+    // --- (b) The cross-filed row is re-keyed to the FILING repo, not logical.
+    // Catches a rebuild that keyed on repo_id instead of
+    // COALESCE(filing_repo_id, repo_id).
+    let (b_key,): (String,) =
+        sqlx::query_as("SELECT filing_repo_id FROM remote_mappings WHERE task_id = 'task-b'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        b_key, "repo-2",
+        "cross-filed mapping must key on the FILING repo (COALESCE), not logical repo-1"
+    );
+    let (a_key,): (String,) =
+        sqlx::query_as("SELECT filing_repo_id FROM remote_mappings WHERE task_id = 'task-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        a_key, "repo-1",
+        "same-filed mapping keys on the backfilled logical repo"
+    );
+
+    // --- (c) Section-3 backfill: set tasks.filing_repo_id where NULL, and leave
+    // an already-diverged value untouched.
+    let (a_task,): (Option<String>,) =
+        sqlx::query_as("SELECT filing_repo_id FROM tasks WHERE id = 'task-a'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        a_task.as_deref(),
+        Some("repo-1"),
+        "backfill must set tasks.filing_repo_id = repo_id for a remote-backed row that had none"
+    );
+    let (b_task,): (Option<String>,) =
+        sqlx::query_as("SELECT filing_repo_id FROM tasks WHERE id = 'task-b'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        b_task.as_deref(),
+        Some("repo-2"),
+        "backfill must NOT overwrite an already-diverged filing_repo_id"
+    );
+
+    // --- (d) remote_mappings now carries filing_repo_id and dropped repo_id,
+    // and the re-keyed UNIQUE(filing_repo_id, provider, remote_id) is enforced.
+    let cols = column_names(&pool, "remote_mappings").await;
+    assert!(
+        cols.contains(&"filing_repo_id".to_string()),
+        "remote_mappings must have filing_repo_id after D6; got {cols:?}"
+    );
+    assert!(
+        !cols.contains(&"repo_id".to_string()),
+        "remote_mappings must NOT retain repo_id after D6; got {cols:?}"
+    );
+    // Use task-c's id: it is a real tasks row (FK satisfied) with no existing
+    // mapping, so ONLY the UNIQUE(filing_repo_id, provider, remote_id) clause
+    // can fail here. A non-existent task_id would also trip the task_id FK, and
+    // "FOREIGN KEY constraint failed" contains "constraint" — the assertion
+    // would then pass even if the UNIQUE clause were missing.
+    let dup = sqlx::query(
+        "INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id) \
+         VALUES ('task-c', 'repo-1', 'github', '42')",
+    )
+    .execute(&pool)
+    .await;
+    let err =
+        dup.expect_err("a duplicate (filing_repo_id, provider, remote_id) must violate UNIQUE");
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("unique"),
+        "expected a UNIQUE constraint violation specifically, got: {err}"
+    );
+
+    // --- (e) Additive nullable columns from #115 / #118.
+    for (table, col) in &[
+        ("workspaces", "filing_repo_id"),
+        ("tasks", "filing_repo_id"),
+        ("task_snapshots", "filing_repo_id"),
+    ] {
+        let tcols = column_names(&pool, table).await;
+        assert!(
+            tcols.contains(&col.to_string()),
+            "{table} must have the additive {col} column; got {tcols:?}"
+        );
+    }
+
+    // --- (f) No FK orphans after the full sequence + seed.
+    let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let table: String = sqlx::Row::get(&r, "table");
+            let rowid: i64 = sqlx::Row::get(&r, "rowid");
+            let parent: String = sqlx::Row::get(&r, "parent");
+            format!("{table} rowid={rowid} → {parent}")
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "PRAGMA foreign_key_check must find no orphans after the RFC 0002 sequence; got {orphans:?}"
+    );
+
+    drop(dir);
+}
