@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use domain_core::{RepoId, WorkspaceId};
 use domain_repo::RepoBinding;
+use domain_workspace::WorkspaceStatus;
 use dto_shared::{
     AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, RepoAttachOutcomeDto,
     RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
@@ -154,29 +155,44 @@ impl RepoBindingService {
 
     /// Resolve `query` to a binding by trying, in order: exact
     /// `prefix` match (globally-unique, single index lookup); then
-    /// exact `name` or `alias` match across ALL workspaces, archived
-    /// included. The prefix takes priority because it carries an
-    /// explicit uniqueness guarantee — names and aliases can clash
+    /// exact `name` or `alias` match. The prefix takes priority because it
+    /// carries an explicit uniqueness guarantee — names and aliases can clash
     /// across workspaces, so they still produce the ambiguity error.
     ///
     /// This resolver backs write commands (`--repo` on `task create`,
-    /// `set-filing-repo`, etc.), so it must include archived workspaces:
-    /// archiving hides a workspace from listings but does NOT lock it, and a
-    /// repo whose workspace is archived must still be addressable by handle.
+    /// `set-filing-repo`, etc.), so a repo whose workspace is archived must
+    /// still be addressable by handle: archiving hides a workspace from
+    /// listings but does NOT lock it.
+    ///
+    /// Archived workspaces are therefore searched, but only as a **fallback**:
+    /// name/alias matches in ACTIVE workspaces win outright, and archived
+    /// bindings are consulted solely when the active set yields nothing. This
+    /// keeps archiving from broadening the ambiguity surface — a live handle
+    /// that resolved cleanly before still resolves cleanly even when an
+    /// archived workspace happens to hold a same-named binding. Ambiguity is
+    /// still surfaced WITHIN whichever set ultimately resolves the handle.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
         if let Some(binding) = self.bindings.find_by_prefix(query).await? {
             return Ok(binding);
         }
         let workspaces = self.workspaces.list(true).await?;
-        let mut matches: Vec<RepoBinding> = Vec::new();
+        let mut active: Vec<RepoBinding> = Vec::new();
+        let mut archived: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {
             let bindings = self.bindings.list_by_workspace(ws.id).await?;
             for b in bindings {
                 if b.name == query || b.aliases.iter().any(|a| a == query) {
-                    matches.push(b);
+                    if ws.status == WorkspaceStatus::Archived {
+                        archived.push(b);
+                    } else {
+                        active.push(b);
+                    }
                 }
             }
         }
+        // Active wins; archived is the fallback consulted only when no active
+        // binding matches the handle.
+        let mut matches = if active.is_empty() { archived } else { active };
         match matches.len() {
             0 => Err(ServiceError::BindingNotFound(query.to_string())),
             1 => Ok(matches.remove(0)),
@@ -751,6 +767,34 @@ mod tests {
             }
             other => panic!("expected AmbiguousHandle, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_resolution_prefers_active_over_archived_collision() {
+        let (ws_svc, bsvc) = setup();
+        // Same alias on two workspaces' bindings; archive one. The active
+        // binding must still resolve cleanly — archiving must NOT introduce a
+        // new ambiguity where a live handle resolved before.
+        let active = seeded(&ws_svc, &bsvc, "ws-active", "github.com/o/a").await;
+        let stale = seeded(&ws_svc, &bsvc, "ws-stale", "github.com/o/b").await;
+        bsvc.add_alias(&active.id, "gw".into()).await.unwrap();
+        bsvc.add_alias(&stale.id, "gw".into()).await.unwrap();
+        ws_svc.archive(&stale.workspace_id).await.unwrap();
+        let hit = bsvc.show("gw").await.unwrap();
+        assert_eq!(hit.id, active.id, "active binding wins the handle");
+    }
+
+    #[tokio::test]
+    async fn handle_resolution_falls_back_to_archived_when_no_active_match() {
+        let (ws_svc, bsvc) = setup();
+        // A binding whose only workspace is archived stays addressable by
+        // handle (archiving hides, never locks) — the archived set is the
+        // fallback when no active workspace matches.
+        let b = seeded(&ws_svc, &bsvc, "ws-only-archived", "github.com/o/lonely").await;
+        bsvc.add_alias(&b.id, "gw".into()).await.unwrap();
+        ws_svc.archive(&b.workspace_id).await.unwrap();
+        let hit = bsvc.show("gw").await.unwrap();
+        assert_eq!(hit.id, b.id);
     }
 
     #[tokio::test]
