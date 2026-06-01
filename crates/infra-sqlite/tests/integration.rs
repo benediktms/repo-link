@@ -291,6 +291,103 @@ async fn remote_mapping_is_repo_scoped() {
     );
 }
 
+/// RFC 0002 D6: remote dedup is keyed on the FILING repo, not the logical repo.
+/// A task whose filing repo diverges from its logical repo is found by its
+/// filing repo (read side, `find_by_remote`) and collides on
+/// (filing_repo_id, provider, remote_id) (write side, the UNIQUE key) — and is
+/// NOT found by its logical repo.
+#[tokio::test]
+async fn remote_dedup_keyed_on_filing_repo_when_it_diverges() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let logical = RepoBinding::new(
+        w.id,
+        "git@github.com:o/logical.git".into(),
+        "github.com/o/logical".into(),
+    )
+    .unwrap();
+    let filing = RepoBinding::new(
+        w.id,
+        "git@github.com:o/filing.git".into(),
+        "github.com/o/filing".into(),
+    )
+    .unwrap();
+    rb.save(&logical).await.unwrap();
+    rb.save(&filing).await.unwrap();
+
+    // Logical repo = `logical`, but the issue is FILED in `filing`.
+    let mk = |num: &str| {
+        let mut t = Task::new_draft(w.id, Some(logical.id), format!("issue {num}")).unwrap();
+        t.set_filing_repo_id(Some(filing.id)).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
+        t
+    };
+
+    ts.save(&mk("1"), SnapshotSource::Promote).await.unwrap();
+
+    // Read side: found by the FILING repo, not the logical repo.
+    assert!(
+        ts.find_by_remote(filing.id, "github", "1")
+            .await
+            .unwrap()
+            .is_some(),
+        "dedup must match on the filing repo"
+    );
+    assert!(
+        ts.find_by_remote(logical.id, "github", "1")
+            .await
+            .unwrap()
+            .is_none(),
+        "dedup must NOT match on the logical repo once filing diverges (D6)"
+    );
+
+    // Write side: a second task filed in the same repo with the same remote
+    // collides on (filing_repo_id, provider, remote_id).
+    let err = ts
+        .save(&mk("1"), SnapshotSource::Promote)
+        .await
+        .expect_err("duplicate filing-scoped remote must conflict");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("conflict"),
+        "got: {err:?}"
+    );
+}
+
+/// Pre-resolution / migrated rows (filing_repo_id NULL) still dedup by their
+/// logical repo via the COALESCE fallback, so D6 doesn't break tasks promoted
+/// before the filing repo was resolved.
+#[tokio::test]
+async fn remote_dedup_falls_back_to_logical_when_filing_unresolved() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+    let repo = RepoBinding::new(
+        w.id,
+        "git@github.com:o/r.git".into(),
+        "github.com/o/r".into(),
+    )
+    .unwrap();
+    rb.save(&repo).await.unwrap();
+
+    // filing_repo_id left None (pre-resolution); logical repo is `repo`.
+    let mut t = Task::new_draft(w.id, Some(repo.id), "issue 7".into()).unwrap();
+    t.stage_for_sync().unwrap();
+    t.promote_to_remote(RemoteRef::new("github", "7")).unwrap();
+    ts.save(&t, SnapshotSource::Promote).await.unwrap();
+
+    assert!(
+        ts.find_by_remote(repo.id, "github", "7")
+            .await
+            .unwrap()
+            .is_some(),
+        "a task with NULL filing repo must still be found by its logical repo (COALESCE fallback)"
+    );
+}
+
 #[tokio::test]
 async fn repo_with_worktrees_roundtrip() {
     let (_dir, ws, rb, _ts) = setup().await;

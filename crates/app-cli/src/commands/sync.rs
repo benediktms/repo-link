@@ -219,6 +219,11 @@ async fn sync_import(
 
         // Resolve the task id for this node: either the already-tracked one,
         // or a freshly imported mirror. Used to parent its children.
+        //
+        // D6 dedup is keyed on the FILING repo; `import_mirror` records
+        // filing == logical for imports (#116), so the import target repo_id is
+        // the filing repo to look up — and the lookup agrees with the row the
+        // import will write.
         let node_task_id = if let Some(existing) = svc
             .tasks_repo
             .find_by_remote(repo_id, PROVIDER, &number)

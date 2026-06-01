@@ -116,12 +116,16 @@ pub trait TaskRepository: Send + Sync {
     /// the prefix half of a composite (`rlk-ak7`) instead of a UUID.
     async fn find_by_hash(&self, hash: &str) -> PortResult<Option<Task>>;
     /// Look up the task mirroring a given remote issue within a repo
-    /// (`repo_id` + `provider` + `remote_id`). Scoped by repo because remote
+    /// (`filing_repo_id` + `provider` + `remote_id`). Scoped by the **filing**
+    /// repo (RFC 0002 D6) — where the issue actually lives — because remote
     /// issue numbers are only unique per repo (GitHub `repoA#123` ≠
-    /// `repoB#123`). Used by `sync import` to skip already-tracked issues.
+    /// `repoB#123`). Implementations COALESCE to the logical `repo_id` for rows
+    /// whose filing repo is unresolved, so callers may pass the logical repo
+    /// when filing == logical (e.g. `sync import`, which records both equal).
+    /// Used by `sync import` to skip already-tracked issues.
     async fn find_by_remote(
         &self,
-        repo_id: RepoId,
+        filing_repo_id: RepoId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>>;
