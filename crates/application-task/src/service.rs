@@ -383,7 +383,7 @@ impl TaskService {
         // LocalOnly task / priority-only / no-op edit the plan is empty and
         // `save_with_outbox` behaves exactly like `save`.
         let mutations = self
-            .plan_update_mutations(&t, sync_before, resolved_filing.is_some())
+            .plan_update_mutations(&mut t, sync_before, resolved_filing.is_some())
             .await?;
         let entries = into_entries(t.id, mutations);
         self.repo
