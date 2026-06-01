@@ -213,6 +213,7 @@ impl RestClient {
         const PER_PAGE: usize = 100;
         const MAX_PAGES: u32 = 50;
         let mut issues: Vec<Issue> = Vec::new();
+        let mut cap_page_full = false;
         for page in 1..=MAX_PAGES {
             let route = format!(
                 "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by?per_page={PER_PAGE}&page={page}"
@@ -228,6 +229,32 @@ impl RestClient {
             issues.extend(batch);
             if !full {
                 break;
+            }
+            if page == MAX_PAGES {
+                cap_page_full = true;
+            }
+        }
+        // A truncated dependency list is worse than an error: the inbound
+        // reconcile would read the missing blockers as "remote dropped them" and
+        // DELETE valid local `blocked_by` edges. So, like `fetch_sub_issues`,
+        // probe one item past the cap to tell an exact boundary from genuine
+        // overflow and refuse rather than silently truncate.
+        if cap_page_full {
+            let probe_page = MAX_PAGES as usize * PER_PAGE + 1;
+            let probe_route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by?per_page=1&page={probe_page}"
+            );
+            let probe: Vec<Issue> = self
+                .http
+                .get(probe_route, None::<&()>)
+                .await
+                .map_err(map_err)?;
+            if !probe.is_empty() {
+                return Err(PortError::Backend(format!(
+                    "issue {number} in {canonical_repo} has more than {} blocked-by dependencies; \
+                     refusing to reconcile a truncated set",
+                    MAX_PAGES as usize * PER_PAGE
+                )));
             }
         }
         Ok(issues

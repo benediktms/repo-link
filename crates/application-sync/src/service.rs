@@ -570,24 +570,30 @@ impl SyncService {
         // Neighbor tasks whose reciprocal edge we touch, accumulated so each is
         // loaded and saved once even if it appears in both families.
         let mut neighbors: HashMap<TaskId, Task> = HashMap::new();
-        self.reconcile_family(
-            task,
-            RelationKind::ParentOf,
-            RelationKind::ChildOf,
-            &desired_children,
-            &mut neighbors,
-        )
-        .await?;
-        self.reconcile_family(
-            task,
-            RelationKind::BlockedBy,
-            RelationKind::Blocks,
-            &desired_blockers,
-            &mut neighbors,
-        )
-        .await?;
+        let mut task_changed = self
+            .reconcile_family(
+                task,
+                RelationKind::ParentOf,
+                RelationKind::ChildOf,
+                &desired_children,
+                &mut neighbors,
+            )
+            .await?;
+        task_changed |= self
+            .reconcile_family(
+                task,
+                RelationKind::BlockedBy,
+                RelationKind::Blocks,
+                &desired_blockers,
+                &mut neighbors,
+            )
+            .await?;
 
-        if !neighbors.is_empty() {
+        // Persist whenever the subject task changed — not gated on
+        // `neighbors`. Today every edge change also loads a neighbor, but gating
+        // the subject's save on a non-empty neighbor map would silently drop a
+        // future subject-only mutation. The neighbors ride along in the batch.
+        if task_changed {
             let mut batch: Vec<(&Task, SnapshotSource)> = vec![(task, SnapshotSource::Pull)];
             batch.extend(neighbors.values().map(|n| (n, SnapshotSource::Pull)));
             self.tasks.save_many(&batch).await?;
@@ -629,6 +635,8 @@ impl SyncService {
     /// itself issue-backed (remotely representable); a local-only neighbor the
     /// remote can't express is left alone. Reciprocals are mirrored onto the
     /// neighbors, which collect into `neighbors` for the caller's batch save.
+    /// Returns whether `task`'s own edge set changed (so the caller knows to
+    /// persist the subject even if it ever stops loading a neighbor per change).
     async fn reconcile_family(
         &self,
         task: &mut Task,
@@ -636,8 +644,9 @@ impl SyncService {
         inverse: RelationKind,
         desired: &[TaskId],
         neighbors: &mut HashMap<TaskId, Task>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let task_id = task.id;
+        let mut changed = false;
         let desired_set: HashSet<TaskId> = desired.iter().copied().collect();
         let current: Vec<TaskId> = task
             .relations
@@ -655,6 +664,7 @@ impl SyncService {
             let neighbor = self.load_neighbor(neighbors, other).await?;
             task.add_relation(kind, other);
             neighbor.add_relation(inverse, task_id);
+            changed = true;
         }
         // Removals: local has the edge, remote dropped it — only when the far
         // end is issue-backed, so an unrepresentable local-only edge survives.
@@ -668,8 +678,9 @@ impl SyncService {
             }
             task.remove_relation(kind, other);
             neighbor.remove_relation(inverse, task_id);
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Load `id` into the neighbor cache if absent, returning a mutable handle.
