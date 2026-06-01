@@ -863,7 +863,16 @@ impl TaskService {
             task.set_filing_repo_id(filing)?;
         }
 
-        let logical_canonical = self.logical_canonical_for(task).await?;
+        // RFC 0002 (#143): the backing GitHub issue lives in the FILING repo, so
+        // the issue-state mirror (`UpdateRemote`) must address the filing repo —
+        // NOT the logical repo. Addressing the logical repo filed a 404 for any
+        // cross-filed task (issue in repo A, logical repo B) and, because the
+        // failing entry head-of-line-blocks the per-task FIFO outbox, also
+        // stranded the sibling `AddItem` so the card never reached the board.
+        // `logical_canonical_for` stays for D4 logical-context ops (prefix /
+        // worktree / relink) elsewhere; only the issue-addressing mutation moves
+        // to the filing axis.
+        let filing_canonical = self.filing_canonical_for(task).await?;
         // An issue-backed mirror with no repo binding can't form an
         // `UpdateRemote` (it has no canonical repo to address), so a
         // remote-observable lifecycle change would be silently dropped if it
@@ -872,7 +881,7 @@ impl TaskService {
         // always supplies a repo), but a future caller that constructs an
         // unbound issue-backed mirror would otherwise lose the push without a
         // signal.
-        if enqueue::is_issue_backed(task) && logical_canonical.is_none() && project.is_none() {
+        if enqueue::is_issue_backed(task) && filing_canonical.is_none() && project.is_none() {
             tracing::warn!(
                 task_id = %task.id,
                 "mirror lifecycle change has no repo binding and no project; \
@@ -882,7 +891,7 @@ impl TaskService {
         Ok(enqueue::plan_mutations(
             task,
             project.as_ref(),
-            logical_canonical.as_deref(),
+            filing_canonical.as_deref(),
             content_changed,
         ))
     }
@@ -890,23 +899,19 @@ impl TaskService {
     /// Best-effort canonical-URL lookup for the task's **logical** repo binding
     /// (D4: also used for prefix / worktree / relink ops). `None` when the task
     /// has no logical repo (orphan-draft).
-    async fn logical_canonical_for(&self, task: &Task) -> Result<Option<String>> {
-        let Some(repo_id) = task.repo_id else {
-            return Ok(None);
-        };
-        Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
-    }
-
     /// Best-effort canonical-URL lookup for the repo the task's backing issue
-    /// is *filed* in (RFC 0002 D3). Mirrors `SyncService::filing_canonical_for`
-    /// but returns `Option` rather than erroring — the `ConvertDraftToIssue`
-    /// planner calls `.unwrap_or_default()` so a truly unaddressable draft
-    /// (no `filing_repo_id` and no `repo_id`) still enqueues an empty
-    /// `repo_node_id`, matching the behaviour before this RFC.
+    /// is *filed* in (RFC 0002 D3 / #143). Mirrors
+    /// `SyncService::filing_canonical_for` but returns `Option` rather than
+    /// erroring — the `ConvertDraftToIssue` planner calls `.unwrap_or_default()`
+    /// so a truly unaddressable draft (no `filing_repo_id` and no `repo_id`)
+    /// still enqueues an empty `repo_node_id`, matching the behaviour before this
+    /// RFC.
     ///
-    /// Prefers the recorded `filing_repo_id`, falling back to `repo_id`. The
-    /// logical canonical (`logical_canonical_for`) stays for logical-binding ops
-    /// (D4: prefix / worktree / relink).
+    /// Prefers the recorded `filing_repo_id`, falling back to the logical
+    /// `repo_id`. Used for every issue-addressing mutation (create / update /
+    /// convert) so a cross-filed task targets the repo its issue actually lives
+    /// in. (Logical-context ops — D4 prefix / worktree / relink — resolve the
+    /// logical binding directly where they need it, not through here.)
     async fn filing_canonical_for(&self, task: &Task) -> Result<Option<String>> {
         let Some(repo_id) = task.filing_repo_id.or(task.repo_id) else {
             return Ok(None);
@@ -2934,6 +2939,69 @@ mod tests {
         assert!(
             kinds.contains(&"add_item"),
             "AddItem must be enqueued: {kinds:?}"
+        );
+    }
+
+    /// RFC 0002 (#143): a CROSS-FILED issue-backed mirror (logical repo ≠ filing
+    /// repo) must address its `UpdateRemote` to the FILING repo — where the
+    /// backing issue actually lives — not the logical repo. Regression for the
+    /// bug where `plan_mirror_mutations` fed the logical canonical to the
+    /// planner, 404ing every cross-filed lifecycle push (and head-of-line
+    /// blocking the sibling board `AddItem`).
+    #[tokio::test]
+    async fn cross_filed_lifecycle_update_targets_filing_repo() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects: _,
+            bindings,
+        } = rich_svc();
+
+        // No project on the workspace, so the only enqueued mutation is the
+        // issue-state UpdateRemote — isolates the canonical under test.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+
+        // Two distinct bindings: the logical repo (where code lives) and the
+        // filing repo (where the issue was filed).
+        let logical = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/logical.git".into(),
+            "github.com/o/logical".into(),
+        )
+        .unwrap();
+        let filing = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&logical).await.unwrap();
+        bindings.save(&filing).await.unwrap();
+
+        // Issue-backed mirror filed in `filing` while its logical repo is
+        // `logical` — the cross-filed shape.
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_node"), None).await;
+        t.repo_id = Some(logical.id);
+        t.set_filing_repo_id(Some(filing.id)).unwrap();
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        // Lifecycle transition → plan_mirror_mutations → UpdateRemote.
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        let canonical = outbox
+            .all()
+            .iter()
+            .find_map(|e| match &e.mutation {
+                OutboxMutation::UpdateRemote { canonical_repo, .. } => Some(canonical_repo.clone()),
+                _ => None,
+            })
+            .expect("a lifecycle UpdateRemote must be enqueued");
+        assert_eq!(
+            canonical, "github.com/o/filing",
+            "UpdateRemote must address the FILING repo, not the logical repo"
         );
     }
 

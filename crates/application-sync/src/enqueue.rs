@@ -102,9 +102,12 @@ pub async fn enqueue(
 ///   open/closed bit + title/body track the local task.
 /// - Draft-backed mirror content edit → `UpdateDraftIssue`.
 ///
-/// `canonical_repo` is the canonical URL of the repo the issue lives in — the
-/// task's logical repo, which is also its filing repo today (until RFC 0002
-/// makes the filing repo a separate axis).
+/// `filing_canonical` is the canonical URL of the repo the backing issue is
+/// *filed* in (RFC 0002). For a cross-filed task this is the FILING repo, which
+/// can differ from the logical repo — so the issue-addressing `UpdateRemote`
+/// targets where the issue actually lives. Callers pass `filing_canonical_for`
+/// (the recorded `filing_repo_id`, falling back to the logical `repo_id`), NOT
+/// the logical canonical (which stays for D4 prefix / worktree / relink ops).
 ///
 /// `content_changed` indicates a title/body edit happened (so issue/draft
 /// content is pushed); lifecycle-only changes still push the open/closed bit
@@ -117,7 +120,7 @@ pub async fn enqueue(
 pub fn plan_mutations(
     task: &Task,
     project: Option<&Project>,
-    canonical_repo: Option<&str>,
+    filing_canonical: Option<&str>,
     content_changed: bool,
 ) -> Vec<OutboxMutation> {
     if !is_mirror(task) {
@@ -130,7 +133,7 @@ pub fn plan_mutations(
     // lifecycle-only changes too (GitHub's issue state IS the lifecycle
     // mirror, so the open/closed bit must always push).
     if is_issue_backed(task) {
-        if let (Some(remote), Some(canonical)) = (task.remote.as_ref(), canonical_repo) {
+        if let (Some(remote), Some(canonical)) = (task.remote.as_ref(), filing_canonical) {
             out.push(OutboxMutation::UpdateRemote {
                 canonical_repo: canonical.to_string(),
                 remote_id: remote.remote_id.clone(),
