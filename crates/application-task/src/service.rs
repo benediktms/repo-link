@@ -358,18 +358,23 @@ impl TaskService {
         // the workspace-default (step-2) case where `repo_id` stays NULL.
         // Resolution is computed once and feeds the gate, the recording, and
         // the canonical. Per-task override stays None until #122.
-        let resolved_filing = if was_orphan_draft {
+        // Resolve + record the filing repo only on the GENUINE FIRST filing of
+        // an orphan draft — gate on `filing_repo_id.is_none()`. Once recorded it
+        // is authoritative and must never be re-resolved (the resolver's own
+        // contract). Without this guard, a workspace-default change between two
+        // edits of a not-yet-converted draft would make the second edit either
+        // error in `set_filing_repo_id` (cannot change a recorded filing repo)
+        // or enqueue a duplicate `ConvertDraftToIssue` (Greptile #137).
+        let resolved_filing = if was_orphan_draft && t.filing_repo_id.is_none() {
             let workspace = self.workspaces.get(t.workspace_id).await?;
             resolve_filing_repo(None, workspace.filing_repo_id, t.repo_id)
         } else {
             None
         };
 
-        // Record the resolved filing repo BEFORE planning/saving so it persists
-        // atomically with the outbox entries. `set_filing_repo_id` is idempotent
-        // on the same value and does not dirty the task — safe to call
-        // unconditionally on the convert path.
-        if was_orphan_draft && resolved_filing.is_some() {
+        // Record BEFORE planning/saving so it persists atomically with the
+        // outbox entries.
+        if resolved_filing.is_some() {
             t.set_filing_repo_id(resolved_filing)?;
         }
 
@@ -378,11 +383,7 @@ impl TaskService {
         // LocalOnly task / priority-only / no-op edit the plan is empty and
         // `save_with_outbox` behaves exactly like `save`.
         let mutations = self
-            .plan_update_mutations(
-                &t,
-                sync_before,
-                was_orphan_draft && resolved_filing.is_some(),
-            )
+            .plan_update_mutations(&t, sync_before, resolved_filing.is_some())
             .await?;
         let entries = into_entries(t.id, mutations);
         self.repo
@@ -2423,7 +2424,7 @@ mod tests {
 
         // Set up a workspace default filing repo binding.
         let default_binding = domain_repo::RepoBinding::new(
-            WorkspaceId::new(), // placeholder — overwritten below
+            WorkspaceId::new(), // bindings.get(id) looks up by binding id, not workspace scope; any value is fine
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
@@ -2491,6 +2492,105 @@ mod tests {
             }
             other => panic!("expected ConvertDraftToIssue, got {other:?}"),
         }
+    }
+
+    /// RFC 0002 D3 regression (Greptile #137): once an orphan draft has recorded
+    /// its filing repo, a later edit must NOT re-resolve it — even if the
+    /// workspace default changed in between. Without the `filing_repo_id.is_none()`
+    /// guard the second edit re-resolves to the new default, which either errors
+    /// in `set_filing_repo_id` (cannot change a recorded filing repo) or enqueues
+    /// a duplicate `ConvertDraftToIssue`.
+    #[tokio::test]
+    async fn orphan_draft_filing_recording_is_idempotent_across_edits() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+
+        let first_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/first.git".into(),
+            "github.com/o/first".into(),
+        )
+        .unwrap();
+        let second_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/second.git".into(),
+            "github.com/o/second".into(),
+        )
+        .unwrap();
+        bindings.save(&first_binding).await.unwrap();
+        bindings.save(&second_binding).await.unwrap();
+
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.filing_repo_id = Some(first_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        // First edit: records filing = first default and enqueues one convert.
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("e1".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.get(t.id).await.unwrap().filing_repo_id,
+            Some(first_binding.id)
+        );
+
+        // The workspace default changes AFTER the draft recorded its filing repo.
+        ws.filing_repo_id = Some(second_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // A second edit must NOT error and must NOT re-resolve/re-record.
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("e2".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .expect("second edit must not error on an already-recorded filing repo");
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(first_binding.id),
+            "recorded filing repo is authoritative — not retargeted to the new default"
+        );
+        let converts = outbox
+            .all()
+            .iter()
+            .filter(|e| e.mutation.kind() == "convert_draft_to_issue")
+            .count();
+        assert_eq!(
+            converts, 1,
+            "filing recording + convert must enqueue once, not once per edit"
+        );
     }
 
     /// RFC 0002 D3 regression — attach-repo case with no workspace default:
