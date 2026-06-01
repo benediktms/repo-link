@@ -21,9 +21,10 @@ pub struct Workspace {
     /// backing GitHub issue is filed when nothing more specific applies. New
     /// and additive — supersedes RFC 0001's deferred `creation_default_repo_id`.
     /// `None` means "no default", and the D2 resolution chain falls through to
-    /// the task's logical `repo_id`, so behaviour is unchanged. Internal: this
-    /// is consumed by the promote/sync path, not surfaced on the workspace DTO.
-    /// Set via the `workspace set-filing-repo` CLI (#121, gated behind D6).
+    /// the task's logical `repo_id`, so behaviour is unchanged. Surfaced on
+    /// `WorkspaceDto` as workspace config (set via `rl workspace set-filing-repo`
+    /// per RFC 0002 §4, GitHub #121); distinct from the D5-protected per-TASK
+    /// filing axis which is never surfaced on the task boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filing_repo_id: Option<RepoId>,
     pub created_at: Timestamp,
@@ -83,6 +84,16 @@ impl Workspace {
                 "cannot archive from {other:?}"
             ))),
         }
+    }
+
+    /// Set the workspace's default filing repo (RFC 0002 §4). Forward-looking:
+    /// reassigning an already-set default is permitted (unlike `set_project`)
+    /// and affects only tasks resolved AFTER the change — already-recorded
+    /// `tasks.filing_repo_id` are never retargeted (D2 never re-resolves).
+    /// Bumps `updated_at` so the mutation is observable.
+    pub fn set_filing_repo_id(&mut self, repo_id: Option<RepoId>) {
+        self.filing_repo_id = repo_id;
+        self.touch();
     }
 
     fn touch(&mut self) {

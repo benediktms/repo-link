@@ -34,6 +34,51 @@ fn workspace_create_show_list_roundtrip() {
     assert_eq!(shown["id"], id);
 }
 
+/// RFC 0002 §4 (#121): a workspace filing default must be one of THAT
+/// workspace's own bindings. The repo-handle resolver searches all workspaces,
+/// so `set-filing-repo` rejects a binding owned by a different workspace; a
+/// same-workspace binding is accepted and recorded.
+#[test]
+fn set_filing_repo_rejects_a_binding_from_another_workspace() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A binding owned by workspace B must not become workspace A's default.
+    let repo_b = attach_no_link(&dir, &ws_b, "git@github.com:o/b.git", "github.com/o/b");
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "set-filing-repo", &ws_a, "--repo", &repo_b])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("belongs to workspace"),
+        "expected a cross-workspace rejection, got: {stderr}"
+    );
+
+    // A binding owned by workspace A is accepted and recorded.
+    let repo_a = attach_no_link(&dir, &ws_a, "git@github.com:o/a.git", "github.com/o/a");
+    let dto = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_a, "--repo", &repo_a],
+    );
+    assert_eq!(dto["filing_repo_id"], repo_a);
+}
+
 #[test]
 fn task_create_list_includes_state_filter() {
     let dir = TempDir::new().unwrap();
@@ -3092,6 +3137,124 @@ fn workspace_set_project_requires_one_of_project_or_none() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("--project") || stderr.contains("--none"),
+        "error should mention the required flags: {stderr}"
+    );
+}
+
+// ---------- workspace set-filing-repo (RFC 0002 §4 / GitHub #121) ----------
+
+#[test]
+fn workspace_set_filing_repo_attaches_by_name() {
+    let dir = TempDir::new().unwrap();
+
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // canonical "github.com/o/r" → derived name is "r"
+    let binding_id = attach_no_link(&dir, &ws_id, "git@github.com:o/r.git", "github.com/o/r");
+
+    let dto = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_id, "--repo", "r"],
+    );
+    assert_eq!(
+        dto["filing_repo_id"].as_str().unwrap(),
+        binding_id,
+        "filing_repo_id on the dto must equal the binding UUID"
+    );
+}
+
+#[test]
+fn workspace_set_filing_repo_none_clears_it() {
+    let dir = TempDir::new().unwrap();
+
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let _binding_id = attach_no_link(&dir, &ws_id, "git@github.com:o/r.git", "github.com/o/r");
+
+    // Set, then clear.
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_id, "--repo", "r"],
+    );
+    let cleared = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_id, "--none"],
+    );
+    assert!(
+        cleared.get("filing_repo_id").is_none() || cleared["filing_repo_id"].is_null(),
+        "after --none, filing_repo_id must be absent/null: {cleared}"
+    );
+}
+
+#[test]
+fn workspace_set_filing_repo_reassignment_succeeds() {
+    // Unlike set-project, reassigning from repo A to repo B is ALLOWED.
+    let dir = TempDir::new().unwrap();
+
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let id_a = attach_no_link(&dir, &ws_id, "git@github.com:o/a.git", "github.com/o/a");
+    let id_b = attach_no_link(&dir, &ws_id, "git@github.com:o/b.git", "github.com/o/b");
+
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_id, "--repo", "a"],
+    );
+    let dto = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_id, "--repo", "b"],
+    );
+    assert_eq!(
+        dto["filing_repo_id"].as_str().unwrap(),
+        id_b,
+        "after reassignment, dto must reflect repo B's id"
+    );
+    assert_ne!(
+        dto["filing_repo_id"].as_str().unwrap(),
+        id_a,
+        "dto must no longer show repo A after reassignment"
+    );
+}
+
+#[test]
+fn workspace_set_filing_repo_requires_repo_or_none() {
+    let dir = TempDir::new().unwrap();
+
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "set-filing-repo", &ws_id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--repo") || stderr.contains("--none"),
         "error should mention the required flags: {stderr}"
     );
 }
