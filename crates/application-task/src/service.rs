@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use application_sync::enqueue;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
-use domain_sync::{OutboxEntry, OutboxMutation};
+use domain_sync::{OutboxEntry, OutboxMutation, resolve_filing_repo};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
@@ -345,21 +345,45 @@ impl TaskService {
         if let Some(assignees) = cmd.assignees {
             t.set_assignees(assignees);
         }
-        let attached_repo = if let Some(repo_id) = cmd.repo_id {
+        if let Some(repo_id) = cmd.repo_id {
             let parsed = repo_id.parse::<RepoId>()?;
-            let changed = t.repo_id != Some(parsed);
             t.set_repo_id(Some(parsed))?;
-            changed
+        }
+
+        // RFC 0002 D3: re-run the D2 filing-repo chain at draft-conversion
+        // planning time. An orphan draft (no repo, has a project item) may now
+        // resolve a filing repo via either (a) the logical repo just attached
+        // above or (b) the workspace default. The gate fires whenever a filing
+        // repo resolves — this subsumes the old `attached_repo` case and adds
+        // the workspace-default (step-2) case where `repo_id` stays NULL.
+        // Resolution is computed once and feeds the gate, the recording, and
+        // the canonical. Per-task override stays None until #122.
+        // Resolve + record the filing repo only on the GENUINE FIRST filing of
+        // an orphan draft — gate on `filing_repo_id.is_none()`. Once recorded it
+        // is authoritative and must never be re-resolved (the resolver's own
+        // contract). Without this guard, a workspace-default change between two
+        // edits of a not-yet-converted draft would make the second edit either
+        // error in `set_filing_repo_id` (cannot change a recorded filing repo)
+        // or enqueue a duplicate `ConvertDraftToIssue` (Greptile #137).
+        let resolved_filing = if was_orphan_draft && t.filing_repo_id.is_none() {
+            let workspace = self.workspaces.get(t.workspace_id).await?;
+            resolve_filing_repo(None, workspace.filing_repo_id, t.repo_id)
         } else {
-            false
+            None
         };
+
+        // Record BEFORE planning/saving so it persists atomically with the
+        // outbox entries.
+        if resolved_filing.is_some() {
+            t.set_filing_repo_id(resolved_filing)?;
+        }
 
         // Plan the outbound mutations the edit owes BEFORE writing, then commit
         // the task + its outbox entries in one atomic write (#54). For a
         // LocalOnly task / priority-only / no-op edit the plan is empty and
         // `save_with_outbox` behaves exactly like `save`.
         let mutations = self
-            .plan_update_mutations(&t, sync_before, was_orphan_draft && attached_repo)
+            .plan_update_mutations(&t, sync_before, resolved_filing.is_some())
             .await?;
         let entries = into_entries(t.id, mutations);
         self.repo
@@ -413,12 +437,16 @@ impl TaskService {
                 });
             }
             // The draft graduates to an issue. `repo_node_id` carries the
-            // canonical URL — the adapter resolves it to the GraphQL repo node
-            // id (canonical→node-id resolution is an adapter concern, see #54).
-            let logical_canonical = self.logical_canonical_for(task).await?.unwrap_or_default();
+            // canonical URL of the FILING repo — the adapter resolves it to the
+            // GraphQL repo node id (canonical→node-id resolution is an adapter
+            // concern, see #54). RFC 0002 D3: the filing canonical is sourced
+            // from the recorded `filing_repo_id` (set just before this call in
+            // `update`), falling back to `repo_id` when both are absent —
+            // exactly the `SyncService::filing_canonical_for` semantics (#123).
+            let filing_canonical = self.filing_canonical_for(task).await?.unwrap_or_default();
             out.push(OutboxMutation::ConvertDraftToIssue {
                 item_node_id,
-                repo_node_id: logical_canonical,
+                repo_node_id: filing_canonical,
             });
             return Ok(out);
         }
@@ -822,11 +850,27 @@ impl TaskService {
     }
 
     /// Best-effort canonical-URL lookup for the task's **logical** repo binding
-    /// — today also the repo the issue is filed in (until RFC 0002). `None`
-    /// when the task has no logical repo (orphan-draft) — issue-backed planning
-    /// needs it; draft/project planning doesn't.
+    /// (D4: also used for prefix / worktree / relink ops). `None` when the task
+    /// has no logical repo (orphan-draft).
     async fn logical_canonical_for(&self, task: &Task) -> Result<Option<String>> {
         let Some(repo_id) = task.repo_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
+    }
+
+    /// Best-effort canonical-URL lookup for the repo the task's backing issue
+    /// is *filed* in (RFC 0002 D3). Mirrors `SyncService::filing_canonical_for`
+    /// but returns `Option` rather than erroring — the `ConvertDraftToIssue`
+    /// planner calls `.unwrap_or_default()` so a truly unaddressable draft
+    /// (no `filing_repo_id` and no `repo_id`) still enqueues an empty
+    /// `repo_node_id`, matching the behaviour before this RFC.
+    ///
+    /// Prefers the recorded `filing_repo_id`, falling back to `repo_id`. The
+    /// logical canonical (`logical_canonical_for`) stays for logical-binding ops
+    /// (D4: prefix / worktree / relink).
+    async fn filing_canonical_for(&self, task: &Task) -> Result<Option<String>> {
+        let Some(repo_id) = task.filing_repo_id.or(task.repo_id) else {
             return Ok(None);
         };
         Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
@@ -2360,6 +2404,392 @@ mod tests {
             }
             other => panic!("expected UpdateDraftIssue first, got {other:?}"),
         }
+    }
+
+    /// RFC 0002 D3 — workspace-default filing case (step 2 of the D2 chain):
+    /// an orphan draft with NO `cmd.repo_id` converts when the workspace has a
+    /// default `filing_repo_id`. `repo_id` stays NULL; `filing_repo_id` is set
+    /// to the workspace default; the enqueued `ConvertDraftToIssue.repo_node_id`
+    /// is the default binding's canonical URL.
+    #[tokio::test]
+    async fn orphan_draft_converts_via_workspace_filing_default() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+
+        // Set up a workspace default filing repo binding.
+        let default_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(), // bindings.get(id) looks up by binding id, not workspace scope; any value is fine
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.filing_repo_id = Some(default_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // Orphan-draft mirror: a project draft with no remote + no repo.
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        // Update with NO cmd.repo_id — should still convert via workspace default.
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        // repo_id stays NULL (D2 step-2 invariant).
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert!(
+            reloaded.repo_id.is_none(),
+            "repo_id must stay NULL in the workspace-default case"
+        );
+        // filing_repo_id is recorded as the workspace default.
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(default_binding.id),
+            "filing_repo_id must be the workspace default"
+        );
+        // Exactly [convert_draft_to_issue] is enqueued.
+        let entries = outbox.all();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["convert_draft_to_issue"],
+            "orphan draft with workspace default enqueues convert: {kinds:?}"
+        );
+        // repo_node_id carries the default binding's canonical URL.
+        match &entries[0].mutation {
+            OutboxMutation::ConvertDraftToIssue { repo_node_id, .. } => {
+                assert_eq!(
+                    repo_node_id, "github.com/o/filing",
+                    "repo_node_id must be the filing binding's canonical URL"
+                );
+            }
+            other => panic!("expected ConvertDraftToIssue, got {other:?}"),
+        }
+    }
+
+    /// RFC 0002 D3 regression (Greptile #137): once an orphan draft has recorded
+    /// its filing repo, a later edit must NOT re-resolve it — even if the
+    /// workspace default changed in between. Without the `filing_repo_id.is_none()`
+    /// guard the second edit re-resolves to the new default, which either errors
+    /// in `set_filing_repo_id` (cannot change a recorded filing repo) or enqueues
+    /// a duplicate `ConvertDraftToIssue`.
+    #[tokio::test]
+    async fn orphan_draft_filing_recording_is_idempotent_across_edits() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+
+        let first_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/first.git".into(),
+            "github.com/o/first".into(),
+        )
+        .unwrap();
+        let second_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/second.git".into(),
+            "github.com/o/second".into(),
+        )
+        .unwrap();
+        bindings.save(&first_binding).await.unwrap();
+        bindings.save(&second_binding).await.unwrap();
+
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.filing_repo_id = Some(first_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        // First edit: records filing = first default and enqueues one convert.
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("e1".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.get(t.id).await.unwrap().filing_repo_id,
+            Some(first_binding.id)
+        );
+
+        // The workspace default changes AFTER the draft recorded its filing repo.
+        ws.filing_repo_id = Some(second_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // A second edit must NOT error and must NOT re-resolve/re-record.
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("e2".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .expect("second edit must not error on an already-recorded filing repo");
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(first_binding.id),
+            "recorded filing repo is authoritative — not retargeted to the new default"
+        );
+        let converts = outbox
+            .all()
+            .iter()
+            .filter(|e| e.mutation.kind() == "convert_draft_to_issue")
+            .count();
+        assert_eq!(
+            converts, 1,
+            "filing recording + convert must enqueue once, not once per edit"
+        );
+    }
+
+    /// RFC 0002 D3 regression — attach-repo case with no workspace default:
+    /// an orphan draft that gains a logical repo via `cmd.repo_id` (the
+    /// original pre-RFC behaviour) still converts, `filing_repo_id` is set to
+    /// the attached logical repo (chain collapses to logical), and `repo_node_id`
+    /// carries the logical repo's canonical.
+    #[tokio::test]
+    async fn orphan_draft_gaining_repo_records_filing_as_logical() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        // Workspace with NO filing default — chain collapses to logical.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/logical.git".into(),
+            "github.com/o/logical".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: Some(binding.id.to_string()),
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        // filing_repo_id == logical repo (D2 step-3 collapse).
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(binding.id),
+            "filing_repo_id must equal the attached logical repo when there is no workspace default"
+        );
+        let entries = outbox.all();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["convert_draft_to_issue"],
+            "attaching a repo to an orphan-draft still converts: {kinds:?}"
+        );
+        match &entries[0].mutation {
+            OutboxMutation::ConvertDraftToIssue { repo_node_id, .. } => {
+                assert_eq!(
+                    repo_node_id, "github.com/o/logical",
+                    "repo_node_id must be the logical repo canonical when no default exists"
+                );
+            }
+            other => panic!("expected ConvertDraftToIssue, got {other:?}"),
+        }
+    }
+
+    /// RFC 0002 D3 — combined title-edit + workspace-default conversion:
+    /// when the workspace has a filing default and an orphan draft also has a
+    /// content change in the same `update`, the plan is
+    /// `[update_draft_issue, convert_draft_to_issue]` (FIFO order) and
+    /// `filing_repo_id` is recorded.
+    #[tokio::test]
+    async fn orphan_draft_title_edit_with_workspace_default_enqueues_update_then_convert() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let default_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.filing_repo_id = Some(default_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        let mut t = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "old title".into(),
+            "old body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        t.project_item_id = Some("PVTI_d".into());
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("new title".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(default_binding.id),
+            "filing_repo_id recorded even with combined title + convert"
+        );
+        let entries = outbox.all();
+        let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec!["update_draft_issue", "convert_draft_to_issue"],
+            "combined title edit + default convert: {kinds:?}"
+        );
+        match &entries[0].mutation {
+            OutboxMutation::UpdateDraftIssue { title, .. } => {
+                assert_eq!(title.as_deref(), Some("new title"));
+            }
+            other => panic!("expected UpdateDraftIssue first, got {other:?}"),
+        }
+    }
+
+    /// RFC 0002 D3 negative — a non-convert edit on a draft (workspace has a
+    /// filing default but the task is NOT an orphan draft) must NOT record
+    /// `filing_repo_id` and must NOT enqueue a conversion.
+    #[tokio::test]
+    async fn non_orphan_draft_edit_does_not_record_filing_repo_id() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let default_binding = domain_repo::RepoBinding::new(
+            WorkspaceId::new(),
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.filing_repo_id = Some(default_binding.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // Issue-backed mirror (NOT a draft) — the convert gate must not fire.
+        let t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: Some("edited".into()),
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert!(
+            reloaded.filing_repo_id.is_none(),
+            "filing_repo_id must stay NULL for non-convert edits"
+        );
+        // An issue-backed mirror edit enqueues UpdateRemote, NOT a conversion.
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            !kinds.contains(&"convert_draft_to_issue"),
+            "non-orphan-draft edit must not convert: {kinds:?}"
+        );
     }
 
     #[tokio::test]
