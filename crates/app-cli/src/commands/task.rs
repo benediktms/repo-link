@@ -9,7 +9,7 @@ use dto_shared::{
 use infra_config::RepoLinkConfig;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
-use crate::commands::repo::resolve_repo_handle;
+use crate::commands::repo::{resolve_repo_handle, resolve_repo_handle_required};
 use crate::commands::sync::parse_issue_url;
 use crate::render;
 use crate::services::{Services, build_sync_service};
@@ -235,7 +235,7 @@ pub(crate) async fn task_dispatch(
             // explicit deferral error directing the user to `rl sync promote`
             // / a future workspace filing default.
             if let Some(handle) = filing_repo {
-                let resolved = resolve_repo_handle(svc, Some(handle)).await?;
+                let resolved = resolve_repo_handle_required(svc, &handle).await?;
                 return Err(anyhow!(
                     "`--filing-repo` is not yet consumed by `task create` (RFC 0002 §4, #122): \
                      `rl task create` only mints a local draft and does not promote the task to \
@@ -244,7 +244,7 @@ pub(crate) async fn task_dispatch(
                      via the workspace filing default. To file the task in a specific repo, \
                      create it without `--filing-repo` and then run `rl sync promote`. \
                      (Resolved binding: {})",
-                    resolved.unwrap_or_else(|| "<unknown>".into())
+                    resolved
                 ));
             }
             let dto = svc
@@ -275,7 +275,14 @@ pub(crate) async fn task_dispatch(
                         "name": binding.name,
                         "canonical_url": binding.canonical_url,
                     }),
-                    Err(_) => serde_json::Value::Null,
+                    // A recorded filing repo whose binding was since deleted is
+                    // a legitimate dangling pointer (no FK on filing_repo_id) —
+                    // surface it as null. Any OTHER error (I/O, etc.) must
+                    // propagate, not be silently masked as "no filing repo".
+                    Err(application_workspace::ServiceError::BindingNotFound(_)) => {
+                        serde_json::Value::Null
+                    }
+                    Err(e) => return Err(anyhow!("resolve filing repo binding: {e}")),
                 }
             } else {
                 serde_json::Value::Null
