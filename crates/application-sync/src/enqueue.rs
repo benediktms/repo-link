@@ -18,9 +18,72 @@ use std::sync::Arc;
 
 use domain_project::Project;
 use domain_sync::{OutboxEntry, OutboxMutation};
-use domain_task::{SyncState, Task};
+use domain_task::{RelationKind, SyncState, Task};
 use domain_workspace::Workspace;
 use ports::{OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository};
+
+/// The single GitHub-native outbound mutation a relation edge owes, keyed on
+/// the stated `kind` so the locally-mirrored reciprocal edge does NOT
+/// double-enqueue (each edge emits exactly one mutation). `None` for kinds with
+/// no native primitive (`related_to` / `duplicates`). `add` selects the `Add*`
+/// vs `Remove*` variant.
+///
+/// `this` is the task the edge is being evaluated from; `other` is the far end.
+/// Both are `(filing_canonical, remote_id)`. The REST endpoint is always
+/// addressed to the FIRST coord pair, so the direction mapping is:
+/// - `ParentOf`  (this=parent)  → sub-issue(parent=this,  child=other)
+/// - `ChildOf`   (this=child)   → sub-issue(parent=other, child=this)
+/// - `BlockedBy` (this blocked) → blocked_by(blocked=this,  blocker=other)
+/// - `Blocks`    (this blocks)  → blocked_by(blocked=other, blocker=this)
+///
+/// Shared by [`crate::SyncService`] (promote / link backfill) and
+/// `application-task`'s `TaskService` (relate-time) so the direction logic lives
+/// in exactly one place.
+pub fn relation_mutation(
+    kind: RelationKind,
+    add: bool,
+    this: &(String, String),
+    other: &(String, String),
+) -> Option<OutboxMutation> {
+    // `addressed` is the issue the endpoint targets; `related` is the issue
+    // whose db id the adapter resolves at apply time. `is_sub` picks the
+    // sub-issue family over the dependency family.
+    let (addressed, related, is_sub) = match kind {
+        RelationKind::ParentOf => (this, other, true),
+        RelationKind::ChildOf => (other, this, true),
+        RelationKind::BlockedBy => (this, other, false),
+        RelationKind::Blocks => (other, this, false),
+        RelationKind::RelatedTo | RelationKind::Duplicates => return None,
+    };
+    let (a_canonical, a_remote_id) = (addressed.0.clone(), addressed.1.clone());
+    let (b_canonical, b_remote_id) = (related.0.clone(), related.1.clone());
+    Some(match (is_sub, add) {
+        (true, true) => OutboxMutation::AddSubIssue {
+            parent_canonical: a_canonical,
+            parent_remote_id: a_remote_id,
+            child_canonical: b_canonical,
+            child_remote_id: b_remote_id,
+        },
+        (true, false) => OutboxMutation::RemoveSubIssue {
+            parent_canonical: a_canonical,
+            parent_remote_id: a_remote_id,
+            child_canonical: b_canonical,
+            child_remote_id: b_remote_id,
+        },
+        (false, true) => OutboxMutation::AddBlockedBy {
+            blocked_canonical: a_canonical,
+            blocked_remote_id: a_remote_id,
+            blocker_canonical: b_canonical,
+            blocker_remote_id: b_remote_id,
+        },
+        (false, false) => OutboxMutation::RemoveBlockedBy {
+            blocked_canonical: a_canonical,
+            blocked_remote_id: a_remote_id,
+            blocker_canonical: b_canonical,
+            blocker_remote_id: b_remote_id,
+        },
+    })
+}
 
 /// Is this task a mirror (i.e. not purely local)? Only mirror tasks owe
 /// outbound mutations. Mirrors RFC 0001 §3 D2: `sync_state != LocalOnly`.

@@ -193,6 +193,84 @@ impl RestClient {
             .collect())
     }
 
+    /// List the issues a given issue is **blocked by** via
+    /// `GET /repos/{o}/{r}/issues/{n}/dependencies/blocked_by`. octocrab has no
+    /// typed handler, so (like `fetch_sub_issues`) we hit it through the generic
+    /// `get` and decode into the typed `Issue` model. Each blocker carries its
+    /// own canonical repo (derived from `repository_url`) since a dependency can
+    /// cross repos. Backs inbound relation reconcile on pull.
+    pub(crate) async fn fetch_blocked_by(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        // Same redirect-silence hazard as `fetch_sub_issues`: the dependency
+        // response doesn't name the parent's `repository_url`, so a transferred
+        // parent would otherwise return the new repo's dependencies.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut issues: Vec<Issue> = Vec::new();
+        let mut cap_page_full = false;
+        for page in 1..=MAX_PAGES {
+            let route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by?per_page={PER_PAGE}&page={page}"
+            );
+            let batch: Vec<Issue> = self
+                .detect_move_or_map(
+                    canonical_repo,
+                    remote_id,
+                    self.http.get(route, None::<&()>).await,
+                )
+                .await?;
+            let full = batch.len() == PER_PAGE;
+            issues.extend(batch);
+            if !full {
+                break;
+            }
+            if page == MAX_PAGES {
+                cap_page_full = true;
+            }
+        }
+        // A truncated dependency list is worse than an error: the inbound
+        // reconcile would read the missing blockers as "remote dropped them" and
+        // DELETE valid local `blocked_by` edges. So, like `fetch_sub_issues`,
+        // probe one item past the cap to tell an exact boundary from genuine
+        // overflow and refuse rather than silently truncate.
+        if cap_page_full {
+            let probe_page = MAX_PAGES as usize * PER_PAGE + 1;
+            let probe_route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by?per_page=1&page={probe_page}"
+            );
+            let probe: Vec<Issue> = self
+                .http
+                .get(probe_route, None::<&()>)
+                .await
+                .map_err(map_err)?;
+            if !probe.is_empty() {
+                return Err(PortError::Backend(format!(
+                    "issue {number} in {canonical_repo} has more than {} blocked-by dependencies; \
+                     refusing to reconcile a truncated set",
+                    MAX_PAGES as usize * PER_PAGE
+                )));
+            }
+        }
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                let blocker_canonical =
+                    canonical_from_repository_url(issue.repository_url.as_str())
+                        .unwrap_or_else(|| canonical_repo.to_string());
+                RemoteChildIssue {
+                    canonical_repo: blocker_canonical,
+                    snapshot: map_issue(issue),
+                }
+            })
+            .collect())
+    }
+
     /// List an issue's comments, oldest first, paging through the typed
     /// `list_comments` handler. Caps pages like `fetch_sub_issues` and
     /// surfaces a cap-hit rather than silently truncating.
