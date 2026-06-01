@@ -492,12 +492,25 @@ impl Task {
     }
 
     /// Reassign the task's **logical repo** binding (code/worktrees/prefix).
-    /// Permitted only while the task is not yet remote-backed: once promoted,
-    /// the backing issue lives in a specific GitHub repo (today the logical
-    /// repo, until RFC 0002 splits out a separate filing repo), so moving the
-    /// local task to a different binding would orphan that issue. Logical-repo
-    /// ownership is local metadata (it selects the promote/filing target), so
-    /// — like `priority` — changing it does NOT flip sync state.
+    ///
+    /// Pre-RFC-0002 `repo_id` WAS the backing issue's home, so reassigning it
+    /// on a remote-backed task would orphan that issue — hence the original
+    /// blanket lock. Post-RFC-0002 (docs/rfcs/0002-task-repo-axes) `repo_id` is
+    /// purely the LOGICAL repo; the issue lives in [`Task::filing_repo_id`].
+    ///
+    /// So once remote-backed, a change is permitted IFF a **distinct** filing
+    /// repo is recorded — `filing_repo_id` is `Some` and differs from the
+    /// current logical `repo_id` — because the issue's home is then the filing
+    /// repo, which this leaves untouched. It is still rejected when filing ==
+    /// logical (`filing_repo_id` is `None`, or equals the current `repo_id`):
+    /// there the issue's home IS the logical repo, so moving it would orphan
+    /// the issue (pre-RFC behaviour, preserved). Re-collapsing logical onto
+    /// filing (new `repo_id` == `filing_repo_id`) is allowed — the recorded
+    /// filing repo stays authoritative and is never re-resolved.
+    ///
+    /// Logical-repo ownership is local metadata (it selects the promote/filing
+    /// target), so — like `priority`, and per RFC 0003's dirty-detection
+    /// exclusion of both repo axes — changing it does NOT flip sync state.
     pub fn set_repo_id(&mut self, repo_id: Option<RepoId>) -> Result<()> {
         // Idempotent no-op: setting the same value is always fine, even on
         // a remote-backed task — only an actual *change* is rejected.
@@ -505,9 +518,20 @@ impl Task {
             return Ok(());
         }
         if self.remote.is_some() {
-            return Err(DomainError::validation(
-                "cannot reassign the repo of a task already synced to a remote issue",
-            ));
+            // The backing issue's home is the filing repo when a DISTINCT one
+            // is recorded; only then is the logical repo free to move. Compare
+            // the recorded filing repo against the CURRENT (pre-change) logical
+            // repo — equal (or filing absent) means filing == logical, so the
+            // issue lives in the repo we're about to move off of.
+            let filing_is_distinct = self
+                .filing_repo_id
+                .as_ref()
+                .is_some_and(|f| Some(f) != self.repo_id.as_ref());
+            if !filing_is_distinct {
+                return Err(DomainError::validation(
+                    "cannot reassign the repo of a synced task unless a distinct filing repo is recorded",
+                ));
+            }
         }
         self.repo_id = repo_id;
         self.touch();
@@ -995,6 +1019,60 @@ mod tests {
         let before = t.updated_at;
         t.set_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
         assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn set_repo_id_allowed_when_remote_backed_with_distinct_filing() {
+        // Post-RFC-0002: the backing issue lives in the recorded DISTINCT
+        // filing repo, so the logical repo is free to move without orphaning
+        // it.
+        let mut t = draft();
+        let logical = RepoId::new();
+        let filing = RepoId::new();
+        t.set_repo_id(Some(logical)).unwrap();
+        t.set_filing_repo_id(Some(filing)).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        let new_logical = RepoId::new();
+        t.set_repo_id(Some(new_logical)).unwrap();
+        assert_eq!(t.repo_id, Some(new_logical));
+        // Filing repo (the issue's home) is untouched, and a logical-repo move
+        // is local metadata — no spurious DirtyLocal flip.
+        assert_eq!(t.filing_repo_id, Some(filing));
+        assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn set_repo_id_rejected_when_remote_backed_and_filing_equals_logical() {
+        // When filing == logical the issue's home IS the logical repo, so
+        // moving it would orphan the issue — rejected, exactly as pre-RFC-0002.
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_repo_id(Some(repo)).unwrap();
+        t.set_filing_repo_id(Some(repo)).unwrap(); // filing collapsed onto logical
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        let err = t.set_repo_id(Some(RepoId::new())).unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn set_repo_id_recollapse_onto_filing_allowed() {
+        // With a distinct filing recorded, moving the logical repo to EQUAL the
+        // filing repo is allowed (re-collapse): the recorded filing stays
+        // authoritative and is never touched.
+        let mut t = draft();
+        let logical = RepoId::new();
+        let filing = RepoId::new();
+        t.set_repo_id(Some(logical)).unwrap();
+        t.set_filing_repo_id(Some(filing)).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.set_repo_id(Some(filing)).unwrap();
+        assert_eq!(t.repo_id, Some(filing));
+        assert_eq!(t.filing_repo_id, Some(filing));
     }
 
     #[test]
