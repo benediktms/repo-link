@@ -19,6 +19,7 @@ use std::sync::Arc;
 use domain_project::Project;
 use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::{SyncState, Task};
+use domain_workspace::Workspace;
 use ports::{OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository};
 
 /// Is this task a mirror (i.e. not purely local)? Only mirror tasks owe
@@ -45,6 +46,16 @@ pub async fn resolve_project(
     task: &Task,
 ) -> PortResult<Option<Project>> {
     let workspace = workspaces.get(task.workspace_id).await?;
+    project_for_workspace(projects, &workspace).await
+}
+
+/// Resolve the parent project from an ALREADY-FETCHED workspace, so a caller
+/// that also needs the workspace (e.g. the RFC 0002 first-board-filing default)
+/// doesn't pay a second `workspaces.get` round-trip.
+pub async fn project_for_workspace(
+    projects: &Arc<dyn ProjectRepository>,
+    workspace: &Workspace,
+) -> PortResult<Option<Project>> {
     let Some(project_id) = workspace.project_id.clone() else {
         return Ok(None);
     };

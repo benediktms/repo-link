@@ -821,11 +821,12 @@ impl TaskService {
     /// `project_item_id` is `None`), the D2 chain is run and the resolved
     /// filing repo recorded on the task **before** the mutation is built, so
     /// the `remote_mappings` row written by `save_with_outbox` (#120) is keyed
-    /// under the correct D6 filing-scoped key. The recording is idempotent:
-    /// `set_filing_repo_id` is a no-op when the value is already recorded (e.g.
-    /// issue-backed tasks that recorded at promote). A `CreateDraftIssue` that
-    /// resolves to `None` (step 4: orphan, no workspace default) legitimately
-    /// stays a board draft with `filing_repo_id == None`.
+    /// under the correct D6 filing-scoped key. The recording is gated on
+    /// `filing_repo_id.is_none()`, so for a task that already recorded its
+    /// filing repo (e.g. at promote, #117) the block is skipped entirely — the
+    /// recorded value is never re-resolved. A `CreateDraftIssue` that resolves
+    /// to `None` (step 4: orphan, no workspace default) legitimately stays a
+    /// board draft with `filing_repo_id == None`.
     ///
     /// Precedence mirror of the promote site (see `SyncService::promote`):
     /// `resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id)`.
@@ -840,20 +841,24 @@ impl TaskService {
         if !enqueue::is_mirror(task) {
             return Ok(Vec::new());
         }
-        let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
+        // Fetch the workspace once and reuse it for both the project lookup and
+        // the RFC 0002 filing default — `resolve_project` would otherwise repeat
+        // the `workspaces.get` round-trip on every transition (Greptile #139).
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let project = enqueue::project_for_workspace(&self.projects, &workspace).await?;
 
-        // RFC 0002 D2 first-board-filing: resolve and record the filing repo
-        // ONLY at the genuine first filing — gate on `filing_repo_id.is_none()`.
-        // Once recorded the value is authoritative and must never be re-resolved
-        // (the resolver's contract). Without the is_none() guard a task that
-        // recorded its filing repo at promote (#117) but is not yet a board item
-        // re-resolves on EVERY lifecycle transition; if the workspace default
-        // changed in between, `resolve_filing_repo` yields a different repo and
-        // `set_filing_repo_id` errors, hard-failing the transition
-        // (start/complete/block/…). A NULL result (step 4: pure orphan draft
-        // with no default) records as None and stays a board draft.
+        // RFC 0002 D2 first-board-filing: resolve + record the filing repo at
+        // the first filing, gated on `filing_repo_id.is_none()`. Once a repo is
+        // recorded the block is SKIPPED entirely (the guard is false), so a
+        // task that recorded at promote (#117) is never re-resolved — which is
+        // what stops a later workspace-default change from erroring a lifecycle
+        // transition. The block is still re-entered while filing stays None (a
+        // pure orphan draft, step 4): that is intentional and cheap (the
+        // workspace is already in hand) — it lets a workspace default added
+        // *after* the draft was created take effect on the draft's next
+        // transition. `set_filing_repo_id(None)` is a no-op, so a draft with no
+        // default simply stays a board draft.
         if project.is_some() && task.project_item_id.is_none() && task.filing_repo_id.is_none() {
-            let workspace = self.workspaces.get(task.workspace_id).await?;
             let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
             task.set_filing_repo_id(filing)?;
         }
