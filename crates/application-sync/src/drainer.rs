@@ -397,6 +397,73 @@ impl OutboxDrainer {
                     .set_status(project_node_id, item_node_id, status_field_id, option_id)
                     .await?;
             }
+            // Relation-sync arms (#95/#96). These address the GitHub-native
+            // primitives directly via REST; the adapter resolves the *related*
+            // issue's integer db id at apply time (the entry carries only the
+            // offline-known `#number`). The provider calls are idempotent
+            // (already-linked / already-gone collapse to success), so an
+            // at-least-once redelivery after a crash is safe with no extra
+            // guard.
+            OutboxMutation::AddSubIssue {
+                parent_canonical,
+                parent_remote_id,
+                child_canonical,
+                child_remote_id,
+            } => {
+                self.remote_tasks
+                    .add_sub_issue(
+                        parent_canonical,
+                        parent_remote_id,
+                        child_canonical,
+                        child_remote_id,
+                    )
+                    .await?;
+            }
+            OutboxMutation::RemoveSubIssue {
+                parent_canonical,
+                parent_remote_id,
+                child_canonical,
+                child_remote_id,
+            } => {
+                self.remote_tasks
+                    .remove_sub_issue(
+                        parent_canonical,
+                        parent_remote_id,
+                        child_canonical,
+                        child_remote_id,
+                    )
+                    .await?;
+            }
+            OutboxMutation::AddBlockedBy {
+                blocked_canonical,
+                blocked_remote_id,
+                blocker_canonical,
+                blocker_remote_id,
+            } => {
+                self.remote_tasks
+                    .add_blocked_by(
+                        blocked_canonical,
+                        blocked_remote_id,
+                        blocker_canonical,
+                        blocker_remote_id,
+                    )
+                    .await?;
+            }
+            OutboxMutation::RemoveBlockedBy {
+                blocked_canonical,
+                blocked_remote_id,
+                blocker_canonical,
+                blocker_remote_id,
+            } => {
+                self.remote_tasks
+                    .remove_blocked_by(
+                        blocked_canonical,
+                        blocked_remote_id,
+                        blocker_canonical,
+                        blocker_remote_id,
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -653,6 +720,70 @@ mod tests {
 
         let all = h.outbox.all();
         assert_eq!(all[0].status, OutboxStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn drain_add_sub_issue_calls_provider() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "10").await;
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddSubIssue {
+                parent_canonical: "github.com/o/r".into(),
+                parent_remote_id: "10".into(),
+                child_canonical: "github.com/o/r".into(),
+                child_remote_id: "20".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+
+        let calls = h.remote_tasks.relation_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].op, "add_sub_issue");
+        assert_eq!(
+            calls[0].addressed_remote_id, "10",
+            "endpoint addresses parent"
+        );
+        assert_eq!(
+            calls[0].related_remote_id, "20",
+            "child is the related issue"
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn drain_add_blocked_by_calls_provider() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "10").await;
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddBlockedBy {
+                blocked_canonical: "github.com/o/r".into(),
+                blocked_remote_id: "10".into(),
+                blocker_canonical: "github.com/o/r".into(),
+                blocker_remote_id: "20".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+
+        let calls = h.remote_tasks.relation_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].op, "add_blocked_by");
+        assert_eq!(
+            calls[0].addressed_remote_id, "10",
+            "endpoint addresses blocked"
+        );
+        assert_eq!(
+            calls[0].related_remote_id, "20",
+            "blocker is the related issue"
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
     }
 
     #[tokio::test]

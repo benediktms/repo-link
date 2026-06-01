@@ -92,6 +92,35 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn save_many_with_outbox(
+        &self,
+        tasks: &[(&Task, SnapshotSource)],
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        // The reciprocal-edge guarantee of `save_many` AND the transactional-
+        // outbox guarantee of `save_with_outbox`, in ONE transaction: a relation
+        // edit's two task rows + the single outbound mutation it owes either all
+        // commit or none do. Without this, a crash between the row write and the
+        // enqueue would leave the relation permanently unsynced (relations have
+        // no dirty-detection backstop). BEGIN IMMEDIATE grabs the writer lock
+        // once for the whole unit; the outbox repo shares the same pool, so its
+        // insert slots straight into this transaction.
+        let mut tx = self
+            .db
+            .writes
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_sqlx_err)?;
+        for (t, source) in tasks {
+            write_task_in_tx(&mut tx, t, *source).await?;
+        }
+        for entry in entries {
+            crate::outbox_repo::insert_outbox_in_tx(&mut tx, entry).await?;
+        }
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn get(&self, id: TaskId) -> PortResult<Task> {
         let row = sqlx::query(&format!("SELECT {TASK_COLS} FROM tasks WHERE id = ?"))
             .bind(id.to_string())

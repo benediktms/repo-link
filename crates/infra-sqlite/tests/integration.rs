@@ -642,6 +642,55 @@ async fn save_with_outbox_persists_task_snapshot_and_entries_in_one_tx() {
 }
 
 #[tokio::test]
+async fn save_many_with_outbox_persists_both_sides_and_entry_in_one_tx() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use infra_sqlite::SqliteOutboxRepository;
+    use ports::OutboxRepository;
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Both ends already exist (relation ops only batch already-loaded tasks).
+    let mut a = Task::new_draft(w.id, None, "A".into()).unwrap();
+    let mut b = Task::new_draft(w.id, None, "B".into()).unwrap();
+    ts.save(&a, SnapshotSource::Created).await.unwrap();
+    ts.save(&b, SnapshotSource::Created).await.unwrap();
+
+    // The reciprocal halves of a blocked_by/blocks pair PLUS the single
+    // dependency mutation the edit owes — all in one atomic write.
+    a.add_relation(RelationKind::BlockedBy, b.id);
+    b.add_relation(RelationKind::Blocks, a.id);
+    let entry = OutboxEntry::new(
+        a.id,
+        OutboxMutation::AddBlockedBy {
+            blocked_canonical: "github.com/o/r".into(),
+            blocked_remote_id: "10".into(),
+            blocker_canonical: "github.com/o/r".into(),
+            blocker_remote_id: "20".into(),
+        },
+    );
+    ts.save_many_with_outbox(
+        &[
+            (&a, SnapshotSource::LocalEdit),
+            (&b, SnapshotSource::LocalEdit),
+        ],
+        std::slice::from_ref(&entry),
+    )
+    .await
+    .unwrap();
+
+    // Both reciprocal edges round-trip.
+    assert_eq!(ts.get(a.id).await.unwrap().relations.len(), 1);
+    assert_eq!(ts.get(b.id).await.unwrap().relations.len(), 1);
+    // The dependency entry is pending, keyed on the command subject `a`.
+    let outbox = SqliteOutboxRepository::new(db);
+    let pending = outbox.list_pending(a.id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].mutation.kind(), "add_blocked_by");
+}
+
+#[tokio::test]
 async fn save_with_outbox_empty_entries_behaves_like_save() {
     use infra_sqlite::SqliteOutboxRepository;
     use ports::OutboxRepository;

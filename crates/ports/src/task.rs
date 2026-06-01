@@ -109,6 +109,35 @@ pub trait TaskRepository: Send + Sync {
         let _ = entries;
         Ok(())
     }
+    /// Persist several tasks (each with its snapshot `source`) **and** the given
+    /// outbox `entries` in ONE atomic transaction — the [`save_many`] reciprocal
+    /// guarantee and the [`save_with_outbox`] transactional-outbox guarantee
+    /// combined. Relation sync needs exactly this: a `parent_of`/`blocked_by`
+    /// edit writes the two reciprocal task rows together with the single
+    /// outbound mutation it owes, and a torn write would leave the graph
+    /// asymmetric OR the relation permanently unsynced (relations have no
+    /// dirty-detection backstop, unlike title/body drift).
+    ///
+    /// When `entries` is empty this MUST behave exactly like [`save_many`].
+    ///
+    /// [`save_many`]: Self::save_many
+    /// [`save_with_outbox`]: Self::save_with_outbox
+    ///
+    /// The default implementation is **not** atomic — it loops `save` then
+    /// enqueues separately, the tear-prone shape the dedicated method exists to
+    /// replace. Provided only so test doubles needn't reimplement it; any
+    /// adapter backed by real storage MUST override it with one transaction.
+    async fn save_many_with_outbox(
+        &self,
+        tasks: &[(&Task, SnapshotSource)],
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        for (task, source) in tasks {
+            self.save(task, *source).await?;
+        }
+        let _ = entries;
+        Ok(())
+    }
     async fn get(&self, id: TaskId) -> PortResult<Task>;
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>>;
     /// Look up a task by its globally-unique `hash`. Used by the
