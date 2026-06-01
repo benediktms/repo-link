@@ -387,6 +387,25 @@ impl RestClient {
         Ok(issue.id.into_inner())
     }
 
+    /// Like [`resolve_issue_db_id`](Self::resolve_issue_db_id) but maps a 404 —
+    /// the related issue was deleted from GitHub — to `Ok(None)`. A *remove*
+    /// whose target issue no longer exists is already in the desired state, so
+    /// the un-link is a no-op success; without this, the preliminary GET's 404
+    /// would propagate as a hard error and the drainer would retry the entry
+    /// forever (it can never succeed). Only the remove paths use this — an `add`
+    /// against a deleted issue is a genuine failure worth surfacing.
+    async fn resolve_issue_db_id_or_gone(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<u64>> {
+        match self.resolve_issue_db_id(canonical_repo, remote_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(PortError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link `child` under
     /// `parent`. Resolves the child's db id first, then posts `sub_issue_id`.
     /// 422 (already a sub-issue) is treated as idempotent success.
@@ -423,9 +442,14 @@ impl RestClient {
         child_canonical: &str,
         child_remote_id: &str,
     ) -> PortResult<()> {
-        let child_db_id = self
-            .resolve_issue_db_id(child_canonical, child_remote_id)
-            .await?;
+        let Some(child_db_id) = self
+            .resolve_issue_db_id_or_gone(child_canonical, child_remote_id)
+            .await?
+        else {
+            // Child issue deleted from GitHub → the sub-issue link can't exist →
+            // un-link is already satisfied.
+            return Ok(());
+        };
         let (owner, repo) = split_owner_repo(parent_canonical)?;
         let number = parse_issue_number(parent_remote_id)?;
         let route = format!("/repos/{owner}/{repo}/issues/{number}/sub_issue");
@@ -475,9 +499,14 @@ impl RestClient {
         blocker_canonical: &str,
         blocker_remote_id: &str,
     ) -> PortResult<()> {
-        let blocker_db_id = self
-            .resolve_issue_db_id(blocker_canonical, blocker_remote_id)
-            .await?;
+        let Some(blocker_db_id) = self
+            .resolve_issue_db_id_or_gone(blocker_canonical, blocker_remote_id)
+            .await?
+        else {
+            // Blocker issue deleted from GitHub → the dependency can't exist →
+            // un-link is already satisfied.
+            return Ok(());
+        };
         let (owner, repo) = split_owner_repo(blocked_canonical)?;
         let number = parse_issue_number(blocked_remote_id)?;
         let route = format!(
