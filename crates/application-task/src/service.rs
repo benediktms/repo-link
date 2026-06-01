@@ -383,7 +383,7 @@ impl TaskService {
         // LocalOnly task / priority-only / no-op edit the plan is empty and
         // `save_with_outbox` behaves exactly like `save`.
         let mutations = self
-            .plan_update_mutations(&t, sync_before, resolved_filing.is_some())
+            .plan_update_mutations(&mut t, sync_before, resolved_filing.is_some())
             .await?;
         let entries = into_entries(t.id, mutations);
         self.repo
@@ -412,7 +412,7 @@ impl TaskService {
     ///    contract.
     async fn plan_update_mutations(
         &self,
-        task: &Task,
+        task: &mut Task,
         sync_before: SyncState,
         converted_orphan_draft: bool,
     ) -> Result<Vec<OutboxMutation>> {
@@ -448,6 +448,9 @@ impl TaskService {
                 item_node_id,
                 repo_node_id: filing_canonical,
             });
+            // Return early: the convert branch handles filing-repo recording
+            // separately (#123); do NOT fall through to plan_mirror_mutations
+            // or the first-filing resolve/record would double-resolve.
             return Ok(out);
         }
 
@@ -790,7 +793,7 @@ impl TaskService {
         // its card move rides on `SetProjectStatus`), then commit the task AND
         // its outbox entries in one atomic write (#54). A LocalOnly task plans
         // nothing, so `save_with_outbox` behaves like `save`.
-        let mutations = self.plan_mirror_mutations(&t, false).await?;
+        let mutations = self.plan_mirror_mutations(&mut t, false).await?;
         let entries = into_entries(t.id, mutations);
         self.repo
             .save_with_outbox(&t, SnapshotSource::LocalEdit, &entries)
@@ -813,18 +816,53 @@ impl TaskService {
     /// enqueue a no-op draft content write (the card move via
     /// `SetProjectStatus` carries the lifecycle change for drafts).
     ///
-    /// The `logical_canonical` it resolves is the task's **logical** repo URL
-    /// — also where the issue is filed today, until RFC 0002 splits the filing
-    /// repo out as its own axis.
+    /// **RFC 0002 D2 — first-board-filing recording (#124).** When this is a
+    /// genuine first-board-filing moment (mirror, project present,
+    /// `project_item_id` is `None`), the D2 chain is run and the resolved
+    /// filing repo recorded on the task **before** the mutation is built, so
+    /// the `remote_mappings` row written by `save_with_outbox` (#120) is keyed
+    /// under the correct D6 filing-scoped key. The recording is gated on
+    /// `filing_repo_id.is_none()`, so for a task that already recorded its
+    /// filing repo (e.g. at promote, #117) the block is skipped entirely — the
+    /// recorded value is never re-resolved. A `CreateDraftIssue` that resolves
+    /// to `None` (step 4: orphan, no workspace default) legitimately stays a
+    /// board draft with `filing_repo_id == None`.
+    ///
+    /// Precedence mirror of the promote site (see `SyncService::promote`):
+    /// `resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id)`.
+    /// The per-task override (`--filing-repo` CLI flag) lands in #122; with no
+    /// override and no workspace default the chain collapses to the logical
+    /// repo — board filing targets the same place as today.
     async fn plan_mirror_mutations(
         &self,
-        task: &Task,
+        task: &mut Task,
         content_changed: bool,
     ) -> Result<Vec<OutboxMutation>> {
         if !enqueue::is_mirror(task) {
             return Ok(Vec::new());
         }
-        let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
+        // Fetch the workspace once and reuse it for both the project lookup and
+        // the RFC 0002 filing default — `resolve_project` would otherwise repeat
+        // the `workspaces.get` round-trip on every transition (Greptile #139).
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let project = enqueue::project_for_workspace(&self.projects, &workspace).await?;
+
+        // RFC 0002 D2 first-board-filing: resolve + record the filing repo at
+        // the first filing, gated on `filing_repo_id.is_none()`. Once a repo is
+        // recorded the block is SKIPPED entirely (the guard is false), so a
+        // task that recorded at promote (#117) is never re-resolved — which is
+        // what stops a later workspace-default change from erroring a lifecycle
+        // transition. The block is still re-entered while filing stays None (a
+        // pure orphan draft, step 4): that is intentional and cheap (the
+        // workspace is already in hand) — it lets a workspace default added
+        // *after* the draft was created take effect on the draft's next
+        // transition. `set_filing_repo_id(None)` is a no-op, so a draft with no
+        // default simply stays a board draft.
+        if project.is_some() && task.project_item_id.is_none() && task.filing_repo_id.is_none() {
+            let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
+            task.set_filing_repo_id(filing)?;
+        }
+
         let logical_canonical = self.logical_canonical_for(task).await?;
         // An issue-backed mirror with no repo binding can't form an
         // `UpdateRemote` (it has no canonical repo to address), so a
@@ -2827,6 +2865,350 @@ mod tests {
         // follows via the drainer's AddItem write-back, not at enqueue time.
         assert!(kinds.contains(&"add_item"), "lazy attach: {kinds:?}");
         assert!(kinds.contains(&"update_remote"), "issue state: {kinds:?}");
+    }
+
+    // ---------- RFC 0002 D2 first-board-filing (#124) ----------------------
+
+    /// Issue-backed mirror whose workspace has a project but no `project_item_id`
+    /// records `filing_repo_id == repo_id` (step 3 — logical repo) before the
+    /// `AddItem` mutation is enqueued.
+    #[tokio::test]
+    async fn first_board_filing_issue_backed_records_logical_filing_repo() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_issue");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Issue-backed mirror with a node id, NOT yet a board item, no filing
+        // repo recorded yet (filing_repo_id == None before the transition).
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_r1"), None).await;
+        t.repo_id = Some(binding.id);
+        // Confirm: filing_repo_id not recorded yet (pre-condition).
+        assert_eq!(t.filing_repo_id, None);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        // Trigger the first-board-filing path via a lifecycle transition.
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        // The filing repo must be recorded before the AddItem lands.
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(binding.id),
+            "filing_repo_id must equal the logical repo (step 3) after first board filing"
+        );
+        // AddItem was enqueued (lazy net for issue-backed mirror).
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"add_item"),
+            "AddItem must be enqueued: {kinds:?}"
+        );
+    }
+
+    /// Draft-backed orphan mirror (no `repo_id`, no workspace default) resolves
+    /// to `None` (step 4 — board draft), records `filing_repo_id == None`, and
+    /// emits `CreateDraftIssue`.
+    #[tokio::test]
+    async fn first_board_filing_draft_backed_orphan_stays_null_emits_create_draft() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_draft");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        // No workspace default filing repo.
+        workspaces.save(&ws).await.unwrap();
+
+        // Draft-backed mirror: remote == None, project_item_id == None, no repo_id.
+        let mut t = Task::import_mirror(
+            ws.id,
+            None, // no repo_id — orphan
+            RemoteRef::new("github", "0"),
+            "board draft".into(),
+            "needs triage".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None; // strip REST issue → pure draft
+        // project_item_id is None → first-filing precondition met
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        // Step 4: filing_repo_id stays None (legitimate board draft).
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id, None,
+            "orphan draft with no workspace default must stay filing_repo_id = None (step 4)"
+        );
+        // CreateDraftIssue was enqueued.
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"create_draft_issue"),
+            "CreateDraftIssue must be enqueued for draft-backed first board filing: {kinds:?}"
+        );
+    }
+
+    /// Orphan draft whose workspace has a filing default resolves to the
+    /// workspace default (step 2) and records that as the filing repo.
+    #[tokio::test]
+    async fn first_board_filing_orphan_draft_with_ws_default_resolves_to_default() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_ws_default");
+        projects.save(&project).await.unwrap();
+
+        // Bind a "filing default" repo to the workspace.
+        let ws_placeholder_id = domain_core::WorkspaceId::new();
+        let default_binding = domain_repo::RepoBinding::new(
+            ws_placeholder_id,
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        ws.filing_repo_id = Some(default_binding.id); // workspace default
+        workspaces.save(&ws).await.unwrap();
+
+        // Orphan draft: no repo_id, pure draft (remote = None, project_item_id = None).
+        let mut t = Task::import_mirror(
+            ws.id,
+            None, // orphan — no logical repo
+            RemoteRef::new("github", "0"),
+            "orphan".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        t.remote = None;
+        repo.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        // Step 2: workspace default wins over the absent logical repo.
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(default_binding.id),
+            "orphan + workspace default must resolve to the workspace default repo (step 2)"
+        );
+        // CreateDraftIssue is enqueued (the issue conversion to a real issue
+        // in the filing repo is coordinated by ConvertDraftToIssue — #123).
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"create_draft_issue"),
+            "CreateDraftIssue must be enqueued: {kinds:?}"
+        );
+        // filing_repo_id is now recorded — a second transition must be idempotent.
+        let _ = outbox.all(); // drain for next assertion
+        let _ = svc.start(&t.id.to_string()).await;
+        let reloaded2 = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded2.filing_repo_id,
+            Some(default_binding.id),
+            "filing_repo_id must not change on repeat transition (idempotent same-value set)"
+        );
+    }
+
+    /// A task that is ALREADY a board item (`project_item_id` is `Some`) does
+    /// NOT trigger the first-filing path — `filing_repo_id` is left unchanged
+    /// and no extra recording bump occurs.
+    #[tokio::test]
+    async fn already_attached_card_does_not_re_resolve_filing_repo() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_attached");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Already attached: project_item_id is set; filing_repo_id already recorded.
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_a1"), Some("PVTI_a1")).await;
+        t.repo_id = Some(binding.id);
+        t.set_filing_repo_id(Some(binding.id)).unwrap();
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+        let filing_before = t.filing_repo_id;
+
+        svc.start(&t.id.to_string()).await.unwrap();
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        // filing_repo_id must be unchanged — already-attached card skips first-filing.
+        assert_eq!(
+            reloaded.filing_repo_id, filing_before,
+            "already-attached card must not re-resolve or change filing_repo_id"
+        );
+        // Only SetProjectStatus is enqueued (card move), not AddItem.
+        let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
+        assert!(
+            kinds.contains(&"set_project_status"),
+            "attached card must produce a SetProjectStatus card move: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"add_item"),
+            "attached card must NOT produce AddItem: {kinds:?}"
+        );
+    }
+
+    /// RFC 0002 regression (verify #124): a task that recorded its filing repo
+    /// at promote (#117) but is NOT yet a board item (`project_item_id` None)
+    /// must NOT re-resolve on a later lifecycle transition. Before the
+    /// `filing_repo_id.is_none()` guard, if the workspace default changed after
+    /// promote, the transition re-resolved to the new default and
+    /// `set_filing_repo_id` errored, hard-failing start/complete/etc.
+    #[tokio::test]
+    async fn recorded_filing_not_re_resolved_when_workspace_default_changes() {
+        let RichSvc {
+            svc,
+            repo,
+            workspaces,
+            projects,
+            bindings,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_changed");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let logical = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/logical.git".into(),
+            "github.com/o/logical".into(),
+        )
+        .unwrap();
+        let other = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/other.git".into(),
+            "github.com/o/other".into(),
+        )
+        .unwrap();
+        bindings.save(&logical).await.unwrap();
+        bindings.save(&other).await.unwrap();
+
+        // Issue-backed, NOT yet a board item (project_item_id None); filing
+        // recorded at promote = the logical repo (#117, no default then).
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_x"), None).await;
+        t.repo_id = Some(logical.id);
+        t.set_filing_repo_id(Some(logical.id)).unwrap();
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        // The workspace default is set to a DIFFERENT repo AFTER promote.
+        ws.filing_repo_id = Some(other.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // A lifecycle transition must NOT error and must NOT retarget filing.
+        svc.start(&t.id.to_string())
+            .await
+            .expect("transition must not error on a recorded filing repo when the workspace default changed");
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(logical.id),
+            "recorded filing repo is authoritative — not retargeted to the changed workspace default"
+        );
+    }
+
+    /// A second lifecycle transition after the filing repo was recorded is an
+    /// idempotent same-value set — `set_filing_repo_id` returns `Ok(())` and
+    /// the recorded value is unchanged.
+    #[tokio::test]
+    async fn repeat_transition_after_filing_recorded_is_idempotent() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            bindings,
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_repeat");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Not yet attached.
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_rep"), None).await;
+        t.repo_id = Some(binding.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        // First transition: records filing_repo_id.
+        svc.start(&t.id.to_string()).await.unwrap();
+        let after_first = repo.get(t.id).await.unwrap();
+        assert_eq!(after_first.filing_repo_id, Some(binding.id));
+
+        // Clear outbox for a clean second-pass observation.
+        let _ = outbox.all();
+
+        // Simulate card write-back (drainer would set project_item_id); do it
+        // manually so the second transition sees the attached state.
+        let mut attached = after_first.clone();
+        attached.project_item_id = Some("PVTI_rep".into());
+        repo.save(&attached, SnapshotSource::Promote).await.unwrap();
+
+        // Second transition: idempotent — filing_repo_id must stay the same value.
+        svc.complete(&t.id.to_string()).await.unwrap();
+        let after_second = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            after_second.filing_repo_id,
+            Some(binding.id),
+            "repeat transition must not change or error on the already-recorded filing_repo_id"
+        );
     }
 
     #[tokio::test]

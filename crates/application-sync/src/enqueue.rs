@@ -19,6 +19,7 @@ use std::sync::Arc;
 use domain_project::Project;
 use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::{SyncState, Task};
+use domain_workspace::Workspace;
 use ports::{OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository};
 
 /// Is this task a mirror (i.e. not purely local)? Only mirror tasks owe
@@ -45,6 +46,16 @@ pub async fn resolve_project(
     task: &Task,
 ) -> PortResult<Option<Project>> {
     let workspace = workspaces.get(task.workspace_id).await?;
+    project_for_workspace(projects, &workspace).await
+}
+
+/// Resolve the parent project from an ALREADY-FETCHED workspace, so a caller
+/// that also needs the workspace (e.g. the RFC 0002 first-board-filing default)
+/// doesn't pay a second `workspaces.get` round-trip.
+pub async fn project_for_workspace(
+    projects: &Arc<dyn ProjectRepository>,
+    workspace: &Workspace,
+) -> PortResult<Option<Project>> {
     let Some(project_id) = workspace.project_id.clone() else {
         return Ok(None);
     };
@@ -153,16 +164,180 @@ pub fn plan_mutations(
                 // Lazy net — attach now; SetProjectStatus follows via the
                 // drainer's AddItem / CreateDraftIssue write-back.
                 if let Some(remote) = task.remote.as_ref().and_then(|r| r.node_id.clone()) {
+                    // Issue-backed: attach the existing issue to the board.
                     out.push(OutboxMutation::AddItem {
                         project_node_id: project.id.as_str().to_string(),
                         issue_node_id: remote,
                     });
+                } else if task.remote.is_none() {
+                    // Draft-backed (no REST issue): create a new board draft.
+                    // The drainer's CreateDraftIssue write-back records the
+                    // returned PVTI_ item id and enqueues the follow-up
+                    // SetProjectStatus.
+                    out.push(OutboxMutation::CreateDraftIssue {
+                        project_node_id: project.id.as_str().to_string(),
+                        title: task.title.clone(),
+                        body: task.body.clone(),
+                    });
                 }
-                // (A projectless-but-no-node-id issue can't be attached yet;
+                // (An issue-backed task with no node id yet can't be attached;
                 //  it will attach once its node id is known via a pull.)
             }
         }
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain_core::{ProjectId, WorkspaceId};
+    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_task::{RemoteRef, SyncState, Task};
+
+    fn make_project(id: &str) -> Project {
+        Project::new(
+            ProjectId::parse(id).unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            "PVTSSF_f".into(),
+            vec![StatusOption {
+                option_id: "o1".into(),
+                name: "Backlog".into(),
+                ordinal: 0,
+            }],
+            vec![StatusMapping {
+                status: domain_task::TaskStatus::Open,
+                option_id: "o1".into(),
+            }],
+            false,
+            domain_core::Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    /// Build a minimal synced draft-backed mirror (remote == None,
+    /// project_item_id == None) ready for first-board-filing.
+    fn make_draft_backed_mirror() -> Task {
+        let ws = WorkspaceId::new();
+        let mut t = Task::import_mirror(
+            ws,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft title".into(),
+            "draft body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        // Strip the REST remote — makes it a pure draft with SyncState retained.
+        t.remote = None;
+        t
+    }
+
+    /// Build an issue-backed mirror with a GraphQL node id and no project_item_id.
+    fn make_issue_backed_mirror(node_id: &str) -> Task {
+        let ws = WorkspaceId::new();
+        let mut t = Task::new_draft(ws, None, "issue title".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "42".into(),
+            node_id: Some(node_id.to_string()),
+        })
+        .unwrap();
+        t
+    }
+
+    // --- lazy-net branch: draft-backed emits CreateDraftIssue ---------------
+
+    #[test]
+    fn draft_backed_first_filing_emits_create_draft_issue() {
+        let t = make_draft_backed_mirror();
+        let project = make_project("PVT_kwHO_enq_draft");
+
+        let mutations = plan_mutations(&t, Some(&project), None, false);
+        let kinds: Vec<&str> = mutations.iter().map(|m| m.kind()).collect();
+        assert!(
+            kinds.contains(&"create_draft_issue"),
+            "draft-backed first filing must emit CreateDraftIssue: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn draft_backed_create_draft_issue_carries_title_and_body() {
+        let t = make_draft_backed_mirror();
+        let project = make_project("PVT_kwHO_enq_content");
+
+        let mutations = plan_mutations(&t, Some(&project), None, false);
+        let m = mutations
+            .iter()
+            .find(|m| m.kind() == "create_draft_issue")
+            .unwrap();
+        match m {
+            OutboxMutation::CreateDraftIssue {
+                project_node_id,
+                title,
+                body,
+            } => {
+                assert_eq!(project_node_id, project.id.as_str());
+                assert_eq!(title, "draft title");
+                assert_eq!(body, "draft body");
+            }
+            other => panic!("expected CreateDraftIssue, got {other:?}"),
+        }
+    }
+
+    // --- lazy-net branch: issue-backed still emits AddItem (regression guard) --
+
+    #[test]
+    fn issue_backed_first_filing_still_emits_add_item() {
+        let t = make_issue_backed_mirror("I_nid");
+        let project = make_project("PVT_kwHO_enq_additem");
+
+        let mutations = plan_mutations(&t, Some(&project), Some("github.com/o/r"), false);
+        let kinds: Vec<&str> = mutations.iter().map(|m| m.kind()).collect();
+        assert!(
+            kinds.contains(&"add_item"),
+            "issue-backed first filing must still emit AddItem (regression): {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"create_draft_issue"),
+            "issue-backed must NOT emit CreateDraftIssue: {kinds:?}"
+        );
+    }
+
+    // --- no project → no lazy-net mutation (existing behaviour) -------------
+
+    #[test]
+    fn draft_backed_without_project_emits_nothing_for_project_axis() {
+        let t = make_draft_backed_mirror();
+        // No project passed → project axis is skipped entirely.
+        let mutations = plan_mutations(&t, None, None, false);
+        let kinds: Vec<&str> = mutations.iter().map(|m| m.kind()).collect();
+        assert!(
+            !kinds.contains(&"create_draft_issue"),
+            "without a project there is no board to file on: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"add_item"),
+            "without a project AddItem must not be emitted: {kinds:?}"
+        );
+    }
+
+    // --- local-only tasks are always silent ---------------------------------
+
+    #[test]
+    fn local_only_task_emits_nothing() {
+        let t = Task::new_draft(WorkspaceId::new(), None, "local".into()).unwrap();
+        assert_eq!(t.sync, SyncState::LocalOnly);
+        let project = make_project("PVT_kwHO_enq_local");
+        let mutations = plan_mutations(&t, Some(&project), None, false);
+        assert!(
+            mutations.is_empty(),
+            "LocalOnly task must produce no mutations"
+        );
+    }
 }
