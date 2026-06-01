@@ -302,7 +302,8 @@ impl RepoBindingService {
 
     /// Return every (workspace, binding) pair whose binding's
     /// `canonical_url` is an exact match. Archived workspaces are excluded
-    /// unless `include_archived` is set (the `rl repo locate -a` opt-in).
+    /// unless `include_archived` is set (the `rl repo locate -a` opt-in);
+    /// Deleted workspaces are ALWAYS excluded, even under `include_archived`.
     /// Direct key lookup, not a search — callers want the full membership set,
     /// not a ranked best hit. See [`find`] for the ranked / fuzzy variant.
     ///
@@ -315,6 +316,12 @@ impl RepoBindingService {
         let workspaces = self.workspaces.list(include_archived).await?;
         let mut out = Vec::new();
         for ws in &workspaces {
+            // `list(true)` returns ALL statuses, Deleted included — a deleted
+            // workspace must never surface as a membership (same guard as
+            // `resolve_by_handle`).
+            if ws.status == WorkspaceStatus::Deleted {
+                continue;
+            }
             if let Some(binding) = self
                 .bindings
                 .find_by_canonical_url(ws.id, canonical_url)
@@ -951,6 +958,44 @@ mod tests {
             all.len(),
             2,
             "-a / include_archived surfaces the archived one"
+        );
+    }
+
+    #[tokio::test]
+    async fn memberships_exclude_deleted_even_with_include_archived() {
+        use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
+        // `include_archived` opts in archived, NOT deleted: `list(true)`
+        // returns Deleted rows too, so the loop must drop them — else
+        // `rl repo locate -a` would surface a dead workspace's binding.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let bsvc = RepoBindingService::new(workspaces.clone(), bindings);
+
+        let canonical = "github.com/o/ghost";
+        let mut deleted = Workspace::new(WorkspaceName::new("ws-deleted-mem").unwrap(), None, true);
+        deleted.status = WorkspaceStatus::Deleted;
+        workspaces.save(&deleted).await.unwrap();
+        bsvc.attach(AttachRepoCmd {
+            workspace_id: deleted.id.to_string(),
+            remote_url: format!("git@example.com:{canonical}.git"),
+            canonical_url: canonical.into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+
+        // Even with the broadest opt-in, a deleted workspace stays hidden.
+        let all = bsvc
+            .memberships_for_canonical_url(canonical, true)
+            .await
+            .unwrap();
+        assert!(
+            all.is_empty(),
+            "deleted workspace must not surface, got {all:?}"
         );
     }
 }
