@@ -193,6 +193,57 @@ impl RestClient {
             .collect())
     }
 
+    /// List the issues a given issue is **blocked by** via
+    /// `GET /repos/{o}/{r}/issues/{n}/dependencies/blocked_by`. octocrab has no
+    /// typed handler, so (like `fetch_sub_issues`) we hit it through the generic
+    /// `get` and decode into the typed `Issue` model. Each blocker carries its
+    /// own canonical repo (derived from `repository_url`) since a dependency can
+    /// cross repos. Backs inbound relation reconcile on pull.
+    pub(crate) async fn fetch_blocked_by(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        // Same redirect-silence hazard as `fetch_sub_issues`: the dependency
+        // response doesn't name the parent's `repository_url`, so a transferred
+        // parent would otherwise return the new repo's dependencies.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut issues: Vec<Issue> = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let route = format!(
+                "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by?per_page={PER_PAGE}&page={page}"
+            );
+            let batch: Vec<Issue> = self
+                .detect_move_or_map(
+                    canonical_repo,
+                    remote_id,
+                    self.http.get(route, None::<&()>).await,
+                )
+                .await?;
+            let full = batch.len() == PER_PAGE;
+            issues.extend(batch);
+            if !full {
+                break;
+            }
+        }
+        Ok(issues
+            .into_iter()
+            .map(|issue| {
+                let blocker_canonical =
+                    canonical_from_repository_url(issue.repository_url.as_str())
+                        .unwrap_or_else(|| canonical_repo.to_string());
+                RemoteChildIssue {
+                    canonical_repo: blocker_canonical,
+                    snapshot: map_issue(issue),
+                }
+            })
+            .collect())
+    }
+
     /// List an issue's comments, oldest first, paging through the typed
     /// `list_comments` handler. Caps pages like `fetch_sub_issues` and
     /// surfaces a cap-hit rather than silently truncating.

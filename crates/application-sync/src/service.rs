@@ -1,10 +1,13 @@
 //! [`SyncService`] — orchestrates remote promotion / push / pull / link.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use domain_core::TaskId;
-use domain_sync::{SyncDecision, SyncPolicy, decide, resolve_filing_repo};
-use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
+use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
+use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
+
+use crate::enqueue;
 use dto_shared::SyncSummaryDto;
 use ports::{
     PortError, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate, RepoBindingRepository,
@@ -102,7 +105,20 @@ impl SyncService {
         // board (RFC 0001 §9 / §D1).
         remote_ref.node_id = snap.node_id.clone();
         task.promote_to_remote(remote_ref)?;
-        self.tasks.save(&task, SnapshotSource::Promote).await?;
+
+        // Relation backfill (#151): edges set while this task was local-only were
+        // skipped at relate-time (the gate requires both ends issue-backed). Now
+        // that the task has an issue, re-scan its edges and enqueue the native
+        // mutation for every neighbor that is itself issue-backed. Relations are
+        // stored reciprocally, so scanning this task's own edges also covers the
+        // case where the NEIGHBOR was the side that promoted first and skipped.
+        // Enqueued atomically with the promote save (a torn write would leave the
+        // relation permanently unsynced — relations have no dirty backstop).
+        let this_coords = (filing_canonical.clone(), snap.remote_id.clone());
+        let entries = self.relation_backfill_entries(&task, &this_coords).await?;
+        self.tasks
+            .save_with_outbox(&task, SnapshotSource::Promote, &entries)
+            .await?;
         Ok(summary(&task, prev, SyncDecision::PushLocal))
     }
 
@@ -284,6 +300,15 @@ impl SyncService {
             .fetch_comments(&filing_canonical, &remote.remote_id)
             .await?;
         self.tasks.replace_comments(id, &comments).await?;
+
+        // Inbound relation reconcile (#150): bring local parent/child + blocked_by
+        // edges in line with the issue's GitHub sub-issues and dependencies.
+        // Orthogonal to the title/body drift decision (like comments), so it runs
+        // on every pull including Noop / conflict. Applied via a plain save — NOT
+        // save_with_outbox — so a relation pulled FROM GitHub does not re-enqueue
+        // an outbound mutation back TO GitHub (which would loop).
+        self.reconcile_relations_inbound(&mut task, &filing_canonical, &remote.remote_id)
+            .await?;
 
         // Persist the node-id backfill with a targeted single-column write.
         // Redundant after a PullRemote whole-row save (it already wrote the
@@ -477,6 +502,191 @@ impl SyncService {
         let binding = self.bindings.get(repo_id).await?;
         Ok(binding.canonical_url)
     }
+
+    /// Issue coordinates `(filing_canonical, remote_id)` for a task, or `None`
+    /// when it is not issue-backed or its filing repo can't be resolved — in
+    /// either case the relation can't be projected onto GitHub, so the caller
+    /// skips it. Read-only twin of `filing_canonical_for` that tolerates a
+    /// missing repo instead of erroring.
+    async fn relation_remote_coords(&self, task: &Task) -> Result<Option<(String, String)>> {
+        let Some(remote) = task.remote.as_ref() else {
+            return Ok(None);
+        };
+        let Some(repo_id) = task.filing_repo_id.or(task.repo_id) else {
+            return Ok(None);
+        };
+        let canonical = self.bindings.get(repo_id).await?.canonical_url;
+        Ok(Some((canonical, remote.remote_id.clone())))
+    }
+
+    /// Plan the outbox entries a just-promoted task owes for its existing
+    /// relations: one native mutation per edge whose far end is issue-backed.
+    /// `this_coords` is the promoting task's own `(filing_canonical, remote_id)`.
+    async fn relation_backfill_entries(
+        &self,
+        task: &Task,
+        this_coords: &(String, String),
+    ) -> Result<Vec<OutboxEntry>> {
+        let mut entries = Vec::new();
+        for rel in &task.relations {
+            let neighbor = self.tasks.get(rel.other).await?;
+            let Some(neighbor_coords) = self.relation_remote_coords(&neighbor).await? else {
+                continue; // far end not issue-backed → not yet projectable
+            };
+            if let Some(m) =
+                enqueue::relation_mutation(rel.kind, true, this_coords, &neighbor_coords)
+            {
+                entries.push(OutboxEntry::new(task.id, m));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Inbound relation reconcile (#150): align `task`'s local parent/child and
+    /// blocked_by edges with the issue's GitHub sub-issues and dependencies.
+    /// Remote is authoritative for edges between two issue-backed local tasks;
+    /// edges whose far end isn't a tracked local task (cross-repo, or never
+    /// imported) are left untouched, as are edges to local-only tasks the remote
+    /// can't represent. Saves via plain `save_many` so no outbound re-enqueue.
+    async fn reconcile_relations_inbound(
+        &self,
+        task: &mut Task,
+        filing_canonical: &str,
+        remote_id: &str,
+    ) -> Result<()> {
+        let subs = self
+            .provider
+            .fetch_sub_issues(filing_canonical, remote_id)
+            .await?;
+        let blockers = self
+            .provider
+            .fetch_blocked_by(filing_canonical, remote_id)
+            .await?;
+        let desired_children = self.map_remote_to_local(task.workspace_id, &subs).await?;
+        let desired_blockers = self
+            .map_remote_to_local(task.workspace_id, &blockers)
+            .await?;
+
+        // Neighbor tasks whose reciprocal edge we touch, accumulated so each is
+        // loaded and saved once even if it appears in both families.
+        let mut neighbors: HashMap<TaskId, Task> = HashMap::new();
+        self.reconcile_family(
+            task,
+            RelationKind::ParentOf,
+            RelationKind::ChildOf,
+            &desired_children,
+            &mut neighbors,
+        )
+        .await?;
+        self.reconcile_family(
+            task,
+            RelationKind::BlockedBy,
+            RelationKind::Blocks,
+            &desired_blockers,
+            &mut neighbors,
+        )
+        .await?;
+
+        if !neighbors.is_empty() {
+            let mut batch: Vec<(&Task, SnapshotSource)> = vec![(task, SnapshotSource::Pull)];
+            batch.extend(neighbors.values().map(|n| (n, SnapshotSource::Pull)));
+            self.tasks.save_many(&batch).await?;
+        }
+        Ok(())
+    }
+
+    /// Resolve each remote related issue to its local task id, dropping any that
+    /// aren't tracked locally (binding for the issue's repo not attached, or the
+    /// issue never imported). Keyed on the FILING repo per D6 `find_by_remote`.
+    async fn map_remote_to_local(
+        &self,
+        workspace_id: domain_core::WorkspaceId,
+        related: &[ports::RemoteChildIssue],
+    ) -> Result<Vec<TaskId>> {
+        let mut ids = Vec::new();
+        for item in related {
+            let Some(binding) = self
+                .bindings
+                .find_by_canonical_url(workspace_id, &item.canonical_repo)
+                .await?
+            else {
+                continue; // related issue's repo not tracked in this workspace
+            };
+            if let Some(t) = self
+                .tasks
+                .find_by_remote(binding.id, "github", &item.snapshot.remote_id)
+                .await?
+            {
+                ids.push(t.id);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Reconcile one relation family on `task` toward `desired` (the local task
+    /// ids the remote says are related via `kind`). Adds missing edges and
+    /// removes edges the remote dropped — but only removals whose far end is
+    /// itself issue-backed (remotely representable); a local-only neighbor the
+    /// remote can't express is left alone. Reciprocals are mirrored onto the
+    /// neighbors, which collect into `neighbors` for the caller's batch save.
+    async fn reconcile_family(
+        &self,
+        task: &mut Task,
+        kind: RelationKind,
+        inverse: RelationKind,
+        desired: &[TaskId],
+        neighbors: &mut HashMap<TaskId, Task>,
+    ) -> Result<()> {
+        let task_id = task.id;
+        let desired_set: HashSet<TaskId> = desired.iter().copied().collect();
+        let current: Vec<TaskId> = task
+            .relations
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| r.other)
+            .collect();
+        let current_set: HashSet<TaskId> = current.iter().copied().collect();
+
+        // Additions: remote has the edge, local doesn't.
+        for &other in desired {
+            if other == task_id || current_set.contains(&other) {
+                continue;
+            }
+            let neighbor = self.load_neighbor(neighbors, other).await?;
+            task.add_relation(kind, other);
+            neighbor.add_relation(inverse, task_id);
+        }
+        // Removals: local has the edge, remote dropped it — only when the far
+        // end is issue-backed, so an unrepresentable local-only edge survives.
+        for other in current {
+            if other == task_id || desired_set.contains(&other) {
+                continue;
+            }
+            let neighbor = self.load_neighbor(neighbors, other).await?;
+            if neighbor.remote.is_none() {
+                continue; // remote can't represent a local-only neighbor
+            }
+            task.remove_relation(kind, other);
+            neighbor.remove_relation(inverse, task_id);
+        }
+        Ok(())
+    }
+
+    /// Load `id` into the neighbor cache if absent, returning a mutable handle.
+    // The `entry` API can't host the fallible async `tasks.get` between the miss
+    // check and the insert, so the contains/insert split is intentional.
+    #[allow(clippy::map_entry)]
+    async fn load_neighbor<'a>(
+        &self,
+        neighbors: &'a mut HashMap<TaskId, Task>,
+        id: TaskId,
+    ) -> Result<&'a mut Task> {
+        if !neighbors.contains_key(&id) {
+            let t = self.tasks.get(id).await?;
+            neighbors.insert(id, t);
+        }
+        Ok(neighbors.get_mut(&id).expect("just inserted"))
+    }
 }
 
 #[cfg(test)]
@@ -486,12 +696,14 @@ mod tests {
     use chrono::Utc;
     use domain_core::{Timestamp, WorkspaceId};
     use domain_repo::RepoBinding;
+    use domain_sync::OutboxMutation;
     use domain_task::Task;
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot};
     use std::sync::Mutex;
     use testing_fixtures::{
-        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
+        InMemoryOutboxRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
+        InMemoryWorkspaceRepository,
     };
 
     #[derive(Clone)]
@@ -512,6 +724,8 @@ mod tests {
         created_comments: Mutex<Vec<String>>,
         move_target: Mutex<Option<(String, String)>>,
         fetch_moved: Mutex<Option<(String, String)>>,
+        sub_issues: Mutex<Vec<ports::RemoteChildIssue>>,
+        blocked_by: Mutex<Vec<ports::RemoteChildIssue>>,
     }
 
     impl FakeProvider {
@@ -521,6 +735,16 @@ mod tests {
 
         fn set_comments(&self, comments: Vec<RemoteComment>) {
             *self.comments.lock().unwrap() = comments;
+        }
+
+        /// Seed the issue's GitHub sub-issues / blocked_by deps for inbound
+        /// relation reconcile, as `(canonical, number)` pairs.
+        fn set_sub_issues(&self, items: &[(&str, &str)]) {
+            *self.sub_issues.lock().unwrap() = items.iter().map(|(c, n)| child(c, n)).collect();
+        }
+
+        fn set_blocked_by(&self, items: &[(&str, &str)]) {
+            *self.blocked_by.lock().unwrap() = items.iter().map(|(c, n)| child(c, n)).collect();
         }
 
         fn set_move_target(&self, canonical: &str, remote_id: &str) {
@@ -596,6 +820,22 @@ mod tests {
             Ok(self.comments.lock().unwrap().clone())
         }
 
+        async fn fetch_sub_issues(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> PortResult<Vec<ports::RemoteChildIssue>> {
+            Ok(self.sub_issues.lock().unwrap().clone())
+        }
+
+        async fn fetch_blocked_by(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> PortResult<Vec<ports::RemoteChildIssue>> {
+            Ok(self.blocked_by.lock().unwrap().clone())
+        }
+
         async fn create_comment(&self, _: &str, _: &str, body: &str) -> PortResult<RemoteComment> {
             let mut created = self.created_comments.lock().unwrap();
             created.push(body.to_string());
@@ -664,6 +904,241 @@ mod tests {
             provider.clone(),
         );
         (svc, tasks, bindings, task, provider)
+    }
+
+    /// Build a `RemoteChildIssue` (`canonical`, `number`) for seeding the
+    /// inbound sub-issue / dependency stubs.
+    fn child(canonical: &str, number: &str) -> ports::RemoteChildIssue {
+        ports::RemoteChildIssue {
+            canonical_repo: canonical.into(),
+            snapshot: RemoteTaskSnapshot {
+                remote_id: number.into(),
+                node_id: None,
+                title: format!("issue {number}"),
+                body: String::new(),
+                closed: false,
+                updated_at: Timestamp::from_utc(Utc::now()),
+                assignees: vec![],
+                labels: vec![],
+            },
+        }
+    }
+
+    /// A `SyncService` whose task repo shares `outbox`, plus a helper to seed an
+    /// already-promoted (issue-backed) task. Used by the relation-sync tests
+    /// that need to inspect enqueued mutations and resolve neighbor coords.
+    async fn setup_with_outbox() -> (
+        SyncService,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryRepoBindingRepository>,
+        Arc<InMemoryOutboxRepository>,
+        WorkspaceId,
+        domain_core::RepoId,
+        Arc<FakeProvider>,
+    ) {
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let workspace = Workspace::new(WorkspaceName::new("sync-ws").unwrap(), None, true);
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+        let binding = RepoBinding::new(
+            workspace_id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        let repo_id = binding.id;
+        bindings.save(&binding).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+        );
+        (
+            svc,
+            tasks,
+            bindings,
+            outbox,
+            workspace_id,
+            repo_id,
+            provider,
+        )
+    }
+
+    /// Persist an already-promoted, issue-backed task bound to `repo_id`.
+    async fn seed_promoted(
+        tasks: &Arc<InMemoryTaskRepository>,
+        ws: WorkspaceId,
+        repo_id: domain_core::RepoId,
+        remote_id: &str,
+    ) -> Task {
+        let mut t = Task::new_draft(ws, Some(repo_id), format!("issue {remote_id}")).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", remote_id))
+            .unwrap();
+        tasks.save(&t, SnapshotSource::Promote).await.unwrap();
+        t
+    }
+
+    #[tokio::test]
+    async fn promote_backfills_existing_relation_to_issue_backed_neighbor() {
+        // A child task related to an already-promoted parent BEFORE the child
+        // had an issue: relate-time skipped it (child was local-only). Promoting
+        // the child must now backfill the AddSubIssue mutation.
+        let (svc, tasks, _b, outbox, ws, repo_id, _p) = setup_with_outbox().await;
+        let parent = seed_promoted(&tasks, ws, repo_id, "200").await;
+
+        // Local draft child, related child_of the promoted parent.
+        let mut child_task = Task::new_draft(ws, Some(repo_id), "child".into()).unwrap();
+        child_task.add_relation(RelationKind::ChildOf, parent.id);
+        tasks
+            .save(&child_task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        svc.promote(&child_task.id.to_string()).await.unwrap();
+
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1, "promote backfills the one eligible edge");
+        match &entries[0].mutation {
+            OutboxMutation::AddSubIssue {
+                parent_remote_id,
+                child_remote_id,
+                ..
+            } => {
+                assert_eq!(
+                    parent_remote_id, "200",
+                    "parent issue addresses the endpoint"
+                );
+                assert_eq!(
+                    child_remote_id, "100",
+                    "freshly promoted child is the sub-issue"
+                );
+            }
+            other => panic!("expected AddSubIssue, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_skips_relation_to_local_only_neighbor() {
+        // The neighbor has no issue yet → not projectable → no enqueue. (It will
+        // backfill when the NEIGHBOR promotes, since the edge is reciprocal.)
+        let (svc, tasks, _b, outbox, ws, repo_id, _p) = setup_with_outbox().await;
+        let mut neighbor = Task::new_draft(ws, Some(repo_id), "neighbor".into()).unwrap();
+        tasks
+            .save(&neighbor, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        let mut t = Task::new_draft(ws, Some(repo_id), "t".into()).unwrap();
+        t.add_relation(RelationKind::BlockedBy, neighbor.id);
+        let _ = &mut neighbor;
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.promote(&t.id.to_string()).await.unwrap();
+        assert!(
+            outbox.all().is_empty(),
+            "neighbor not issue-backed ⇒ nothing to backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_reconciles_inbound_sub_issue_and_dependency() {
+        // Remote says #100 has a sub-issue #200 and is blocked_by #300; both map
+        // to local tasks. Pull must add child_of #200... actually parent_of, and
+        // blocked_by, locally — without enqueuing any outbound mutation.
+        let (svc, tasks, _b, outbox, ws, repo_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, "100").await;
+        // Give it a baseline so pull's drift compare is a clean Noop.
+        subject.confirm_synced(SnapshotSource::Pull).ok();
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+        let child = seed_promoted(&tasks, ws, repo_id, "200").await;
+        let blocker = seed_promoted(&tasks, ws, repo_id, "300").await;
+
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: "issue 100".into(),
+            body: String::new(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        });
+        provider.set_sub_issues(&[("github.com/o/r", "200")]);
+        provider.set_blocked_by(&[("github.com/o/r", "300")]);
+
+        svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        let kinds: Vec<_> = back.relations.iter().map(|r| (r.kind, r.other)).collect();
+        assert!(
+            kinds.contains(&(RelationKind::ParentOf, child.id)),
+            "sub-issue #200 → parent_of locally: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&(RelationKind::BlockedBy, blocker.id)),
+            "dependency #300 → blocked_by locally: {kinds:?}"
+        );
+        // Reciprocals mirrored onto the neighbors.
+        assert!(
+            tasks
+                .get(child.id)
+                .await
+                .unwrap()
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == subject.id)
+        );
+        // Inbound reconcile must NOT re-enqueue outbound.
+        assert!(
+            outbox.all().is_empty(),
+            "relations pulled FROM github must not enqueue outbound mutations"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_drops_local_edge_the_remote_removed() {
+        // Local has parent_of #200, but the remote sub-issue list is now empty →
+        // the edge must be dropped locally (both ends issue-backed).
+        let (svc, tasks, _b, _o, ws, repo_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, "100").await;
+        let child = seed_promoted(&tasks, ws, repo_id, "200").await;
+        subject.add_relation(RelationKind::ParentOf, child.id);
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+        let mut child = tasks.get(child.id).await.unwrap();
+        child.add_relation(RelationKind::ChildOf, subject.id);
+        tasks.save(&child, SnapshotSource::Pull).await.unwrap();
+
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: "issue 100".into(),
+            body: String::new(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        });
+        // No sub-issues, no deps on the remote anymore.
+
+        svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        assert!(
+            !back
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ParentOf),
+            "remote dropped the sub-issue ⇒ local parent_of removed: {:?}",
+            back.relations
+        );
     }
 
     #[tokio::test]

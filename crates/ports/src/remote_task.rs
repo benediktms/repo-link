@@ -107,6 +107,20 @@ pub trait RemoteTaskProvider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// List the issues that the given remote task is **blocked by** — the
+    /// inbound read counterpart of [`add_blocked_by`](Self::add_blocked_by),
+    /// backing relation reconcile on pull. Each entry carries the blocker's
+    /// canonical repo (a dependency may be cross-repo) so the caller can map it
+    /// to a local task. Providers without an issue-dependency concept inherit
+    /// the default empty result; GitHub overrides.
+    async fn fetch_blocked_by(
+        &self,
+        _canonical_repo: &str,
+        _remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        Ok(Vec::new())
+    }
+
     /// List the comments on a remote task, oldest first. Providers without a
     /// comment concept inherit the default empty result; GitHub overrides.
     async fn fetch_comments(
