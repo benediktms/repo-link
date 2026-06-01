@@ -138,11 +138,11 @@ CREATE TABLE remote_mappings_restore (
     last_synced_at          TEXT,
     UNIQUE(repo_id, provider, remote_id)
 );
-# Copy the stored filing_repo_id straight into the old repo_id column. That
-# value IS the dedup key the row was stored under post-D6, so this is lossless
-# even for a task whose filing repo diverged from its logical repo. (Do NOT
-# source repo_id from tasks — for a cross-filed row that is the logical repo,
-# which is NOT the key the row was stored under, and would corrupt the key.)
+-- Copy the stored filing_repo_id straight into the old repo_id column. That
+-- value IS the dedup key the row was stored under post-D6, so this is lossless
+-- even for a task whose filing repo diverged from its logical repo. (Do NOT
+-- source repo_id from tasks — for a cross-filed row that is the logical repo,
+-- which is NOT the key the row was stored under, and would corrupt the key.)
 INSERT INTO remote_mappings_restore
     (task_id, repo_id, provider, remote_id, last_remote_updated_at, last_synced_at)
 SELECT m.task_id, m.filing_repo_id, m.provider, m.remote_id,
