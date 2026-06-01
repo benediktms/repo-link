@@ -2100,6 +2100,8 @@ async fn rfc0002_migration_sequence_data_integrity() {
     // the post-D6 remote_mappings shape, so they cannot seed the old columns.
     // task-a: filed in its logical repo, filing_repo_id NULL (backfill target).
     // task-b: CROSS-FILED — logical repo-1, filing repo-2 already recorded.
+    // task-c: local-only, no remote mapping — exists purely so the UNIQUE
+    //   subtest below has a valid FK target (see that assertion for why).
     sqlx::raw_sql(&format!(
         "INSERT INTO workspaces (id, name, status, local_only, created_at, updated_at)
            VALUES ('ws-1', 'd6-audit', 'created', 1, '{TS}', '{TS}');
@@ -2107,8 +2109,9 @@ async fn rfc0002_migration_sequence_data_integrity() {
            VALUES ('repo-1', 'ws-1', 'git@github.com:o/logical.git', 'github.com/o/logical', '{TS}', '{TS}'),
                   ('repo-2', 'ws-1', 'git@github.com:o/filing.git',  'github.com/o/filing',  '{TS}', '{TS}');
          INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, remote_provider, remote_id, filing_repo_id, created_at, updated_at)
-           VALUES ('task-a', 'ws-1', 'repo-1', 'same-filed',  '', 'done', 'synced', 'p2', 'github', '42', NULL,     '{TS}', '{TS}'),
-                  ('task-b', 'ws-1', 'repo-1', 'cross-filed', '', 'done', 'synced', 'p2', 'github', '77', 'repo-2', '{TS}', '{TS}');
+           VALUES ('task-a', 'ws-1', 'repo-1', 'same-filed',  '', 'done', 'synced',     'p2', 'github', '42', NULL,     '{TS}', '{TS}'),
+                  ('task-b', 'ws-1', 'repo-1', 'cross-filed', '', 'done', 'synced',     'p2', 'github', '77', 'repo-2', '{TS}', '{TS}'),
+                  ('task-c', 'ws-1', 'repo-1', 'no-mapping',  '', 'open', 'local_only', 'p2', NULL,     NULL, NULL,     '{TS}', '{TS}');
          INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id)
            VALUES ('task-a', 'repo-1', 'github', '42'),
                   ('task-b', 'repo-1', 'github', '77');"
@@ -2195,9 +2198,14 @@ async fn rfc0002_migration_sequence_data_integrity() {
         !cols.contains(&"repo_id".to_string()),
         "remote_mappings must NOT retain repo_id after D6; got {cols:?}"
     );
+    // Use task-c's id: it is a real tasks row (FK satisfied) with no existing
+    // mapping, so ONLY the UNIQUE(filing_repo_id, provider, remote_id) clause
+    // can fail here. A non-existent task_id would also trip the task_id FK, and
+    // "FOREIGN KEY constraint failed" contains "constraint" — the assertion
+    // would then pass even if the UNIQUE clause were missing.
     let dup = sqlx::query(
         "INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id) \
-         VALUES ('task-dup', 'repo-1', 'github', '42')",
+         VALUES ('task-c', 'repo-1', 'github', '42')",
     )
     .execute(&pool)
     .await;
@@ -2205,8 +2213,8 @@ async fn rfc0002_migration_sequence_data_integrity() {
         dup.expect_err("a duplicate (filing_repo_id, provider, remote_id) must violate UNIQUE");
     let msg = format!("{err}").to_lowercase();
     assert!(
-        msg.contains("unique") || msg.contains("constraint"),
-        "expected a UNIQUE constraint violation, got: {err}"
+        msg.contains("unique"),
+        "expected a UNIQUE constraint violation specifically, got: {err}"
     );
 
     // --- (e) Additive nullable columns from #115 / #118.
