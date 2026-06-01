@@ -56,3 +56,15 @@ JOIN tasks t ON t.id = m.task_id;
 
 DROP TABLE remote_mappings;
 ALTER TABLE remote_mappings_new RENAME TO remote_mappings;
+
+-- (3) Expression index for the re-keyed read-side dedup. find_by_remote now
+-- filters on `COALESCE(filing_repo_id, repo_id)`, which is non-sargable against
+-- the plain `idx_tasks_repo(repo_id)` index — the function-wrapped column would
+-- force a full `tasks` scan on every `sync import` dedup as the table grows.
+-- This expression index matches the predicate exactly (same COALESCE, same
+-- provider/remote_id ordering) so the lookup stays O(log N). Partial on
+-- `remote_provider IS NOT NULL` because only remote-backed rows can match,
+-- keeping the index off the local-only majority.
+CREATE INDEX idx_tasks_remote_lookup
+    ON tasks (COALESCE(filing_repo_id, repo_id), remote_provider, remote_id)
+    WHERE remote_provider IS NOT NULL;
