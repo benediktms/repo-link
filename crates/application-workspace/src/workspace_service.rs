@@ -286,7 +286,9 @@ impl WorkspaceService {
     ) -> Result<WorkspaceDto> {
         let id: WorkspaceId = workspace_id.parse()?;
         let mut w = self.repo.get(id).await?;
-        w.filing_repo_id = repo_id.map(str::parse).transpose()?;
+        let parsed = repo_id.map(str::parse).transpose()?;
+        // Domain setter bumps updated_at so the mutation is observable.
+        w.set_filing_repo_id(parsed);
         self.repo.save(&w).await?;
         Ok(workspace_to_dto(&w))
     }

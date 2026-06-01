@@ -86,6 +86,16 @@ impl Workspace {
         }
     }
 
+    /// Set the workspace's default filing repo (RFC 0002 §4). Forward-looking:
+    /// reassigning an already-set default is permitted (unlike `set_project`)
+    /// and affects only tasks resolved AFTER the change — already-recorded
+    /// `tasks.filing_repo_id` are never retargeted (D2 never re-resolves).
+    /// Bumps `updated_at` so the mutation is observable.
+    pub fn set_filing_repo_id(&mut self, repo_id: Option<RepoId>) {
+        self.filing_repo_id = repo_id;
+        self.touch();
+    }
+
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }

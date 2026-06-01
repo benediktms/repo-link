@@ -34,6 +34,51 @@ fn workspace_create_show_list_roundtrip() {
     assert_eq!(shown["id"], id);
 }
 
+/// RFC 0002 §4 (#121): a workspace filing default must be one of THAT
+/// workspace's own bindings. The repo-handle resolver searches all workspaces,
+/// so `set-filing-repo` rejects a binding owned by a different workspace; a
+/// same-workspace binding is accepted and recorded.
+#[test]
+fn set_filing_repo_rejects_a_binding_from_another_workspace() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A binding owned by workspace B must not become workspace A's default.
+    let repo_b = attach_no_link(&dir, &ws_b, "git@github.com:o/b.git", "github.com/o/b");
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "set-filing-repo", &ws_a, "--repo", &repo_b])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("belongs to workspace"),
+        "expected a cross-workspace rejection, got: {stderr}"
+    );
+
+    // A binding owned by workspace A is accepted and recorded.
+    let repo_a = attach_no_link(&dir, &ws_a, "git@github.com:o/a.git", "github.com/o/a");
+    let dto = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-filing-repo", &ws_a, "--repo", &repo_a],
+    );
+    assert_eq!(dto["filing_repo_id"], repo_a);
+}
+
 #[test]
 fn task_create_list_includes_state_filter() {
     let dir = TempDir::new().unwrap();

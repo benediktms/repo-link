@@ -56,6 +56,22 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
             } else {
                 Some(resolve_repo_handle_required(svc, &repo.unwrap()).await?)
             };
+            // The repo-handle resolver searches bindings across ALL workspaces,
+            // so scope the result to the target workspace: a workspace filing
+            // default must be one of THAT workspace's own bindings, otherwise we
+            // would silently record a foreign binding the workspace can't file
+            // into. (`set_filing_repo` takes the workspace UUID, so the binding's
+            // workspace_id is a direct string compare.)
+            if let Some(repo_id) = &resolved {
+                let binding = svc.bindings.show(repo_id).await?;
+                if binding.workspace_id != workspace {
+                    return Err(anyhow!(
+                        "repo {repo_id} belongs to workspace {} — a workspace \
+                         filing default must be one of this workspace's own bindings",
+                        binding.workspace_id
+                    ));
+                }
+            }
             let dto = svc
                 .workspaces
                 .set_filing_repo(&workspace, resolved.as_deref())
