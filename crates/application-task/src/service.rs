@@ -843,12 +843,16 @@ impl TaskService {
         let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
 
         // RFC 0002 D2 first-board-filing: resolve and record the filing repo
-        // at the genuine first-filing precondition (project present, not yet a
-        // board item). This is idempotent — `set_filing_repo_id` is a no-op
-        // when the value is already equal (issue-backed tasks that recorded at
-        // promote #117), and a NULL result (step 4: pure orphan draft) is
-        // deliberately recorded as None and stays a board draft.
-        if project.is_some() && task.project_item_id.is_none() {
+        // ONLY at the genuine first filing — gate on `filing_repo_id.is_none()`.
+        // Once recorded the value is authoritative and must never be re-resolved
+        // (the resolver's contract). Without the is_none() guard a task that
+        // recorded its filing repo at promote (#117) but is not yet a board item
+        // re-resolves on EVERY lifecycle transition; if the workspace default
+        // changed in between, `resolve_filing_repo` yields a different repo and
+        // `set_filing_repo_id` errors, hard-failing the transition
+        // (start/complete/block/…). A NULL result (step 4: pure orphan draft
+        // with no default) records as None and stays a board draft.
+        if project.is_some() && task.project_item_id.is_none() && task.filing_repo_id.is_none() {
             let workspace = self.workspaces.get(task.workspace_id).await?;
             let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
             task.set_filing_repo_id(filing)?;
@@ -3084,6 +3088,66 @@ mod tests {
         assert!(
             !kinds.contains(&"add_item"),
             "attached card must NOT produce AddItem: {kinds:?}"
+        );
+    }
+
+    /// RFC 0002 regression (verify #124): a task that recorded its filing repo
+    /// at promote (#117) but is NOT yet a board item (`project_item_id` None)
+    /// must NOT re-resolve on a later lifecycle transition. Before the
+    /// `filing_repo_id.is_none()` guard, if the workspace default changed after
+    /// promote, the transition re-resolved to the new default and
+    /// `set_filing_repo_id` errored, hard-failing start/complete/etc.
+    #[tokio::test]
+    async fn recorded_filing_not_re_resolved_when_workspace_default_changes() {
+        let RichSvc {
+            svc,
+            repo,
+            workspaces,
+            projects,
+            bindings,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_d2_changed");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let logical = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/logical.git".into(),
+            "github.com/o/logical".into(),
+        )
+        .unwrap();
+        let other = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/other.git".into(),
+            "github.com/o/other".into(),
+        )
+        .unwrap();
+        bindings.save(&logical).await.unwrap();
+        bindings.save(&other).await.unwrap();
+
+        // Issue-backed, NOT yet a board item (project_item_id None); filing
+        // recorded at promote = the logical repo (#117, no default then).
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_x"), None).await;
+        t.repo_id = Some(logical.id);
+        t.set_filing_repo_id(Some(logical.id)).unwrap();
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        // The workspace default is set to a DIFFERENT repo AFTER promote.
+        ws.filing_repo_id = Some(other.id);
+        workspaces.save(&ws).await.unwrap();
+
+        // A lifecycle transition must NOT error and must NOT retarget filing.
+        svc.start(&t.id.to_string())
+            .await
+            .expect("transition must not error on a recorded filing repo when the workspace default changed");
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(logical.id),
+            "recorded filing repo is authoritative — not retargeted to the changed workspace default"
         );
     }
 
