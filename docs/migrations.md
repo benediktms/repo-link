@@ -138,12 +138,16 @@ CREATE TABLE remote_mappings_restore (
     last_synced_at          TEXT,
     UNIQUE(repo_id, provider, remote_id)
 );
+# Copy the stored filing_repo_id straight into the old repo_id column. That
+# value IS the dedup key the row was stored under post-D6, so this is lossless
+# even for a task whose filing repo diverged from its logical repo. (Do NOT
+# source repo_id from tasks — for a cross-filed row that is the logical repo,
+# which is NOT the key the row was stored under, and would corrupt the key.)
 INSERT INTO remote_mappings_restore
     (task_id, repo_id, provider, remote_id, last_remote_updated_at, last_synced_at)
-SELECT m.task_id, COALESCE(t.repo_id, ''), m.provider, m.remote_id,
+SELECT m.task_id, m.filing_repo_id, m.provider, m.remote_id,
        m.last_remote_updated_at, m.last_synced_at
-FROM remote_mappings m
-JOIN tasks t ON t.id = m.task_id;
+FROM remote_mappings m;
 DROP TABLE remote_mappings;
 ALTER TABLE remote_mappings_restore RENAME TO remote_mappings;
 DROP INDEX IF EXISTS idx_tasks_remote_lookup;
@@ -155,10 +159,14 @@ SQL
 
 **For a production release rollback (if D6 shipped to users):**
 
-D6 is data-preserving in both directions: the backfill sets `filing_repo_id =
-repo_id` for all existing rows, so the stored values are identical under both
-key shapes. A rollback that restores `repo_id` from `filing_repo_id` loses no
-information.
+The reverse copies each row's stored `filing_repo_id` straight into the restored
+`repo_id` column, so every remote-identity row keeps the exact dedup key it had
+under D6 — lossless even for a task whose filing repo diverged from its logical
+repo. The pre-D6 schema has no separate filing axis, so collapsing the recorded
+filing repo into `repo_id` is the correct inverse (there, `repo_id` *was* the
+remote-identity key). What a downgrade necessarily gives up is the
+filing-vs-logical distinction itself: `tasks.repo_id` is untouched, but
+`remote_mappings` can only carry one repo column on the old schema.
 
 Steps:
 
@@ -171,10 +179,10 @@ Steps:
    file from the release build entirely and ship a hotfix binary.
 
 In practice, because repo-link is a local CLI tool with a per-user SQLite DB,
-"production rollback" means the user runs a one-liner and restarts. The D6
-migration leaves no ambiguity: `filing_repo_id` values are identical to
-`repo_id` values for all rows that existed before the RFC 0002 wave, so
-restoring the old key is lossless.
+"production rollback" means the user runs a one-liner and restarts. Restoring
+`repo_id` from the stored `filing_repo_id` keeps every dedup key intact; the
+only thing a downgrade surrenders is the filing-vs-logical split that the old
+schema cannot represent.
 
 ### What NOT to do
 
