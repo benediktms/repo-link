@@ -106,7 +106,9 @@ pub(crate) enum WorkspaceCmd {
         project: Option<String>,
     },
     List {
-        #[arg(long)]
+        /// Include archived workspaces, which are hidden from the listing by
+        /// default.
+        #[arg(short = 'a', long)]
         include_archived: bool,
     },
     Show {
@@ -119,6 +121,11 @@ pub(crate) enum WorkspaceCmd {
         id: String,
     },
     Archive {
+        id: String,
+    },
+    /// Bring an archived workspace back to Active — the inverse of `archive`,
+    /// and the only way out of the otherwise-terminal Archived state.
+    Unarchive {
         id: String,
     },
     /// Attach a workspace to a project (or detach with `--none`). Resolves
@@ -223,6 +230,9 @@ pub(crate) enum RepoCmd {
         /// Path to probe. Defaults to current working directory.
         #[arg(short = 'p', long)]
         path: Option<PathBuf>,
+        /// Include archived workspaces in the matches, hidden by default.
+        #[arg(short = 'a', long)]
+        include_archived: bool,
     },
     /// Set a new short name on a binding. Identity stays at canonical_url —
     /// rename is purely a display affordance.

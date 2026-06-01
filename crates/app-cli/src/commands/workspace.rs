@@ -89,6 +89,7 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
         WorkspaceCmd::Activate { id } => render::workspace(&svc.workspaces.activate(&id).await?),
         WorkspaceCmd::Pause { id } => render::workspace(&svc.workspaces.pause(&id).await?),
         WorkspaceCmd::Archive { id } => render::workspace(&svc.workspaces.archive(&id).await?),
+        WorkspaceCmd::Unarchive { id } => render::workspace(&svc.workspaces.unarchive(&id).await?),
     }
     Ok(())
 }

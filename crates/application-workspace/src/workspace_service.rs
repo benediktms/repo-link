@@ -349,6 +349,10 @@ impl WorkspaceService {
         self.transition(id, |w| w.archive()).await
     }
 
+    pub async fn unarchive(&self, id: &str) -> Result<WorkspaceDto> {
+        self.transition(id, |w| w.unarchive()).await
+    }
+
     async fn transition<F>(&self, id: &str, op: F) -> Result<WorkspaceDto>
     where
         F: FnOnce(&mut Workspace) -> domain_core::Result<()>,
@@ -440,6 +444,11 @@ mod tests {
         assert_eq!(active.status, "active");
         let archived = svc.archive(&dto.id).await.unwrap();
         assert_eq!(archived.status, "archived");
+        let revived = svc.unarchive(&dto.id).await.unwrap();
+        assert_eq!(
+            revived.status, "active",
+            "unarchive returns Archived → Active"
+        );
     }
 
     // ---------- Stage 6 (#54): eager set-project backfill ------------------

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use domain_core::{RepoId, WorkspaceId};
 use domain_repo::RepoBinding;
+use domain_workspace::WorkspaceStatus;
 use dto_shared::{
     AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, RepoAttachOutcomeDto,
     RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
@@ -154,24 +155,51 @@ impl RepoBindingService {
 
     /// Resolve `query` to a binding by trying, in order: exact
     /// `prefix` match (globally-unique, single index lookup); then
-    /// exact `name` or `alias` match across all non-archived
-    /// workspaces. The prefix takes priority because it carries an
-    /// explicit uniqueness guarantee — names and aliases can clash
+    /// exact `name` or `alias` match. The prefix takes priority because it
+    /// carries an explicit uniqueness guarantee — names and aliases can clash
     /// across workspaces, so they still produce the ambiguity error.
+    ///
+    /// This resolver backs write commands (`--repo` on `task create`,
+    /// `set-filing-repo`, etc.), so a repo whose workspace is archived must
+    /// still be addressable by handle: archiving hides a workspace from
+    /// listings but does NOT lock it.
+    ///
+    /// Archived workspaces are therefore searched, but only as a **fallback**:
+    /// name/alias matches in ACTIVE workspaces win outright, and archived
+    /// bindings are consulted solely when the active set yields nothing. This
+    /// keeps archiving from broadening the ambiguity surface — a live handle
+    /// that resolved cleanly before still resolves cleanly even when an
+    /// archived workspace happens to hold a same-named binding. Ambiguity is
+    /// still surfaced WITHIN whichever set ultimately resolves the handle.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
         if let Some(binding) = self.bindings.find_by_prefix(query).await? {
             return Ok(binding);
         }
-        let workspaces = self.workspaces.list(false).await?;
-        let mut matches: Vec<RepoBinding> = Vec::new();
+        let workspaces = self.workspaces.list(true).await?;
+        let mut active: Vec<RepoBinding> = Vec::new();
+        let mut archived: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {
+            // `list(true)` returns ALL statuses, Deleted included — a deleted
+            // workspace's bindings must never resolve a handle, so drop them
+            // before bucketing (else they'd land in `active` and either route a
+            // write to a dead workspace or falsely trip AmbiguousHandle).
+            if ws.status == WorkspaceStatus::Deleted {
+                continue;
+            }
             let bindings = self.bindings.list_by_workspace(ws.id).await?;
             for b in bindings {
                 if b.name == query || b.aliases.iter().any(|a| a == query) {
-                    matches.push(b);
+                    if ws.status == WorkspaceStatus::Archived {
+                        archived.push(b);
+                    } else {
+                        active.push(b);
+                    }
                 }
             }
         }
+        // Active wins; archived is the fallback consulted only when no active
+        // binding matches the handle.
+        let mut matches = if active.is_empty() { archived } else { active };
         match matches.len() {
             0 => Err(ServiceError::BindingNotFound(query.to_string())),
             1 => Ok(matches.remove(0)),
@@ -273,19 +301,27 @@ impl RepoBindingService {
     }
 
     /// Return every (workspace, binding) pair whose binding's
-    /// `canonical_url` is an exact match across all non-archived
-    /// workspaces. Direct key lookup, not a search — callers want the
-    /// full membership set, not a ranked best hit. See [`find`] for the
-    /// ranked / fuzzy variant.
+    /// `canonical_url` is an exact match. Archived workspaces are excluded
+    /// unless `include_archived` is set (the `rl repo locate -a` opt-in);
+    /// Deleted workspaces are ALWAYS excluded, even under `include_archived`.
+    /// Direct key lookup, not a search — callers want the full membership set,
+    /// not a ranked best hit. See [`find`] for the ranked / fuzzy variant.
     ///
     /// [`find`]: Self::find
     pub async fn memberships_for_canonical_url(
         &self,
         canonical_url: &str,
+        include_archived: bool,
     ) -> Result<Vec<RepoMembershipDto>> {
-        let workspaces = self.workspaces.list(false).await?;
+        let workspaces = self.workspaces.list(include_archived).await?;
         let mut out = Vec::new();
         for ws in &workspaces {
+            // `list(true)` returns ALL statuses, Deleted included — a deleted
+            // workspace must never surface as a membership (same guard as
+            // `resolve_by_handle`).
+            if ws.status == WorkspaceStatus::Deleted {
+                continue;
+            }
             if let Some(binding) = self
                 .bindings
                 .find_by_canonical_url(ws.id, canonical_url)
@@ -748,6 +784,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_resolution_prefers_active_over_archived_collision() {
+        let (ws_svc, bsvc) = setup();
+        // Same alias on two workspaces' bindings; archive one. The active
+        // binding must still resolve cleanly — archiving must NOT introduce a
+        // new ambiguity where a live handle resolved before.
+        let active = seeded(&ws_svc, &bsvc, "ws-active", "github.com/o/a").await;
+        let stale = seeded(&ws_svc, &bsvc, "ws-stale", "github.com/o/b").await;
+        bsvc.add_alias(&active.id, "gw".into()).await.unwrap();
+        bsvc.add_alias(&stale.id, "gw".into()).await.unwrap();
+        ws_svc.archive(&stale.workspace_id).await.unwrap();
+        let hit = bsvc.show("gw").await.unwrap();
+        assert_eq!(hit.id, active.id, "active binding wins the handle");
+    }
+
+    #[tokio::test]
+    async fn handle_resolution_falls_back_to_archived_when_no_active_match() {
+        let (ws_svc, bsvc) = setup();
+        // A binding whose only workspace is archived stays addressable by
+        // handle (archiving hides, never locks) — the archived set is the
+        // fallback when no active workspace matches.
+        let b = seeded(&ws_svc, &bsvc, "ws-only-archived", "github.com/o/lonely").await;
+        bsvc.add_alias(&b.id, "gw".into()).await.unwrap();
+        ws_svc.archive(&b.workspace_id).await.unwrap();
+        let hit = bsvc.show("gw").await.unwrap();
+        assert_eq!(hit.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn handle_resolution_ignores_deleted_workspace_bindings() {
+        use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
+        // `list(true)` returns ALL statuses, Deleted included. A deleted
+        // workspace's binding must never resolve a handle — neither route a
+        // write to a dead workspace nor falsely trip AmbiguousHandle against a
+        // live one. Force-seed Deleted directly (no command transitions into
+        // it yet) to lock the guard.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let bsvc = RepoBindingService::new(workspaces.clone(), bindings);
+
+        let mut deleted = Workspace::new(WorkspaceName::new("ws-deleted").unwrap(), None, true);
+        deleted.status = WorkspaceStatus::Deleted;
+        workspaces.save(&deleted).await.unwrap();
+        // Name = canonical's last segment = "widget-service"; query by name so
+        // the prefix path (globally-unique, status-agnostic) doesn't shadow it.
+        bsvc.attach(AttachRepoCmd {
+            workspace_id: deleted.id.to_string(),
+            remote_url: "git@example.com:o/widget-service.git".into(),
+            canonical_url: "github.com/o/widget-service".into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+
+        let err = bsvc.show("widget-service").await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::BindingNotFound(_)),
+            "deleted workspace's binding must not resolve, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn show_errors_when_handle_unknown() {
         let (ws_svc, bsvc) = setup();
         let _ = seeded(&ws_svc, &bsvc, "w-unknown", "github.com/o/r").await;
@@ -792,7 +893,7 @@ mod tests {
         let (ws_svc, bsvc) = setup();
         let _ = seeded(&ws_svc, &bsvc, "ws-mempty", "github.com/o/r").await;
         let out = bsvc
-            .memberships_for_canonical_url("github.com/o/other")
+            .memberships_for_canonical_url("github.com/o/other", false)
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -803,7 +904,7 @@ mod tests {
         let (ws_svc, bsvc) = setup();
         let binding = seeded(&ws_svc, &bsvc, "ws-msingle", "github.com/o/repo").await;
         let out = bsvc
-            .memberships_for_canonical_url("github.com/o/repo")
+            .memberships_for_canonical_url("github.com/o/repo", false)
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -821,7 +922,10 @@ mod tests {
         // Decoy in a third workspace with a different repo.
         let _ = seeded(&ws_svc, &bsvc, "ws-decoy", "github.com/o/unrelated").await;
 
-        let out = bsvc.memberships_for_canonical_url(canonical).await.unwrap();
+        let out = bsvc
+            .memberships_for_canonical_url(canonical, false)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 2);
         let workspace_names: Vec<&str> = out.iter().map(|m| m.workspace.name.as_str()).collect();
         assert!(workspace_names.contains(&"ws-alpha"));
@@ -829,5 +933,69 @@ mod tests {
         let binding_ids: Vec<&str> = out.iter().map(|m| m.binding.id.as_str()).collect();
         assert!(binding_ids.contains(&a.id.as_str()));
         assert!(binding_ids.contains(&b.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn memberships_excludes_archived_by_default_includes_with_flag() {
+        let (ws_svc, bsvc) = setup();
+        let canonical = "github.com/o/arch";
+        let _live = seeded(&ws_svc, &bsvc, "ws-live", canonical).await;
+        let arch = seeded(&ws_svc, &bsvc, "ws-arch", canonical).await;
+        ws_svc.archive(&arch.workspace_id).await.unwrap();
+
+        let default = bsvc
+            .memberships_for_canonical_url(canonical, false)
+            .await
+            .unwrap();
+        assert_eq!(default.len(), 1, "archived workspace hidden by default");
+        assert_eq!(default[0].workspace.name, "ws-live");
+
+        let all = bsvc
+            .memberships_for_canonical_url(canonical, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "-a / include_archived surfaces the archived one"
+        );
+    }
+
+    #[tokio::test]
+    async fn memberships_exclude_deleted_even_with_include_archived() {
+        use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
+        // `include_archived` opts in archived, NOT deleted: `list(true)`
+        // returns Deleted rows too, so the loop must drop them — else
+        // `rl repo locate -a` would surface a dead workspace's binding.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let bsvc = RepoBindingService::new(workspaces.clone(), bindings);
+
+        let canonical = "github.com/o/ghost";
+        let mut deleted = Workspace::new(WorkspaceName::new("ws-deleted-mem").unwrap(), None, true);
+        deleted.status = WorkspaceStatus::Deleted;
+        workspaces.save(&deleted).await.unwrap();
+        bsvc.attach(AttachRepoCmd {
+            workspace_id: deleted.id.to_string(),
+            remote_url: format!("git@example.com:{canonical}.git"),
+            canonical_url: canonical.into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+
+        // Even with the broadest opt-in, a deleted workspace stays hidden.
+        let all = bsvc
+            .memberships_for_canonical_url(canonical, true)
+            .await
+            .unwrap();
+        assert!(
+            all.is_empty(),
+            "deleted workspace must not surface, got {all:?}"
+        );
     }
 }

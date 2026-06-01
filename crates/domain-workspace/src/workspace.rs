@@ -86,6 +86,24 @@ impl Workspace {
         }
     }
 
+    /// Bring an archived workspace back to `Active` — the inverse of
+    /// [`archive`](Self::archive) and the only exit from the otherwise-terminal
+    /// `Archived` state. Kept distinct from [`activate`](Self::activate) (which
+    /// only accepts `Created`/`Paused`) so un-archiving stays an explicit,
+    /// auditable act rather than a side effect of activate.
+    pub fn unarchive(&mut self) -> Result<()> {
+        if self.status == WorkspaceStatus::Archived {
+            self.status = WorkspaceStatus::Active;
+            self.touch();
+            Ok(())
+        } else {
+            Err(DomainError::transition(format!(
+                "cannot unarchive from {:?}",
+                self.status
+            )))
+        }
+    }
+
     /// Set the workspace's default filing repo (RFC 0002 §4). Forward-looking:
     /// reassigning an already-set default is permitted (unlike `set_project`)
     /// and affects only tasks resolved AFTER the change — already-recorded
@@ -146,5 +164,24 @@ mod tests {
         w.activate().unwrap();
         w.pause().unwrap();
         assert_eq!(w.status, WorkspaceStatus::Paused);
+    }
+
+    #[test]
+    fn unarchive_from_archived_returns_to_active() {
+        let mut w = ws();
+        w.archive().unwrap();
+        assert_eq!(w.status, WorkspaceStatus::Archived);
+        w.unarchive().unwrap();
+        assert_eq!(w.status, WorkspaceStatus::Active);
+    }
+
+    #[test]
+    fn unarchive_rejected_when_not_archived() {
+        // `activate` owns the Created/Paused → Active path; unarchive is only
+        // for the terminal Archived state.
+        let mut w = ws();
+        assert!(w.unarchive().is_err());
+        w.activate().unwrap();
+        assert!(w.unarchive().is_err());
     }
 }
