@@ -1070,9 +1070,12 @@ mod tests {
         t.set_filing_repo_id(Some(filing)).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
         t.set_repo_id(Some(filing)).unwrap();
         assert_eq!(t.repo_id, Some(filing));
         assert_eq!(t.filing_repo_id, Some(filing));
+        // Re-collapse is still a logical-repo move — local metadata, no flip.
+        assert_eq!(t.sync, SyncState::Synced);
     }
 
     #[test]
