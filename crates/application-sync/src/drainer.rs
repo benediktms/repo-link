@@ -1448,11 +1448,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The filing-aware planner would have encoded the FILING canonical here
-        // (e.g. "github.com/org/filing-repo"). The logical canonical would be
-        // different (e.g. "github.com/org/logical-repo").
+        // The filing-aware planner would have encoded the FILING canonical here.
         let filing_canonical = "github.com/org/filing-repo";
-        let logical_canonical = "github.com/org/logical-repo";
 
         let entry = OutboxEntry::new(
             task.id,
@@ -1471,13 +1468,14 @@ mod tests {
 
         let updates = h.remote_tasks.updates();
         assert_eq!(updates.len(), 1);
+        // The task is an orphan (repo_id unset), so any attempt to re-derive a
+        // canonical from the task — instead of using the entry's carried literal
+        // — would yield None/empty, never `filing_canonical`. This assert_eq is
+        // therefore load-bearing against a fall-back-to-logical regression.
         assert_eq!(
             updates[0].canonical_repo, filing_canonical,
-            "UpdateRemote must target the FILING repo carried on the entry"
-        );
-        assert_ne!(
-            updates[0].canonical_repo, logical_canonical,
-            "UpdateRemote must NOT fall back to the logical repo"
+            "UpdateRemote must target the FILING repo carried on the entry, \
+             not a canonical re-derived from the task's logical repo"
         );
     }
 
@@ -1509,9 +1507,7 @@ mod tests {
             .set_convert_returns_with_number("I_converted_cross", 99);
 
         // The filing-aware planner encodes the FILING repo's node id here.
-        // The logical repo's node id would be different.
         let filing_repo_node_id = "R_kgDOfiling";
-        let logical_repo_node_id = "R_kgDOlogical";
 
         let entry = OutboxEntry::new(
             task.id,
@@ -1538,13 +1534,15 @@ mod tests {
             })
             .expect("ConvertDraftToIssue call must have been applied");
 
+        // The task has no repo binding (import_mirror with repo_id = None), so
+        // any re-derivation of a repo node id from the task — instead of using
+        // the entry's carried literal — would yield None/empty, never
+        // `filing_repo_node_id`. This assert_eq is therefore load-bearing
+        // against a fall-back-to-logical regression.
         assert_eq!(
             convert_call.1, filing_repo_node_id,
-            "ConvertDraftToIssue must target the FILING repo node id carried on the entry"
-        );
-        assert_ne!(
-            convert_call.1, logical_repo_node_id,
-            "ConvertDraftToIssue must NOT fall back to the logical repo node id"
+            "ConvertDraftToIssue must target the FILING repo node id carried on \
+             the entry, not one re-derived from the task's logical repo"
         );
 
         // Write-back: the task should now carry the returned issue node id and REST number.
