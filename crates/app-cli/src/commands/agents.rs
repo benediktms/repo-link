@@ -26,7 +26,7 @@ pub(crate) async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()
             let memberships = match canonical_url.as_deref() {
                 Some(c) => svc
                     .bindings
-                    .memberships_for_canonical_url(c)
+                    .memberships_for_canonical_url(c, false)
                     .await?
                     .into_iter()
                     .map(|m| docs::DocRepoMembership {

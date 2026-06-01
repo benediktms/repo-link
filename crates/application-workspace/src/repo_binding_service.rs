@@ -154,15 +154,20 @@ impl RepoBindingService {
 
     /// Resolve `query` to a binding by trying, in order: exact
     /// `prefix` match (globally-unique, single index lookup); then
-    /// exact `name` or `alias` match across all non-archived
-    /// workspaces. The prefix takes priority because it carries an
+    /// exact `name` or `alias` match across ALL workspaces, archived
+    /// included. The prefix takes priority because it carries an
     /// explicit uniqueness guarantee — names and aliases can clash
     /// across workspaces, so they still produce the ambiguity error.
+    ///
+    /// This resolver backs write commands (`--repo` on `task create`,
+    /// `set-filing-repo`, etc.), so it must include archived workspaces:
+    /// archiving hides a workspace from listings but does NOT lock it, and a
+    /// repo whose workspace is archived must still be addressable by handle.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
         if let Some(binding) = self.bindings.find_by_prefix(query).await? {
             return Ok(binding);
         }
-        let workspaces = self.workspaces.list(false).await?;
+        let workspaces = self.workspaces.list(true).await?;
         let mut matches: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {
             let bindings = self.bindings.list_by_workspace(ws.id).await?;
@@ -273,17 +278,18 @@ impl RepoBindingService {
     }
 
     /// Return every (workspace, binding) pair whose binding's
-    /// `canonical_url` is an exact match across all non-archived
-    /// workspaces. Direct key lookup, not a search — callers want the
-    /// full membership set, not a ranked best hit. See [`find`] for the
-    /// ranked / fuzzy variant.
+    /// `canonical_url` is an exact match. Archived workspaces are excluded
+    /// unless `include_archived` is set (the `rl repo locate -a` opt-in).
+    /// Direct key lookup, not a search — callers want the full membership set,
+    /// not a ranked best hit. See [`find`] for the ranked / fuzzy variant.
     ///
     /// [`find`]: Self::find
     pub async fn memberships_for_canonical_url(
         &self,
         canonical_url: &str,
+        include_archived: bool,
     ) -> Result<Vec<RepoMembershipDto>> {
-        let workspaces = self.workspaces.list(false).await?;
+        let workspaces = self.workspaces.list(include_archived).await?;
         let mut out = Vec::new();
         for ws in &workspaces {
             if let Some(binding) = self
@@ -792,7 +798,7 @@ mod tests {
         let (ws_svc, bsvc) = setup();
         let _ = seeded(&ws_svc, &bsvc, "ws-mempty", "github.com/o/r").await;
         let out = bsvc
-            .memberships_for_canonical_url("github.com/o/other")
+            .memberships_for_canonical_url("github.com/o/other", false)
             .await
             .unwrap();
         assert!(out.is_empty());
@@ -803,7 +809,7 @@ mod tests {
         let (ws_svc, bsvc) = setup();
         let binding = seeded(&ws_svc, &bsvc, "ws-msingle", "github.com/o/repo").await;
         let out = bsvc
-            .memberships_for_canonical_url("github.com/o/repo")
+            .memberships_for_canonical_url("github.com/o/repo", false)
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -821,7 +827,10 @@ mod tests {
         // Decoy in a third workspace with a different repo.
         let _ = seeded(&ws_svc, &bsvc, "ws-decoy", "github.com/o/unrelated").await;
 
-        let out = bsvc.memberships_for_canonical_url(canonical).await.unwrap();
+        let out = bsvc
+            .memberships_for_canonical_url(canonical, false)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 2);
         let workspace_names: Vec<&str> = out.iter().map(|m| m.workspace.name.as_str()).collect();
         assert!(workspace_names.contains(&"ws-alpha"));
@@ -829,5 +838,31 @@ mod tests {
         let binding_ids: Vec<&str> = out.iter().map(|m| m.binding.id.as_str()).collect();
         assert!(binding_ids.contains(&a.id.as_str()));
         assert!(binding_ids.contains(&b.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn memberships_excludes_archived_by_default_includes_with_flag() {
+        let (ws_svc, bsvc) = setup();
+        let canonical = "github.com/o/arch";
+        let _live = seeded(&ws_svc, &bsvc, "ws-live", canonical).await;
+        let arch = seeded(&ws_svc, &bsvc, "ws-arch", canonical).await;
+        ws_svc.archive(&arch.workspace_id).await.unwrap();
+
+        let default = bsvc
+            .memberships_for_canonical_url(canonical, false)
+            .await
+            .unwrap();
+        assert_eq!(default.len(), 1, "archived workspace hidden by default");
+        assert_eq!(default[0].workspace.name, "ws-live");
+
+        let all = bsvc
+            .memberships_for_canonical_url(canonical, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            2,
+            "-a / include_archived surfaces the archived one"
+        );
     }
 }

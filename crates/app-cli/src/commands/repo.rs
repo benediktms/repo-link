@@ -102,7 +102,10 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             }
             render::discovered(&rows);
         }
-        RepoCmd::Locate { path } => {
+        RepoCmd::Locate {
+            path,
+            include_archived,
+        } => {
             let candidate = match path {
                 Some(p) => p,
                 None => std::env::current_dir()
@@ -123,7 +126,11 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             };
 
             let matches = match canonical_url.as_deref() {
-                Some(c) => svc.bindings.memberships_for_canonical_url(c).await?,
+                Some(c) => {
+                    svc.bindings
+                        .memberships_for_canonical_url(c, include_archived)
+                        .await?
+                }
                 None => vec![],
             };
 
@@ -275,7 +282,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
                 // workspaces.
                 let memberships = svc
                     .bindings
-                    .memberships_for_canonical_url(&discovered)
+                    .memberships_for_canonical_url(&discovered, false)
                     .await?;
                 let repo_short = &repo;
                 match memberships.as_slice() {
