@@ -896,9 +896,6 @@ impl TaskService {
         ))
     }
 
-    /// Best-effort canonical-URL lookup for the task's **logical** repo binding
-    /// (D4: also used for prefix / worktree / relink ops). `None` when the task
-    /// has no logical repo (orphan-draft).
     /// Best-effort canonical-URL lookup for the repo the task's backing issue
     /// is *filed* in (RFC 0002 D3 / #143). Mirrors
     /// `SyncService::filing_canonical_for` but returns `Option` rather than
