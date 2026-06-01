@@ -141,6 +141,12 @@ mod tests {
             title: "t".into(),
             body: None,
             priority: None,
+            // RFC 0002 D5 / #122: the per-task filing-repo override uses a
+            // key distinct from `filing_repo_id` — this field being named
+            // `filing_repo_override` (not `filing_repo_id`) keeps the guard
+            // below valid. Testing with Some proves the serialization path
+            // never emits `filing_repo_id` even when the field is populated.
+            filing_repo_override: Some(RepoId::new().to_string()),
         };
         let update = UpdateTaskCmd {
             task_id: "rpl-abc".into(),

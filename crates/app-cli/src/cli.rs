@@ -321,6 +321,20 @@ pub(crate) enum TaskCmd {
         /// / name / alias (same forms as `rl repo show`).
         #[arg(short = 'r', long)]
         repo: Option<String>,
+        /// Per-task filing-repo override (RFC 0002 D2 step 1, #122). Accepts
+        /// the same handle forms as `--repo` (UUID / prefix / name / alias).
+        /// When present, the resolved binding beats the workspace filing default
+        /// and the logical repo in the D2 resolution chain.
+        ///
+        /// Note: `rl task create` only mints a local draft — it does not
+        /// promote the task to a remote issue. The filing-repo override is
+        /// consumed at the first-filing transition (`rl sync promote`), which
+        /// is not yet wired to read a per-task pending override. Supplying this
+        /// flag on a non-promoting create is therefore rejected with a deferral
+        /// error; use `rl sync promote` to file the task and control the target
+        /// repo via the workspace filing default for now.
+        #[arg(long = "filing-repo")]
+        filing_repo: Option<String>,
         #[arg(long)]
         title: String,
         #[arg(long)]

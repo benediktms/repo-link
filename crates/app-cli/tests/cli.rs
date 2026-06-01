@@ -124,6 +124,97 @@ fn task_create_list_includes_state_filter() {
     assert_eq!(staged_list.as_array().unwrap().len(), 1);
 }
 
+/// RFC 0002 #122 (option a): `task create --filing-repo` resolves the handle
+/// (to validate it / surface ambiguity like `--repo`) then REJECTS with a
+/// deferral error — `task create` only mints a local draft and has no filing
+/// transition to consume the override. The flag must never be a silent no-op.
+#[test]
+fn task_create_filing_repo_override_is_deferred() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A resolvable filing-repo handle (so we hit the deferral, not a not-found).
+    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+
+    let output = bin("repo-link", &dir)
+        .args([
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "t",
+            "--filing-repo",
+            &repo_id,
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("not yet consumed by `task create`"),
+        "expected the --filing-repo deferral error, got: {stderr}"
+    );
+    // The rejected create must not have persisted a task.
+    let listed = run_json(&mut bin("repo-link", &dir), &["task", "list"]);
+    assert!(
+        listed.as_array().unwrap().is_empty(),
+        "a rejected create must not persist a task"
+    );
+}
+
+/// RFC 0002 #122 / D5: `task show` overlays an additive `filing_repo` block
+/// (null for an unpromoted task) WITHOUT leaking the internal `filing_repo_id`
+/// onto the task surface, and leaves the base TaskDto + list shapes unchanged.
+#[test]
+fn task_show_surfaces_filing_repo_without_leaking_filing_repo_id() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let task = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "t"],
+    );
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["task", "show", &task_id]);
+    // Additive key present and null for an unpromoted task.
+    assert!(
+        shown.as_object().unwrap().contains_key("filing_repo"),
+        "task show must include the additive filing_repo key"
+    );
+    assert!(
+        shown["filing_repo"].is_null(),
+        "an unpromoted task has no recorded filing repo"
+    );
+    // D5: the internal filing_repo_id must NEVER appear on the task surface.
+    assert!(
+        !shown.as_object().unwrap().contains_key("filing_repo_id"),
+        "filing_repo_id must never leak onto the task surface (D5)"
+    );
+    // Base TaskDto shape intact.
+    assert_eq!(shown["id"], task_id);
+    assert_eq!(shown["status"], "open");
+    assert_eq!(shown["repo_id"], Value::Null);
+    // list keeps the byte-identical TaskDto shape — no show-only overlay.
+    let listed = run_json(&mut bin("repo-link", &dir), &["task", "list"]);
+    assert!(
+        !listed[0].as_object().unwrap().contains_key("filing_repo"),
+        "list must not carry the show-only filing_repo overlay"
+    );
+}
+
 #[test]
 fn task_comment_creates_pending_and_surfaces_in_unsynced() {
     let dir = TempDir::new().unwrap();

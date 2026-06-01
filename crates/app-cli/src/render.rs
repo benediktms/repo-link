@@ -66,6 +66,32 @@ pub fn tasks(rows: &[TaskDto]) {
     print_json(&rows);
 }
 
+/// Show-specific display helper (RFC 0002 D5 / #122). Serializes the base
+/// `TaskDto` as usual, then injects an additive `filing_repo` key that
+/// surfaces the resolved filing-repo binding (id / name / canonical_url).
+/// `filing_repo` is `null` when no filing repo has been recorded yet (the
+/// task was never promoted or was created before RFC 0002).
+///
+/// `task()` and `tasks()` (list / query) are unchanged — this path is used
+/// ONLY by `rl task show`, keeping the shared `TaskDto` contract byte-
+/// identical for all other consumers.
+pub fn task_show(dto: &TaskDto, filing_repo: serde_json::Value) {
+    let mut obj = match serde_json::to_value(dto) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: failed to serialize task: {e}");
+            return;
+        }
+    };
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("filing_repo".to_string(), filing_repo);
+    }
+    match serde_json::to_string_pretty(&obj) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("error: failed to serialize output: {e}"),
+    }
+}
+
 pub fn snapshots(snaps: &[TaskSnapshot]) {
     print_json(&snaps);
 }

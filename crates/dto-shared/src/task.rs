@@ -66,6 +66,18 @@ pub struct CreateTaskCmd {
     pub title: String,
     pub body: Option<String>,
     pub priority: Option<String>,
+    /// RFC 0002 D2 step-1 per-task filing-repo override (a repo UUID). Takes
+    /// highest precedence in the D2 chain (beats workspace default and logical
+    /// repo). Distinct from `repo_id` (the logical axis) and NEVER named
+    /// `filing_repo_id` (D5 guard, #119). Carried here for wiring completeness;
+    /// `TaskService::create` does NOT consume it today because `task create`
+    /// only mints a `LocalOnly` draft and never promotes — the override has no
+    /// filing transition to feed until `sync promote` consumes it. A
+    /// non-promoting create that supplies this field is rejected at the CLI
+    /// boundary with a deferral error pointing at `rl sync promote` (RFC 0002
+    /// §4, #122 brief preference (a)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filing_repo_override: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
