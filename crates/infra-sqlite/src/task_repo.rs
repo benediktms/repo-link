@@ -164,14 +164,22 @@ impl TaskRepository for SqliteTaskRepository {
 
     async fn find_by_remote(
         &self,
-        repo_id: RepoId,
+        filing_repo_id: RepoId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>> {
+        // RFC 0002 D6: dedup on the FILING repo (where the issue lives),
+        // COALESCE-ing to the logical repo_id for pre-resolution / migrated rows
+        // whose filing_repo_id is still NULL — so the read-side dedup agrees
+        // with the (filing_repo_id, provider, remote_id) UNIQUE key on
+        // remote_mappings. No empty-string sentinel here: this binds a real
+        // repo id, so it never matches a NULL COALESCE result (the sentinel
+        // only exists in the UNIQUE-key storage, where NULLs must not be
+        // treated as distinct).
         let row = sqlx::query(&format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE repo_id = ? AND remote_provider = ? AND remote_id = ?"
+            "SELECT {TASK_COLS} FROM tasks WHERE COALESCE(filing_repo_id, repo_id) = ? AND remote_provider = ? AND remote_id = ?"
         ))
-        .bind(repo_id.to_string())
+        .bind(filing_repo_id.to_string())
         .bind(provider)
         .bind(remote_id)
         .fetch_optional(&self.db.reads)
@@ -487,25 +495,28 @@ async fn write_task_in_tx(
     }
 
     // Mirror remote ref into the remote_mappings table for unique-index
-    // protection. The unique key is (repo_id, provider, remote_id) since
-    // remote issue numbers are only unique within a repo.
+    // protection. The unique key is (filing_repo_id, provider, remote_id)
+    // (RFC 0002 D6) — the issue lives in the filing repo, and remote issue
+    // numbers are only unique within a repo.
     if let Some(remote) = &t.remote {
         sqlx::query(
             r#"
-            INSERT INTO remote_mappings (task_id, repo_id, provider, remote_id, last_synced_at)
+            INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id, last_synced_at)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
-                repo_id = excluded.repo_id,
+                filing_repo_id = excluded.filing_repo_id,
                 provider = excluded.provider,
                 remote_id = excluded.remote_id,
                 last_synced_at = excluded.last_synced_at
             "#,
         )
         .bind(t.id.to_string())
-        // Empty-string sentinel for a repo-less remote task — keeps the
-        // (repo_id, provider, remote_id) UNIQUE key well-defined (NULLs
-        // would dedupe as distinct).
-        .bind(t.repo_id.map(|r| r.to_string()).unwrap_or_default())
+        // Key on the FILING repo (D6), falling back to the logical repo when
+        // filing is unresolved (pre-resolution / migrated rows) so this agrees
+        // with find_by_remote's COALESCE predicate. Empty-string sentinel for a
+        // repo-less remote task keeps the UNIQUE key well-defined (NULLs would
+        // dedupe as distinct).
+        .bind(t.filing_repo_id.or(t.repo_id).map(|r| r.to_string()).unwrap_or_default())
         .bind(&remote.provider)
         .bind(&remote.remote_id)
         .bind(t.updated_at.into_inner())

@@ -215,7 +215,7 @@ impl TaskRepository for InMemoryTaskRepository {
 
     async fn find_by_remote(
         &self,
-        repo_id: RepoId,
+        filing_repo_id: RepoId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>> {
@@ -223,7 +223,10 @@ impl TaskRepository for InMemoryTaskRepository {
         let Some(task) = g
             .values()
             .find(|t| {
-                t.repo_id == Some(repo_id)
+                // D6: match on the filing repo, COALESCE-ing to the logical
+                // repo for rows whose filing repo is unresolved — mirrors the
+                // SQLite `COALESCE(filing_repo_id, repo_id)` predicate.
+                t.filing_repo_id.or(t.repo_id) == Some(filing_repo_id)
                     && t.remote
                         .as_ref()
                         .is_some_and(|r| r.provider == provider && r.remote_id == remote_id)
