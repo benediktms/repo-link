@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutboxMutation {
     /// REST `PATCH /repos/{o}/{r}/issues/{number}`. Carries the canonical URL
-    /// of the repo the issue lives in — the task's filing repo, which today is
-    /// always its logical repo (until RFC 0002) — so the drainer doesn't have
-    /// to re-resolve the binding.
+    /// of the repo the issue lives in — the task's FILING repo (RFC 0002), which
+    /// may differ from its logical repo for a cross-filed task — so the drainer
+    /// doesn't have to re-resolve the binding.
     UpdateRemote {
         canonical_repo: String,
         remote_id: String,
