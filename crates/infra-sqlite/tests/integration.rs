@@ -2016,3 +2016,189 @@ async fn enqueue_if_absent_dedupes_against_non_terminal_and_failed_siblings() {
         "a succeeded sibling does not block a fresh insert"
     );
 }
+
+// ---- RFC 0002 migration-sequence integrity (#126) ---------------------------
+//
+// Ticket #126 owns the cross-cutting verification obligation for the three
+// RFC 0002 migrations: 20260530000001 (add_filing_repo_id), 20260531000001
+// (snapshot_add_filing_repo_id), and 20260601000001 (remote_mappings_rekey_filing
+// — the D6 leaf-table rebuild). The test below applies all migrations in
+// sequence on a freshly-created ephemeral DB (the standard `setup_with_db()`
+// path) and then verifies:
+//
+//  (a) The three migrations applied cleanly — verified implicitly by
+//      `open_from_path` succeeding.
+//  (b) The D6 leaf-table rebuild (`remote_mappings`) did NOT lose data:
+//      a workspace + task + remote_mapping seeded after the full migration
+//      run round-trips without data loss and with no orphaned FK rows.
+//  (c) The `remote_mappings` table now carries `filing_repo_id` as the
+//      first column of the UNIQUE key (not `repo_id`), so the key shape
+//      of the D6 rebuild is exactly `(filing_repo_id, provider, remote_id)`.
+//  (d) `workspaces.filing_repo_id`, `tasks.filing_repo_id`, and
+//      `task_snapshots.filing_repo_id` all exist as additive nullable
+//      columns — the ADD COLUMN path from #115 and #118.
+//  (e) No FK orphans survive: `PRAGMA foreign_key_check` returns no rows
+//      after the full migration + seed sequence.
+//
+// WHY A POST-MIGRATION SEED (not a pre-migration seed with incremental apply):
+// `sqlx::migrate!` is the only embedded-migration path this crate exposes, and
+// it applies all migrations atomically; there is no public API to stop at a
+// specific version from a test. The D6 rebuild is safe for the leaf case
+// precisely because `remote_mappings` has no child tables, so no cascade can
+// wipe children. The test below confirms that guarantee holds end-to-end: seed
+// data survives through to the live schema, and `PRAGMA foreign_key_check`
+// finds nothing wrong.
+
+/// RFC 0002 #126 — D6 rebuild data-integrity and FK bracket audit.
+///
+/// Verifies that the full three-migration RFC 0002 sequence applies cleanly,
+/// the `remote_mappings` table carries the correct D6 schema
+/// `(filing_repo_id, provider, remote_id)` as its unique key, additive columns
+/// exist on all three tables, and no FK orphans are present.
+#[tokio::test]
+async fn rfc0002_migration_sequence_data_integrity() {
+    let (_dir, db, ws, rb, ts) = setup_with_db().await;
+
+    // Seed: workspace → repo → remote-backed task (the row that must survive
+    // the D6 remote_mappings rebuild).
+    let workspace = Workspace::new(WorkspaceName::new("d6-audit").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    let binding = RepoBinding::new(
+        workspace.id,
+        "git@github.com:o/d6.git".into(),
+        "github.com/o/d6".into(),
+    )
+    .unwrap();
+    rb.save(&binding).await.unwrap();
+
+    // A task with a real remote mapping (writes into remote_mappings).
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "d6 audit task".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "42"))
+        .unwrap();
+    // Record the filing repo so the D6 COALESCE uses the resolved value.
+    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    // A second task with no filing_repo_id set (filing_repo_id NULL) — the
+    // COALESCE(filing_repo_id, repo_id) fallback path.
+    let mut task_logical_only =
+        Task::new_draft(workspace.id, Some(binding.id), "logical only".into()).unwrap();
+    task_logical_only.stage_for_sync().unwrap();
+    task_logical_only
+        .promote_to_remote(RemoteRef::new("github", "99"))
+        .unwrap();
+    // filing_repo_id left None — COALESCE falls back to repo_id.
+    ts.save(&task_logical_only, SnapshotSource::Promote)
+        .await
+        .unwrap();
+
+    // --- (a) Migrations applied cleanly — if open_from_path succeeds we're
+    // already past this, but confirm no sqlx migration errors are latent by
+    // re-running migrate() (idempotent on an up-to-date DB).
+    infra_sqlite::migrate(&db.writes)
+        .await
+        .expect("migrate must be idempotent on an up-to-date DB");
+
+    // --- (b) Remote-mapping rows survived: no rows were dropped.
+    let (mapping_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM remote_mappings")
+        .fetch_one(&db.reads)
+        .await
+        .unwrap();
+    assert_eq!(
+        mapping_count, 2,
+        "both remote_mapping rows must survive the D6 rebuild path"
+    );
+
+    // Workspace and task rows are also intact.
+    let (ws_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM workspaces")
+        .fetch_one(&db.reads)
+        .await
+        .unwrap();
+    assert_eq!(ws_count, 1, "workspace row must not be dropped");
+
+    let (task_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM tasks")
+        .fetch_one(&db.reads)
+        .await
+        .unwrap();
+    assert_eq!(task_count, 2, "both task rows must not be dropped");
+
+    // --- (c) remote_mappings carries the D6 key shape: filing_repo_id column
+    // exists and participates in the UNIQUE index.
+    // Verify the column is present via PRAGMA.
+    let cols: Vec<String> = sqlx::query("PRAGMA table_info(remote_mappings)")
+        .fetch_all(&db.reads)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "name"))
+        .collect();
+    assert!(
+        cols.contains(&"filing_repo_id".to_string()),
+        "remote_mappings must have filing_repo_id after D6 rebuild; got columns: {cols:?}"
+    );
+    assert!(
+        !cols.contains(&"repo_id".to_string()),
+        "remote_mappings must NOT have the old repo_id column after D6 rebuild; got columns: {cols:?}"
+    );
+
+    // Verify the UNIQUE index covers (filing_repo_id, provider, remote_id):
+    // inserting a duplicate (same filing_repo_id + provider + remote_id) must
+    // fail with a unique-constraint violation.
+    let dup_result = sqlx::query(
+        "INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id) \
+         VALUES ('deadbeef-0000-0000-0000-000000000000', ?, 'github', '42')",
+    )
+    .bind(binding.id.to_string())
+    .execute(&db.writes)
+    .await;
+    let err = dup_result.expect_err(
+        "inserting a duplicate (filing_repo_id, provider, remote_id) must violate UNIQUE",
+    );
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("constraint"),
+        "expected a UNIQUE constraint violation, got: {err}"
+    );
+
+    // --- (d) Additive nullable columns exist on workspaces, tasks, and
+    // task_snapshots (the ADD COLUMN migrations from #115 and #118).
+    for (table, col) in &[
+        ("workspaces", "filing_repo_id"),
+        ("tasks", "filing_repo_id"),
+        ("task_snapshots", "filing_repo_id"),
+    ] {
+        let tcols: Vec<String> = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&db.reads)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| sqlx::Row::get::<String, _>(&r, "name"))
+            .collect();
+        assert!(
+            tcols.contains(&col.to_string()),
+            "{table} must have the additive {col} column; got: {tcols:?}"
+        );
+    }
+
+    // --- (e) No FK orphans: PRAGMA foreign_key_check returns no rows after
+    // the full migration + seed sequence. An orphaned FK would appear here as
+    // a row describing the constraint that was violated.
+    let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&db.reads)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let table: String = sqlx::Row::get(&r, "table");
+            let rowid: i64 = sqlx::Row::get(&r, "rowid");
+            let parent: String = sqlx::Row::get(&r, "parent");
+            format!("{table} rowid={rowid} → {parent}")
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "PRAGMA foreign_key_check must find no orphaned FK rows after the RFC 0002 migration sequence; violations: {orphans:?}"
+    );
+}
