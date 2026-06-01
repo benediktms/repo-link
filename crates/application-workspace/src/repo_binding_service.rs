@@ -179,6 +179,13 @@ impl RepoBindingService {
         let mut active: Vec<RepoBinding> = Vec::new();
         let mut archived: Vec<RepoBinding> = Vec::new();
         for ws in &workspaces {
+            // `list(true)` returns ALL statuses, Deleted included — a deleted
+            // workspace's bindings must never resolve a handle, so drop them
+            // before bucketing (else they'd land in `active` and either route a
+            // write to a dead workspace or falsely trip AmbiguousHandle).
+            if ws.status == WorkspaceStatus::Deleted {
+                continue;
+            }
             let bindings = self.bindings.list_by_workspace(ws.id).await?;
             for b in bindings {
                 if b.name == query || b.aliases.iter().any(|a| a == query) {
@@ -795,6 +802,43 @@ mod tests {
         ws_svc.archive(&b.workspace_id).await.unwrap();
         let hit = bsvc.show("gw").await.unwrap();
         assert_eq!(hit.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn handle_resolution_ignores_deleted_workspace_bindings() {
+        use domain_workspace::{Workspace, WorkspaceName, WorkspaceStatus};
+        // `list(true)` returns ALL statuses, Deleted included. A deleted
+        // workspace's binding must never resolve a handle — neither route a
+        // write to a dead workspace nor falsely trip AmbiguousHandle against a
+        // live one. Force-seed Deleted directly (no command transitions into
+        // it yet) to lock the guard.
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let bindings: Arc<dyn RepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let bsvc = RepoBindingService::new(workspaces.clone(), bindings);
+
+        let mut deleted = Workspace::new(WorkspaceName::new("ws-deleted").unwrap(), None, true);
+        deleted.status = WorkspaceStatus::Deleted;
+        workspaces.save(&deleted).await.unwrap();
+        // Name = canonical's last segment = "widget-service"; query by name so
+        // the prefix path (globally-unique, status-agnostic) doesn't shadow it.
+        bsvc.attach(AttachRepoCmd {
+            workspace_id: deleted.id.to_string(),
+            remote_url: "git@example.com:o/widget-service.git".into(),
+            canonical_url: "github.com/o/widget-service".into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+            prefix: None,
+        })
+        .await
+        .unwrap();
+
+        let err = bsvc.show("widget-service").await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::BindingNotFound(_)),
+            "deleted workspace's binding must not resolve, got {err:?}"
+        );
     }
 
     #[tokio::test]
