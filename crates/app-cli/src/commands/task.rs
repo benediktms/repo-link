@@ -221,10 +221,32 @@ pub(crate) async fn task_dispatch(
         TaskCmd::Create {
             ws: WorkspaceArg { workspace },
             repo,
+            filing_repo,
             title,
             body,
             priority,
         } => {
+            // RFC 0002 D2 step 1 / #122 brief preference (a): `task create`
+            // only mints a LocalOnly draft — it does not promote and has no
+            // filing transition to consume the override. Silently accepting
+            // `--filing-repo` would create a flag that does nothing (a
+            // footgun). Instead, resolve the handle first (to validate it and
+            // surface ambiguity identically to `--repo`), then reject with an
+            // explicit deferral error directing the user to `rl sync promote`
+            // / a future workspace filing default.
+            if let Some(handle) = filing_repo {
+                let resolved = resolve_repo_handle(svc, Some(handle)).await?;
+                return Err(anyhow!(
+                    "`--filing-repo` is not yet consumed by `task create` (RFC 0002 §4, #122): \
+                     `rl task create` only mints a local draft and does not promote the task to \
+                     a remote issue. The per-task filing-repo override will be honoured at the \
+                     first-filing transition; until that path is wired, control the filing target \
+                     via the workspace filing default. To file the task in a specific repo, \
+                     create it without `--filing-repo` and then run `rl sync promote`. \
+                     (Resolved binding: {})",
+                    resolved.unwrap_or_else(|| "<unknown>".into())
+                ));
+            }
             let dto = svc
                 .tasks
                 .create(CreateTaskCmd {
@@ -233,11 +255,33 @@ pub(crate) async fn task_dispatch(
                     title,
                     body,
                     priority,
+                    filing_repo_override: None,
                 })
                 .await?;
             render::task(&dto);
         }
-        TaskCmd::Show { id } => render::task(&svc.tasks.show(&id).await?),
+        TaskCmd::Show { id } => {
+            // Show-specific display path (RFC 0002 D5 / #122): read the
+            // domain Task directly for the internal `filing_repo_id` axis,
+            // then overlay an additive `filing_repo` block on top of the
+            // base TaskDto — without extending TaskDto itself. The base
+            // shape (and all list/query shapes) remain byte-identical.
+            let base = svc.tasks.show(&id).await?;
+            let domain_task = svc.tasks.resolve_task(&id).await?;
+            let filing_repo_block = if let Some(filing_id) = domain_task.filing_repo_id {
+                match svc.bindings.show(&filing_id.to_string()).await {
+                    Ok(binding) => serde_json::json!({
+                        "id": binding.id,
+                        "name": binding.name,
+                        "canonical_url": binding.canonical_url,
+                    }),
+                    Err(_) => serde_json::Value::Null,
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            render::task_show(&base, filing_repo_block);
+        }
         TaskCmd::Edit {
             id,
             title,

@@ -947,6 +947,7 @@ mod tests {
                 title: "ship it".into(),
                 body: Some("with feeling".into()),
                 priority: Some("p1".into()),
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -980,6 +981,7 @@ mod tests {
                 title: "a".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -990,6 +992,7 @@ mod tests {
                 title: "b".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1034,6 +1037,7 @@ mod tests {
                 title: "t".into(),
                 body: None,
                 priority: Some("p99".into()),
+                filing_repo_override: None,
             })
             .await
             .unwrap_err();
@@ -1056,6 +1060,7 @@ mod tests {
                 title: "a".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1066,6 +1071,7 @@ mod tests {
                 title: "b".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1099,6 +1105,7 @@ mod tests {
                 title: "a".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1109,6 +1116,7 @@ mod tests {
                 title: "b".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1137,6 +1145,7 @@ mod tests {
                     title: (*title).into(),
                     body: None,
                     priority: None,
+                    filing_repo_override: None,
                 })
                 .await
                 .unwrap();
@@ -1331,6 +1340,7 @@ mod tests {
                 title: "t".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1352,6 +1362,7 @@ mod tests {
                 title: "t".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1374,6 +1385,7 @@ mod tests {
                 title: "resolve me".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1401,6 +1413,7 @@ mod tests {
                 title: "sync me".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1448,6 +1461,7 @@ mod tests {
                 title: "bound task".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -1997,6 +2011,7 @@ mod tests {
                 title: "local".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -2163,6 +2178,7 @@ mod tests {
                 title: "local".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
@@ -2410,6 +2426,7 @@ mod tests {
                 title: "original title".into(),
                 body: None,
                 priority: None,
+                filing_repo_override: None,
             })
             .await
             .unwrap();
