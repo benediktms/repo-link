@@ -562,19 +562,41 @@ impl TaskService {
             });
         }
 
+        // Whether this edge is genuinely new (vs. an idempotent re-add). Only a
+        // new edge owes an outbound mutation — re-adding an existing relation
+        // must not enqueue a duplicate `AddSubIssue`/`AddBlockedBy`.
+        let newly_added = !t
+            .relations
+            .iter()
+            .any(|r| r.kind == kind && r.other == other_task.id);
+
         t.add_relation(kind, other_task.id);
         // Mirror the reciprocal edge onto the other task so the graph reads
         // coherently from both ends. `add_relation` is idempotent, so a
         // pre-existing reciprocal (or a re-run) is a no-op rather than a dup.
         other_task.add_relation(kind.inverse(), t.id);
 
-        // Persist both sides atomically: a partial write would leave the
-        // forward edge without its reciprocal (or vice-versa).
+        // Project the new edge onto its GitHub-native primitive (sub-issue /
+        // dependency) when both ends are issue-backed. Empty otherwise.
+        let entries = if newly_added {
+            self.plan_relation_entries(kind, true, &t, &other_task)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        // Persist both sides AND the outbound entry atomically: a partial write
+        // would leave the forward edge without its reciprocal, or the saved
+        // relation without the durable mutation it owes (relations have no
+        // dirty-detection backstop to re-enqueue a lost entry).
         self.repo
-            .save_many(&[
-                (&t, SnapshotSource::LocalEdit),
-                (&other_task, SnapshotSource::LocalEdit),
-            ])
+            .save_many_with_outbox(
+                &[
+                    (&t, SnapshotSource::LocalEdit),
+                    (&other_task, SnapshotSource::LocalEdit),
+                ],
+                &entries,
+            )
             .await?;
 
         self.task_dto(&t).await
@@ -594,6 +616,14 @@ impl TaskService {
         // atomically, so removing one half can't outlive the other.
         let t_changed = t.remove_relation(kind, other_task.id);
         let other_changed = other_task.remove_relation(kind.inverse(), t.id);
+        // Only a relation that actually existed (from `t`'s side) owes an
+        // outbound un-link; re-removing an absent edge enqueues nothing.
+        let entries = if t_changed {
+            self.plan_relation_entries(kind, false, &t, &other_task)
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut batch: Vec<(&Task, SnapshotSource)> = Vec::new();
         if t_changed {
             batch.push((&t, SnapshotSource::LocalEdit));
@@ -602,7 +632,7 @@ impl TaskService {
             batch.push((&other_task, SnapshotSource::LocalEdit));
         }
         if !batch.is_empty() {
-            self.repo.save_many(&batch).await?;
+            self.repo.save_many_with_outbox(&batch, &entries).await?;
         }
         self.task_dto(&t).await
     }
@@ -625,27 +655,51 @@ impl TaskService {
             }
         }
         let mut others_changed: Vec<Task> = Vec::new();
+        // Issue coords for each loaded far end, captured whether or not its
+        // reciprocal edge changed — the cleared task's *forward* edge is what
+        // owes the GitHub un-link, so the plan below needs every far end's
+        // coords, not just the ones whose back-edge was stripped.
+        let mut coords_by_other: HashMap<TaskId, Option<(String, String)>> = HashMap::new();
         for (other_id, inv_kinds) in by_other {
             let mut other = self.repo.get(other_id).await?;
             let mut changed = false;
             for k in inv_kinds {
                 changed |= other.remove_relation(k, t.id);
             }
+            coords_by_other.insert(other.id, self.relation_remote_coords(&other).await?);
             if changed {
                 others_changed.push(other);
             }
         }
 
-        // Persist the stripped task and every touched back-edge holder in one
-        // transaction so no task is left pointing at a relation the cleared
-        // task no longer mirrors.
+        // Plan one outbound un-link per removed native edge whose far end is
+        // issue-backed. Keyed on `t`'s stored kind, so each removed edge maps to
+        // a single canonical `RemoveSubIssue`/`RemoveBlockedBy` (the reciprocal
+        // back-edge stripped above does not separately enqueue).
+        let mut entries: Vec<OutboxEntry> = Vec::new();
+        if let Some(this_coords) = self.relation_remote_coords(&t).await? {
+            for r in &removed {
+                if r.other == t.id {
+                    continue;
+                }
+                if let Some(Some(other_coords)) = coords_by_other.get(&r.other)
+                    && let Some(m) = relation_mutation(r.kind, false, &this_coords, other_coords)
+                {
+                    entries.push(OutboxEntry::new(t.id, m));
+                }
+            }
+        }
+
+        // Persist the stripped task, every touched back-edge holder, AND the
+        // un-link entries in one transaction so no task is left pointing at a
+        // relation the cleared task no longer mirrors, and no un-link is lost.
         let mut batch: Vec<(&Task, SnapshotSource)> = vec![(&t, SnapshotSource::LocalEdit)];
         batch.extend(
             others_changed
                 .iter()
                 .map(|o| (o, SnapshotSource::LocalEdit)),
         );
-        self.repo.save_many(&batch).await?;
+        self.repo.save_many_with_outbox(&batch, &entries).await?;
 
         self.task_dto(&t).await
     }
@@ -915,6 +969,48 @@ impl TaskService {
         };
         Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
     }
+
+    /// Issue coordinates `(filing_canonical, remote_id)` for a task, or `None`
+    /// when the task isn't issue-backed or its filing repo can't be resolved. A
+    /// relation can only be projected onto GitHub when BOTH ends resolve, so the
+    /// relation-sync planner treats `None` on either side as "skip enqueue".
+    async fn relation_remote_coords(&self, task: &Task) -> Result<Option<(String, String)>> {
+        let Some(remote) = &task.remote else {
+            return Ok(None);
+        };
+        let Some(canonical) = self.filing_canonical_for(task).await? else {
+            return Ok(None);
+        };
+        Ok(Some((canonical, remote.remote_id.clone())))
+    }
+
+    /// Plan the (zero or one) outbox entries a single relation edge owes when it
+    /// is added (`add = true`) or removed (`add = false`). Empty unless BOTH
+    /// ends are issue-backed AND the kind has a GitHub-native primitive
+    /// (`parent_of`/`child_of` → sub-issues, `blocked_by`/`blocks` →
+    /// dependencies). `related_to`/`duplicates` and any local-only end yield no
+    /// entry. The entry is keyed on `t`'s id (the relation command's subject),
+    /// so it FIFO-orders with `t`'s other outbound mutations.
+    async fn plan_relation_entries(
+        &self,
+        kind: RelationKind,
+        add: bool,
+        t: &Task,
+        other: &Task,
+    ) -> Result<Vec<OutboxEntry>> {
+        let (Some(this_coords), Some(other_coords)) = (
+            self.relation_remote_coords(t).await?,
+            self.relation_remote_coords(other).await?,
+        ) else {
+            return Ok(Vec::new());
+        };
+        Ok(
+            match relation_mutation(kind, add, &this_coords, &other_coords) {
+                Some(m) => into_entries(t.id, vec![m]),
+                None => Vec::new(),
+            },
+        )
+    }
 }
 
 /// Wrap each planned [`OutboxMutation`] in a fresh `Pending` [`OutboxEntry`]
@@ -927,6 +1023,65 @@ fn into_entries(task_id: TaskId, mutations: Vec<OutboxMutation>) -> Vec<OutboxEn
         .into_iter()
         .map(|m| OutboxEntry::new(task_id, m))
         .collect()
+}
+
+/// The single GitHub-native outbound mutation a relation edit owes, keyed on
+/// the user's stated `kind` so the locally-mirrored reciprocal edge does NOT
+/// double-enqueue (each user action emits exactly one mutation). `None` for
+/// kinds with no native primitive (`related_to` / `duplicates`). `add` selects
+/// the `Add*` vs `Remove*` variant.
+///
+/// `this` is the task the relation command names; `other` is the far end. Both
+/// are `(filing_canonical, remote_id)`. The REST endpoint is always addressed
+/// to the FIRST coord pair, so the direction mapping is:
+/// - `ParentOf`  (this=parent)  → sub-issue(parent=this,  child=other)
+/// - `ChildOf`   (this=child)   → sub-issue(parent=other, child=this)
+/// - `BlockedBy` (this blocked) → blocked_by(blocked=this,  blocker=other)
+/// - `Blocks`    (this blocks)  → blocked_by(blocked=other, blocker=this)
+fn relation_mutation(
+    kind: RelationKind,
+    add: bool,
+    this: &(String, String),
+    other: &(String, String),
+) -> Option<OutboxMutation> {
+    // `addressed` is the issue the endpoint targets; `related` is the issue
+    // whose db id the adapter resolves at apply time. `is_sub` picks the
+    // sub-issue family over the dependency family.
+    let (addressed, related, is_sub) = match kind {
+        RelationKind::ParentOf => (this, other, true),
+        RelationKind::ChildOf => (other, this, true),
+        RelationKind::BlockedBy => (this, other, false),
+        RelationKind::Blocks => (other, this, false),
+        RelationKind::RelatedTo | RelationKind::Duplicates => return None,
+    };
+    let (a_canonical, a_remote_id) = (addressed.0.clone(), addressed.1.clone());
+    let (b_canonical, b_remote_id) = (related.0.clone(), related.1.clone());
+    Some(match (is_sub, add) {
+        (true, true) => OutboxMutation::AddSubIssue {
+            parent_canonical: a_canonical,
+            parent_remote_id: a_remote_id,
+            child_canonical: b_canonical,
+            child_remote_id: b_remote_id,
+        },
+        (true, false) => OutboxMutation::RemoveSubIssue {
+            parent_canonical: a_canonical,
+            parent_remote_id: a_remote_id,
+            child_canonical: b_canonical,
+            child_remote_id: b_remote_id,
+        },
+        (false, true) => OutboxMutation::AddBlockedBy {
+            blocked_canonical: a_canonical,
+            blocked_remote_id: a_remote_id,
+            blocker_canonical: b_canonical,
+            blocker_remote_id: b_remote_id,
+        },
+        (false, false) => OutboxMutation::RemoveBlockedBy {
+            blocked_canonical: a_canonical,
+            blocked_remote_id: a_remote_id,
+            blocker_canonical: b_canonical,
+            blocker_remote_id: b_remote_id,
+        },
+    })
 }
 
 /// For a cycle-protected relation, return `(forward, inverse, x, y)` where the
@@ -1850,6 +2005,24 @@ mod tests {
         t
     }
 
+    /// Save a synced issue-backed mirror that is fully *addressable* on GitHub:
+    /// bound to `repo_id` (so `filing_canonical_for` resolves) and carrying
+    /// `remote_id`. Used by the relation-sync tests, where both ends must
+    /// resolve `(filing_canonical, remote_id)` for a mutation to be enqueued.
+    async fn addressable_mirror(
+        repo: &Arc<InMemoryTaskRepository>,
+        ws: WorkspaceId,
+        repo_id: domain_core::RepoId,
+        remote_id: &str,
+    ) -> Task {
+        let mut t = Task::new_draft(ws, Some(repo_id), "m".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", remote_id))
+            .unwrap();
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+        t
+    }
+
     // ---------- Stage 8 (#56, closes #39): task show project status --------
 
     /// `task show` surfaces the cached project-board status as a display name,
@@ -2311,20 +2484,39 @@ mod tests {
         );
     }
 
+    /// Seed a workspace + a single `github.com/o/r` binding, returning both so a
+    /// relation-sync test can hang addressable mirrors off the binding.
+    async fn ws_with_binding(
+        workspaces: &Arc<InMemoryWorkspaceRepository>,
+        bindings: &Arc<InMemoryRepoBindingRepository>,
+    ) -> (Workspace, domain_repo::RepoBinding) {
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let binding = domain_repo::RepoBinding::new(
+            ws.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+        (ws, binding)
+    }
+
     #[tokio::test]
-    async fn relation_ops_enqueue_nothing() {
-        // Relations live in their own table and are never mirrored — adding a
-        // relation between two issue-backed mirrors must not enqueue anything.
+    async fn relation_with_unaddressable_end_enqueues_nothing() {
+        // A relation can only be projected onto GitHub when BOTH ends resolve to
+        // `(filing_canonical, remote_id)`. Here `b` is issue-backed but has no
+        // repo binding, so its filing repo is unresolved → no enqueue.
         let RichSvc {
             svc,
             repo,
             outbox,
             workspaces,
+            bindings,
             ..
         } = rich_svc();
-        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
-        workspaces.save(&ws).await.unwrap();
-        let a = save_issue_mirror(&repo, ws.id, Some("I_a"), None).await;
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
         let mut b = Task::new_draft(ws.id, None, "b".into()).unwrap();
         b.stage_for_sync().unwrap();
         b.promote_to_remote(RemoteRef::new("github", "8")).unwrap();
@@ -2338,7 +2530,288 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(outbox.all().is_empty(), "relation ops enqueue nothing");
+        assert!(
+            outbox.all().is_empty(),
+            "unaddressable far end ⇒ relation can't be projected ⇒ no enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_blocked_by_enqueues_dependency_with_correct_direction() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1, "exactly one dependency mutation");
+        assert_eq!(
+            entries[0].task_id, a.id,
+            "entry keyed on the relation command's subject"
+        );
+        match &entries[0].mutation {
+            OutboxMutation::AddBlockedBy {
+                blocked_canonical,
+                blocked_remote_id,
+                blocker_canonical,
+                blocker_remote_id,
+            } => {
+                assert_eq!(blocked_remote_id, "10", "a is the blocked issue");
+                assert_eq!(blocker_remote_id, "20", "b is the blocker");
+                assert_eq!(blocked_canonical, "github.com/o/r");
+                assert_eq!(blocker_canonical, "github.com/o/r");
+            }
+            other => panic!("expected AddBlockedBy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_of_addresses_the_parent_issue() {
+        // `a parent_of b` ⇒ sub-issue(parent=a, child=b).
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "parent_of".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+        match &outbox.all()[0].mutation {
+            OutboxMutation::AddSubIssue {
+                parent_remote_id,
+                child_remote_id,
+                ..
+            } => {
+                assert_eq!(parent_remote_id, "10", "a parent_of b ⇒ a is parent");
+                assert_eq!(child_remote_id, "20", "b is the child");
+            }
+            other => panic!("expected AddSubIssue, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn child_of_swaps_to_address_the_parent_issue() {
+        // `c child_of d` is the same GitHub edge as `d parent_of c`, so it must
+        // address the PARENT (d) and carry c as the child — proving the
+        // direction swap is keyed on the stated kind, not the command subject.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let c = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let d = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: c.id.to_string(),
+            kind: "child_of".into(),
+            other: d.id.to_string(),
+        })
+        .await
+        .unwrap();
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1, "one sub-issue mutation");
+        match &entries[0].mutation {
+            OutboxMutation::AddSubIssue {
+                parent_remote_id,
+                child_remote_id,
+                ..
+            } => {
+                assert_eq!(parent_remote_id, "20", "child_of swaps: d is parent");
+                assert_eq!(child_remote_id, "10", "c is child");
+            }
+            other => panic!("expected AddSubIssue, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn related_to_enqueues_nothing() {
+        // `related_to` has no GitHub-native primitive → never enqueues, even
+        // between two fully addressable mirrors.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "related_to".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "related_to has no native primitive ⇒ no enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_adding_an_existing_relation_does_not_double_enqueue() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+        let cmd = || AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: b.id.to_string(),
+        };
+
+        svc.add_relation(cmd()).await.unwrap();
+        svc.add_relation(cmd()).await.unwrap();
+
+        assert_eq!(
+            outbox.all().len(),
+            1,
+            "idempotent re-add must not enqueue a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_relation_enqueues_unlink() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+        svc.remove_relation(RemoveTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 2, "one add + one remove");
+        match &entries[1].mutation {
+            OutboxMutation::RemoveBlockedBy {
+                blocked_remote_id,
+                blocker_remote_id,
+                ..
+            } => {
+                assert_eq!(blocked_remote_id, "10");
+                assert_eq!(blocker_remote_id, "20");
+            }
+            other => panic!("expected RemoveBlockedBy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_relations_enqueues_one_unlink_per_native_edge() {
+        // `a` parent_of `b` and blocked_by `c`; clearing `a` must emit one
+        // un-link per native edge (RemoveSubIssue + RemoveBlockedBy), keyed on
+        // `a`'s stored direction.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, binding) = ws_with_binding(&workspaces, &bindings).await;
+        let a = addressable_mirror(&repo, ws.id, binding.id, "10").await;
+        let b = addressable_mirror(&repo, ws.id, binding.id, "20").await;
+        let c = addressable_mirror(&repo, ws.id, binding.id, "30").await;
+
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "parent_of".into(),
+            other: b.id.to_string(),
+        })
+        .await
+        .unwrap();
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: a.id.to_string(),
+            kind: "blocked_by".into(),
+            other: c.id.to_string(),
+        })
+        .await
+        .unwrap();
+        let before = outbox.all().len();
+        assert_eq!(before, 2, "two add mutations");
+
+        svc.clear_relations(&a.id.to_string()).await.unwrap();
+
+        let unlinks: Vec<_> = outbox.all().into_iter().skip(before).collect();
+        assert_eq!(unlinks.len(), 2, "one un-link per native edge");
+        let has_sub = unlinks.iter().any(|e| {
+            matches!(
+                &e.mutation,
+                OutboxMutation::RemoveSubIssue { parent_remote_id, child_remote_id, .. }
+                    if parent_remote_id == "10" && child_remote_id == "20"
+            )
+        });
+        let has_dep = unlinks.iter().any(|e| {
+            matches!(
+                &e.mutation,
+                OutboxMutation::RemoveBlockedBy { blocked_remote_id, blocker_remote_id, .. }
+                    if blocked_remote_id == "10" && blocker_remote_id == "30"
+            )
+        });
+        assert!(has_sub, "expected RemoveSubIssue(parent=10, child=20)");
+        assert!(has_dep, "expected RemoveBlockedBy(blocked=10, blocker=30)");
     }
 
     #[tokio::test]

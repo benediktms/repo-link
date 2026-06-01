@@ -367,6 +367,176 @@ impl RestClient {
             Err(e) => Err(map_err(e)),
         }
     }
+
+    /// Resolve an issue's integer **database id** (`issue.id`) from its
+    /// `(canonical_repo, number)`. GitHub's sub-issue and dependency write
+    /// endpoints address the *related* issue by db id, not by `#number`, so the
+    /// relation-sync drainer resolves it here at apply time (the outbox entry
+    /// only carries the offline-known number). Costs one GET per relation op —
+    /// acceptable for a rare path, and it doubles as a liveness check that the
+    /// related issue still exists before we POST against it.
+    async fn resolve_issue_db_id(&self, canonical_repo: &str, remote_id: &str) -> PortResult<u64> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        let issue: Issue = self
+            .http
+            .issues(owner, repo)
+            .get(number)
+            .await
+            .map_err(map_err)?;
+        Ok(issue.id.into_inner())
+    }
+
+    /// Like [`resolve_issue_db_id`](Self::resolve_issue_db_id) but maps a 404 —
+    /// the related issue was deleted from GitHub — to `Ok(None)`. A *remove*
+    /// whose target issue no longer exists is already in the desired state, so
+    /// the un-link is a no-op success; without this, the preliminary GET's 404
+    /// would propagate as a hard error and the drainer would retry the entry
+    /// forever (it can never succeed). Only the remove paths use this — an `add`
+    /// against a deleted issue is a genuine failure worth surfacing.
+    async fn resolve_issue_db_id_or_gone(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<u64>> {
+        match self.resolve_issue_db_id(canonical_repo, remote_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(PortError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link `child` under
+    /// `parent`. Resolves the child's db id first, then posts `sub_issue_id`.
+    /// 422 (already a sub-issue) is treated as idempotent success.
+    pub(crate) async fn add_sub_issue(
+        &self,
+        parent_canonical: &str,
+        parent_remote_id: &str,
+        child_canonical: &str,
+        child_remote_id: &str,
+    ) -> PortResult<()> {
+        let child_db_id = self
+            .resolve_issue_db_id(child_canonical, child_remote_id)
+            .await?;
+        let (owner, repo) = split_owner_repo(parent_canonical)?;
+        let number = parse_issue_number(parent_remote_id)?;
+        let route = format!("/repos/{owner}/{repo}/issues/{number}/sub_issues");
+        let body = serde_json::json!({ "sub_issue_id": child_db_id });
+        let resp = self
+            .http
+            ._post(route.as_str(), Some(&body))
+            .await
+            .map_err(map_err)?;
+        // 422: already a sub-issue of this parent → idempotent success.
+        rest_ok_or_err(resp.status().as_u16(), "add sub-issue", 422)
+    }
+
+    /// `DELETE /repos/{o}/{r}/issues/{parent}/sub_issue` (body `sub_issue_id`) —
+    /// unlink `child` from `parent`. 404 (not currently a sub-issue) is treated
+    /// as idempotent success.
+    pub(crate) async fn remove_sub_issue(
+        &self,
+        parent_canonical: &str,
+        parent_remote_id: &str,
+        child_canonical: &str,
+        child_remote_id: &str,
+    ) -> PortResult<()> {
+        let Some(child_db_id) = self
+            .resolve_issue_db_id_or_gone(child_canonical, child_remote_id)
+            .await?
+        else {
+            // Child issue deleted from GitHub → the sub-issue link can't exist →
+            // un-link is already satisfied.
+            return Ok(());
+        };
+        let (owner, repo) = split_owner_repo(parent_canonical)?;
+        let number = parse_issue_number(parent_remote_id)?;
+        let route = format!("/repos/{owner}/{repo}/issues/{number}/sub_issue");
+        let body = serde_json::json!({ "sub_issue_id": child_db_id });
+        let resp = self
+            .http
+            ._delete(route.as_str(), Some(&body))
+            .await
+            .map_err(map_err)?;
+        // 404: not currently a sub-issue → already in the desired state.
+        rest_ok_or_err(resp.status().as_u16(), "remove sub-issue", 404)
+    }
+
+    /// `POST /repos/{o}/{r}/issues/{blocked}/dependencies/blocked_by` (body
+    /// `issue_id`) — record that `blocked` is blocked by `blocker`. 422
+    /// (dependency already recorded) is treated as idempotent success.
+    pub(crate) async fn add_blocked_by(
+        &self,
+        blocked_canonical: &str,
+        blocked_remote_id: &str,
+        blocker_canonical: &str,
+        blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        let blocker_db_id = self
+            .resolve_issue_db_id(blocker_canonical, blocker_remote_id)
+            .await?;
+        let (owner, repo) = split_owner_repo(blocked_canonical)?;
+        let number = parse_issue_number(blocked_remote_id)?;
+        let route = format!("/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by");
+        let body = serde_json::json!({ "issue_id": blocker_db_id });
+        let resp = self
+            .http
+            ._post(route.as_str(), Some(&body))
+            .await
+            .map_err(map_err)?;
+        // 422: dependency already recorded → idempotent success.
+        rest_ok_or_err(resp.status().as_u16(), "add blocked-by dependency", 422)
+    }
+
+    /// `DELETE /repos/{o}/{r}/issues/{blocked}/dependencies/blocked_by/{issue_id}`
+    /// — drop the dependency. The blocker's db id rides in the path. 404
+    /// (dependency not present) is treated as idempotent success.
+    pub(crate) async fn remove_blocked_by(
+        &self,
+        blocked_canonical: &str,
+        blocked_remote_id: &str,
+        blocker_canonical: &str,
+        blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        let Some(blocker_db_id) = self
+            .resolve_issue_db_id_or_gone(blocker_canonical, blocker_remote_id)
+            .await?
+        else {
+            // Blocker issue deleted from GitHub → the dependency can't exist →
+            // un-link is already satisfied.
+            return Ok(());
+        };
+        let (owner, repo) = split_owner_repo(blocked_canonical)?;
+        let number = parse_issue_number(blocked_remote_id)?;
+        let route = format!(
+            "/repos/{owner}/{repo}/issues/{number}/dependencies/blocked_by/{blocker_db_id}"
+        );
+        let resp = self
+            .http
+            ._delete(route.as_str(), None::<&()>)
+            .await
+            .map_err(map_err)?;
+        // 404: dependency not present → already in the desired state.
+        rest_ok_or_err(resp.status().as_u16(), "remove blocked-by dependency", 404)
+    }
+}
+
+/// Treat a raw `_post`/`_delete` status as success when it is 2xx OR equals
+/// `idempotent_status` — the code GitHub returns when the relation is already
+/// in the desired state (422 already-linked on `add`, 404 already-gone on
+/// `remove`). The local cycle guard blocks cycle-forming edges before enqueue,
+/// so a 422 reaching here means "already exists", not a fresh validation
+/// failure. Any other non-success surfaces as a backend error. Takes the
+/// `StatusCode` by value so the octocrab response/body types (not re-exported)
+/// never have to be named.
+fn rest_ok_or_err(status: u16, context: &str, idempotent_status: u16) -> PortResult<()> {
+    if (200..300).contains(&status) || status == idempotent_status {
+        return Ok(());
+    }
+    Err(PortError::Backend(format!(
+        "{context} failed: HTTP {status}"
+    )))
 }
 
 // ---------- Mapping (octocrab models ↔ port types) ----------------------

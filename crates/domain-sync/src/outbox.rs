@@ -69,6 +69,49 @@ pub enum OutboxMutation {
         status_field_id: String,
         option_id: String,
     },
+    /// REST `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link an existing
+    /// issue as a sub-issue of another (the GitHub-native projection of a
+    /// `parent_of` / `child_of` relation). `parent_*` addresses the URL; GitHub
+    /// wants the child's integer **database id** in the `sub_issue_id` body
+    /// field (NOT its `#number`), so the drainer resolves `child_*` → db id at
+    /// apply time, keeping enqueue offline. The db id is global, so a cross-repo
+    /// child is representable here even though the import side skips them.
+    AddSubIssue {
+        parent_canonical: String,
+        parent_remote_id: String,
+        child_canonical: String,
+        child_remote_id: String,
+    },
+    /// REST `DELETE /repos/{o}/{r}/issues/{parent}/sub_issue` (body
+    /// `sub_issue_id`) — unlink a sub-issue. Same addressing / db-id resolution
+    /// as [`OutboxMutation::AddSubIssue`].
+    RemoveSubIssue {
+        parent_canonical: String,
+        parent_remote_id: String,
+        child_canonical: String,
+        child_remote_id: String,
+    },
+    /// REST `POST /repos/{o}/{r}/issues/{blocked}/dependencies/blocked_by` (body
+    /// `issue_id` = the blocker's integer **database id**) — record an issue
+    /// dependency (GitHub issue dependencies, GA 2025-08-21). The native
+    /// projection of a `blocked_by` / `blocks` relation. `blocked_*` addresses
+    /// the URL; the drainer resolves `blocker_*` → db id at apply time. Only the
+    /// `blocked_by` side is written — `blocking` is GitHub's inverse read.
+    AddBlockedBy {
+        blocked_canonical: String,
+        blocked_remote_id: String,
+        blocker_canonical: String,
+        blocker_remote_id: String,
+    },
+    /// REST `DELETE .../issues/{blocked}/dependencies/blocked_by/{issue_id}` —
+    /// drop a dependency. The blocker's db id rides in the URL path, so the
+    /// drainer resolves `blocker_*` → db id at apply time.
+    RemoveBlockedBy {
+        blocked_canonical: String,
+        blocked_remote_id: String,
+        blocker_canonical: String,
+        blocker_remote_id: String,
+    },
 }
 
 impl OutboxMutation {
@@ -83,6 +126,10 @@ impl OutboxMutation {
             Self::UpdateDraftIssue { .. } => "update_draft_issue",
             Self::ConvertDraftToIssue { .. } => "convert_draft_to_issue",
             Self::SetProjectStatus { .. } => "set_project_status",
+            Self::AddSubIssue { .. } => "add_sub_issue",
+            Self::RemoveSubIssue { .. } => "remove_sub_issue",
+            Self::AddBlockedBy { .. } => "add_blocked_by",
+            Self::RemoveBlockedBy { .. } => "remove_blocked_by",
         }
     }
 }
@@ -155,6 +202,56 @@ mod tests {
         assert_eq!(m.kind(), "add_item");
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["kind"], "add_item");
+    }
+
+    #[test]
+    fn relation_mutation_kinds_match_serde_tags() {
+        // Same lockstep guard as above, for the relation-sync variants: a
+        // serde rename without a `kind()` arm update would desync the SQLite
+        // discriminator from the payload.
+        let cases: [(OutboxMutation, &str); 4] = [
+            (
+                OutboxMutation::AddSubIssue {
+                    parent_canonical: "github.com/o/r".into(),
+                    parent_remote_id: "1".into(),
+                    child_canonical: "github.com/o/r".into(),
+                    child_remote_id: "2".into(),
+                },
+                "add_sub_issue",
+            ),
+            (
+                OutboxMutation::RemoveSubIssue {
+                    parent_canonical: "github.com/o/r".into(),
+                    parent_remote_id: "1".into(),
+                    child_canonical: "github.com/o/r".into(),
+                    child_remote_id: "2".into(),
+                },
+                "remove_sub_issue",
+            ),
+            (
+                OutboxMutation::AddBlockedBy {
+                    blocked_canonical: "github.com/o/r".into(),
+                    blocked_remote_id: "1".into(),
+                    blocker_canonical: "github.com/o/r".into(),
+                    blocker_remote_id: "2".into(),
+                },
+                "add_blocked_by",
+            ),
+            (
+                OutboxMutation::RemoveBlockedBy {
+                    blocked_canonical: "github.com/o/r".into(),
+                    blocked_remote_id: "1".into(),
+                    blocker_canonical: "github.com/o/r".into(),
+                    blocker_remote_id: "2".into(),
+                },
+                "remove_blocked_by",
+            ),
+        ];
+        for (m, tag) in cases {
+            assert_eq!(m.kind(), tag);
+            let json = serde_json::to_value(&m).unwrap();
+            assert_eq!(json["kind"], tag);
+        }
     }
 
     #[test]

@@ -122,6 +122,74 @@ impl RemoteTaskProvider for GithubAdapter {
             .discover_move_target(canonical_repo, remote_id)
             .await
     }
+
+    async fn add_sub_issue(
+        &self,
+        parent_canonical: &str,
+        parent_remote_id: &str,
+        child_canonical: &str,
+        child_remote_id: &str,
+    ) -> PortResult<()> {
+        self.rest
+            .add_sub_issue(
+                parent_canonical,
+                parent_remote_id,
+                child_canonical,
+                child_remote_id,
+            )
+            .await
+    }
+
+    async fn remove_sub_issue(
+        &self,
+        parent_canonical: &str,
+        parent_remote_id: &str,
+        child_canonical: &str,
+        child_remote_id: &str,
+    ) -> PortResult<()> {
+        self.rest
+            .remove_sub_issue(
+                parent_canonical,
+                parent_remote_id,
+                child_canonical,
+                child_remote_id,
+            )
+            .await
+    }
+
+    async fn add_blocked_by(
+        &self,
+        blocked_canonical: &str,
+        blocked_remote_id: &str,
+        blocker_canonical: &str,
+        blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        self.rest
+            .add_blocked_by(
+                blocked_canonical,
+                blocked_remote_id,
+                blocker_canonical,
+                blocker_remote_id,
+            )
+            .await
+    }
+
+    async fn remove_blocked_by(
+        &self,
+        blocked_canonical: &str,
+        blocked_remote_id: &str,
+        blocker_canonical: &str,
+        blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        self.rest
+            .remove_blocked_by(
+                blocked_canonical,
+                blocked_remote_id,
+                blocker_canonical,
+                blocker_remote_id,
+            )
+            .await
+    }
 }
 
 #[async_trait]

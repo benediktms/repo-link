@@ -127,6 +127,33 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(())
     }
 
+    async fn save_many_with_outbox(
+        &self,
+        tasks: &[(&Task, SnapshotSource)],
+        entries: &[OutboxEntry],
+    ) -> PortResult<()> {
+        // Empty entries → behave exactly like `save_many` (the no-projection
+        // relation path), so a plain `new()` repo with no outbox handle works.
+        if entries.is_empty() {
+            for (task, source) in tasks {
+                self.write_locked(task, *source);
+            }
+            return Ok(());
+        }
+        // Non-empty entries: append every task write AND the entries under the
+        // outbox lock, the in-memory analogue of the SQLite single transaction.
+        let store = self.outbox.as_ref().expect(
+            "InMemoryTaskRepository::save_many_with_outbox called with entries but no outbox \
+             handle; build the repo via InMemoryTaskRepository::with_outbox(&outbox)",
+        );
+        let mut guard = store.lock().unwrap();
+        for (task, source) in tasks {
+            self.write_locked(task, *source);
+        }
+        guard.extend(entries.iter().cloned());
+        Ok(())
+    }
+
     async fn get(&self, id: TaskId) -> PortResult<Task> {
         let mut task = self
             .inner

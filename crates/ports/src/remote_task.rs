@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use domain_core::Timestamp;
 
-use crate::error::PortResult;
+use crate::error::{PortError, PortResult};
 
 #[derive(Clone, Debug)]
 pub struct RemoteTaskCreate<'a> {
@@ -153,5 +153,73 @@ pub trait RemoteTaskProvider: Send + Sync {
         _since: Timestamp,
     ) -> PortResult<Vec<RemoteTaskSnapshot>> {
         Ok(Vec::new())
+    }
+
+    /// Link `(child_canonical, child_remote_id)` as a sub-issue of
+    /// `(parent_canonical, parent_remote_id)` — the outbound projection of a
+    /// `parent_of` / `child_of` relation. The adapter is responsible for
+    /// resolving the child's provider-native id form its API needs (GitHub's
+    /// `sub_issues` body wants the child's integer **database id**, not its
+    /// `#number`). Idempotent: re-linking an existing sub-issue must succeed.
+    /// Providers without a sub-issue concept inherit the `Unsupported` default.
+    async fn add_sub_issue(
+        &self,
+        _parent_canonical: &str,
+        _parent_remote_id: &str,
+        _child_canonical: &str,
+        _child_remote_id: &str,
+    ) -> PortResult<()> {
+        Err(PortError::Backend(
+            "sub-issue relations not supported by this provider".into(),
+        ))
+    }
+
+    /// Unlink the sub-issue relationship created by [`add_sub_issue`]. Idempotent:
+    /// removing an absent link must succeed.
+    ///
+    /// [`add_sub_issue`]: Self::add_sub_issue
+    async fn remove_sub_issue(
+        &self,
+        _parent_canonical: &str,
+        _parent_remote_id: &str,
+        _child_canonical: &str,
+        _child_remote_id: &str,
+    ) -> PortResult<()> {
+        Err(PortError::Backend(
+            "sub-issue relations not supported by this provider".into(),
+        ))
+    }
+
+    /// Record that `(blocked_canonical, blocked_remote_id)` is blocked by
+    /// `(blocker_canonical, blocker_remote_id)` — the outbound projection of a
+    /// `blocked_by` / `blocks` relation onto GitHub issue dependencies. The
+    /// adapter resolves the blocker's native id (GitHub wants the blocker's
+    /// integer **database id** in the `issue_id` body). Idempotent.
+    /// Providers without a dependency concept inherit the `Unsupported` default.
+    async fn add_blocked_by(
+        &self,
+        _blocked_canonical: &str,
+        _blocked_remote_id: &str,
+        _blocker_canonical: &str,
+        _blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        Err(PortError::Backend(
+            "issue dependencies not supported by this provider".into(),
+        ))
+    }
+
+    /// Drop the dependency created by [`add_blocked_by`]. Idempotent.
+    ///
+    /// [`add_blocked_by`]: Self::add_blocked_by
+    async fn remove_blocked_by(
+        &self,
+        _blocked_canonical: &str,
+        _blocked_remote_id: &str,
+        _blocker_canonical: &str,
+        _blocker_remote_id: &str,
+    ) -> PortResult<()> {
+        Err(PortError::Backend(
+            "issue dependencies not supported by this provider".into(),
+        ))
     }
 }
