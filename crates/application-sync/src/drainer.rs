@@ -1410,4 +1410,145 @@ mod tests {
             "replay must not re-convert (guarded by remote.node_id)"
         );
     }
+
+    // --- RFC 0002 D6: cross-filed task async apply targets the filing repo ------
+    //
+    // These two tests are the load-bearing guard for #125: when a task's
+    // filing_repo_id diverges from its logical repo_id (i.e. the issue was
+    // filed in a different repo than the task's owner repo), the async drainer
+    // must target the FILING repo — never the logical repo — for both
+    // UpdateRemote and ConvertDraftToIssue mutations.
+    //
+    // The mechanism: both mutations carry the already-resolved filing canonical
+    // (or filing repo node id) on the outbox entry itself, set at enqueue time
+    // by the filing-aware planner. The drainer passes the entry's carried
+    // literal straight through to the provider; it NEVER re-derives a canonical
+    // from the task's logical repo_id during apply. These tests confirm that
+    // contract holds.
+
+    #[tokio::test]
+    async fn update_remote_cross_filed_targets_filing_repo_not_logical_repo() {
+        // A task whose issue was filed in "filing.repo" (filing canonical),
+        // NOT in its logical "logical.repo". The outbox entry's canonical_repo
+        // carries the filing canonical (resolved at enqueue time by the
+        // filing-aware planner). The drainer must pass that literal through —
+        // it must NOT re-derive the canonical from the task's logical repo.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+
+        // Seed an issue-backed task. The task's repo_id would resolve to
+        // "logical.repo" if the drainer ever re-derived the canonical from it;
+        // we leave it unset (orphan) precisely so such re-derivation would
+        // produce nothing or a wrong answer — making the test sensitive to
+        // any attempt to re-resolve from the task rather than the entry.
+        let mut task = seed_issue_task(&h, ws, "42").await;
+        task.start().unwrap();
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        // The filing-aware planner would have encoded the FILING canonical here.
+        let filing_canonical = "github.com/org/filing-repo";
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: filing_canonical.into(),
+                remote_id: "42".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        let n = h.drainer.drain_once().await.unwrap();
+        assert_eq!(n, 1);
+
+        let updates = h.remote_tasks.updates();
+        assert_eq!(updates.len(), 1);
+        // The task is an orphan (repo_id unset), so any attempt to re-derive a
+        // canonical from the task — instead of using the entry's carried literal
+        // — would yield None/empty, never `filing_canonical`. This assert_eq is
+        // therefore load-bearing against a fall-back-to-logical regression.
+        assert_eq!(
+            updates[0].canonical_repo, filing_canonical,
+            "UpdateRemote must target the FILING repo carried on the entry, \
+             not a canonical re-derived from the task's logical repo"
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_draft_to_issue_cross_filed_uses_entry_repo_node_id() {
+        // A draft→issue conversion where the filing repo is different from
+        // what the task's logical repo would resolve to. The outbox entry's
+        // repo_node_id carries the filing repo's node id (resolved at enqueue
+        // time by the filing-aware draft-conversion planner). The drainer must
+        // pass that literal through to convert_draft_to_issue — never
+        // re-deriving from the logical repo.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+
+        let mut task = Task::import_mirror(
+            ws,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.project_item_id = Some("PVTI_cross_filed_draft".into());
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+
+        h.remote_projects
+            .set_convert_returns_with_number("I_converted_cross", 99);
+
+        // The filing-aware planner encodes the FILING repo's node id here.
+        let filing_repo_node_id = "R_kgDOfiling";
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::ConvertDraftToIssue {
+                item_node_id: "PVTI_cross_filed_draft".into(),
+                repo_node_id: filing_repo_node_id.into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        // The provider must have received the FILING repo node id, not the
+        // logical one.
+        let calls = h.remote_projects.calls();
+        let convert_call = calls
+            .iter()
+            .find_map(|c| match c {
+                ProjectCall::ConvertDraftToIssue {
+                    item_node_id,
+                    repo_node_id,
+                } => Some((item_node_id.as_str(), repo_node_id.as_str())),
+                _ => None,
+            })
+            .expect("ConvertDraftToIssue call must have been applied");
+
+        // The task has no repo binding (import_mirror with repo_id = None), so
+        // any re-derivation of a repo node id from the task — instead of using
+        // the entry's carried literal — would yield None/empty, never
+        // `filing_repo_node_id`. This assert_eq is therefore load-bearing
+        // against a fall-back-to-logical regression.
+        assert_eq!(
+            convert_call.1, filing_repo_node_id,
+            "ConvertDraftToIssue must target the FILING repo node id carried on \
+             the entry, not one re-derived from the task's logical repo"
+        );
+
+        // Write-back: the task should now carry the returned issue node id and REST number.
+        let reloaded = h.tasks.get(task.id).await.unwrap();
+        let remote = reloaded.remote.as_ref().expect("remote populated");
+        assert_eq!(remote.node_id.as_deref(), Some("I_converted_cross"));
+        assert_eq!(remote.remote_id, "99");
+    }
 }
