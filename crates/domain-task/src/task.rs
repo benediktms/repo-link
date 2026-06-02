@@ -623,10 +623,7 @@ impl Task {
         let Some(baseline) = &self.synced_baseline else {
             return;
         };
-        let differs = self.title != baseline.title
-            || self.body != baseline.body
-            || self.status != baseline.status
-            || !assignees_equal(&self.assignees, &baseline.assignees);
+        let differs = MIRRORED_FIELDS.iter().any(|f| f.differs(self, baseline));
         self.sync = match (self.sync, differs) {
             (SyncState::Synced, true) => SyncState::DirtyLocal,
             (SyncState::DirtyLocal, false) => SyncState::Synced,
@@ -640,12 +637,54 @@ impl Task {
     }
 }
 
-/// Order-insensitive assignee comparison. GitHub does not preserve the order
-/// of assignees in its REST responses, so `["alice","bob"]` and `["bob","alice"]`
-/// must be treated as equal to avoid spurious `DirtyLocal` transitions.
-/// Order-insensitive set equality for assignee lists. GitHub doesn't guarantee
-/// a stable order across responses, so callers reconciling local + remote
-/// assignees must compare as sets to avoid spurious drift on re-ordering.
+/// The fields GitHub mirrors on a task's backing issue — the single source of
+/// truth (RFC 0003 D1) for what counts as remote-observable content. Dirty
+/// detection here, the field-level diff ([`Task::diff_against_baseline`], rpl-day),
+/// and the outbound/inbound field sets (`application-sync`, rpl-47f) all reference
+/// this set so the definitions cannot drift apart. `priority`, `relations`, and
+/// the project-status axis are deliberately NOT mirrored.
+///
+/// Keep in lockstep with the mirrored fields [`Task::snapshot_view`] captures into
+/// the baseline — [`MirrorField::differs`] compares the live task against exactly
+/// those captured fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorField {
+    Title,
+    Body,
+    Status,
+    Assignees,
+}
+
+/// Canonical iteration order over [`MirrorField`]. Detection folds this with
+/// [`MirrorField::differs`]; the field-level diff (rpl-day) walks the same set.
+pub const MIRRORED_FIELDS: [MirrorField; 4] = [
+    MirrorField::Title,
+    MirrorField::Body,
+    MirrorField::Status,
+    MirrorField::Assignees,
+];
+
+impl MirrorField {
+    /// True iff this field differs between the live `task` and its `baseline`
+    /// snapshot, using the canonical per-field comparator: string inequality for
+    /// title/body, enum inequality for status, and [`assignees_equal`] (unordered
+    /// set equality) for assignees. Compared field-by-field on purpose — never via
+    /// whole-snapshot `PartialEq`, whose `version`/`captured_at`/`sync_state` always
+    /// differ.
+    pub fn differs(self, task: &Task, baseline: &TaskSnapshot) -> bool {
+        match self {
+            MirrorField::Title => task.title != baseline.title,
+            MirrorField::Body => task.body != baseline.body,
+            MirrorField::Status => task.status != baseline.status,
+            MirrorField::Assignees => !assignees_equal(&task.assignees, &baseline.assignees),
+        }
+    }
+}
+
+/// Order-insensitive set equality for assignee lists. GitHub doesn't guarantee a
+/// stable order across REST responses, so `["alice","bob"]` and `["bob","alice"]`
+/// must compare equal — callers reconciling local + remote assignees compare as
+/// sets to avoid spurious `DirtyLocal` transitions on a pure re-ordering.
 pub fn assignees_equal(a: &[String], b: &[String]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -681,6 +720,15 @@ mod tests {
 
     fn remote_ref() -> RemoteRef {
         RemoteRef::new("github", "org/repo#1")
+    }
+
+    /// A remote-backed, `Synced` task with a baseline captured at promote.
+    fn synced() -> Task {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        t
     }
 
     #[test]
@@ -725,6 +773,112 @@ mod tests {
         // Baseline captured from the remote, so a fresh import is NOT dirty.
         let baseline = t.synced_baseline.as_ref().expect("baseline set");
         assert_eq!(baseline.source, SnapshotSource::Pull);
+    }
+
+    #[test]
+    fn mirrored_fields_set_is_canonical_and_complete() {
+        // Tripwire: adding a mirrored field to `Task` without extending the set
+        // (or vice versa) fails here. Supports the rpl-3j3 labels decision.
+        assert_eq!(MIRRORED_FIELDS.len(), 4);
+        for f in [
+            MirrorField::Title,
+            MirrorField::Body,
+            MirrorField::Status,
+            MirrorField::Assignees,
+        ] {
+            assert!(
+                MIRRORED_FIELDS.contains(&f),
+                "{f:?} missing from MIRRORED_FIELDS"
+            );
+        }
+    }
+
+    #[test]
+    fn mirror_field_differs_isolates_each_field() {
+        let mut t = synced();
+        t.set_assignees(vec!["alice".into()]);
+        // Re-baseline so the seeded assignee is part of the baseline, not a diff.
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        let baseline = t.synced_baseline.clone().expect("baseline");
+
+        // Unmodified task: no field differs.
+        for f in MIRRORED_FIELDS {
+            assert!(
+                !f.differs(&t, &baseline),
+                "{f:?} must not differ when unchanged"
+            );
+        }
+
+        // Each mutation (applied to a fresh clone) trips exactly one field.
+        let assert_only = |changed: MirrorField, c: &Task| {
+            for f in MIRRORED_FIELDS {
+                assert_eq!(
+                    f.differs(c, &baseline),
+                    f == changed,
+                    "only {changed:?} should differ, but {f:?} disagreed"
+                );
+            }
+        };
+
+        let mut title = t.clone();
+        title.title = "changed".into();
+        assert_only(MirrorField::Title, &title);
+
+        let mut body = t.clone();
+        body.body = "changed".into();
+        assert_only(MirrorField::Body, &body);
+
+        let mut status = t.clone();
+        status.status = TaskStatus::Done;
+        assert_only(MirrorField::Status, &status);
+
+        let mut assignees = t.clone();
+        assignees.assignees = vec!["bob".into()];
+        assert_only(MirrorField::Assignees, &assignees);
+    }
+
+    #[test]
+    fn mirror_field_assignees_ignores_order() {
+        let mut t = synced();
+        t.set_assignees(vec!["alice".into(), "bob".into()]);
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        let baseline = t.synced_baseline.clone().expect("baseline");
+
+        // A pure re-order is not a difference…
+        let mut reordered = t.clone();
+        reordered.assignees = vec!["bob".into(), "alice".into()];
+        assert!(!MirrorField::Assignees.differs(&reordered, &baseline));
+
+        // …and reconciling a re-order keeps the task Synced (no spurious flip).
+        t.set_assignees(vec!["bob".into(), "alice".into()]);
+        assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn each_mirrored_field_edit_flips_dirty_local() {
+        // snapshot_view captures every mirrored field into the baseline, so an
+        // edit to any of them is detectable through reconcile — proving the
+        // captured-baseline set and the comparator set agree.
+        {
+            let mut t = synced();
+            t.set_title("changed".into()).unwrap();
+            assert_eq!(t.sync, SyncState::DirtyLocal, "title");
+        }
+        {
+            let mut t = synced();
+            t.set_body("changed".into());
+            assert_eq!(t.sync, SyncState::DirtyLocal, "body");
+        }
+        {
+            let mut t = synced();
+            t.start().unwrap(); // Open → InProgress
+            assert_eq!(t.sync, SyncState::DirtyLocal, "status");
+        }
+        {
+            let mut t = synced();
+            t.set_assignees(vec!["zoe".into()]);
+            assert_eq!(t.sync, SyncState::DirtyLocal, "assignees");
+        }
     }
 
     #[test]
