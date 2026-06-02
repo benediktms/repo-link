@@ -632,6 +632,35 @@ impl Task {
         };
     }
 
+    /// Field-level diff of the live task against [`Task::synced_baseline`]: each
+    /// [`MirrorPatch`] field is `Some(current value)` iff that mirrored field
+    /// differs from the baseline, reusing the **same** [`MirrorField::differs`]
+    /// comparators as dirty-detection so the diff and the sync-state verdict can
+    /// never disagree. Without a baseline (never promoted) the patch is empty —
+    /// mirroring [`Task::reconcile_dirty_against_baseline`]'s no-baseline no-op.
+    ///
+    /// Compared field-by-field on purpose — never whole-snapshot `PartialEq`, whose
+    /// `version`/`captured_at`/`sync_state` always differ (RFC 0003 D2).
+    pub fn diff_against_baseline(&self) -> MirrorPatch {
+        let Some(baseline) = &self.synced_baseline else {
+            return MirrorPatch::default();
+        };
+        MirrorPatch {
+            title: MirrorField::Title
+                .differs(self, baseline)
+                .then(|| self.title.clone()),
+            body: MirrorField::Body
+                .differs(self, baseline)
+                .then(|| self.body.clone()),
+            status: MirrorField::Status
+                .differs(self, baseline)
+                .then_some(self.status),
+            assignees: MirrorField::Assignees
+                .differs(self, baseline)
+                .then(|| self.assignees.clone()),
+        }
+    }
+
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }
@@ -678,6 +707,30 @@ impl MirrorField {
             MirrorField::Status => task.status != baseline.status,
             MirrorField::Assignees => !assignees_equal(&task.assignees, &baseline.assignees),
         }
+    }
+}
+
+/// A field-level diff of a task against its [`Task::synced_baseline`]: each field is
+/// `Some(current value)` iff it differs from the baseline (per
+/// [`MirrorField::differs`]), else `None`. Built by [`Task::diff_against_baseline`]
+/// so the outbound push (rpl-x2v / rpl-47f) can send only the fields that changed.
+/// Carries domain values — `status` stays a [`TaskStatus`]; the open/closed mapping
+/// happens at the outbound boundary, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MirrorPatch {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub status: Option<TaskStatus>,
+    pub assignees: Option<Vec<String>>,
+}
+
+impl MirrorPatch {
+    /// No mirrored field differs from the baseline (or there is no baseline).
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.body.is_none()
+            && self.status.is_none()
+            && self.assignees.is_none()
     }
 }
 
@@ -879,6 +932,93 @@ mod tests {
             t.set_assignees(vec!["zoe".into()]);
             assert_eq!(t.sync, SyncState::DirtyLocal, "assignees");
         }
+    }
+
+    #[test]
+    fn diff_against_baseline_empty_without_baseline() {
+        // Never promoted ⇒ no baseline ⇒ empty patch (mirrors reconcile's no-op).
+        let t = draft();
+        assert!(t.synced_baseline.is_none());
+        assert!(t.diff_against_baseline().is_empty());
+    }
+
+    #[test]
+    fn diff_against_baseline_empty_when_clean() {
+        let t = synced();
+        let patch = t.diff_against_baseline();
+        assert!(patch.is_empty());
+        assert_eq!(patch, MirrorPatch::default());
+    }
+
+    #[test]
+    fn diff_against_baseline_isolates_single_field() {
+        // Title.
+        let mut t = synced();
+        t.set_title("new title".into()).unwrap();
+        let p = t.diff_against_baseline();
+        assert_eq!(p.title.as_deref(), Some("new title"));
+        assert!(p.body.is_none() && p.status.is_none() && p.assignees.is_none());
+        assert!(!p.is_empty());
+
+        // Body.
+        let mut t = synced();
+        t.set_body("new body".into());
+        let p = t.diff_against_baseline();
+        assert_eq!(p.body.as_deref(), Some("new body"));
+        assert!(p.title.is_none() && p.status.is_none() && p.assignees.is_none());
+
+        // Status (Open → InProgress).
+        let mut t = synced();
+        t.start().unwrap();
+        let p = t.diff_against_baseline();
+        assert_eq!(p.status, Some(TaskStatus::InProgress));
+        assert!(p.title.is_none() && p.body.is_none() && p.assignees.is_none());
+
+        // Assignees.
+        let mut t = synced();
+        t.set_assignees(vec!["alice".into()]);
+        let p = t.diff_against_baseline();
+        assert_eq!(p.assignees, Some(vec!["alice".to_string()]));
+        assert!(p.title.is_none() && p.body.is_none() && p.status.is_none());
+    }
+
+    #[test]
+    fn diff_against_baseline_multi_field() {
+        let mut t = synced();
+        t.set_title("t2".into()).unwrap();
+        t.set_assignees(vec!["bob".into()]);
+        let p = t.diff_against_baseline();
+        assert_eq!(p.title.as_deref(), Some("t2"));
+        assert_eq!(p.assignees, Some(vec!["bob".to_string()]));
+        assert!(p.body.is_none() && p.status.is_none());
+    }
+
+    #[test]
+    fn diff_against_baseline_ignores_assignee_reorder() {
+        let mut t = synced();
+        t.set_assignees(vec!["alice".into(), "bob".into()]);
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        // Pure re-order ⇒ not a diff (reuses assignees_equal).
+        t.set_assignees(vec!["bob".into(), "alice".into()]);
+        assert!(t.diff_against_baseline().assignees.is_none());
+        assert!(t.diff_against_baseline().is_empty());
+    }
+
+    #[test]
+    fn diff_emptiness_agrees_with_dirty_detection() {
+        // The patch is non-empty exactly when reconcile flips DirtyLocal.
+        let mut t = synced();
+        assert!(t.diff_against_baseline().is_empty());
+        assert_eq!(t.sync, SyncState::Synced);
+
+        t.set_body("changed".into());
+        assert!(!t.diff_against_baseline().is_empty());
+        assert_eq!(t.sync, SyncState::DirtyLocal);
+
+        // Revert to baseline value ⇒ clean again, patch empty again.
+        t.set_body(String::new());
+        assert!(t.diff_against_baseline().is_empty());
+        assert_eq!(t.sync, SyncState::Synced);
     }
 
     #[test]
