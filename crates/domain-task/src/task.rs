@@ -498,15 +498,18 @@ impl Task {
     /// blanket lock. Post-RFC-0002 (docs/rfcs/0002-task-repo-axes) `repo_id` is
     /// purely the LOGICAL repo; the issue lives in [`Task::filing_repo_id`].
     ///
-    /// So once remote-backed, a change is permitted IFF a **distinct** filing
-    /// repo is recorded — `filing_repo_id` is `Some` and differs from the
-    /// current logical `repo_id` — because the issue's home is then the filing
-    /// repo, which this leaves untouched. It is still rejected when filing ==
-    /// logical (`filing_repo_id` is `None`, or equals the current `repo_id`):
-    /// there the issue's home IS the logical repo, so moving it would orphan
-    /// the issue (pre-RFC behaviour, preserved). Re-collapsing logical onto
-    /// filing (new `repo_id` == `filing_repo_id`) is allowed — the recorded
-    /// filing repo stays authoritative and is never re-resolved.
+    /// So once remote-backed, a change is permitted IFF a filing repo is
+    /// **recorded** — `filing_repo_id` is `Some` — because the issue's home is
+    /// then pinned by `filing_repo_id` independently of the logical repo, which
+    /// this leaves untouched. Whether the recorded filing repo *equals* the
+    /// logical repo is irrelevant: a logical-repo change cannot move an issue
+    /// whose home is already pinned (e.g. `sync import --cascade` rows where
+    /// `filing_repo_id == repo_id` are valid, fully-recorded states and must be
+    /// reassignable). It is still rejected only when `filing_repo_id` is `None`:
+    /// there nothing pins the issue's home, so moving the logical repo would
+    /// orphan the issue (pre-RFC behaviour, preserved). Re-collapsing logical
+    /// onto filing (new `repo_id` == `filing_repo_id`) is likewise allowed — the
+    /// recorded filing repo stays authoritative and is never re-resolved.
     ///
     /// Logical-repo ownership is local metadata (it selects the promote/filing
     /// target), so — like `priority`, and per RFC 0003's dirty-detection
@@ -517,21 +520,16 @@ impl Task {
         if self.repo_id == repo_id {
             return Ok(());
         }
-        if self.remote.is_some() {
-            // The backing issue's home is the filing repo when a DISTINCT one
-            // is recorded; only then is the logical repo free to move. Compare
-            // the recorded filing repo against the CURRENT (pre-change) logical
-            // repo — equal (or filing absent) means filing == logical, so the
-            // issue lives in the repo we're about to move off of.
-            let filing_is_distinct = self
-                .filing_repo_id
-                .as_ref()
-                .is_some_and(|f| Some(f) != self.repo_id.as_ref());
-            if !filing_is_distinct {
-                return Err(DomainError::validation(
-                    "cannot reassign the repo of a synced task unless a distinct filing repo is recorded",
-                ));
-            }
+        if self.remote.is_some() && self.filing_repo_id.is_none() {
+            // The backing issue's home is pinned by `filing_repo_id`; only when
+            // it is recorded is the logical repo free to move without orphaning
+            // the issue. Equality with the logical repo does not matter — a
+            // recorded filing repo (even one collapsed onto the logical repo)
+            // pins the issue independently. Reject only when nothing is
+            // recorded.
+            return Err(DomainError::validation(
+                "cannot reassign the repo of a synced task unless a filing repo is recorded",
+            ));
         }
         self.repo_id = repo_id;
         self.touch();
@@ -991,8 +989,9 @@ mod tests {
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
-        // The remote issue lives in a specific repo; reassigning would
-        // orphan it.
+        // No filing repo was ever recorded (`filing_repo_id == None`), so
+        // nothing pins the issue's home — reassigning the logical repo would
+        // orphan it. This is the canonical "filing not recorded" reject (#164).
         let err = t.set_repo_id(Some(RepoId::new())).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
@@ -1045,17 +1044,26 @@ mod tests {
     }
 
     #[test]
-    fn set_repo_id_rejected_when_remote_backed_and_filing_equals_logical() {
-        // When filing == logical the issue's home IS the logical repo, so
-        // moving it would orphan the issue — rejected, exactly as pre-RFC-0002.
+    fn set_repo_id_allowed_when_remote_backed_and_filing_equals_logical() {
+        // A recorded filing repo pins the issue's home even when it EQUALS the
+        // logical repo (e.g. `sync import --cascade` rows). The logical repo is
+        // then free to move — `filing_repo_id != repo_id` is irrelevant; only
+        // `filing_repo_id IS NOT NULL` matters (#164).
         let mut t = draft();
         let repo = RepoId::new();
         t.set_repo_id(Some(repo)).unwrap();
         t.set_filing_repo_id(Some(repo)).unwrap(); // filing collapsed onto logical
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
-        let err = t.set_repo_id(Some(RepoId::new())).unwrap_err();
-        assert!(matches!(err, DomainError::Validation(_)));
+        assert_eq!(t.sync, SyncState::Synced);
+
+        let new_logical = RepoId::new();
+        t.set_repo_id(Some(new_logical)).unwrap();
+        assert_eq!(t.repo_id, Some(new_logical));
+        // Filing repo (the issue's home) is untouched, and a logical-repo move
+        // is local metadata — no spurious DirtyLocal flip.
+        assert_eq!(t.filing_repo_id, Some(repo));
+        assert_eq!(t.sync, SyncState::Synced);
     }
 
     #[test]
@@ -1174,6 +1182,10 @@ mod tests {
         // An imported mirror already has a remote issue and historically
         // filing == logical, so the constructor records the filing repo as
         // the logical one (keeps the written row in step with the D6 dedup).
+        // The value is stored as `Some(repo)`, never collapsed to `None` on
+        // equality — `task show`'s additive `filing_repo` overlay relies on
+        // this to surface the recorded filing repo even when it equals the
+        // logical repo (#164 secondary display guarantee).
         let repo = RepoId::new();
         let t = Task::import_mirror(
             WorkspaceId::new(),
