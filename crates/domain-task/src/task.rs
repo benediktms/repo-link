@@ -318,9 +318,7 @@ impl Task {
             .synced_baseline
             .as_ref()
             .ok_or_else(|| {
-                DomainError::transition(
-                    "cannot confirm_synced_fields without a synced_baseline",
-                )
+                DomainError::transition("cannot confirm_synced_fields without a synced_baseline")
             })?
             .clone();
         let mut merged = prior;
@@ -1119,12 +1117,19 @@ mod tests {
         let post = t.synced_baseline.clone().expect("baseline");
         assert_eq!(post.title, "new title");
         assert_eq!(post.body, pre.body, "body baseline entry must be unchanged");
-        assert_eq!(post.status, pre.status, "status baseline entry must be unchanged");
+        assert_eq!(
+            post.status, pre.status,
+            "status baseline entry must be unchanged"
+        );
         assert_eq!(
             post.assignees, pre.assignees,
             "assignees baseline entry must be unchanged"
         );
-        assert_eq!(post.source, SnapshotSource::Push, "source stamped on merged baseline");
+        assert_eq!(
+            post.source,
+            SnapshotSource::Push,
+            "source stamped on merged baseline"
+        );
     }
 
     #[test]
@@ -1132,11 +1137,22 @@ mod tests {
         // Body-only, status-only, assignees-only: each patches a single
         // field; the other three baseline entries stay byte-identical.
         for edit in [
-            ("body", Box::new(|t: &mut Task| t.set_body("revised".into())) as Box<dyn Fn(&mut Task)>),
-            ("status", Box::new(|t: &mut Task| { t.start().unwrap(); })),
-            ("assignees", Box::new(|t: &mut Task| {
-                t.set_assignees(vec!["zoe".into()]);
-            })),
+            (
+                "body",
+                Box::new(|t: &mut Task| t.set_body("revised".into())) as Box<dyn Fn(&mut Task)>,
+            ),
+            (
+                "status",
+                Box::new(|t: &mut Task| {
+                    t.start().unwrap();
+                }),
+            ),
+            (
+                "assignees",
+                Box::new(|t: &mut Task| {
+                    t.set_assignees(vec!["zoe".into()]);
+                }),
+            ),
         ] {
             let (label, mutate) = edit;
             let mut t = synced();
@@ -1277,14 +1293,22 @@ mod tests {
             .unwrap();
 
         // Title is rebaselined; body and assignees are NOT.
-        assert_eq!(t.sync, SyncState::DirtyLocal,
-            "un-rebaselined body/assignees must keep the task dirty");
+        assert_eq!(
+            t.sync,
+            SyncState::DirtyLocal,
+            "un-rebaselined body/assignees must keep the task dirty"
+        );
         let post = t.synced_baseline.clone().expect("baseline");
         assert_eq!(post.title, "pushed title");
-        assert_ne!(post.body, "pushed body",
-            "body baseline must NOT have been rebaselined by a title-only patch");
-        assert_ne!(post.assignees, vec!["carol".to_string()],
-            "assignees baseline must NOT have been rebaselined by a title-only patch");
+        assert_ne!(
+            post.body, "pushed body",
+            "body baseline must NOT have been rebaselined by a title-only patch"
+        );
+        assert_ne!(
+            post.assignees,
+            vec!["carol".to_string()],
+            "assignees baseline must NOT have been rebaselined by a title-only patch"
+        );
 
         // The un-pushed fields are still detectable as a diff.
         let next = t.diff_against_baseline();

@@ -859,8 +859,7 @@ mod tests {
         // while the state stays Staged.
         let mut t = Task::new_draft(ws, None, "task 7".into()).unwrap();
         t.stage_for_sync().unwrap();
-        t.promote_to_remote(RemoteRef::new("github", "7"))
-            .unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "7")).unwrap();
         // Persist the Promote snapshot so the repo's snapshot history
         // can re-project `synced_baseline` on `get`; without this the
         // history only carries the initial LocalEdit save and the
