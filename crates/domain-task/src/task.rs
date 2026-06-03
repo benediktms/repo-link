@@ -268,6 +268,86 @@ impl Task {
         }
     }
 
+    /// Confirm a sync event that aligned local with remote for **only** the
+    /// fields actually transmitted in the PATCH (RFC 0003 D5). The baseline
+    /// advances per-field — every field whose `Some` flag is set in `patch`
+    /// is overwritten on the prior baseline; every other field stays
+    /// byte-identical to its pre-call value. This closes the silent-rebaseline
+    /// class: an untransmitted field (today: any field whose channel is
+    /// incomplete) must remain dirty so the next push re-sends it, instead
+    /// of being hidden by a premature whole-baseline refresh.
+    ///
+    /// Same guards as [`Task::confirm_synced`]: `source` must be baseline-
+    /// eligible (`Promote`/`Push`/`Pull`/`ConflictResolve`/`Link`) and
+    /// `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`. A baseline
+    /// must be present — the merge is over the existing baseline, not a
+    /// fresh one. `version`/`captured_at` are preserved from the prior
+    /// baseline; the repository overwrites them on save.
+    ///
+    /// After the merge, `reconcile_dirty_against_baseline` runs so that any
+    /// un-rebaselined field that still differs flips the task back to
+    /// `DirtyLocal` — a partial re-baseline must NOT silently turn a
+    /// `DirtyLocal` task into a `Synced` one when other fields are still
+    /// diverged.
+    ///
+    /// The PATCH response MUST NOT be used to source the new baseline —
+    /// `update_issue` returns the response value, which reflects the
+    /// `assignees=[]` it sent (a `None` assignees field becomes an empty
+    /// list in the response), and re-baselining from it would clobber local
+    /// intent. The application layer passes the transmitted local
+    /// `MirrorPatch` instead.
+    pub fn confirm_synced_fields(
+        &mut self,
+        source: SnapshotSource,
+        patch: &MirrorPatch,
+    ) -> Result<()> {
+        if !source.is_baseline() {
+            return Err(DomainError::validation(format!(
+                "confirm_synced_fields source must be Promote/Push/Pull/ConflictResolve, got {source:?}"
+            )));
+        }
+        match self.sync {
+            SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote => {}
+            other => {
+                return Err(DomainError::transition(format!(
+                    "cannot confirm_synced_fields from sync={other:?}"
+                )));
+            }
+        }
+        let prior = self
+            .synced_baseline
+            .as_ref()
+            .ok_or_else(|| {
+                DomainError::transition(
+                    "cannot confirm_synced_fields without a synced_baseline",
+                )
+            })?
+            .clone();
+        let mut merged = prior;
+        merged.source = source;
+        merged.captured_at = Timestamp::now();
+        if let Some(title) = &patch.title {
+            merged.title = title.clone();
+        }
+        if let Some(body) = &patch.body {
+            merged.body = body.clone();
+        }
+        if let Some(status) = patch.status {
+            merged.status = status;
+        }
+        if let Some(assignees) = &patch.assignees {
+            merged.assignees = assignees.clone();
+        }
+        self.synced_baseline = Some(merged);
+        self.sync = SyncState::Synced;
+        self.touch();
+        // Re-run dirty detection so any un-rebaselined field that still
+        // differs keeps the task DirtyLocal — the partial-baseline fix
+        // would be defeated by leaving the task Synced.
+        self.reconcile_dirty_against_baseline();
+        Ok(())
+    }
+
     pub fn mark_dirty_local(&mut self) -> Result<()> {
         match self.sync {
             SyncState::Synced => {
@@ -1019,6 +1099,246 @@ mod tests {
         t.set_body(String::new());
         assert!(t.diff_against_baseline().is_empty());
         assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn confirm_synced_fields_title_only_rebaselines_only_title() {
+        // Title-only patch: only the title baseline entry moves; body,
+        // status, and assignees stay byte-identical to the pre-call baseline.
+        let mut t = synced();
+        t.set_title("new title".into()).unwrap();
+        let pre = t.synced_baseline.clone().expect("baseline");
+        let patch = t.diff_against_baseline();
+        assert_eq!(patch.title.as_deref(), Some("new title"));
+        assert!(patch.body.is_none() && patch.status.is_none() && patch.assignees.is_none());
+
+        t.confirm_synced_fields(SnapshotSource::Push, &patch)
+            .unwrap();
+
+        assert_eq!(t.sync, SyncState::Synced);
+        let post = t.synced_baseline.clone().expect("baseline");
+        assert_eq!(post.title, "new title");
+        assert_eq!(post.body, pre.body, "body baseline entry must be unchanged");
+        assert_eq!(post.status, pre.status, "status baseline entry must be unchanged");
+        assert_eq!(
+            post.assignees, pre.assignees,
+            "assignees baseline entry must be unchanged"
+        );
+        assert_eq!(post.source, SnapshotSource::Push, "source stamped on merged baseline");
+    }
+
+    #[test]
+    fn confirm_synced_fields_each_field_isolated() {
+        // Body-only, status-only, assignees-only: each patches a single
+        // field; the other three baseline entries stay byte-identical.
+        for edit in [
+            ("body", Box::new(|t: &mut Task| t.set_body("revised".into())) as Box<dyn Fn(&mut Task)>),
+            ("status", Box::new(|t: &mut Task| { t.start().unwrap(); })),
+            ("assignees", Box::new(|t: &mut Task| {
+                t.set_assignees(vec!["zoe".into()]);
+            })),
+        ] {
+            let (label, mutate) = edit;
+            let mut t = synced();
+            mutate(&mut t);
+            let pre = t.synced_baseline.clone().expect("baseline");
+            let patch = t.diff_against_baseline();
+            assert_eq!(
+                patch,
+                {
+                    let mut p = MirrorPatch::default();
+                    match label {
+                        "body" => p.body = Some("revised".into()),
+                        "status" => p.status = Some(TaskStatus::InProgress),
+                        "assignees" => p.assignees = Some(vec!["zoe".into()]),
+                        _ => unreachable!(),
+                    }
+                    p
+                },
+                "only {label} in the patch"
+            );
+
+            t.confirm_synced_fields(SnapshotSource::Push, &patch)
+                .unwrap();
+
+            assert_eq!(t.sync, SyncState::Synced);
+            let post = t.synced_baseline.clone().expect("baseline");
+            // The edited field carries the new value; the other three are
+            // byte-identical to pre.
+            match label {
+                "body" => {
+                    assert_eq!(post.body, "revised");
+                    assert_eq!(post.title, pre.title);
+                    assert_eq!(post.status, pre.status);
+                    assert_eq!(post.assignees, pre.assignees);
+                }
+                "status" => {
+                    assert_eq!(post.status, TaskStatus::InProgress);
+                    assert_eq!(post.title, pre.title);
+                    assert_eq!(post.body, pre.body);
+                    assert_eq!(post.assignees, pre.assignees);
+                }
+                "assignees" => {
+                    assert_eq!(post.assignees, vec!["zoe".to_string()]);
+                    assert_eq!(post.title, pre.title);
+                    assert_eq!(post.body, pre.body);
+                    assert_eq!(post.status, pre.status);
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn confirm_synced_fields_full_patch_matches_full_rebaseline() {
+        // All four `Some` in the patch: the merged baseline must equal
+        // the live task and behave identically to a full
+        // `confirm_synced(SnapshotSource::Push)` rebaseline.
+        let mut t = synced();
+        t.set_title("full t".into()).unwrap();
+        t.set_body("full b".into());
+        t.start().unwrap();
+        t.set_assignees(vec!["alice".into(), "bob".into()]);
+        let patch = t.diff_against_baseline();
+        assert!(!patch.is_empty());
+
+        t.confirm_synced_fields(SnapshotSource::Push, &patch)
+            .unwrap();
+
+        assert_eq!(t.sync, SyncState::Synced);
+        let post = t.synced_baseline.clone().expect("baseline");
+        assert_eq!(post.title, "full t");
+        assert_eq!(post.body, "full b");
+        assert_eq!(post.status, TaskStatus::InProgress);
+        assert_eq!(post.assignees, vec!["alice".to_string(), "bob".to_string()]);
+        // The patch was the WHOLE diff, so reconcile sees no remaining
+        // delta and the task stays Synced.
+        assert!(t.diff_against_baseline().is_empty());
+    }
+
+    #[test]
+    fn confirm_synced_fields_empty_patch_flips_state_baseline_unchanged() {
+        // Empty patch on a Staged task: the state flips to Synced (a
+        // no-op drain still owes the state transition) but no baseline
+        // entry is touched. The captured `source` is stamped on the
+        // unchanged-baseline entry so the audit trail records the drain.
+        //
+        // Path: synced() (Synced + baseline) → set_title("edit") flips
+        // to DirtyLocal → stage_for_sync() flips to Staged (Staged
+        // survives any further reconcile, so we can revert the title
+        // to its baseline value WITHOUT the state machine bouncing us
+        // back to Synced) → diff is now empty + state is Staged, the
+        // exact precondition a no-op drain delivers.
+        let mut t = synced();
+        t.set_title("stale edit".into()).unwrap();
+        assert_eq!(t.sync, SyncState::DirtyLocal);
+        t.stage_for_sync().unwrap();
+        assert_eq!(t.sync, SyncState::Staged);
+        t.set_title(t.synced_baseline.as_ref().unwrap().title.clone())
+            .unwrap();
+        assert_eq!(t.sync, SyncState::Staged, "Staged survives reconcile");
+        let pre = t.synced_baseline.clone().expect("baseline");
+        let patch = t.diff_against_baseline();
+        assert!(patch.is_empty(), "no field differs from baseline");
+
+        t.confirm_synced_fields(SnapshotSource::Push, &patch)
+            .unwrap();
+
+        assert_eq!(t.sync, SyncState::Synced);
+        let post = t.synced_baseline.clone().expect("baseline");
+        assert_eq!(post.title, pre.title);
+        assert_eq!(post.body, pre.body);
+        assert_eq!(post.status, pre.status);
+        assert_eq!(post.assignees, pre.assignees);
+        assert_eq!(post.source, SnapshotSource::Push);
+    }
+
+    #[test]
+    fn confirm_synced_fields_keeps_unrebaselined_fields_dirty() {
+        // The load-bearing silent-loss-fix assertion: a title-only patch on
+        // a task that ALSO has un-pushed body and assignee edits must keep
+        // the task DirtyLocal after confirm (the un-rebaselined fields
+        // still differ, so reconcile_dirty_against_baseline must flip it
+        // back). The next push will see the un-pushed fields and re-send
+        // them. Without this guarantee, a partial push would silently
+        // "succeed" and the un-pushed fields would never reach GitHub.
+        let mut t = synced();
+        t.set_title("pushed title".into()).unwrap();
+        t.set_body("pushed body".into());
+        t.set_assignees(vec!["carol".into()]);
+        let title_patch = MirrorPatch {
+            title: Some("pushed title".into()),
+            ..Default::default()
+        };
+        assert!(title_patch.body.is_none());
+        assert!(title_patch.assignees.is_none());
+
+        t.confirm_synced_fields(SnapshotSource::Push, &title_patch)
+            .unwrap();
+
+        // Title is rebaselined; body and assignees are NOT.
+        assert_eq!(t.sync, SyncState::DirtyLocal,
+            "un-rebaselined body/assignees must keep the task dirty");
+        let post = t.synced_baseline.clone().expect("baseline");
+        assert_eq!(post.title, "pushed title");
+        assert_ne!(post.body, "pushed body",
+            "body baseline must NOT have been rebaselined by a title-only patch");
+        assert_ne!(post.assignees, vec!["carol".to_string()],
+            "assignees baseline must NOT have been rebaselined by a title-only patch");
+
+        // The un-pushed fields are still detectable as a diff.
+        let next = t.diff_against_baseline();
+        assert!(next.body.is_some() && next.assignees.is_some());
+        assert!(next.title.is_none(), "title is already rebaselined");
+    }
+
+    #[test]
+    fn confirm_synced_fields_invalid_source_errors() {
+        let mut t = synced();
+        t.set_body("changed".into());
+        let patch = t.diff_against_baseline();
+        // LocalEdit / PrePull / Rollback are not baseline-eligible.
+        for bad in [
+            SnapshotSource::LocalEdit,
+            SnapshotSource::PrePull,
+            SnapshotSource::Rollback,
+            SnapshotSource::Created,
+        ] {
+            let err = t
+                .confirm_synced_fields(bad, &patch)
+                .expect_err("non-baseline source must be rejected");
+            assert!(
+                format!("{err}").contains("confirm_synced_fields source"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_synced_fields_invalid_state_errors() {
+        // Synced is NOT a confirmable state (confirm_synced / confirm_
+        // synced_fields only accept Staged | DirtyLocal | DirtyRemote).
+        let mut t = synced();
+        let patch = MirrorPatch::default();
+        let err = t
+            .confirm_synced_fields(SnapshotSource::Push, &patch)
+            .expect_err("Synced must be rejected");
+        assert!(
+            format!("{err}").contains("from sync=Synced"),
+            "unexpected error: {err}"
+        );
+
+        // LocalOnly is not confirmable either.
+        let mut t = draft();
+        assert_eq!(t.sync, SyncState::LocalOnly);
+        assert!(t.synced_baseline.is_none());
+        let err = t
+            .confirm_synced_fields(SnapshotSource::Push, &MirrorPatch::default())
+            .expect_err("LocalOnly must be rejected");
+        assert!(
+            format!("{err}").contains("from sync=LocalOnly"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -158,6 +158,14 @@ impl SyncService {
             // the PATCH and when the call is skipped (empty patch ⇒
             // no PATCH). The drainer's `UpdateRemote` arm goes through
             // the same function — no drift possible.
+            //
+            // Re-baseline ONLY the fields actually transmitted (RFC 0003
+            // D5): an untransmitted field (e.g. assignees when only a
+            // title was pushed) must stay dirty and get re-pushed
+            // later, instead of being silently rebaselined to the
+            // un-pushed local value by a whole-snapshot rebaseline.
+            // We thread the same `patch` we just sent so the rebaseline
+            // and the PATCH cannot disagree on what was transmitted.
             let patch = task.diff_against_baseline();
             let canonical_repo = filing_canonical.clone();
             let remote_id = remote.remote_id.clone();
@@ -167,7 +175,7 @@ impl SyncService {
                 self.provider.update_remote(update).await?;
             }
 
-            task.confirm_synced(SnapshotSource::Push)?;
+            task.confirm_synced_fields(SnapshotSource::Push, &patch)?;
             self.tasks.save(&task, SnapshotSource::Push).await?;
         }
 
@@ -1445,6 +1453,67 @@ mod tests {
         assert_eq!(recorded.body, None);
         assert_eq!(recorded.closed, None);
         assert_eq!(recorded.state_reason, None);
+    }
+
+    /// RFC 0003 D5 (rpl-xq6) synchronous-path parity: the synchronous
+    /// `push` uses `confirm_synced_fields` (per-field rebaseline) the
+    /// same way the drainer does, so a title-only push rebaselines
+    /// ONLY the title on the post-push baseline — body / status /
+    /// assignees stay at their pre-push baseline values, and a
+    /// subsequent un-pushed edit to any of those fields is still
+    /// detected as a diff. (rpl-vvf nails the byte-identical
+    /// assertion across both paths; this test confirms the call site
+    /// moved and the basic happy-path property holds on the sync
+    /// path too — without it, a `rl task claim` post-promote would
+    /// still drop the assignee because the synchronous push was
+    /// whole-snapshot rebaselining.)
+    #[tokio::test]
+    async fn push_uses_confirm_synced_fields_per_field_baseline() {
+        let (svc, tasks, task, _provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Capture the Promote-time baseline (what push will later
+        // re-baseline on top of).
+        let pre = tasks.get(task.id).await.unwrap();
+        let pre_baseline = pre.synced_baseline.clone().expect("baseline");
+        assert_eq!(
+            pre_baseline.body, pre.body,
+            "baseline body == live body post-promote"
+        );
+        assert_eq!(pre_baseline.status, pre.status);
+        assert_eq!(pre_baseline.assignees, pre.assignees);
+
+        // Title-only edit: diff = {title: Some("renamed")},
+        // body / status / assignees stay None in the patch.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_title("renamed".into()).unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.push(&task.id.to_string()).await.unwrap();
+
+        let post = tasks.get(task.id).await.unwrap();
+        assert_eq!(post.sync, SyncState::Synced);
+        let post_baseline = post.synced_baseline.clone().expect("baseline");
+        // The transmitted field moved.
+        assert_eq!(post_baseline.title, "renamed", "title rebaselined");
+        // The un-transmitted fields stayed at the pre-push baseline
+        // entry — the per-field merge is the load-bearing property
+        // that closes the silent-rebaseline class on the sync path.
+        assert_eq!(
+            post_baseline.body, pre_baseline.body,
+            "body baseline entry must be unchanged after a title-only push"
+        );
+        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.assignees, pre_baseline.assignees);
+        assert_eq!(
+            post_baseline.source,
+            SnapshotSource::Push,
+            "confirm source stamped on the rebaselined snapshot"
+        );
+        // The title diff is gone; the task is fully clean against
+        // the new baseline.
+        assert!(post.diff_against_baseline().is_empty());
     }
 
     #[tokio::test]

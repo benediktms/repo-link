@@ -85,7 +85,7 @@ use std::time::Duration;
 
 use domain_core::Timestamp;
 use domain_sync::{OutboxEntry, OutboxMutation};
-use domain_task::{RemoteRef, SnapshotSource};
+use domain_task::{RemoteRef, SnapshotSource, SyncState};
 use ports::{
     OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider, TaskRepository,
     WorkspaceRepository,
@@ -253,12 +253,52 @@ impl OutboxDrainer {
                 // still succeeds). Per-task FIFO means reading the
                 // live task + its baseline cannot race a coalesced
                 // sibling; the payload's captured fields are ignored.
-                let task = self.tasks.get(entry.task_id).await?;
-                let patch = task.diff_against_baseline();
-                if let Some(update) =
-                    crate::build_update_from_patch(&task, &patch, canonical_repo, remote_id)
-                {
-                    self.remote_tasks.update_remote(update).await?;
+                //
+                // Re-baseline on success (RFC 0003 D5, rpl-xq6):
+                // advance the baseline ONLY for the fields actually
+                // transmitted in the patch, via
+                // `confirm_synced_fields` — a field whose channel is
+                // incomplete (e.g. an older push that didn't carry
+                // assignees) must stay dirty and get re-pushed later,
+                // instead of being silently rebaselined to the
+                // un-pushed local value. We confirm + save
+                // unconditionally when the task is in a confirmable
+                // state (Staged | DirtyLocal | DirtyRemote), including
+                // the empty-patch path: a Staged task drained with no
+                // live diff still owes the Staged → Synced transition.
+                //
+                // Gating on confirmable state: a `Synced` task drained
+                // for an `UpdateRemote` (e.g. a coalesced empty head,
+                // a now-reverted local edit) is a no-op — the baseline
+                // is already aligned, the state is already Synced, and
+                // the entry just needs to mark succeeded. Calling
+                // `confirm_synced_fields` on a `Synced` task would
+                // error on the state guard and the entry would back
+                // off behind a non-issue, head-of-line blocking the
+                // next same-task tail. Non-confirmable states
+                // (`LocalOnly` / `Conflict`) skip silently for the
+                // same reason.
+                let mut task = self.tasks.get(entry.task_id).await?;
+                let confirmable = matches!(
+                    task.sync,
+                    SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote
+                );
+                if confirmable {
+                    let patch = task.diff_against_baseline();
+                    if let Some(update) =
+                        crate::build_update_from_patch(&task, &patch, canonical_repo, remote_id)
+                    {
+                        self.remote_tasks.update_remote(update).await?;
+                    }
+                    // Never re-baseline from the PATCH response:
+                    // octocrab's `update_issue` returns assignees=[]
+                    // for a PATCH that didn't set them, and
+                    // re-baselining from it would clobber local
+                    // assignee intent. The `patch` carries the
+                    // transmitted set, which is what we merge over
+                    // the existing baseline.
+                    task.confirm_synced_fields(SnapshotSource::Push, &patch)?;
+                    self.tasks.save(&task, SnapshotSource::Push).await?;
                 }
             }
             OutboxMutation::AddItem {
@@ -568,7 +608,7 @@ mod tests {
     use domain_core::{ProjectId, Timestamp, WorkspaceId};
     use domain_project::{Project, StatusMapping, StatusOption};
     use domain_sync::{OutboxEntry, OutboxStatus};
-    use domain_task::{RemoteRef, Task, TaskStatus};
+    use domain_task::{RemoteRef, SyncState, Task, TaskStatus};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
         OutboxRepository, ProjectRepository, RemoteStateReason, TaskRepository, WorkspaceRepository,
@@ -730,6 +770,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_update_remote_rebaselines_on_success_rfc0003_d5() {
+        // RFC 0003 D5 (rpl-xq6): a successful drain of an `UpdateRemote`
+        // must re-baseline the task so a later reconcile does not see
+        // the same diff and re-push it. The rebaseline advances
+        // per-field — the patched field moves to the transmitted
+        // value, the un-patched fields stay at the pre-drain baseline
+        // entry (rpl-vvf nails the byte-identical assertion; this
+        // happy-path test confirms the basic rebaseline + the
+        // Staged/DirtyLocal → Synced transition the old code skipped).
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        // Capture the pre-drain baseline (the Promote snapshot).
+        let pre = h.tasks.get(task.id).await.unwrap();
+        let pre_baseline = pre.synced_baseline.clone().expect("baseline");
+        assert_eq!(pre_baseline.title, "task 1");
+        assert_eq!(pre.sync, SyncState::DirtyLocal);
+        assert_eq!(pre.title, "1-edited", "seed set a one-shot title edit");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        let n = h.drainer.drain_once().await.unwrap();
+        assert_eq!(n, 1);
+
+        // The drainer sent a PATCH carrying the live diff (the helper
+        // re-derives title from the live task — the payload's
+        // captured fields are ignored by design).
+        let updates = h.remote_tasks.updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].title.as_deref(), Some("1-edited"));
+        assert_eq!(updates[0].remote_id, "1");
+
+        // The task is Synced and the baseline advanced per-field.
+        let post = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(post.sync, SyncState::Synced);
+        let post_baseline = post.synced_baseline.clone().expect("baseline");
+        assert_eq!(post_baseline.title, "1-edited", "title rebaselined");
+        assert_eq!(
+            post_baseline.body, pre_baseline.body,
+            "body baseline entry must be unchanged (rpl-xq6 happy path; \
+             rpl-vvf nails the byte-identical assertion across the wire)"
+        );
+        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.assignees, pre_baseline.assignees);
+        assert_eq!(
+            post_baseline.source,
+            SnapshotSource::Push,
+            "confirm source stamped on the rebaselined snapshot"
+        );
+        // No diff left: the post-drain patch is empty.
+        assert!(post.diff_against_baseline().is_empty());
+
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn drain_update_remote_empty_patch_confirms_without_pushing() {
+        // The empty-patch path: a task reaches the drainer's UpdateRemote
+        // arm with no live diff against the baseline (e.g. a Staged
+        // task whose local edit was reverted before the drain fired).
+        // The drainer must:
+        //  (a) skip the remote PATCH (no field to send),
+        //  (b) still call `confirm_synced_fields` so the Staged →
+        //      Synced transition lands — the old code (no confirm at
+        //      all) would have left the task stuck in Staged even
+        //      though the entry succeeded,
+        //  (c) re-baseline with no field changes (the merged baseline
+        //      is byte-identical to the pre-drain baseline; only the
+        //      source stamp and captured_at move).
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+
+        // Build a promoted task in Staged state with an empty diff.
+        // Staged survives `reconcile_dirty_against_baseline`, so we
+        // can revert a one-shot title edit to its baseline value
+        // while the state stays Staged.
+        let mut t = Task::new_draft(ws, None, "task 7".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "7"))
+            .unwrap();
+        // Persist the Promote snapshot so the repo's snapshot history
+        // can re-project `synced_baseline` on `get`; without this the
+        // history only carries the initial LocalEdit save and the
+        // baseline would be missing on the reload below.
+        h.tasks.save(&t, SnapshotSource::Promote).await.unwrap();
+        t.set_title("stale".into()).unwrap();
+        assert_eq!(t.sync, SyncState::DirtyLocal);
+        t.stage_for_sync().unwrap();
+        assert_eq!(t.sync, SyncState::Staged);
+        t.set_title(t.synced_baseline.as_ref().unwrap().title.clone())
+            .unwrap();
+        assert_eq!(t.sync, SyncState::Staged, "Staged survives reconcile");
+        assert!(t.diff_against_baseline().is_empty());
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let pre = h.tasks.get(t.id).await.unwrap();
+        let pre_baseline = pre.synced_baseline.clone().expect("baseline");
+        assert_eq!(pre.sync, SyncState::Staged);
+
+        let entry = OutboxEntry::new(
+            t.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "7".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        let n = h.drainer.drain_once().await.unwrap();
+        assert_eq!(n, 1, "the entry still succeeds on an empty patch");
+
+        // (a) No PATCH was sent.
+        assert!(
+            h.remote_tasks.updates().is_empty(),
+            "build_update_from_patch returns None for an empty patch"
+        );
+
+        // (b) The Staged → Synced transition landed.
+        let post = h.tasks.get(t.id).await.unwrap();
+        assert_eq!(post.sync, SyncState::Synced);
+
+        // (c) The merged baseline is byte-identical except for the
+        // stamped source + captured_at.
+        let post_baseline = post.synced_baseline.clone().expect("baseline");
+        assert_eq!(post_baseline.title, pre_baseline.title);
+        assert_eq!(post_baseline.body, pre_baseline.body);
+        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.assignees, pre_baseline.assignees);
+        assert_eq!(post_baseline.source, SnapshotSource::Push);
+
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+    }
+
+    #[tokio::test]
     async fn drain_add_sub_issue_calls_provider() {
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
@@ -875,6 +1063,15 @@ mod tests {
         // payload — use it as the per-entry ordering signal. No `sleep()` to
         // stagger enqueued_at: the in-memory claim tie-breaks on insertion
         // order (mirroring the SQLite `rowid` contract).
+        //
+        // RFC 0003 D5 (rpl-xq6) change: with the per-field rebaseline on
+        // success, the FIRST drain PATCHes + rebaselines the title so the
+        // task is Synced. The second and third drains then see a Synced
+        // task with an empty diff and the new drainer code (gated on
+        // confirmable state) skips the PATCH — but the entries still
+        // succeed. So only one remote PATCH lands; the FIFO claim order
+        // is verified by the order of the outbox entries' terminal
+        // status, not by remote call count.
         for remote_id in ["r-started", "r-edited", "r-completed"] {
             let entry = OutboxEntry::new(
                 task.id,
@@ -890,7 +1087,12 @@ mod tests {
         }
 
         let n = h.drainer.drain_once().await.unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 3, "all three entries drain in one pass");
+
+        // Only the first entry produced a remote PATCH — the rebaseline
+        // collapsed the diff for the next two. The first PATCH carries
+        // the first entry's `remote_id` (carried verbatim from the
+        // payload), which is the FIFO claim-order signal.
         let remote_ids: Vec<String> = h
             .remote_tasks
             .updates()
@@ -899,12 +1101,21 @@ mod tests {
             .collect();
         assert_eq!(
             remote_ids,
-            vec![
-                "r-started".to_string(),
-                "r-edited".to_string(),
-                "r-completed".to_string()
-            ],
-            "same-task UpdateRemote entries drain in enqueue order"
+            vec!["r-started".to_string()],
+            "only the first entry PATCHes (post-rpl-xq6 rebaseline collapses the rest)"
+        );
+
+        // All three entries are Succeeded (the rebaseline collapsed
+        // the diff for the trailing two, so they no-op at the remote
+        // layer but still drain).
+        let all = h.outbox.all();
+        let succeeded_count = all
+            .iter()
+            .filter(|e| e.status == OutboxStatus::Succeeded)
+            .count();
+        assert_eq!(
+            succeeded_count, 3,
+            "all three entries succeed; the FIFO order is the claim order"
         );
     }
 
