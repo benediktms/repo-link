@@ -1334,6 +1334,119 @@ mod tests {
         );
     }
 
+    /// Positive counterpart of `push_sends_only_changed_fields`: a local
+    /// assignee edit MUST ride the PATCH as `Some(&[..])`, and every other
+    /// mirrored field must stay `None`. RFC 0003 §7 case 1 (rpl-oa6).
+    #[tokio::test]
+    async fn push_sends_changed_assignee() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_assignees(vec!["alice".into()]);
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.push(&task.id.to_string()).await.unwrap();
+
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.remote_id, "100");
+        assert_eq!(
+            recorded.assignees.as_deref(),
+            Some(&["alice".to_string()][..]),
+            "assignees MUST be in the patch when locally changed"
+        );
+        assert_eq!(recorded.title, None);
+        assert_eq!(recorded.body, None);
+        assert_eq!(recorded.closed, None);
+        assert_eq!(recorded.state_reason, None);
+    }
+
+    /// Push-side mirror of `pull_is_noop_when_remote_assignees_are_reordered`:
+    /// a local reorder (set-equivalent lists in different order) is NOT a
+    /// PATCH. `assignees_equal` (domain-task) is order-insensitive, so
+    /// `reconcile_dirty_against_baseline` collapses the would-be dirty task
+    /// back to Synced before `push` runs. RFC 0003 §7 case 4 (rpl-oa6).
+    #[tokio::test]
+    async fn push_does_not_publish_on_pure_assignee_reorder() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Plant a baseline with two assignees in a known order.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.assignees = vec!["alice".into(), "bob".into()];
+        // Save as Pull so the synced_baseline reflects the new assignees.
+        tasks.save(&t, SnapshotSource::Pull).await.unwrap();
+
+        // Reorder locally. The dirty detector sees set-equivalent lists
+        // and collapses the task back to Synced.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.assignees = vec!["bob".into(), "alice".into()];
+        t.mark_dirty_local().unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let _s = svc.push(&task.id.to_string()).await.unwrap();
+        assert!(
+            provider.last_update.lock().unwrap().is_none(),
+            "reorder must not produce a PATCH (assignees_equal is set-equality)"
+        );
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            after.sync,
+            SyncState::Synced,
+            "reconcile_dirty_against_baseline collapses back to Synced"
+        );
+        assert_eq!(
+            after.assignees,
+            vec!["bob".to_string(), "alice".to_string()]
+        );
+    }
+
+    /// `set_assignees(vec![])` is an explicit CLEAR, distinct from omitting
+    /// the field. The diff helper must emit `Some(vec![])` (which the wire
+    /// adapter serializes as `"assignees": []`), not `None`. RFC 0003 §7
+    /// case 5 (rpl-oa6).
+    #[tokio::test]
+    async fn push_with_empty_assignees_sends_explicit_clear() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // First push: seed non-empty assignees and re-baseline.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_assignees(vec!["alice".into()]);
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        svc.push(&task.id.to_string()).await.unwrap();
+
+        // Single-slot recorder: drain before the second push so the
+        // assertion below isolates the clear.
+        *provider.last_update.lock().unwrap() = None;
+
+        // Clear the assignees list and push. The diff must carry
+        // `Some(vec![])` (explicit clear), NOT `None` (omit).
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_assignees(vec![]);
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.push(&task.id.to_string()).await.unwrap();
+
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert!(
+            recorded.assignees.is_some(),
+            "Some(vec![]) is an explicit clear; it must reach the wire as Some, not None"
+        );
+        assert_eq!(
+            recorded.assignees.as_deref(),
+            Some(&[][..]),
+            "explicit clear: empty slice, not None"
+        );
+        // Other fields unchanged from the previous push's empty payload.
+        assert_eq!(recorded.title, None);
+        assert_eq!(recorded.body, None);
+        assert_eq!(recorded.closed, None);
+        assert_eq!(recorded.state_reason, None);
+    }
+
     #[tokio::test]
     async fn pull_applies_remote_snapshot_when_newer() {
         let (svc, tasks, task, provider) = setup().await;
