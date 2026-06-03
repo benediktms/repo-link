@@ -277,12 +277,17 @@ impl Task {
     /// incomplete) must remain dirty so the next push re-sends it, instead
     /// of being hidden by a premature whole-baseline refresh.
     ///
-    /// Same guards as [`Task::confirm_synced`]: `source` must be baseline-
-    /// eligible (`Promote`/`Push`/`Pull`/`ConflictResolve`/`Link`) and
-    /// `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`. A baseline
-    /// must be present — the merge is over the existing baseline, not a
-    /// fresh one. `version`/`captured_at` are preserved from the prior
-    /// baseline; the repository overwrites them on save.
+    /// Guards:
+    /// - `source` must be one of `Promote` / `Push` / `Pull` / `ConflictResolve`
+    ///   — the four sources that correspond to an actual transmitted PATCH
+    ///   payload. **`Link` is rejected** even though [`SnapshotSource::is_baseline`]
+    ///   admits it: a `Link` event rewires the remote identity but does not
+    ///   send a PATCH, so there are no per-field transmitted values to merge —
+    ///   use the full-snapshot [`Task::confirm_synced`] for a verified relink.
+    /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`.
+    /// - A baseline must be present — the merge is over the existing baseline,
+    ///   not a fresh one. `version`/`captured_at` are preserved from the prior
+    ///   baseline; the repository overwrites them on save.
     ///
     /// After the merge, `reconcile_dirty_against_baseline` runs so that any
     /// un-rebaselined field that still differs flips the task back to
@@ -301,7 +306,13 @@ impl Task {
         source: SnapshotSource,
         patch: &MirrorPatch,
     ) -> Result<()> {
-        if !source.is_baseline() {
+        if !matches!(
+            source,
+            SnapshotSource::Promote
+                | SnapshotSource::Push
+                | SnapshotSource::Pull
+                | SnapshotSource::ConflictResolve
+        ) {
             return Err(DomainError::validation(format!(
                 "confirm_synced_fields source must be Promote/Push/Pull/ConflictResolve, got {source:?}"
             )));
@@ -1321,16 +1332,22 @@ mod tests {
         let mut t = synced();
         t.set_body("changed".into());
         let patch = t.diff_against_baseline();
-        // LocalEdit / PrePull / Rollback are not baseline-eligible.
+        // Non-transmitting sources must be rejected: LocalEdit /
+        // PrePull / Rollback are not baseline-eligible, and Link
+        // (baseline-eligible per `is_baseline`) is also rejected
+        // because there is no PATCH payload to merge per-field —
+        // callers wanting a relink rebaseline must use the
+        // full-snapshot `confirm_synced` instead.
         for bad in [
             SnapshotSource::LocalEdit,
             SnapshotSource::PrePull,
             SnapshotSource::Rollback,
             SnapshotSource::Created,
+            SnapshotSource::Link,
         ] {
             let err = t
                 .confirm_synced_fields(bad, &patch)
-                .expect_err("non-baseline source must be rejected");
+                .expect_err("non-transmitting source must be rejected");
             assert!(
                 format!("{err}").contains("confirm_synced_fields source"),
                 "unexpected error for {bad:?}: {err}"
