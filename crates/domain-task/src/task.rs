@@ -286,8 +286,11 @@ impl Task {
     ///   use the full-snapshot [`Task::confirm_synced`] for a verified relink.
     /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`.
     /// - A baseline must be present — the merge is over the existing baseline,
-    ///   not a fresh one. `version`/`captured_at` are preserved from the prior
-    ///   baseline; the repository overwrites them on save.
+    ///   not a fresh one. The merged baseline's `source` is stamped with the
+    ///   call's `source` argument; `version` / `captured_at` are preserved
+    ///   from the prior baseline (the repository re-stamps `captured_at` on
+    ///   save with its own clock, so the in-memory value is informational
+    ///   only).
     ///
     /// After the merge, `reconcile_dirty_against_baseline` runs so that any
     /// un-rebaselined field that still differs flips the task back to
@@ -334,7 +337,6 @@ impl Task {
             .clone();
         let mut merged = prior;
         merged.source = source;
-        merged.captured_at = Timestamp::now();
         if let Some(title) = &patch.title {
             merged.title = title.clone();
         }

@@ -607,7 +607,7 @@ mod tests {
     use super::*;
     use domain_core::{ProjectId, Timestamp, WorkspaceId};
     use domain_project::{Project, StatusMapping, StatusOption};
-    use domain_sync::{OutboxEntry, OutboxStatus};
+    use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
     use domain_task::{RemoteRef, SyncState, Task, TaskStatus};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
@@ -1068,9 +1068,7 @@ mod tests {
         // task is Synced. The second and third drains then see a Synced
         // task with an empty diff and the new drainer code (gated on
         // confirmable state) skips the PATCH — but the entries still
-        // succeed. So only one remote PATCH lands; the FIFO claim order
-        // is verified by the order of the outbox entries' terminal
-        // status, not by remote call count.
+        // succeed. So only one remote PATCH lands.
         for remote_id in ["r-started", "r-edited", "r-completed"] {
             let entry = OutboxEntry::new(
                 task.id,
@@ -1091,7 +1089,7 @@ mod tests {
         // Only the first entry produced a remote PATCH — the rebaseline
         // collapsed the diff for the next two. The first PATCH carries
         // the first entry's `remote_id` (carried verbatim from the
-        // payload), which is the FIFO claim-order signal.
+        // payload).
         let remote_ids: Vec<String> = h
             .remote_tasks
             .updates()
@@ -1104,17 +1102,41 @@ mod tests {
             "only the first entry PATCHes (post-rpl-xq6 rebaseline collapses the rest)"
         );
 
-        // All three entries are Succeeded (the rebaseline collapsed
-        // the diff for the trailing two, so they no-op at the remote
-        // layer but still drain).
+        // FIFO claim order is preserved: every entry lands in
+        // OutboxStatus::Succeeded, and the order in which the in-memory
+        // fixture stamps `updated_at` (via `mark_succeeded`) is the
+        // claim order, which is the enqueue order. Sorting the
+        // succeeded entries by `updated_at` and reading the
+        // payload's `remote_id` field gives the FIFO claim sequence.
         let all = h.outbox.all();
-        let succeeded_count = all
+        let succeeded: Vec<&OutboxEntry> = all
             .iter()
             .filter(|e| e.status == OutboxStatus::Succeeded)
-            .count();
+            .collect();
         assert_eq!(
-            succeeded_count, 3,
+            succeeded.len(),
+            3,
             "all three entries succeed; the FIFO order is the claim order"
+        );
+        let mut ordered: Vec<&OutboxEntry> = succeeded.clone();
+        ordered.sort_by_key(|e| e.updated_at);
+        let claim_order: Vec<String> = ordered
+            .iter()
+            .map(|e| match &e.mutation {
+                OutboxMutation::UpdateRemote { remote_id, .. } => remote_id.clone(),
+                other => panic!("expected UpdateRemote, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            claim_order,
+            vec![
+                "r-started".to_string(),
+                "r-edited".to_string(),
+                "r-completed".to_string()
+            ],
+            "FIFO: same-task entries are mark_succeeded in enqueue order, \
+             even though only the first PATCHes (the rebaseline collapses \
+             the trailing two into no-ops)"
         );
     }
 
@@ -1586,16 +1608,31 @@ mod tests {
         // remote call to retry). This is the new "no wasted PATCH"
         // behavior — a coalesced empty head, a comment-only push, etc.
         // all collapse to a no-op.
+        //
+        // RFC 0003 D5 (rpl-xq6): the drainer also gates the entire
+        // PATCH+confirm+save block on `confirmable` state. After
+        // reverting the title to its baseline value, the task is
+        // `Synced` (not confirmable), so the block is skipped entirely
+        // — no PATCH, no confirm, no rebaseline, no save. The task
+        // must stay `Synced` with a byte-identical baseline; the
+        // entry still succeeds.
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
         // `seed_issue_task` writes a Promote snapshot (baseline title =
         // "task 1") then a LocalEdit bumping the title to "1-edited".
         // Revert the title back to "task 1" with another LocalEdit so
-        // the live title matches the baseline — the diff is now empty.
+        // the live title matches the baseline — the diff is now empty
+        // and `reconcile_dirty_against_baseline` flips the task back
+        // to `Synced`.
         let task = seed_issue_task(&h, ws, "1").await;
         let mut t = h.tasks.get(task.id).await.unwrap();
         t.set_title("task 1".into()).unwrap();
         h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        // Capture the pre-drain baseline + state for the no-op assertion.
+        let pre = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(pre.sync, SyncState::Synced, "Synced post-revert");
+        let pre_baseline = pre.synced_baseline.clone().expect("baseline");
 
         let entry = OutboxEntry::new(
             task.id,
@@ -1617,6 +1654,22 @@ mod tests {
         // The entry still succeeded.
         let all = h.outbox.all();
         assert_eq!(all[0].status, OutboxStatus::Succeeded);
+
+        // The new no-op-path contract: a Synced task drained for
+        // UpdateRemote is a true no-op — no PATCH, no rebaseline, no
+        // save. State stays Synced and the baseline entry is
+        // byte-identical to pre-drain.
+        let post = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            post.sync,
+            SyncState::Synced,
+            "Synced stays Synced on a no-op drain"
+        );
+        assert_eq!(
+            post.synced_baseline,
+            Some(pre_baseline),
+            "baseline must be unchanged on a no-op drain (confirmable gate skipped the save)"
+        );
     }
 
     #[tokio::test]
