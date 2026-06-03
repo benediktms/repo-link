@@ -266,6 +266,8 @@ impl OutboxDrainer {
                         body: Some(&task.body),
                         closed: Some(closed),
                         state_reason,
+                        // assignees: real diff wired in #173 (x2v); None = no-op here.
+                        assignees: None,
                     })
                     .await?;
             }

@@ -127,6 +127,7 @@ async fn update_issue_patches_only_provided_fields() {
             body: None,
             closed: Some(true),
             state_reason: None,
+            assignees: None,
         })
         .await
         .unwrap();
@@ -156,6 +157,56 @@ async fn update_issue_sends_state_reason_when_closing() {
             body: None,
             closed: Some(true),
             state_reason: Some(RemoteStateReason::NotPlanned),
+            assignees: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn update_issue_sets_and_clears_assignees() {
+    // Set: `Some(&[..])` PATCHes the exact login list.
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/o/r/issues/42"))
+        .and(body_partial_json(
+            serde_json::json!({"assignees": ["alice"]}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload(42, "x", "y", "open")))
+        .mount(&server)
+        .await;
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
+    provider
+        .update_remote(RemoteTaskUpdate {
+            canonical_repo: "github.com/o/r",
+            remote_id: "42",
+            title: None,
+            body: None,
+            closed: None,
+            state_reason: None,
+            assignees: Some(&["alice".to_string()]),
+        })
+        .await
+        .unwrap();
+
+    // Clear: `Some(&[])` PATCHes an explicit empty array (distinct from omit).
+    let clear_server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/o/r/issues/42"))
+        .and(body_partial_json(serde_json::json!({"assignees": []})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload(42, "x", "y", "open")))
+        .mount(&clear_server)
+        .await;
+    let clear_provider = GithubAdapter::with_base_url("t0k", clear_server.uri()).unwrap();
+    clear_provider
+        .update_remote(RemoteTaskUpdate {
+            canonical_repo: "github.com/o/r",
+            remote_id: "42",
+            title: None,
+            body: None,
+            closed: None,
+            state_reason: None,
+            assignees: Some(&[]),
         })
         .await
         .unwrap();
