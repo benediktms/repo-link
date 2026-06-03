@@ -1321,6 +1321,54 @@ mod tests {
         assert_eq!(u.assignees, None);
     }
 
+    /// Parallel to `update_remote_pushes_live_task_title_body_not_payload_snapshot`:
+    /// the drainer must re-derive assignees from the live task, not from any
+    /// payload snapshot. `OutboxMutation::UpdateRemote` carries NO `assignees`
+    /// field (the drainer is the sole source — the rpl-x2v invariant), so the
+    /// LIVE task's assignees must reach the wire even if the entry was enqueued
+    /// earlier with no assignees. RFC 0003 §7 case 2 (rpl-oa6).
+    #[tokio::test]
+    async fn drainer_rerederives_assignees_from_live_task() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let mut task = seed_issue_task(&h, ws, "1").await;
+        // Set assignees on the LIVE task post-enqueue-style: the entry below
+        // carries no assignees at all, so the only source is the live task.
+        task.set_assignees(vec!["carol".into()]);
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let updates = h.remote_tasks.updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].assignees.as_deref(),
+            Some(&["carol".to_string()][..]),
+            "drainer re-derives assignees from the live task (rpl-x2v invariant)"
+        );
+        // The other fields stay None because seed_issue_task's title edit
+        // is the only diff in MirrorPatch; assignees join it.
+        assert_eq!(updates[0].title.as_deref(), Some("1-edited"));
+        assert_eq!(updates[0].body, None);
+        assert_eq!(updates[0].closed, None);
+        assert_eq!(updates[0].state_reason, None);
+    }
+
     #[tokio::test]
     async fn drain_update_remote_skips_provider_when_patch_empty() {
         // Empty `MirrorPatch` ⇒ helper returns None ⇒ drainer does NOT
