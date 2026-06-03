@@ -87,8 +87,8 @@ use domain_core::Timestamp;
 use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::{RemoteRef, SnapshotSource};
 use ports::{
-    OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider,
-    RemoteTaskUpdate, TaskRepository, WorkspaceRepository,
+    OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider, TaskRepository,
+    WorkspaceRepository,
 };
 use tracing::{debug, info, warn};
 
@@ -247,29 +247,19 @@ impl OutboxDrainer {
                 body: _,
                 closed: _,
             } => {
-                // Re-derive everything from the *current* task so a mutation
-                // enqueued earlier still reflects the latest local state — and
-                // so push() and the drainer agree. The open/closed bit and
-                // state_reason come from the live status; title/body come from
-                // the live task too (mirroring SyncService::push, which sends
-                // `Some(&task.title)` / `Some(&task.body)`). Per-task FIFO
-                // guarantees at most one in-flight UpdateRemote, so reading the
-                // live content can't race a coalesced sibling. The payload's
-                // captured title/body are intentionally ignored.
+                // Re-derive from the live task + its baseline. The
+                // shared helper decides which fields ride the PATCH
+                // and when to skip (empty patch ⇒ no PATCH, entry
+                // still succeeds). Per-task FIFO means reading the
+                // live task + its baseline cannot race a coalesced
+                // sibling; the payload's captured fields are ignored.
                 let task = self.tasks.get(entry.task_id).await?;
-                let (closed, state_reason) = crate::lifecycle_to_remote_state(task.status);
-                self.remote_tasks
-                    .update_remote(RemoteTaskUpdate {
-                        canonical_repo,
-                        remote_id,
-                        title: Some(&task.title),
-                        body: Some(&task.body),
-                        closed: Some(closed),
-                        state_reason,
-                        // assignees: real diff wired in #173 (x2v); None = no-op here.
-                        assignees: None,
-                    })
-                    .await?;
+                let patch = task.diff_against_baseline();
+                if let Some(update) =
+                    crate::build_update_from_patch(&task, &patch, canonical_repo, remote_id)
+                {
+                    self.remote_tasks.update_remote(update).await?;
+                }
             }
             OutboxMutation::AddItem {
                 project_node_id,
@@ -636,13 +626,22 @@ mod tests {
         BackoffSchedule::new(vec![std::time::Duration::from_secs(60)], max_attempts)
     }
 
-    /// A synced issue-backed task in workspace `ws`.
+    /// A promoted task with a populated `synced_baseline` AND one
+    /// local title edit already applied. The Promote snapshot
+    /// (title `task {remote_id}`) becomes the baseline; the title
+    /// is then bumped to `{remote_id}-edited` and saved as
+    /// LocalEdit so the in-memory task is dirty but the baseline is
+    /// unchanged. Tests wanting a clean baseline can revert the
+    /// title before enqueue.
     async fn seed_issue_task(h: &Harness, ws: WorkspaceId, remote_id: &str) -> Task {
         let mut t = Task::new_draft(ws, None, format!("task {remote_id}")).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", remote_id))
             .unwrap();
         h.tasks.save(&t, SnapshotSource::Promote).await.unwrap();
+        // One-shot title edit so `diff_against_baseline()` is non-empty.
+        t.set_title(format!("{remote_id}-edited")).unwrap();
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
         t
     }
 
@@ -695,10 +694,16 @@ mod tests {
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
         let mut task = seed_issue_task(&h, ws, "1").await;
-        // Drive to Done so the drainer should send (closed=true, Completed).
+        // Drive to Done so the drainer should send (closed=true,
+        // Completed). Save as LocalEdit so the baseline stays at the
+        // Promote snapshot; saving as Push would re-baseline and
+        // leave nothing to send.
         task.start().unwrap();
         task.complete().unwrap();
-        h.tasks.save(&task, SnapshotSource::Push).await.unwrap();
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
 
         let entry = OutboxEntry::new(
             task.id,
@@ -1278,6 +1283,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_update_remote_sends_only_changed_fields() {
+        // Title-only edit must PATCH only `title`; the other
+        // fields stay None so the adapter omits them.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        // Promote then edit only the title.
+        let mut task = Task::new_draft(ws, None, "original".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        h.tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+        let mut t = h.tasks.get(task.id).await.unwrap();
+        t.set_title("renamed".into()).unwrap();
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        h.drainer.drain_once().await.unwrap();
+
+        let updates = h.remote_tasks.updates();
+        assert_eq!(updates.len(), 1);
+        let u = &updates[0];
+        assert_eq!(u.title.as_deref(), Some("renamed"));
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, None);
+        assert_eq!(u.state_reason, None);
+        assert_eq!(u.assignees, None);
+    }
+
+    #[tokio::test]
+    async fn drain_update_remote_skips_provider_when_patch_empty() {
+        // Empty `MirrorPatch` ⇒ helper returns None ⇒ drainer does NOT
+        // call `update_remote` at all. The entry still succeeds (no
+        // remote call to retry). This is the new "no wasted PATCH"
+        // behavior — a coalesced empty head, a comment-only push, etc.
+        // all collapse to a no-op.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        // `seed_issue_task` writes a Promote snapshot (baseline title =
+        // "task 1") then a LocalEdit bumping the title to "1-edited".
+        // Revert the title back to "task 1" with another LocalEdit so
+        // the live title matches the baseline — the diff is now empty.
+        let task = seed_issue_task(&h, ws, "1").await;
+        let mut t = h.tasks.get(task.id).await.unwrap();
+        t.set_title("task 1".into()).unwrap();
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        h.drainer.drain_once().await.unwrap();
+
+        assert!(
+            h.remote_tasks.updates().is_empty(),
+            "empty patch ⇒ no remote update call"
+        );
+        // The entry still succeeded.
+        let all = h.outbox.all();
+        assert_eq!(all[0].status, OutboxStatus::Succeeded);
+    }
+
+    #[tokio::test]
     async fn update_draft_issue_pushes_live_task_title_body_not_payload_snapshot() {
         // Regression (#54): like UpdateRemote, UpdateDraftIssue must re-derive
         // title/body from the *live* task, not the payload snapshotted at
@@ -1367,6 +1451,11 @@ mod tests {
             updates[0].closed,
             Some(false),
             "Blocked must drain with closed=false, never closing the issue"
+        );
+        assert_eq!(
+            updates[0].state_reason,
+            Some(RemoteStateReason::Reopened),
+            "Blocked must drain with state_reason=Reopened (lifecycle_to_remote_state)"
         );
     }
 

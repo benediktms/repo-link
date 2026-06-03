@@ -943,6 +943,14 @@ mod tests {
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
+        // Persist the Promote snapshot (mirrors what `SyncService::promote`
+        // does via `save_with_outbox`) so the in-memory repo's snapshot
+        // history has a baseline-eligible row for the diff to anchor
+        // against.
+        task_repo
+            .save(&task, SnapshotSource::Promote)
+            .await
+            .unwrap();
         task.mark_dirty_local().unwrap();
         task.set_body("new body".into());
         task_repo
@@ -1838,8 +1846,18 @@ mod tests {
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "1"))
             .unwrap();
+        // Persist the Promote snapshot so the in-memory repo's history
+        // has a baseline-eligible row (mirrors what `SyncService::promote`
+        // does).
         task_repo
             .save(&task, SnapshotSource::Promote)
+            .await
+            .unwrap();
+        // Then a body edit so the diff is non-empty (the helper
+        // short-circuits empty patches).
+        task.set_body("edit body".into());
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
             .await
             .unwrap();
         let entry = OutboxEntry::new(

@@ -29,8 +29,8 @@ mod service;
 mod summary;
 
 use domain_project::Project;
-use domain_task::TaskStatus;
-use ports::RemoteStateReason;
+use domain_task::{MirrorPatch, Task, TaskStatus};
+use ports::{RemoteStateReason, RemoteTaskUpdate};
 
 pub use drainer::{BackoffSchedule, OutboxDrainer};
 pub use error::{Result, SyncError};
@@ -71,5 +71,200 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
         TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked => {
             (false, Some(RemoteStateReason::Reopened))
         }
+    }
+}
+
+/// Project a [`MirrorPatch`] onto a [`RemoteTaskUpdate`]. Returns
+/// `None` when the patch is empty so the caller skips the remote PATCH
+/// entirely. Status in patch projects via [`lifecycle_to_remote_state`];
+/// assignees pass through verbatim (the three-state `None`/`Some(&[])`/
+/// `Some(&[..])` semantics live in the adapter).
+///
+/// Draft-backed mirrors are structurally unreachable: the planner
+/// emits `UpdateRemote` only for `is_issue_backed` tasks (draft-backed
+/// ones route to `UpdateDraftIssue`); push's `NoRemote` guard rejects
+/// `task.remote.is_none()` upfront.
+pub(crate) fn build_update_from_patch<'a>(
+    _task: &Task,
+    patch: &'a MirrorPatch,
+    canonical_repo: &'a str,
+    remote_id: &'a str,
+) -> Option<RemoteTaskUpdate<'a>> {
+    if patch.is_empty() {
+        return None;
+    }
+    // Tie `closed` and `state_reason` together: both come through
+    // when status in patch, both None when not. Survives a future
+    // `lifecycle_to_remote_state` arm that returns `(_, None)`.
+    let (closed, state_reason) = match patch.status {
+        Some(s) => {
+            let (c, r) = lifecycle_to_remote_state(s);
+            (Some(c), r)
+        }
+        None => (None, None),
+    };
+    Some(RemoteTaskUpdate {
+        canonical_repo,
+        remote_id,
+        title: patch.title.as_deref(),
+        body: patch.body.as_deref(),
+        closed,
+        state_reason,
+        assignees: patch.assignees.as_deref(),
+    })
+}
+
+#[cfg(test)]
+mod build_update_from_patch_tests {
+    use super::*;
+    use domain_task::TaskStatus;
+
+    // A trivial Task — the helper ignores everything except the patch, so the
+    // task value itself is never inspected.
+    fn any_task() -> Task {
+        // The trait bounds on Task::new_draft (title non-empty) mean we need a
+        // minimal valid task. We use the workhorse since the helper is
+        // field-agnostic; only the patch contents drive the projection.
+        use domain_core::{Timestamp, WorkspaceId};
+        let mut t = Task::new_draft(WorkspaceId::new(), None, "placeholder".into()).unwrap();
+        t.id = domain_core::TaskId::new();
+        t.created_at = Timestamp::now();
+        t.updated_at = Timestamp::now();
+        t
+    }
+
+    #[test]
+    fn none_when_patch_empty() {
+        // Default-constructed MirrorPatch carries no Some-field — the helper
+        // must short-circuit before constructing a RemoteTaskUpdate at all.
+        let patch = MirrorPatch::default();
+        assert!(patch.is_empty());
+        assert!(build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1").is_none());
+    }
+
+    #[test]
+    fn title_only_projects_only_title() {
+        // A title-only diff: title is the only Some(_), every other port
+        // field is None. Closed/state_reason stay None because status isn't
+        // in the patch (so the helper must NOT project lifecycle_to_remote_state
+        // on an absent status).
+        let patch = MirrorPatch {
+            title: Some("new title".into()),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "7")
+            .expect("patch has title ⇒ Some");
+        assert_eq!(u.canonical_repo, "github.com/o/r");
+        assert_eq!(u.remote_id, "7");
+        assert_eq!(u.title, Some("new title"));
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, None);
+        assert_eq!(u.state_reason, None);
+        assert_eq!(u.assignees, None);
+    }
+
+    #[test]
+    fn status_done_projects_to_closed_completed() {
+        // A status-only diff: patch.status = Done ⇒ helper runs
+        // lifecycle_to_remote_state, gets (true, Some(Completed)) ⇒ sets
+        // closed=Some(true) and state_reason=Some(Completed). Title/body/
+        // assignees stay None (status is the only changed field).
+        let patch = MirrorPatch {
+            status: Some(TaskStatus::Done),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has status ⇒ Some");
+        assert_eq!(u.title, None);
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, Some(true));
+        assert_eq!(u.state_reason, Some(RemoteStateReason::Completed));
+        assert_eq!(u.assignees, None);
+    }
+
+    #[test]
+    fn status_blocked_projects_to_closed_false_reopened() {
+        // Status=Blocked is an OPEN status on our side, so the remote
+        // projection is closed=false with Reopened (lifecycle_to_remote_state).
+        // Guards the non-Done branch of the helper's status projection.
+        let patch = MirrorPatch {
+            status: Some(TaskStatus::Blocked),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has status ⇒ Some");
+        assert_eq!(u.closed, Some(false));
+        assert_eq!(u.state_reason, Some(RemoteStateReason::Reopened));
+    }
+
+    #[test]
+    fn assignees_some_passthrough() {
+        // The patch carries assignees ⇒ the helper forwards them as
+        // Some(&[..]). Three-state semantics (None omit / Some(&[]) clear /
+        // Some(&[..]) set) are the adapter's job, not the helper's — the
+        // helper just preserves the Option<&[String]> shape end-to-end.
+        let patch = MirrorPatch {
+            assignees: Some(vec!["alice".into(), "bob".into()]),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has assignees ⇒ Some");
+        assert_eq!(u.title, None);
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, None);
+        assert_eq!(u.state_reason, None);
+        assert_eq!(
+            u.assignees,
+            Some(&["alice".to_string(), "bob".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn body_only_projects_only_body() {
+        // A body-only diff: body is the only Some(_), everything else None.
+        let patch = MirrorPatch {
+            body: Some("revised body".into()),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has body ⇒ Some");
+        assert_eq!(u.title, None);
+        assert_eq!(u.body, Some("revised body"));
+        assert_eq!(u.closed, None);
+        assert_eq!(u.state_reason, None);
+        assert_eq!(u.assignees, None);
+    }
+
+    #[test]
+    fn assignees_empty_some_is_clear() {
+        // Three-state: `Some(vec![])` = clear, `None` = omit. Wire
+        // shape covered in `infra-github`.
+        let patch = MirrorPatch {
+            assignees: Some(vec![]),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has assignees ⇒ Some");
+        assert_eq!(u.title, None);
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, None);
+        assert_eq!(u.state_reason, None);
+        assert_eq!(u.assignees, Some(&[][..]));
+    }
+
+    #[test]
+    fn status_archived_projects_to_closed_not_planned() {
+        // Archived → (true, NotPlanned) per `lifecycle_to_remote_state`.
+        let patch = MirrorPatch {
+            status: Some(TaskStatus::Archived),
+            ..Default::default()
+        };
+        let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
+            .expect("patch has status ⇒ Some");
+        assert_eq!(u.title, None);
+        assert_eq!(u.body, None);
+        assert_eq!(u.closed, Some(true));
+        assert_eq!(u.state_reason, Some(RemoteStateReason::NotPlanned));
+        assert_eq!(u.assignees, None);
     }
 }
