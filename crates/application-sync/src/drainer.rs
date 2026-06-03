@@ -1346,21 +1346,14 @@ mod tests {
         // all collapse to a no-op.
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
-        // Promote without any subsequent edit: the baseline is the
-        // Promote snapshot and the live task matches it perfectly.
+        // `seed_issue_task` writes a Promote snapshot (baseline title =
+        // "task 1") then a LocalEdit bumping the title to "1-edited".
+        // Revert the title back to "task 1" with another LocalEdit so
+        // the live title matches the baseline — the diff is now empty.
         let task = seed_issue_task(&h, ws, "1").await;
-        // Revert the title edit seed_issue_task made so the diff is
-        // empty (the seed's LocalEdit title bump would otherwise keep
-        // the patch non-empty).
         let mut t = h.tasks.get(task.id).await.unwrap();
-        t.set_title(format!("task {}", "1")).unwrap();
+        t.set_title("task 1".into()).unwrap();
         h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
-        // Re-baseline so the next get() returns a baseline that matches
-        // the current live state — making the diff truly empty.
-        let reloaded = h.tasks.get(t.id).await.unwrap();
-        t.set_synced_baseline(reloaded.synced_baseline.clone().unwrap());
-        // No further save — we want the IN-MEMORY baseline set but the
-        // in-memory state to match it.
 
         let entry = OutboxEntry::new(
             task.id,
