@@ -1468,6 +1468,11 @@ mod tests {
             Some(false),
             "Blocked must drain with closed=false, never closing the issue"
         );
+        assert_eq!(
+            updates[0].state_reason,
+            Some(RemoteStateReason::Reopened),
+            "Blocked must drain with state_reason=Reopened (lifecycle_to_remote_state)"
+        );
     }
 
     #[tokio::test]
