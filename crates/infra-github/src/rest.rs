@@ -68,6 +68,14 @@ impl RestClient {
         if let Some(body) = cmd.body {
             builder = builder.body(body);
         }
+        // Three-state (RFC 0003 D3): `None` omits the field (leave unchanged);
+        // `Some(&[])` serializes as `"assignees": []` (clear); `Some(&[..])`
+        // sets the list. The builder's `assignees: Option<_>` is
+        // `skip_serializing_if = is_none`, so an empty-but-`Some` slice still
+        // emits `[]` — only the omitted (`None`) case is skipped.
+        if let Some(assignees) = cmd.assignees {
+            builder = builder.assignees(assignees);
+        }
         if let Some(closed) = cmd.closed {
             builder = builder.state(if closed {
                 IssueState::Closed

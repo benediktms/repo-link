@@ -43,6 +43,12 @@ pub struct RemoteTaskUpdate<'a> {
     /// (`Reopened`). Adapters ignore the field if their backend has no
     /// equivalent concept.
     pub state_reason: Option<RemoteStateReason>,
+    /// Assignees to mirror onto the remote issue, by GitHub login. Three-state:
+    /// `None` leaves the remote assignees unchanged (the field is omitted from
+    /// the PATCH); `Some(&[])` clears all assignees; `Some(&[..])` sets exactly
+    /// that list. Restores create/update symmetry with
+    /// [`RemoteTaskCreate::assignees`] (RFC 0003 D3).
+    pub assignees: Option<&'a [String]>,
 }
 
 #[derive(Clone, Debug)]
