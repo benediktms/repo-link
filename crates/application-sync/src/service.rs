@@ -10,8 +10,8 @@ use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use crate::enqueue;
 use dto_shared::SyncSummaryDto;
 use ports::{
-    PortError, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate, RepoBindingRepository,
-    TaskRepository, WorkspaceRepository,
+    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, TaskRepository,
+    WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -153,22 +153,22 @@ impl SyncService {
         }
 
         if snapshot_dirty {
-            // Mirror the lifecycle status onto the remote issue's open/closed
-            // bit + state_reason. Shared with the outbox drainer so both
-            // outbound paths derive the remote state identically (Stage 6).
-            let (closed, state_reason) = crate::lifecycle_to_remote_state(task.status);
-            self.provider
-                .update_remote(RemoteTaskUpdate {
-                    canonical_repo: &filing_canonical,
-                    remote_id: &remote.remote_id,
-                    title: Some(&task.title),
-                    body: Some(&task.body),
-                    closed: Some(closed),
-                    state_reason,
-                    // assignees: real diff wired in #173 (x2v); None = no-op here.
-                    assignees: None,
-                })
-                .await?;
+            // Build the PATCH from the field-level diff against the synced
+            // baseline (rpl-x2v). The shared `build_update_from_patch` helper
+            // is the single point that decides which fields ride the PATCH
+            // (only the ones that actually changed) and when the remote call
+            // is skipped entirely (empty patch ⇒ no PATCH, the push still
+            // confirms synced). This matches the outbox drainer's
+            // `UpdateRemote` arm — they cannot diverge on wire shape or skip
+            // rule because they go through the same function.
+            let patch = task.diff_against_baseline();
+            let canonical_repo = filing_canonical.clone();
+            let remote_id = remote.remote_id.clone();
+            if let Some(update) =
+                crate::build_update_from_patch(&task, &patch, &canonical_repo, &remote_id)
+            {
+                self.provider.update_remote(update).await?;
+            }
 
             task.confirm_synced(SnapshotSource::Push)?;
             self.tasks.save(&task, SnapshotSource::Push).await?;
@@ -712,7 +712,9 @@ mod tests {
     use domain_sync::OutboxMutation;
     use domain_task::Task;
     use domain_workspace::{Workspace, WorkspaceName};
-    use ports::{PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot};
+    use ports::{
+        PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot, RemoteTaskUpdate,
+    };
     use std::sync::Mutex;
     use testing_fixtures::{
         InMemoryOutboxRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
@@ -722,9 +724,11 @@ mod tests {
     #[derive(Clone)]
     struct RecordedUpdate {
         remote_id: String,
+        title: Option<String>,
         body: Option<String>,
         closed: Option<bool>,
         state_reason: Option<RemoteStateReason>,
+        assignees: Option<Vec<String>>,
     }
 
     #[derive(Default)]
@@ -791,9 +795,11 @@ mod tests {
         async fn update_remote(&self, cmd: RemoteTaskUpdate<'_>) -> PortResult<RemoteTaskSnapshot> {
             *self.last_update.lock().unwrap() = Some(RecordedUpdate {
                 remote_id: cmd.remote_id.into(),
+                title: cmd.title.map(str::to_owned),
                 body: cmd.body.map(str::to_owned),
                 closed: cmd.closed,
                 state_reason: cmd.state_reason,
+                assignees: cmd.assignees.map(|s| s.to_vec()),
             });
             Ok(RemoteTaskSnapshot {
                 remote_id: cmd.remote_id.into(),
@@ -1268,6 +1274,78 @@ mod tests {
         let recorded = provider.last_update.lock().unwrap().clone().unwrap();
         assert_eq!(recorded.remote_id, "100");
         assert_eq!(recorded.body.as_deref(), Some("revised"));
+    }
+
+    #[tokio::test]
+    async fn push_sends_only_changed_fields() {
+        // The PATCH is built from the live-vs-baseline diff (rpl-x2v):
+        // a title-only edit PATCHes only `title`, NOT body/closed/
+        // state_reason. The old hard-coded builder would have re-sent
+        // the whole snapshot. Asserting the field-level shape here is
+        // the load-bearing test for the helper.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_title("renamed".into()).unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.push(&task.id.to_string()).await.unwrap();
+
+        let recorded = provider.last_update.lock().unwrap().clone().unwrap();
+        assert_eq!(recorded.remote_id, "100");
+        assert_eq!(
+            recorded.title.as_deref(),
+            Some("renamed"),
+            "title in the patch"
+        );
+        assert_eq!(recorded.body, None, "body NOT in the patch");
+        assert_eq!(recorded.closed, None, "closed NOT in the patch");
+        assert_eq!(
+            recorded.state_reason, None,
+            "state_reason NOT in the patch (status unchanged)"
+        );
+        assert_eq!(
+            recorded.assignees, None,
+            "assignees NOT in the patch (assignees unchanged)"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_skips_remote_call_when_no_field_changed() {
+        // Title-equivalent push: the task is DirtyLocal (so push's
+        // "nothing to do" gate doesn't reject it) but no MIRRORED field
+        // actually differs from the baseline. The helper short-circuits
+        // to None, so the remote is never PATCHed. The push still
+        // confirms synced and the summary records the PushLocal decision
+        // (the snapshot axis did run, it just had nothing to send).
+        //
+        // The state setup: a promoted task at `setup` time already has a
+        // baseline and the live state matches it (Synced). The cleanest
+        // way to reach "DirtyLocal + empty diff" is to drive a field
+        // change that does NOT participate in dirty detection — the
+        // project board's status option id (rpl-style) is one such
+        // field, but a simpler route is: edit a comment. Comments are
+        // deliberately excluded from `reconcile_dirty_against_baseline`
+        // (the doc comment on `Task::comments` calls this out
+        // explicitly), so a comment edit won't perturb the diff.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        // `mark_dirty_local` flips Synced→DirtyLocal directly; the task
+        // still has no field diff. Save with LocalEdit so the persisted
+        // row reflects the new state.
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let s = svc.push(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "push_local");
+        assert_eq!(s.new_state, "synced");
+        // The remote was never PATCHed.
+        assert!(
+            provider.last_update.lock().unwrap().is_none(),
+            "empty diff ⇒ no remote call, even though the task was dirty"
+        );
     }
 
     #[tokio::test]

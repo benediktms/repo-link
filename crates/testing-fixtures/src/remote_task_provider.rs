@@ -20,6 +20,12 @@ pub struct RecordedUpdate {
     pub body: Option<String>,
     pub closed: Option<bool>,
     pub state_reason: Option<RemoteStateReason>,
+    /// Assignees forwarded to the remote. `None` ⇒ the PATCH omitted the
+    /// field (leave remote unchanged); `Some(vec![])` ⇒ clear;
+    /// `Some(non-empty)` ⇒ the set to apply. Mirrors
+    /// [`RemoteTaskUpdate::assignees`] so drainer tests can assert the
+    /// field-level PATCH shape end-to-end (rpl-x2v).
+    pub assignees: Option<Vec<String>>,
 }
 
 /// One recorded relation-sync call (`add`/`remove` × sub-issue/dependency).
@@ -117,6 +123,7 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
             body: cmd.body.map(str::to_owned),
             closed: cmd.closed,
             state_reason: cmd.state_reason,
+            assignees: cmd.assignees.map(|s| s.to_vec()),
         });
         Ok(RemoteTaskSnapshot {
             remote_id: cmd.remote_id.into(),

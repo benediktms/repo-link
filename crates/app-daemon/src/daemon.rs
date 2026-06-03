@@ -943,6 +943,18 @@ mod tests {
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
+        // Persist the Promote snapshot (mirrors what `SyncService::promote`
+        // does via `save_with_outbox(_, Promote, _)`) so the in-memory
+        // repo's snapshot history has a baseline-eligible row. Without
+        // this, the drainer's `diff_against_baseline()` sees a None
+        // baseline and the new diff-driven PATCH (rpl-x2v) short-circuits
+        // to a no-op — the test was written under the old always-PATCH
+        // shape, where a missing baseline silently fell through to a
+        // full-snapshot send.
+        task_repo
+            .save(&task, SnapshotSource::Promote)
+            .await
+            .unwrap();
         task.mark_dirty_local().unwrap();
         task.set_body("new body".into());
         task_repo
@@ -1838,8 +1850,20 @@ mod tests {
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "1"))
             .unwrap();
+        // Persist the Promote snapshot so the in-memory repo's history has a
+        // baseline-eligible row (mirrors what `SyncService::promote` does).
         task_repo
             .save(&task, SnapshotSource::Promote)
+            .await
+            .unwrap();
+        // Then a LocalEdit that mutates body — gives the drainer's
+        // diff-driven PATCH (rpl-x2v) a non-empty MirrorPatch to send. The
+        // old test sent the entry without a real diff; the new behavior
+        // short-circuits an empty patch, so the test was silent under
+        // rpl-x2v and never saw the provider call.
+        task.set_body("edit body".into());
+        task_repo
+            .save(&task, SnapshotSource::LocalEdit)
             .await
             .unwrap();
         let entry = OutboxEntry::new(
