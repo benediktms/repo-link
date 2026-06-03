@@ -74,38 +74,16 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
     }
 }
 
-/// Build a [`RemoteTaskUpdate`] from the live `task`'s field-level diff
-/// against its `synced_baseline` (RFC 0003 D4). Returns `None` when the
-/// patch is empty (no mirrored field changed) so the caller can skip the
-/// remote PATCH entirely — a no-op push, a coalesced empty head, a
-/// comment-only push, etc. all collapse to "no remote call" instead of a
-/// wasted PATCH.
+/// Project a [`MirrorPatch`] onto a [`RemoteTaskUpdate`]. Returns
+/// `None` when the patch is empty so the caller skips the remote PATCH
+/// entirely. Status in patch projects via [`lifecycle_to_remote_state`];
+/// assignees pass through verbatim (the three-state `None`/`Some(&[])`/
+/// `Some(&[..])` semantics live in the adapter).
 ///
-/// Shared by [`SyncService::push`] and [`OutboxDrainer::apply`]'s
-/// `UpdateRemote` arm so the two outbound paths can never diverge on which
-/// fields ride a PATCH or when the call is skipped.
-///
-/// Status mapping delegates to [`lifecycle_to_remote_state`]: when the
-/// patch carries a `status` change, the helper projects it onto
-/// `(closed, state_reason)` the same way the old hand-rolled builders
-/// did, so the wire shape is unchanged for status-only edits.
-///
-/// Assignees: a `Some(patch.assignees)` is forwarded as
-/// `Some(&patch.assignees)`; the existing `Some(&[])` → clear vs
-/// `None` → omit three-state semantics in the adapter (rpl-ffv) handle
-/// the rest.
-///
-/// D7 (draft-backed mirrors): the helper is never called for a
-/// draft-backed mirror. The structural reason is upstream — the
-/// planner (`enqueue::plan_mutations` at
-/// `crates/application-sync/src/enqueue.rs:198-208`) only emits an
-/// `OutboxMutation::UpdateRemote` for `is_issue_backed` tasks; a
-/// draft-backed mirror routes to `UpdateDraftIssue` instead, which
-/// goes through the `update_draft_issue` port, not the
-/// `update_remote` one. And push's `NoRemote` guard rejects
-/// `task.remote.is_none()` upfront. So a draft-backed task is
-/// structurally unreachable from this helper. The carve-out is
-/// therefore free.
+/// Draft-backed mirrors are structurally unreachable: the planner
+/// emits `UpdateRemote` only for `is_issue_backed` tasks (draft-backed
+/// ones route to `UpdateDraftIssue`); push's `NoRemote` guard rejects
+/// `task.remote.is_none()` upfront.
 pub(crate) fn build_update_from_patch<'a>(
     _task: &Task,
     patch: &'a MirrorPatch,
@@ -115,10 +93,8 @@ pub(crate) fn build_update_from_patch<'a>(
     if patch.is_empty() {
         return None;
     }
-    // Status projection: when the patch carries a status change, project
-    // it through `lifecycle_to_remote_state` in one place. The match
-    // makes the "closed + state_reason come together or not at all"
-    // coupling locally obvious; a `match` survives any future
+    // Tie `closed` and `state_reason` together: both come through
+    // when status in patch, both None when not. Survives a future
     // `lifecycle_to_remote_state` arm that returns `(_, None)`.
     let (closed, state_reason) = match patch.status {
         Some(s) => {
@@ -261,14 +237,8 @@ mod build_update_from_patch_tests {
 
     #[test]
     fn assignees_empty_some_is_clear() {
-        // The clear branch of the three-state assignees semantics
-        // (rpl-ffv). A `Some(vec![])` is NOT the same as `None`:
-        // - `Some(&[])` → PATCH `"assignees": []` (clears all)
-        // - `None`     → field omitted from PATCH (leaves unchanged)
-        // The helper must forward `Some(vec![])` as `Some(&[])` — not
-        // collapse to `None`. Locks the helper-layer invariant; the
-        // adapter wire shape is already tested in
-        // `update_issue_sets_and_clears_assignees` (infra-github).
+        // Three-state: `Some(vec![])` = clear, `None` = omit. Wire
+        // shape covered in `infra-github`.
         let patch = MirrorPatch {
             assignees: Some(vec![]),
             ..Default::default()
@@ -279,22 +249,12 @@ mod build_update_from_patch_tests {
         assert_eq!(u.body, None);
         assert_eq!(u.closed, None);
         assert_eq!(u.state_reason, None);
-        assert_eq!(
-            u.assignees,
-            Some(&[][..]),
-            "Some(empty) is forwarded as Some(empty), NOT collapsed to None"
-        );
+        assert_eq!(u.assignees, Some(&[][..]));
     }
 
     #[test]
     fn status_archived_projects_to_closed_not_planned() {
-        // Archived is the lifecycle's "we're not doing this" terminal
-        // state; the remote projection is closed=true with
-        // state_reason=NotPlanned (per `lifecycle_to_remote_state`).
-        // Symmetric with the Done and Blocked helper tests; pins the
-        // contract locally. The service tier has
-        // `push_archived_task_closes_remote_with_not_planned` for the
-        // end-to-end version.
+        // Archived → (true, NotPlanned) per `lifecycle_to_remote_state`.
         let patch = MirrorPatch {
             status: Some(TaskStatus::Archived),
             ..Default::default()

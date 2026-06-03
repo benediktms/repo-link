@@ -247,16 +247,12 @@ impl OutboxDrainer {
                 body: _,
                 closed: _,
             } => {
-                // Re-derive from the live task and its diff against the
-                // synced baseline (rpl-x2v). The shared
-                // `build_update_from_patch` helper is the single point that
-                // decides which fields ride the PATCH (only the ones that
-                // actually changed) and when the remote call is skipped
-                // entirely (empty patch ⇒ no PATCH, the entry still
-                // succeeds). Per-task FIFO guarantees at most one
-                // in-flight UpdateRemote, so reading the live task + its
-                // baseline cannot race a coalesced sibling. The payload's
-                // captured title/body/closed remain ignored.
+                // Re-derive from the live task + its baseline. The
+                // shared helper decides which fields ride the PATCH
+                // and when to skip (empty patch ⇒ no PATCH, entry
+                // still succeeds). Per-task FIFO means reading the
+                // live task + its baseline cannot race a coalesced
+                // sibling; the payload's captured fields are ignored.
                 let task = self.tasks.get(entry.task_id).await?;
                 let patch = task.diff_against_baseline();
                 if let Some(update) =
@@ -630,27 +626,20 @@ mod tests {
         BackoffSchedule::new(vec![std::time::Duration::from_secs(60)], max_attempts)
     }
 
-    /// A synced issue-backed task in workspace `ws` with a populated
-    /// `synced_baseline` snapshot AND one local title edit already
-    /// applied — the diff-driven PATCH (rpl-x2v) needs a non-empty
-    /// `MirrorPatch` to fire, so most drainer tests want a baseline task
-    /// with something for the diff to compare against. The Promote
-    /// snapshot (with the original title `task {remote_id}`) becomes the
-    /// baseline; the title is then bumped to `{remote_id}-edited` and
-    /// saved with LocalEdit so the in-memory task is dirty but the
-    /// baseline is unchanged. Tests that want a clean baseline (e.g. the
-    /// "skip on empty patch" assertion) can ignore this state and rely on
-    /// the live-vs-baseline equality.
+    /// A promoted task with a populated `synced_baseline` AND one
+    /// local title edit already applied. The Promote snapshot
+    /// (title `task {remote_id}`) becomes the baseline; the title
+    /// is then bumped to `{remote_id}-edited` and saved as
+    /// LocalEdit so the in-memory task is dirty but the baseline is
+    /// unchanged. Tests wanting a clean baseline can revert the
+    /// title before enqueue.
     async fn seed_issue_task(h: &Harness, ws: WorkspaceId, remote_id: &str) -> Task {
         let mut t = Task::new_draft(ws, None, format!("task {remote_id}")).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", remote_id))
             .unwrap();
         h.tasks.save(&t, SnapshotSource::Promote).await.unwrap();
-        // Make a one-shot title edit so `diff_against_baseline()` is
-        // non-empty by default. Tests that don't want this can re-promote
-        // the baseline with another `set_synced_baseline` call, or revert
-        // the title before enqueue.
+        // One-shot title edit so `diff_against_baseline()` is non-empty.
         t.set_title(format!("{remote_id}-edited")).unwrap();
         h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
         t
@@ -705,11 +694,10 @@ mod tests {
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
         let mut task = seed_issue_task(&h, ws, "1").await;
-        // Drive to Done so the drainer should send (closed=true, Completed).
-        // Save with LocalEdit (the user's lifecycle change) so the baseline
-        // stays at the Promote snapshot — saving as Push would re-baseline
-        // the task and the diff-driven PATCH (rpl-x2v) would have nothing
-        // to send. The drainer re-derives from the live task + baseline.
+        // Drive to Done so the drainer should send (closed=true,
+        // Completed). Save as LocalEdit so the baseline stays at the
+        // Promote snapshot; saving as Push would re-baseline and
+        // leave nothing to send.
         task.start().unwrap();
         task.complete().unwrap();
         h.tasks
@@ -1296,15 +1284,11 @@ mod tests {
 
     #[tokio::test]
     async fn drain_update_remote_sends_only_changed_fields() {
-        // The drainer's UpdateRemote arm goes through the same
-        // `build_update_from_patch` helper as push (rpl-x2v). A live
-        // title-only edit must PATCH only `title`; body/closed/
-        // state_reason/assignees stay None so the GitHub adapter omits
-        // them from the JSON body (rpl-ffv, three-state semantics).
+        // Title-only edit must PATCH only `title`; the other
+        // fields stay None so the adapter omits them.
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
-        // Promote a task then edit only the title — body, status, and
-        // assignees stay at the Promote-time baseline.
+        // Promote then edit only the title.
         let mut task = Task::new_draft(ws, None, "original".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(RemoteRef::new("github", "1"))

@@ -153,14 +153,11 @@ impl SyncService {
         }
 
         if snapshot_dirty {
-            // Build the PATCH from the field-level diff against the synced
-            // baseline (rpl-x2v). The shared `build_update_from_patch` helper
-            // is the single point that decides which fields ride the PATCH
-            // (only the ones that actually changed) and when the remote call
-            // is skipped entirely (empty patch ⇒ no PATCH, the push still
-            // confirms synced). This matches the outbox drainer's
-            // `UpdateRemote` arm — they cannot diverge on wire shape or skip
-            // rule because they go through the same function.
+            // Build the PATCH from the live-vs-baseline diff. The shared
+            // helper is the single point that decides which fields ride
+            // the PATCH and when the call is skipped (empty patch ⇒
+            // no PATCH). The drainer's `UpdateRemote` arm goes through
+            // the same function — no drift possible.
             let patch = task.diff_against_baseline();
             let canonical_repo = filing_canonical.clone();
             let remote_id = remote.remote_id.clone();
@@ -1173,8 +1170,7 @@ mod tests {
             Some("ship it")
         );
         // The node id from the REST create response is captured onto the
-        // RemoteRef and persisted, so the promoted task is board-eligible
-        // (rpl-4ui — the create/promote half of the bug).
+        // RemoteRef and persisted, so the promoted task is board-eligible.
         let saved = tasks.get(task.id).await.unwrap();
         assert_eq!(
             saved.remote.unwrap().node_id.as_deref(),
@@ -1278,10 +1274,8 @@ mod tests {
 
     #[tokio::test]
     async fn push_sends_only_changed_fields() {
-        // The PATCH is built from the live-vs-baseline diff (rpl-x2v):
-        // a title-only edit PATCHes only `title`, NOT body/closed/
-        // state_reason. The old hard-coded builder would have re-sent
-        // the whole snapshot. Asserting the field-level shape here is
+        // Title-only edit PATCHes only `title`, not body/closed/
+        // state_reason. Asserting the field-level shape here is
         // the load-bearing test for the helper.
         let (svc, tasks, task, provider) = setup().await;
         svc.promote(&task.id.to_string()).await.unwrap();
@@ -1314,26 +1308,18 @@ mod tests {
     #[tokio::test]
     async fn push_skips_remote_call_when_no_field_changed() {
         // Title-equivalent push: the task is DirtyLocal (so push's
-        // "nothing to do" gate doesn't reject it) but no MIRRORED field
-        // actually differs from the baseline. The helper short-circuits
-        // to None, so the remote is never PATCHed. The push still
-        // confirms synced and the summary records the PushLocal decision
-        // (the snapshot axis did run, it just had nothing to send).
+        // "nothing to do" gate doesn't reject it) but no mirrored
+        // field actually differs from the baseline. The helper
+        // short-circuits to None, so the remote is never PATCHed. The
+        // push still confirms synced and the summary records the
+        // PushLocal decision (the snapshot axis ran but had nothing
+        // to send).
         //
-        // The state setup: a promoted task at `setup` time already has a
-        // baseline and the live state matches it (Synced). The cleanest
-        // way to reach "DirtyLocal + empty diff" is to drive a field
-        // change that does NOT participate in dirty detection — the
-        // project board's status option id (rpl-style) is one such
-        // field, but a simpler route is: edit a comment. Comments are
-        // deliberately excluded from `reconcile_dirty_against_baseline`
-        // (the doc comment on `Task::comments` calls this out
-        // explicitly), so a comment edit won't perturb the diff.
+        // Reaching "DirtyLocal + empty diff" cleanly: just
+        // `mark_dirty_local()` directly. The task flips Synced →
+        // DirtyLocal with no field change, so the diff stays empty.
         let (svc, tasks, task, provider) = setup().await;
         svc.promote(&task.id.to_string()).await.unwrap();
-        // `mark_dirty_local` flips Synced→DirtyLocal directly; the task
-        // still has no field diff. Save with LocalEdit so the persisted
-        // row reflects the new state.
         let mut t = tasks.get(task.id).await.unwrap();
         t.mark_dirty_local().unwrap();
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
