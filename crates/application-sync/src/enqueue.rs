@@ -407,24 +407,25 @@ mod tests {
         match m {
             OutboxMutation::UpdateRemote {
                 title,
-                body,
+                body: _,
                 closed,
                 ..
             } => {
-                // The captured title/body still come from the live task
-                // (the planner's `Some(task.title.clone())` literal) —
-                // that part is allowed and is the only way to keep the
-                // row well-formed for the outbox's serde shape.
+                // The captured title comes from the live task
+                // (the planner's `Some(task.title.clone())` literal).
+                // The literal is allowed — it's the only way to keep
+                // the row well-formed for the outbox's serde shape —
+                // but the D4 invariant is that the drainer ignores
+                // this captured value and re-derives from the live
+                // task via `build_update_from_patch`.
+                //
+                // Body assertion intentionally OMITTED: the planner
+                // literally clones `task.body`, so asserting
+                // `body.as_deref() == Some(t.body.as_str())` is a
+                // tautology that always passes. The body half of the
+                // D4 invariant is pinned at the drainer side
+                // (`update_remote_pushes_live_task_title_body_not_payload_snapshot`).
                 assert_eq!(title.as_deref(), Some("issue title"));
-                // body is "" from `Task::new_draft`; the planner's
-                // literal hand-rolls this from the live task, so we
-                // assert the round-trip is consistent rather than
-                // asserting a specific body value.
-                assert_eq!(body.as_deref(), Some(t.body.as_str()));
-                // The D4 invariant: `closed` is None at enqueue time. The
-                // drainer re-derives closed/state_reason from the live
-                // status via `build_update_from_patch` and
-                // `lifecycle_to_remote_state`.
                 assert!(
                     closed.is_none(),
                     "closed must be None at enqueue time — drainer re-derives from live status (RFC 0003 D4)"

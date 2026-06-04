@@ -278,22 +278,16 @@ impl SyncService {
                 // Direct field assignment (bypassing setter helpers that would
                 // re-trigger dirty detection against the OLD baseline). Status is
                 // intentionally NOT overwritten — GitHub's open/closed doesn't
-                // map onto our 5-state lifecycle cleanly.
-                //
-                // The three-field shape is the inbound mirror set (RFC 0003
-                // §2 D7) and MUST stay in lockstep with
-                // `inbound_mirrors_baseline`'s signature. The tripwire for
-                // drift here is the test
-                // `pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
-                // — the pull path already routed through
-                // `remote_mirrors_baseline` to make this `PullRemote`
-                // decision, so re-asserting it here is a no-op for
-                // correctness. (The relink site at `link` keeps its
-                // `debug_assert!` because relink has no analogous
-                // upstream drift check.)
-                task.title = snap.title.clone();
-                task.body = snap.body.clone();
-                task.assignees = snap.assignees.clone();
+                // map onto our 5-state lifecycle cleanly. Routed through
+                // `copy_inbound_mirror_from_snap` so the 3-field copy
+                // shape is a single function signature, not a literal
+                // hand-rolled at two call sites.
+                crate::copy_inbound_mirror_from_snap(
+                    &mut task,
+                    &snap.title,
+                    &snap.body,
+                    &snap.assignees,
+                );
                 task.confirm_synced(SnapshotSource::Pull)?;
                 self.tasks.save(&task, SnapshotSource::Pull).await?;
             }
@@ -434,28 +428,26 @@ impl SyncService {
                 .provider
                 .fetch_remote(new_canonical, new_remote_id)
                 .await?;
-            // Same inbound-mirror-set contract as the pull copy-back: the
-            // field list MUST stay in lockstep with
-            // `inbound_mirrors_baseline`. Routes through the helper rather
-            // than inlining the three-field compare so a future PR that
-            // adds a field to the helper's signature gets a compile
-            // error here too. The test
-            // `relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
-            // pins the post-relink invariant end-to-end.
-            debug_assert!(
-                !crate::inbound_mirrors_baseline(
-                    &snap.title,
-                    &snap.body,
-                    &snap.assignees,
-                    task.synced_baseline
-                        .as_ref()
-                        .expect("relink rewrite requires a baseline"),
-                ),
-                "relink rewrite should not be a no-op; the helper's three-field shape is the contract"
+            // Routed through the shared copy helper so the 3-field shape
+            // is a single function signature. The post-relink invariant
+            // (live task matches the new Pull baseline on the inbound
+            // set) is pinned end-to-end by
+            // `relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`.
+            //
+            // Note: a same-content relink (new remote has identical
+            // title/body/assignees to the pre-relink baseline) is
+            // legitimate — the user is pointing at a moved issue whose
+            // content hasn't changed, e.g. an org-wide repo rename
+            // without content edit. The pre-condition check
+            // `!helper(snap, baseline)` was REMOVED for that reason; it
+            // would have panicked on a same-content relink in debug
+            // builds after `fetch_remote` already succeeded.
+            crate::copy_inbound_mirror_from_snap(
+                &mut task,
+                &snap.title,
+                &snap.body,
+                &snap.assignees,
             );
-            task.title = snap.title;
-            task.body = snap.body;
-            task.assignees = snap.assignees;
             // The fetched snapshot is the authoritative target, so carry its
             // node id onto the relinked ref — a relinked task should be just as
             // board-eligible as a freshly promoted one (RFC 0001 §9 / §D1).

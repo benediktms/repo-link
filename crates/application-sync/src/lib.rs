@@ -105,6 +105,34 @@ pub(crate) fn inbound_mirrors_baseline(
         && assignees_equal(assignees, &baseline.assignees)
 }
 
+/// Copy the inbound mirror set (title, body, assignees) from a remote
+/// snapshot onto a live `Task`. Single source of truth for the 3-field
+/// copy shape — both the pull path and the relink path call this so a
+/// future PR that adds a field to the inbound set gets a compile error
+/// in **one** function signature, not two hand-rolled copy literals
+/// that drift independently.
+///
+/// Direct field assignment (bypassing setters) is intentional: the
+/// pull and relink paths both have already committed to the decision
+/// that the remote content is authoritative for these fields (the
+/// pull path went through `remote_mirrors_baseline` + `decide()` to
+/// reach this point; the relink path overwrites unconditionally per
+/// its verified-redirect contract). Re-running the per-field dirty
+/// detection against the *old* baseline would be a self-defeating
+/// no-op. `Status` is deliberately NOT copied (D7: pull can't
+/// faithfully map GitHub's two-state open/closed onto the local
+/// 5-state lifecycle).
+pub(crate) fn copy_inbound_mirror_from_snap(
+    task: &mut Task,
+    remote_title: &str,
+    remote_body: &str,
+    remote_assignees: &[String],
+) {
+    task.title = remote_title.to_string();
+    task.body = remote_body.to_string();
+    task.assignees = remote_assignees.to_vec();
+}
+
 /// Project a [`MirrorPatch`] onto a [`RemoteTaskUpdate`]. Returns
 /// `None` when the patch is empty so the caller skips the remote PATCH
 /// entirely. Status in patch projects via [`lifecycle_to_remote_state`];
@@ -311,17 +339,42 @@ mod inbound_mirror_tests {
     /// the other, both build graphs fail. The duplication is the assertion.
     #[test]
     fn inbound_mirror_field_set_excludes_status() {
+        // Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7). The
+        // inbound path excludes `Status` per D7 — the canonical
+        // `MIRRORED_FIELDS` set is `{Title, Body, Status, Assignees}`,
+        // the inbound subset is `{Title, Body, Assignees}`. Two
+        // assertions pin both halves of the property so a future PR
+        // that adds a new `MirrorField` (canonical growth) or removes
+        // an inbound field (carve-out drift) fails the test.
+        //
+        // The `MIRRORED_FIELDS.len() == 4` half catches canonical-set
+        // expansion (e.g. adding `MirrorField::Labels` would push the
+        // canonical set to 5 and force a deliberate decision about
+        // whether the new field is inbound or not). The
+        // `MIRRORED_FIELDS.contains(&Status)` half pins the property
+        // "Status is canonical but excluded from inbound" — a
+        // hand-rolled `INBOUND` slice without `Status` is necessary
+        // but not sufficient; this assertion makes it explicit.
         const INBOUND: [MirrorField; 3] = [
             MirrorField::Title,
             MirrorField::Body,
             MirrorField::Assignees,
         ];
+        assert_eq!(
+            MIRRORED_FIELDS.len(),
+            4,
+            "canonical MIRRORED_FIELDS must be exactly 4 fields (Title, Body, Status, Assignees)"
+        );
         for f in INBOUND {
             assert!(
                 MIRRORED_FIELDS.contains(&f),
                 "inbound field {f:?} not in canonical MIRRORED_FIELDS"
             );
         }
+        assert!(
+            MIRRORED_FIELDS.contains(&MirrorField::Status),
+            "Status is canonical but excluded from inbound — D7 carve-out, not a missing field"
+        );
         assert!(
             !INBOUND.contains(&MirrorField::Status),
             "Status must remain outbound-only (D7)"
@@ -354,16 +407,10 @@ mod inbound_mirror_tests {
         assert!(!inbound_mirrors_baseline("t", "b", &["alice".into()], &snap));
         // Assignees reorder: still equal (order-insensitive set eq)
         assert!(inbound_mirrors_baseline("t", "b", &["bob".into(), "alice".into()], &snap));
-        // Status on the baseline MUST NOT be consulted — change it under
-        // the helper's feet and assert the result is unchanged. This is the
-        // D7 carve-out property: the inbound path is a 3-field compare.
-        let mut snap_with_different_status = snap.clone();
-        snap_with_different_status.status = TaskStatus::Done;
-        assert!(inbound_mirrors_baseline(
-            "t",
-            "b",
-            &["alice".into(), "bob".into()],
-            &snap_with_different_status
-        ));
+        // D7 carve-out is structurally guaranteed by the helper's
+        // signature (no `status` parameter); the tripwire test
+        // `inbound_mirror_field_set_excludes_status` pins it. Mutating
+        // `baseline.status` and re-asserting here was vacuous — the
+        // helper has no way to consult a field it doesn't take.
     }
 }

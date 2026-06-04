@@ -951,17 +951,34 @@ mod tests {
         // the place that decision gets encoded: extend the `INBOUND`
         // slice here AND extend the matching literal in
         // `application-sync`'s `inbound_mirror_field_set_excludes_status`.
+        //
+        // `MIRRORED_FIELDS.len() == 4` pins canonical-set growth: a
+        // 5th `MirrorField` (e.g. `Labels` from RFC 0003 D8) would
+        // force a deliberate decision about whether the new field is
+        // inbound. The `MIRRORED_FIELDS.contains(&Status)` half pins
+        // "Status is canonical but excluded from inbound" — a
+        // hand-rolled INBOUND without Status is necessary but not
+        // sufficient; the assertion makes the carve-out explicit.
         const INBOUND: [MirrorField; 3] = [
             MirrorField::Title,
             MirrorField::Body,
             MirrorField::Assignees,
         ];
+        assert_eq!(
+            MIRRORED_FIELDS.len(),
+            4,
+            "canonical MIRRORED_FIELDS must be exactly 4 fields (Title, Body, Status, Assignees)"
+        );
         for f in INBOUND {
             assert!(
                 MIRRORED_FIELDS.contains(&f),
                 "inbound field {f:?} missing from canonical MIRRORED_FIELDS"
             );
         }
+        assert!(
+            MIRRORED_FIELDS.contains(&MirrorField::Status),
+            "Status is canonical but excluded from inbound — D7 carve-out, not a missing field"
+        );
         assert!(
             !INBOUND.contains(&MirrorField::Status),
             "Status must remain outbound-only (D7) — pulling the REST closed bit into the local 5-state lifecycle is out of scope"

@@ -121,27 +121,44 @@ mod tests {
     /// open/closed back into the 5-state lifecycle is out of scope. If a
     /// future refactor folds `closed` into the comparison, this test fails
     /// and forces a re-think.
+    ///
+    /// The load-bearing assertion is that `closed=true` and `closed=false`
+    /// produce the *same* result: the helper chain reads
+    /// `title/body/assignees` and never `closed`, so flipping `closed`
+    /// cannot change the answer. The earlier version of this test only
+    /// checked `closed=true` against the baseline, which would pass
+    /// identically for `closed=false` — vacuous, since the helper
+    /// can't tell the difference. Parameterizing over both `closed`
+    /// values makes the D7 carve-out an actual property of the
+    /// comparison rather than of the literal.
     #[test]
     fn remote_mirrors_baseline_ignores_status() {
         let base = baseline(TaskStatus::Open);
-        let snap = any_remote_snap(
+        let snap_closed = any_remote_snap(
             base.title.clone(),
             base.body.clone(),
             base.assignees.clone(),
-            // closed differs from the baseline's open lifecycle.
             true,
         );
-        assert!(
-            remote_mirrors_baseline(&snap, &base),
-            "remote_mirrors_baseline must ignore closed (D7)"
+        let snap_open = any_remote_snap(
+            base.title.clone(),
+            base.body.clone(),
+            base.assignees.clone(),
+            false,
         );
-
-        // And: a real field change (title) must still trip the check.
+        assert_eq!(
+            remote_mirrors_baseline(&snap_closed, &base),
+            remote_mirrors_baseline(&snap_open, &base),
+            "closed must not affect the drift verdict (D7)"
+        );
+        // And: a real field change (title) must still trip the check,
+        // independent of `closed`. Use the closed=true form to exercise
+        // the harder-of-two inputs.
         let snap_title_differs = any_remote_snap(
             "different".into(),
             base.body.clone(),
             base.assignees.clone(),
-            false,
+            true,
         );
         assert!(
             !remote_mirrors_baseline(&snap_title_differs, &base),
