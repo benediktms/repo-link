@@ -94,14 +94,6 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
 /// helper exists in parallel with [`MirrorField::differs`]: detection on
 /// the issue-axis walks all four fields, but the inbound path excludes
 /// `Status` because we cannot faithfully invert the open/closed bit.
-//
-// `#[allow(dead_code)]` is temporary scaffolding for the split-commit
-// PR shape: the helper is introduced in this commit but the call site
-// in `summary::remote_mirrors_baseline` is wired up in the follow-up
-// commit. The `inbound_mirror_tests` module exercises the helper under
-// `cargo test`; the lint is misleading on a non-test build. Remove the
-// allow once the call site lands.
-#[allow(dead_code)]
 pub(crate) fn inbound_mirrors_baseline(
     title: &str,
     body: &str,
