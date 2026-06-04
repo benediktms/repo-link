@@ -147,12 +147,14 @@ field on `Task`): `derive_display_status(&Task, relations: &[TaskRelation], &Pro
 The relations slice is the *same* data the relations engine filters by
 `RelationKind::BlockedBy` to answer "is this task blocked?" — the
 display and the predicate share one query. The helper is a pure
-function; the service that composes it does the relations query.### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
+function; the service that composes it does the relations query.
+
+### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
 
 The `tasks` table gains a `synced_at: Option<Timestamp>` column. The
 column is genuinely fresh — no prior column carried this signal. The
 existing `project_status_option_id` cache is a value-only column
-(`20260529000004_task_project_status_cache.sql:15`) with no
+(in the migration that adds `project_status_option_id`) with no
 companion timestamp. The closest pre-existing "last synced" signal
 is `remote_mappings.last_synced_at` (a per-`(task, repo, remote_id)`
 row, not per-task) — semantically different and not a valid
@@ -188,11 +190,18 @@ when the PATCH didn't set them, per D5).
 it to decide per-task whether to fetch. Other readers (the DTO
 freshness annotation, the `--refresh` flag's threshold check, the
 failed-refresh annotation) read the column as a per-row projection
-on an already-loaded task — no JOIN, no extra query. The unified
-abstraction is `synced_at + budget < now() -> needs_refetch`, with
-the `Duration` budget passed by each caller. The named budgets
-(poller: 5min; `--refresh`: 60s) live as `pub const` next to the
-function.
+on an already-loaded task — no JOIN, no extra query. The unified abstraction is `needs_refetch(synced_instant, now_instant, budget) -> bool`.
+The **threshold delta** uses `std::time::Instant` (monotonic,
+clock-skew-safe) carried in-memory as `Task.synced_instant:
+Option<Instant>`. The **display string** uses the wall-clock
+`Timestamp` carried on the `tasks` row as `synced_at: Option<Timestamp>`
+(written *atomically* with the `Instant`: same `cache_synced_at`
+repository call writes both). The named budgets (poller: 5min;
+`--refresh`: 60s) live as `pub const` next to the function. The
+`needs_refetch` helper takes `Instant` and `Duration`, never
+`Timestamp` and `now()`. On process restart, `synced_instant` is
+`None` (treated as stale) — the poller's first tick refreshes
+everything, which is the same shape as the post-migration burst.
 
 ```sql
 SELECT tasks.* FROM tasks
@@ -200,6 +209,8 @@ JOIN workspaces ON workspaces.id = tasks.workspace_id
 WHERE workspaces.status = 'active'
   AND tasks.project_item_id IS NOT NULL
   AND (tasks.synced_at IS NULL OR tasks.synced_at < ?)
+ORDER BY tasks.synced_at ASC NULLS FIRST
+LIMIT 200
 ```
 
 The `?` is the poller's tick boundary — `now() - poll_budget`. Tasks
@@ -231,7 +242,7 @@ silent regression where `Deleted` is omitted will fail the test.
 
 | Caller | Budget | Rationale |
 |---|---|---|
-| Poller (background) | 5 min default | 1,200 fetches/hour for a 100-task workspace (12 polls/hour × 100 tasks); well within GitHub's 5,000 req/h rate limit. 5 min budget supports up to ~415 tasks per workspace at steady state (415 × 12 = ~4,980 fetches/hour); larger workspaces need adaptive budgets (**shipped: `LIMIT` 200 per tick to bound burst cost; out of scope: per-workspace adaptive budget — flagged for followup**). |
+| Poller (background) | 5 min default | At steady state with `LIMIT 200` per tick, the poller fetches `200 × 12 = 2,400 fetches/hour` regardless of workspace size (the per-tick cap absorbs large workspaces). Below 200 tasks, the cost is `N × 12 fetches/hour` (e.g. 100 tasks = 1,200 fetches/hour; 200 tasks = 2,400 fetches/hour). Well within GitHub's 5,000 req/h rate limit in all cases. **Without the `LIMIT`, the uncapped rate is `N × 12`**; the 415-task ceiling the §5 Risks section cites is the un-capped math. The `LIMIT 200` is what makes the design safe at the boundary. |
 | `task show --refresh` (on-demand) | 60s default | "I just looked at this; if I look again 30s later, show me the same thing; if I look 90s later, refresh." Tuned for user-experience, not batch budget. |
 
 A poller `LIMIT` (default 200 per tick) prevents the post-migration
@@ -266,8 +277,29 @@ distinction without expanding the verb surface.
 
 `rl task block` / `rl task unblock` are removed. Blocking is now
 expressed via `rl task relate <this> blocked_by <that>`. The
-`start` / `complete` / `archive` verbs survive as direct setters
-on `is_open` + `state_reason`.
+verbs that survive as direct setters on `is_open` + `state_reason`:
+
+- **`rl task start`** — `is_open = true, state_reason = None` (the
+  "fresh open since creation" state; for a fresh task).
+- **`rl task complete`** — `is_open = false, state_reason = Some(Completed)`.
+- **`rl task archive`** — `is_open = false, state_reason = Some(NotPlanned)`.
+- **`rl task reopen`** — `is_open = true, state_reason = Some(Reopened)`.
+  Required because the only way to get *back to* open with a reason
+  is via the `Reopened` marker; without an explicit verb, a
+  closed task has no path back to open. The `start` verb on a
+  closed task is **not** a reopen — `start` is a no-op on a
+  task with `is_open = true`, and on a closed task it errors
+  ("use `rl task reopen` to transition a closed task to open").
+  `reopen` is a new verb in this RFC; the lifecycle editor
+  shape is `start | complete | archive | reopen`, four verbs
+  covering the four `(is_open, state_reason)` half-transitions.
+
+The lifecycle is editorial: any state can transition to any other
+state without an enforced order (per D1). The four verbs are
+*shorthands* for the four most common transitions; a user with an
+unusual need (e.g. `is_open = true, state_reason = None` → `is_open
+= false, state_reason = Some(NotPlanned)` in one step) can use
+the direct setter exposed on the `TaskService`.
 
 ### D5 — Drainer response disposition is a 3-state machine; not "stamp vs. no-stamp"
 
@@ -300,9 +332,9 @@ corresponding `apply` arms. The disposition per arm:
 
 | Variant | Response shape | Stamped iff | Disposition tripwire |
 |---|---|---|---|
-| `UpdateRemote` | `RemoteTaskSnapshot` (REST `update_issue` returns the updated issue) | `response.assignees == sent.assignees \|\| response.assignees == []` (D5 carve-out; see D3 — "PATCH response reflects `assignees=[]` when the PATCH didn't set them") | injects a port that returns wrong `assignees`; asserts `Conflict` |
-| `AddItem` | new `project_item_id: String` | `project_item_id.is_some()` | injects a port that returns `None`; asserts `Conflict` |
-| `CreateDraftIssue` | new `project_item_id: String` | `project_item_id.is_some()` | same as `AddItem` |
+| `UpdateRemote` | `RemoteTaskSnapshot` (REST `update_issue` returns the updated issue) | `response.assignees == sent.assignees` OR (`sent.assignees.is_empty()` AND `response.assignees.is_empty()`) (the empty-empty case is the legitimate "we didn't set assignees, API confirms" — the `[]` is **not** a free pass when assignees were sent). | injects a port that returns wrong `assignees`; asserts `Conflict` |
+| `AddItem` | new `project_item_id: Option<String>` | `project_item_id.is_some()` (the `Option` is the port's "couldn't attach" signal — `Some` means the remote gave back an id, `None` means the attach silently failed) | injects a port that returns `None`; asserts `Conflict` |
+| `CreateDraftIssue` | new `project_item_id: Option<String>` | `project_item_id.is_some()` | same as `AddItem` |
 | `UpdateDraftIssue` | `()` (fire-and-forget port) | HTTP success (no body to compare) | injects a port that returns `Err`; asserts `Retry` |
 | `ConvertDraftToIssue` | `(issue_node_id, issue_number)` | both fields parse as `I_*` and a positive integer | injects a port that returns junk; asserts `Conflict` |
 | `SetProjectStatus` | new field value (GraphQL) | `response.option_id == sent.option_id` | injects a port that returns the wrong `option_id`; asserts `Conflict` |
@@ -429,14 +461,24 @@ explain the gap.
   rejected, and may re-derive the wrong shape. Mitigation: a
   doc-comment on the `ConflictKind` enum itself explaining
   the gap and pointing at RFC 0004 D1 + RFC 0003 §6 OQ5.
-- **The `synced_at` semantics drift.** Today it's the
-  "project-status cache freshness" stamp; post-RFC it's the
-  "remote-observation freshness" stamp. Any code that reads
-  `synced_at` and assumes the narrow reading (e.g. "this is the
-  last time the project status was refreshed, not the last time
-  anything was observed") will be wrong. Mitigation: rename +
-  backfill, plus a search-and-replace for any consumer that
-  read the old column.
+- **The `synced_at` semantics drift.** Today the codebase has
+  no per-task project-status timestamp column; the closest
+  is `remote_mappings.last_synced_at`, which is a different
+  axis (per-`(task, repo, remote_id)` row, not per-task). The
+  new `synced_at` column is *the* per-task "remote-observation
+  freshness" stamp — its only consumer today is the poller;
+  the DTO display reads it for the "Last refreshed" line; the
+  `--refresh` flag reads it for the threshold check. The risk
+  is that a future reader assumes a narrow reading the column
+  doesn't carry (e.g. "this is the last time the project status
+  was refreshed, not the last time the title or assignees
+  changed"). Mitigation per Phase 1: a pure `ADD COLUMN` with
+  no backfill and no rename — the column starts `NULL` for
+  every existing task, meaning "never observed" is the only
+  initial value, which is unambiguously the wide reading. A
+  search-and-replace for any consumer that previously read
+  `remote_mappings.last_synced_at` and assumed it implied
+  `synced_at` covers the same meaning.
 - **The per-workspace gate interacts with workspace state
   transitions.** When a workspace is paused, its tasks' `synced_at`
   is not touched. The tasks stay "fresh" (stale column, fresh stamp)
@@ -590,6 +632,15 @@ an answer. (Risks and non-goals cover the rest.)
   in `application-task` (or wherever the DTO is composed).
 - `TaskDto` carries the new fields. CLI rendering updated.
 - The freshness line is rendered only on `is_mirror(task) == true`.
+- `DriftRow` (in `application-query`) gains a `last_refreshed_at:
+  Option<Timestamp>` field. The `query drift` view surfaces this
+  alongside the `reasons` list, so a user seeing a `project_status`
+  drift reason also sees *when* the cache was last observed. A
+  `project_status` reason with a 3-day-old `last_refreshed_at` is
+  qualitatively different from one with a 30-second-old stamp —
+  the former might be a stale-cache artifact, the latter is
+  real-time disagreement. Without the timestamp, the drift view
+  is the same shape as the current `query drift` output.
 
 ### Phase 3 — CLI
 
@@ -613,8 +664,13 @@ an answer. (Risks and non-goals cover the rest.)
   burst on a 1000-task workspace and the steady-state cost
   above 400 tasks per workspace. Tasks beyond the `LIMIT` defer
   to the next tick; they are not lost.
-- Per-task: on successful fetch, stamp `synced_at` via
-  `TaskRepository::cache_synced_at(task_id, ts, Polled)`.
+- Per-task: on successful fetch, route through the
+  `mark_synced(task_id, SyncedSource::Polled, synced_instant)` helper
+  (added in Phase 1 alongside `TaskRepository::cache_synced_at`).
+  The helper is the **only** call site for the per-task stamp; the
+  runtime assertion that `source == SyncedSource::Polled` at this
+  call site is the tripwire. Direct `cache_synced_at` calls
+  bypass the tripwire and are forbidden (a code review rule).
 
 ### Phase 5 — Drainer
 
@@ -645,7 +701,7 @@ an answer. (Risks and non-goals cover the rest.)
   these ports' signatures.
 - **Drainer's `enqueue_status_follow_up`** (the lazy
   `AddItem` / `CreateDraftIssue` write-back at
-  `drainer.rs:570-602`) enqueues a follow-up `SetProjectStatus`
+  the drainer's `enqueue_status_follow_up` helper) enqueues a follow-up `SetProjectStatus`
   after the initial `AddItem` succeeds. The two arms are
   applied serially; each arm's disposition is computed
   independently. A successful `AddItem` followed by a
@@ -659,8 +715,39 @@ an answer. (Risks and non-goals cover the rest.)
 - All existing tests that construct `Task`s with `TaskStatus`
   variants are updated to use the new direct setters. The
   compiler is the migration guide.
-- New tripwire tests in `domain-task` and `application-sync`
-  (per the testing strategy above).
+- **Eight new tripwires** (in `domain-task` and `application-sync`),
+  one per locked decision:
+  1. `TaskStatus` enum deletion — grep the workspace for
+     `TaskStatus::` and assert zero matches.
+  2. `synced_at` stamp discipline — a `mark_synced` helper is the
+     **only** call site; runtime assertion that `source` matches
+     the call site (drainer = `Push`, poller = `Polled`, pull path
+     = `Pull`).
+  3. Poller gate — the SQL `JOIN workspaces … WHERE status = 'active'`
+     clause is present and correct.
+  4. Drainer response inspection — for each of the 10
+     `OutboxMutation` arms, a per-arm tripwire (the D5 table) that
+     injects a port returning the wrong response and asserts the
+     right disposition (`Stamped` / `Retry` / `Conflict`).
+  5. `last_refreshed_at` on `DriftRow` — guard against the field
+     being dropped from the drift view (the prior /code-review
+     pass raised this).
+  6. `synced_instant` vs `synced_at` discipline — guard against the
+     threshold check being moved to `synced_at` (the clock-skew
+     mitigation).
+  7. "No re-baseline from response" — guard against a future
+     drainer that re-baselines from the PATCH response (RFC 0003
+     D5's invariant).
+  8. Display-layer composition — guard against
+     `derive_display_status` re-reading the aggregate relations
+     (must take `relations: &[TaskRelation]` as a parameter) and
+     accidentally rendering the freshness line on `LocalOnly`
+     tasks (must check `is_mirror`).
+- D1 invariant coverage: each of the four named invariants
+  (closed-with-reason, not-planned-cannot-be-open,
+  LocalOnly-must-not-have-remote, blocked_by-referential-integrity)
+  gets a unit test in `domain-task` — *not* a hand-wave "etc." The
+  tests are listed in §6.
 - `rpl-2l6` (the original `task show` display spike) is closed,
   pointing at this RFC.
 
