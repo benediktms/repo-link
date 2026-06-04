@@ -204,6 +204,14 @@ pub fn plan_mutations(
                 body: Some(task.body.clone()),
                 // The drainer re-derives (closed, state_reason) from the task's
                 // live status; this hint is informational only.
+                //
+                // The canonical mirrored-field set lives in
+                // `domain_task::MIRRORED_FIELDS`; the outbound projection in
+                // `build_update_from_patch` (RFC 0003 §2 D4). Adding a new
+                // `MirrorField` to the canonical set means updating that
+                // const + helper; this row's captured fields are
+                // intentionally coarse and are ignored at apply time
+                // (see `drainer::OutboxDrainer::apply` for `UpdateRemote`).
                 closed: None,
             });
         }
@@ -211,6 +219,13 @@ pub fn plan_mutations(
         // Draft content edit — drafts have no REST counterpart. Only emit on
         // an actual title/body change; a lifecycle-only transition moves the
         // project card (via SetProjectStatus below), not the draft content.
+        //
+        // Drafts are an assignee-less, status-less field set per RFC 0003
+        // §2 D7 — only the two text fields ride this mutation. The
+        // canonical set is `MIRRORED_FIELDS`; the draft carve-out is
+        // implicit in the port's `update_draft_issue(title, body)`
+        // signature. The drainer's `UpdateDraftIssue` arm re-derives
+        // title/body from the live task and ignores the captured fields.
         out.push(OutboxMutation::UpdateDraftIssue {
             item_node_id: task.project_item_id.clone().unwrap_or_default(),
             title: Some(task.title.clone()),
@@ -353,6 +368,70 @@ mod tests {
                 assert_eq!(body, "draft body");
             }
             other => panic!("expected CreateDraftIssue, got {other:?}"),
+        }
+    }
+
+    // --- D1 follow-up (rpl-47f): planner payload is intentionally coarse ----
+    //
+    // The UpdateRemote arm of `plan_mutations` hand-rolls a 2-field payload
+    // (title, body) and tags `closed: None`. The drainer ignores those
+    // captured fields and re-derives from the live task via
+    // `build_update_from_patch` (RFC 0003 §2 D4). This test pins down
+    // the *D4 invariant at the planner*: the planner does NOT carry the
+    // live assignees in the captured payload, and `closed` is always None
+    // at enqueue time (re-derived at apply time).
+    //
+    // If a future PR adds a new `MirrorField` to the canonical set and
+    // forgets to update the drainer, the drainer-side re-derive tests
+    // (`drainer::drainer_rerederives_assignees_from_live_task` and
+    // `drainer::update_remote_pushes_live_task_title_body_not_payload_snapshot`)
+    // catch the regression at apply time. This test is the planner-side
+    // contract that the on-disk payload stays coarse.
+
+    #[test]
+    fn plan_mutations_update_remote_payload_is_coarse_not_live() {
+        let mut t = make_issue_backed_mirror("I_nid_planner_coarse");
+        // Give the task live assignees that should NOT travel via the
+        // captured UpdateRemote payload (the drainer re-derives them).
+        t.assignees = vec!["alice".into(), "bob".into()];
+        // content_changed=true so the issue-backed arm emits UpdateRemote
+        // (otherwise the planner's `is_issue_backed` short-circuit
+        // would skip it on a lifecycle-only change).
+        let project = make_project("PVT_kwHO_enq_coarse");
+
+        let mutations = plan_mutations(&t, Some(&project), Some("github.com/o/r"), true);
+        let m = mutations
+            .iter()
+            .find(|m| m.kind() == "update_remote")
+            .expect("issue-backed must emit UpdateRemote");
+        match m {
+            OutboxMutation::UpdateRemote {
+                title,
+                body: _,
+                closed,
+                ..
+            } => {
+                // The captured title comes from the live task
+                // (the planner's `Some(task.title.clone())` literal).
+                // The literal is allowed — it's the only way to keep
+                // the row well-formed for the outbox's serde shape —
+                // but the D4 invariant is that the drainer ignores
+                // this captured value and re-derives from the live
+                // task via `build_update_from_patch`.
+                //
+                // Body assertion intentionally OMITTED: the planner
+                // literally clones `task.body`, so asserting
+                // `body.as_deref() == Some(t.body.as_str())` is a
+                // tautology that always passes. The body half of the
+                // D4 invariant is pinned at the drainer side
+                // (`update_remote_pushes_live_task_title_body_not_payload_snapshot`).
+                assert_eq!(title.as_deref(), Some("issue title"));
+                assert!(
+                    closed.is_none(),
+                    "closed must be None at enqueue time — drainer re-derives from live status (RFC 0003 D4)"
+                );
+            }
+            other => panic!("expected UpdateRemote, got {other:?}"),
         }
     }
 

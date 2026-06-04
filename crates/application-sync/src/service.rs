@@ -278,10 +278,16 @@ impl SyncService {
                 // Direct field assignment (bypassing setter helpers that would
                 // re-trigger dirty detection against the OLD baseline). Status is
                 // intentionally NOT overwritten — GitHub's open/closed doesn't
-                // map onto our 5-state lifecycle cleanly.
-                task.title = snap.title.clone();
-                task.body = snap.body.clone();
-                task.assignees = snap.assignees.clone();
+                // map onto our 5-state lifecycle cleanly. Routed through
+                // `copy_inbound_mirror_from_snap` so the 3-field copy
+                // shape is a single function signature, not a literal
+                // hand-rolled at two call sites.
+                crate::copy_inbound_mirror_from_snap(
+                    &mut task,
+                    &snap.title,
+                    &snap.body,
+                    &snap.assignees,
+                );
                 task.confirm_synced(SnapshotSource::Pull)?;
                 self.tasks.save(&task, SnapshotSource::Pull).await?;
             }
@@ -422,9 +428,26 @@ impl SyncService {
                 .provider
                 .fetch_remote(new_canonical, new_remote_id)
                 .await?;
-            task.title = snap.title;
-            task.body = snap.body;
-            task.assignees = snap.assignees;
+            // Routed through the shared copy helper so the 3-field shape
+            // is a single function signature. The post-relink invariant
+            // (live task matches the new Pull baseline on the inbound
+            // set) is pinned end-to-end by
+            // `relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`.
+            //
+            // Note: a same-content relink (new remote has identical
+            // title/body/assignees to the pre-relink baseline) is
+            // legitimate — the user is pointing at a moved issue whose
+            // content hasn't changed, e.g. an org-wide repo rename
+            // without content edit. The pre-condition check
+            // `!helper(snap, baseline)` was REMOVED for that reason; it
+            // would have panicked on a same-content relink in debug
+            // builds after `fetch_remote` already succeeded.
+            crate::copy_inbound_mirror_from_snap(
+                &mut task,
+                &snap.title,
+                &snap.body,
+                &snap.assignees,
+            );
             // The fetched snapshot is the authoritative target, so carry its
             // node id onto the relinked ref — a relinked task should be just as
             // board-eligible as a freshly promoted one (RFC 0001 §9 / §D1).
@@ -725,6 +748,24 @@ mod tests {
         InMemoryOutboxRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
         InMemoryWorkspaceRepository,
     };
+
+    /// Asserts the post-mutation task's inbound mirror set matches its
+    /// new baseline. Shared by the pull and relink copy-back tests
+    /// (`*_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`)
+    /// — both test the same property at the same point in the lifecycle
+    /// (right after the copy-back has run and the new baseline has been
+    /// captured). `context` is the test name fragment used in the
+    /// `expect`/`assert` messages so failures point at the right caller.
+    fn assert_inbound_set_matches_baseline(after: &Task, context: &str) {
+        let baseline = after
+            .synced_baseline
+            .clone()
+            .unwrap_or_else(|| panic!("post-{context} baseline"));
+        assert!(
+            crate::inbound_mirrors_baseline(&after.title, &after.body, &after.assignees, &baseline,),
+            "post-{context} task and baseline must agree on the inbound set ({context} resolved the drift)"
+        );
+    }
 
     #[derive(Clone)]
     struct RecordedUpdate {
@@ -1543,6 +1584,66 @@ mod tests {
         assert_eq!(after.sync, SyncState::Synced);
     }
 
+    /// Pins down the D7 inbound-mirror-set contract on the pull copy-back
+    /// site. The pull decision copies exactly three fields onto the local
+    /// task: `title`, `body`, `assignees`. This test asserts the
+    /// `inbound_mirrors_baseline` helper sees the same three fields on the
+    /// same task — so a future PR that adds a new field to the helper's
+    /// signature but forgets to update the copy-back literal fails here
+    /// (the helper's 4-field compare would not match the literal's 3-field
+    /// shape, and the test asserts "the helper disagrees, the literal
+    /// disagrees, both on the same fields").
+    ///
+    /// Concretely: build a remote snapshot whose `closed` differs from the
+    /// baseline's open lifecycle (a "drift" the inbound path MUST ignore
+    /// per D7). The helper returns `false` (drift detected, because
+    /// title differs). The copy-back literal at the pull site then runs
+    /// and overwrites the local task's title. The post-pull local task
+    /// should reflect the new title (the literal ran) AND the helper
+    /// should have disagreed (the drift-detection was live). Both halves
+    /// of the contract are exercised in one test.
+    #[tokio::test]
+    async fn pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // A different title — the helper WILL detect drift on this. The
+        // closed bit is also flipped to closed=true to exercise the D7
+        // property end-to-end: the helper must NOT consult `closed`, so
+        // the only reason the helper returns false is the title change.
+        let later = Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60));
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: "different title".into(),
+            body: "remote body".into(),
+            // closed differs from the local Open lifecycle — helper must
+            // ignore it (D7).
+            closed: true,
+            updated_at: later,
+            assignees: vec!["bob".into()],
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "pull_remote");
+        let after = tasks.get(task.id).await.unwrap();
+        // Copy-back ran: title/body/assignees reflect the remote. Status
+        // is NOT copied (D7) — after.status is whatever the local
+        // lifecycle was before pull, not the remote's closed bit.
+        assert_eq!(after.title, "different title");
+        assert_eq!(after.body, "remote body");
+        assert_eq!(after.assignees, vec!["bob".to_string()]);
+        // Cross-check: the helper's view of the baseline agrees that
+        // these three fields are the inbound set. Post-pull the
+        // baseline was just re-captured from the live task, so the
+        // helper MUST return true — this is the post-condition that
+        // makes `remote_mirrors_baseline` a no-op on the next pull
+        // (a re-pull of the same remote must produce a `Noop`).
+        assert_inbound_set_matches_baseline(&after, "pull");
+        assert_eq!(after.sync, SyncState::Synced);
+    }
+
     #[tokio::test]
     async fn pull_backfills_missing_remote_node_id_on_noop() {
         let (svc, tasks, task, provider) = setup().await;
@@ -1955,6 +2056,54 @@ mod tests {
         );
         // Baseline rewritten from the new remote → reconcile sees no diff.
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    /// Mirrors `pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
+    /// for the relink path. The relink copy-back overwrites the same three
+    /// fields (title, body, assignees) — if a future PR adds a new field to
+    /// the `inbound_mirrors_baseline` signature but forgets to update the
+    /// relink literal, the `debug_assert!` at the relink call site fires
+    /// and the post-relink task's inbound set will no longer match the
+    /// helper's view of the baseline (the literal missed a field). This
+    /// test exercises the path AND asserts the helper agrees post-relink.
+    #[tokio::test]
+    async fn relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+
+        provider.set_move_target("github.com/o2/r2", "1506");
+        // Closed differs from the local Open lifecycle — the helper must
+        // ignore it (D7) and the literal copy-back must not touch status.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "1506".into(),
+            node_id: Some("I_kwDOrelink1506".into()),
+            title: "relinked title".into(),
+            body: "relinked body".into(),
+            closed: true,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec!["alice".into(), "carol".into()],
+            labels: vec![],
+        });
+
+        let s = svc
+            .link(&task.id.to_string(), "github.com/o2/r2", "1506", true)
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "relinked");
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.title, "relinked title");
+        assert_eq!(after.body, "relinked body");
+        assert_eq!(
+            after.assignees,
+            vec!["alice".to_string(), "carol".to_string()]
+        );
+        // Cross-check: helper sees the same three fields the literal just
+        // copied. Post-relink, the baseline was re-captured from the new
+        // remote, so the helper MUST return true (live task matches the
+        // new baseline on the inbound set).
+        assert_inbound_set_matches_baseline(&after, "relink");
     }
 
     #[tokio::test]

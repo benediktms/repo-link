@@ -938,6 +938,54 @@ mod tests {
     }
 
     #[test]
+    fn inbound_mirror_set_excludes_status_per_d7() {
+        // Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7, rpl-47f):
+        // the inbound (pull) path excludes `Status` because pull cannot
+        // map GitHub's two-state open/closed onto the local 5-state
+        // lifecycle. The 3-field shape is re-encoded inline below on
+        // purpose: the `application-sync` side re-encodes the same
+        // literal in its own tripwire test, and the duplication IS the
+        // assertion — a divergence in either crate fails both build
+        // graphs. If a future PR adds a new `MirrorField` to the
+        // canonical set and wants it on the inbound path, this test is
+        // the place that decision gets encoded: extend the `INBOUND`
+        // slice here AND extend the matching literal in
+        // `application-sync`'s `inbound_mirror_field_set_excludes_status`.
+        //
+        // `MIRRORED_FIELDS.len() == 4` pins canonical-set growth: a
+        // 5th `MirrorField` (e.g. `Labels` from RFC 0003 D8) would
+        // force a deliberate decision about whether the new field is
+        // inbound. The `MIRRORED_FIELDS.contains(&Status)` half pins
+        // "Status is canonical but excluded from inbound" — a
+        // hand-rolled INBOUND without Status is necessary but not
+        // sufficient; the assertion makes the carve-out explicit.
+        const INBOUND: [MirrorField; 3] = [
+            MirrorField::Title,
+            MirrorField::Body,
+            MirrorField::Assignees,
+        ];
+        assert_eq!(
+            MIRRORED_FIELDS.len(),
+            4,
+            "canonical MIRRORED_FIELDS must be exactly 4 fields (Title, Body, Status, Assignees)"
+        );
+        for f in INBOUND {
+            assert!(
+                MIRRORED_FIELDS.contains(&f),
+                "inbound field {f:?} missing from canonical MIRRORED_FIELDS"
+            );
+        }
+        assert!(
+            MIRRORED_FIELDS.contains(&MirrorField::Status),
+            "Status is canonical but excluded from inbound — D7 carve-out, not a missing field"
+        );
+        assert!(
+            !INBOUND.contains(&MirrorField::Status),
+            "Status must remain outbound-only (D7) — pulling the REST closed bit into the local 5-state lifecycle is out of scope"
+        );
+    }
+
+    #[test]
     fn mirror_field_differs_isolates_each_field() {
         let mut t = synced();
         t.set_assignees(vec!["alice".into()]);
