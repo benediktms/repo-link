@@ -99,9 +99,15 @@ lifecycle is editorial: any state can transition to any other state
 without an enforced order. **Invariants** that remain:
 
 - A task with `is_open = false` MUST have a `state_reason` (a
-  closed task is closed *for a reason*).
+  closed task is closed *for a reason*). The valid set is
+  `Some(Completed | NotPlanned)` (an `is_open = false` task with
+  `state_reason = None` is malformed).
 - A task with `is_open = true` MUST NOT have
-  `state_reason = Some(NotPlanned)`.
+  `state_reason = Some(Completed | NotPlanned)` (open tasks cannot
+  carry a terminal-closure reason). A task with `is_open = true`
+  MAY have `state_reason = Some(Reopened)` (the marker for the
+  *transition* from closed to open, distinct from "open since
+  creation") or `state_reason = None`.
 - A `LocalOnly` task MUST NOT have `task.remote.is_some()` (the
   `promote_to_remote` transition is the only path that sets remote).
 - A task referenced in any `blocked_by` relation MUST exist
@@ -114,7 +120,7 @@ directly") becomes a valid transition.
 ### D2 — Display DTO is opaque; freshness annotation only on mirrored tasks
 
 The DTO is no longer a 1:1 mirror of the aggregate. A new layer
-(`derive_display_status(&Task, &Project) -> DisplayStatus`) composes:
+(`derive_display_status(&Task, relations: &[TaskRelation], &Project) -> DisplayStatus`) composes:
 
 - `is_open` + `state_reason` → the lifecycle label.
 - `blocked_by` (queried or carried) → "Blocked (by #N)" when non-empty.
@@ -141,9 +147,7 @@ field on `Task`): `derive_display_status(&Task, relations: &[TaskRelation], &Pro
 The relations slice is the *same* data the relations engine filters by
 `RelationKind::BlockedBy` to answer "is this task blocked?" — the
 display and the predicate share one query. The helper is a pure
-function; the service that composes it does the relations query.
-
-### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
+function; the service that composes it does the relations query.### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
 
 The `tasks` table gains a `synced_at: Option<Timestamp>` column. The
 column is genuinely fresh — no prior column carried this signal. The
@@ -227,7 +231,7 @@ silent regression where `Deleted` is omitted will fail the test.
 
 | Caller | Budget | Rationale |
 |---|---|---|
-| Poller (background) | 5 min default | 12 fetches/hour for a 100-task workspace; well within GitHub's 5000 req/h rate limit. 5 min is correct up to ~400 tasks per workspace; larger workspaces need a longer threshold or a per-project rate budget (**shipped: `LIMIT` on the poller's tick to bound per-tick cost; out of scope: per-workspace adaptive budget — flagged for followup**). |
+| Poller (background) | 5 min default | 1,200 fetches/hour for a 100-task workspace (12 polls/hour × 100 tasks); well within GitHub's 5,000 req/h rate limit. 5 min budget supports up to ~415 tasks per workspace at steady state (415 × 12 = ~4,980 fetches/hour); larger workspaces need adaptive budgets (**shipped: `LIMIT` 200 per tick to bound burst cost; out of scope: per-workspace adaptive budget — flagged for followup**). |
 | `task show --refresh` (on-demand) | 60s default | "I just looked at this; if I look again 30s later, show me the same thing; if I look 90s later, refresh." Tuned for user-experience, not batch budget. |
 
 A poller `LIMIT` (default 200 per tick) prevents the post-migration
@@ -296,7 +300,7 @@ corresponding `apply` arms. The disposition per arm:
 
 | Variant | Response shape | Stamped iff | Disposition tripwire |
 |---|---|---|---|
-| `UpdateRemote` | `RemoteTaskSnapshot` (REST `update_issue` returns the updated issue) | `response.assignees == sent.assignees \|\| response.assignees == []` (D5 carve-out) | injects a port that returns wrong `assignees`; asserts `Conflict` |
+| `UpdateRemote` | `RemoteTaskSnapshot` (REST `update_issue` returns the updated issue) | `response.assignees == sent.assignees \|\| response.assignees == []` (D5 carve-out; see D3 — "PATCH response reflects `assignees=[]` when the PATCH didn't set them") | injects a port that returns wrong `assignees`; asserts `Conflict` |
 | `AddItem` | new `project_item_id: String` | `project_item_id.is_some()` | injects a port that returns `None`; asserts `Conflict` |
 | `CreateDraftIssue` | new `project_item_id: String` | `project_item_id.is_some()` | same as `AddItem` |
 | `UpdateDraftIssue` | `()` (fire-and-forget port) | HTTP success (no body to compare) | injects a port that returns `Err`; asserts `Retry` |
@@ -450,10 +454,24 @@ explain the gap.
 - **The DTO freshness annotation wording.** "Last refreshed: 30s
   ago" is clear, but the wording for "refresh failed" or "never
   refreshed" is TBD. Small UX risk; the design is honest either way.
-- **Clock skew.** The `synced_at` stamp is local wall-clock. If the
-  local clock jumps backwards, the threshold breaks. The
-  `Timestamp` type is presumably monotonic; a one-line test
-  confirms. Not a section-level concern.
+- **Clock skew.** `Timestamp` is `DateTime<Utc>` from `chrono`
+  (wall-clock, not monotonic). A backwards jump (NTP correction,
+  manual `date -s`, VM clock drift) would make `synced_at` appear
+  *in the future* relative to `now()`, so the threshold check
+  `synced_at + budget < now()` always returns true and the
+  poller re-fetches every task on every tick. A forward jump
+  (e.g. NTP slew) makes the threshold fire too late, leaving
+  stale data longer than expected. Mitigation: the freshness
+  comparison uses `std::time::Instant` (monotonic) for the
+  *delta*, stored alongside `Timestamp` (wall-clock) for the
+  *display*. The schema column is `synced_at: Timestamp`; the
+  in-memory `Task` carries a `synced_instant: Option<Instant>`
+  for threshold checks. On process restart, `synced_instant` is
+  `None` (treated as stale) — the poller's first tick refreshes
+  everything, which is the same shape as the post-migration
+  burst. Alternative mitigation (out of scope): clamp negative
+  deltas to "stale" (force refresh) and treat a forward jump
+  exceeding the threshold as "stale" too.
 
 ## 6. Testing strategy
 
@@ -568,7 +586,7 @@ an answer. (Risks and non-goals cover the rest.)
 
 ### Phase 2 — Display layer
 
-- New `derive_display_status(&Task, &Project) -> DisplayStatus`
+- New `derive_display_status(&Task, relations: &[TaskRelation], &Project) -> DisplayStatus`
   in `application-task` (or wherever the DTO is composed).
 - `TaskDto` carries the new fields. CLI rendering updated.
 - The freshness line is rendered only on `is_mirror(task) == true`.
