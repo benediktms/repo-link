@@ -762,12 +762,7 @@ mod tests {
             .clone()
             .unwrap_or_else(|| panic!("post-{context} baseline"));
         assert!(
-            crate::inbound_mirrors_baseline(
-                &after.title,
-                &after.body,
-                &after.assignees,
-                &baseline,
-            ),
+            crate::inbound_mirrors_baseline(&after.title, &after.body, &after.assignees, &baseline,),
             "post-{context} task and baseline must agree on the inbound set ({context} resolved the drift)"
         );
     }

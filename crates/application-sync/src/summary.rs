@@ -91,19 +91,20 @@ mod tests {
     /// status is set explicitly to make the `ignores_status` test's intent
     /// visible (the helper must NOT consult this field).
     fn baseline(status: TaskStatus) -> TaskSnapshot {
-        let mut t = domain_task::Task::new_draft(
-            domain_core::WorkspaceId::new(),
-            None,
-            "t".into(),
-        )
-        .unwrap();
+        let mut t = domain_task::Task::new_draft(domain_core::WorkspaceId::new(), None, "t".into())
+            .unwrap();
         t.body = "b".into();
         t.assignees = vec!["alice".into(), "bob".into()];
         t.status = status;
         t.snapshot_view(SnapshotSource::Pull)
     }
 
-    fn any_remote_snap(title: String, body: String, assignees: Vec<String>, closed: bool) -> RemoteTaskSnapshot {
+    fn any_remote_snap(
+        title: String,
+        body: String,
+        assignees: Vec<String>,
+        closed: bool,
+    ) -> RemoteTaskSnapshot {
         RemoteTaskSnapshot {
             remote_id: "1".into(),
             node_id: Some("node_1".into()),

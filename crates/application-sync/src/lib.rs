@@ -388,25 +388,47 @@ mod inbound_mirror_tests {
         // repo_id, filing_repo_id, captured_at) are filled in correctly.
         // The helper reads only title/body/assignees from the snapshot; the
         // rest is noise that exists to make the type usable end-to-end.
-        let mut baseline_task = domain_task::Task::new_draft(
-            domain_core::WorkspaceId::new(),
-            None,
-            "t".into(),
-        )
-        .unwrap();
+        let mut baseline_task =
+            domain_task::Task::new_draft(domain_core::WorkspaceId::new(), None, "t".into())
+                .unwrap();
         baseline_task.body = "b".into();
         baseline_task.assignees = vec!["alice".into(), "bob".into()];
         let snap = baseline_task.snapshot_view(domain_task::SnapshotSource::Pull);
 
-        assert!(inbound_mirrors_baseline("t", "b", &["alice".into(), "bob".into()], &snap));
+        assert!(inbound_mirrors_baseline(
+            "t",
+            "b",
+            &["alice".into(), "bob".into()],
+            &snap
+        ));
         // Title differs
-        assert!(!inbound_mirrors_baseline("T", "b", &["alice".into(), "bob".into()], &snap));
+        assert!(!inbound_mirrors_baseline(
+            "T",
+            "b",
+            &["alice".into(), "bob".into()],
+            &snap
+        ));
         // Body differs
-        assert!(!inbound_mirrors_baseline("t", "B", &["alice".into(), "bob".into()], &snap));
+        assert!(!inbound_mirrors_baseline(
+            "t",
+            "B",
+            &["alice".into(), "bob".into()],
+            &snap
+        ));
         // Assignees differ (different set)
-        assert!(!inbound_mirrors_baseline("t", "b", &["alice".into()], &snap));
+        assert!(!inbound_mirrors_baseline(
+            "t",
+            "b",
+            &["alice".into()],
+            &snap
+        ));
         // Assignees reorder: still equal (order-insensitive set eq)
-        assert!(inbound_mirrors_baseline("t", "b", &["bob".into(), "alice".into()], &snap));
+        assert!(inbound_mirrors_baseline(
+            "t",
+            "b",
+            &["bob".into(), "alice".into()],
+            &snap
+        ));
         // D7 carve-out is structurally guaranteed by the helper's
         // signature (no `status` parameter); the tripwire test
         // `inbound_mirror_field_set_excludes_status` pins it. Mutating
