@@ -942,16 +942,15 @@ mod tests {
         // Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7, rpl-47f):
         // the inbound (pull) path excludes `Status` because pull cannot
         // map GitHub's two-state open/closed onto the local 5-state
-        // lifecycle. The 3-field inbound set is encoded as a constant in
-        // `application-sync::INBOUND_MIRROR_FIELDS`; this test asserts
-        // the carve-out by shape, *not* by importing the const (the
-        // duplication is the assertion — a divergence in either crate
-        // fails both build graphs).
-        //
-        // If a future PR adds a new `MirrorField` to the canonical set
-        // and wants it on the inbound path, this test is the place that
-        // decision gets encoded: extend the `INBOUND` slice here AND
-        // update `INBOUND_MIRROR_FIELDS` in `application-sync` to match.
+        // lifecycle. The 3-field shape is re-encoded inline below on
+        // purpose: the `application-sync` side re-encodes the same
+        // literal in its own tripwire test, and the duplication IS the
+        // assertion — a divergence in either crate fails both build
+        // graphs. If a future PR adds a new `MirrorField` to the
+        // canonical set and wants it on the inbound path, this test is
+        // the place that decision gets encoded: extend the `INBOUND`
+        // slice here AND extend the matching literal in
+        // `application-sync`'s `inbound_mirror_field_set_excludes_status`.
         const INBOUND: [MirrorField; 3] = [
             MirrorField::Title,
             MirrorField::Body,

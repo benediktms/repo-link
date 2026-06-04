@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use domain_core::TaskId;
 use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
-use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task, assignees_equal};
+use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 
 use crate::enqueue;
 use dto_shared::SyncSummaryDto;
@@ -280,25 +280,17 @@ impl SyncService {
                 // intentionally NOT overwritten — GitHub's open/closed doesn't
                 // map onto our 5-state lifecycle cleanly.
                 //
-                // The field list below is the inbound mirror set (RFC 0003
-                // §2 D7) and MUST stay in lockstep with the canonical set
-                // referenced by `inbound_mirrors_baseline`. The
-                // `debug_assert!` is the load-bearing tripwire: if a future
-                // PR adds a new field to the helper's signature, the test
-                // that fails is the one in this file (`pull_copy_back_uses
-                // _the_same_inbound_set_as_remote_mirrors_baseline`) — the
-                // debug_assert here is a runtime safety net for the
-                // case where the call site is edited without the test being
-                // updated.
-                debug_assert!(
-                    !crate::inbound_mirrors_baseline(
-                        &snap.title,
-                        &snap.body,
-                        &snap.assignees,
-                        task.synced_baseline.as_ref().expect("PullRemote requires a baseline"),
-                    ),
-                    "PullRemote requires drift; the helper must disagree on the inbound set"
-                );
+                // The three-field shape is the inbound mirror set (RFC 0003
+                // §2 D7) and MUST stay in lockstep with
+                // `inbound_mirrors_baseline`'s signature. The tripwire for
+                // drift here is the test
+                // `pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
+                // — the pull path already routed through
+                // `remote_mirrors_baseline` to make this `PullRemote`
+                // decision, so re-asserting it here is a no-op for
+                // correctness. (The relink site at `link` keeps its
+                // `debug_assert!` because relink has no analogous
+                // upstream drift check.)
                 task.title = snap.title.clone();
                 task.body = snap.body.clone();
                 task.assignees = snap.assignees.clone();
@@ -444,14 +436,21 @@ impl SyncService {
                 .await?;
             // Same inbound-mirror-set contract as the pull copy-back: the
             // field list MUST stay in lockstep with
-            // `inbound_mirrors_baseline`. See the long-form comment in
-            // `pull` (and the test
-            // `relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`)
-            // for the tripwire that pins this down.
+            // `inbound_mirrors_baseline`. Routes through the helper rather
+            // than inlining the three-field compare so a future PR that
+            // adds a field to the helper's signature gets a compile
+            // error here too. The test
+            // `relink_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
+            // pins the post-relink invariant end-to-end.
             debug_assert!(
-                snap.title != task.title
-                    || snap.body != task.body
-                    || !assignees_equal(&snap.assignees, &task.assignees),
+                !crate::inbound_mirrors_baseline(
+                    &snap.title,
+                    &snap.body,
+                    &snap.assignees,
+                    task.synced_baseline
+                        .as_ref()
+                        .expect("relink rewrite requires a baseline"),
+                ),
                 "relink rewrite should not be a no-op; the helper's three-field shape is the contract"
             );
             task.title = snap.title;
@@ -757,6 +756,29 @@ mod tests {
         InMemoryOutboxRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
         InMemoryWorkspaceRepository,
     };
+
+    /// Asserts the post-mutation task's inbound mirror set matches its
+    /// new baseline. Shared by the pull and relink copy-back tests
+    /// (`*_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`)
+    /// — both test the same property at the same point in the lifecycle
+    /// (right after the copy-back has run and the new baseline has been
+    /// captured). `context` is the test name fragment used in the
+    /// `expect`/`assert` messages so failures point at the right caller.
+    fn assert_inbound_set_matches_baseline(after: &Task, context: &str) {
+        let baseline = after
+            .synced_baseline
+            .clone()
+            .unwrap_or_else(|| panic!("post-{context} baseline"));
+        assert!(
+            crate::inbound_mirrors_baseline(
+                &after.title,
+                &after.body,
+                &after.assignees,
+                &baseline,
+            ),
+            "post-{context} task and baseline must agree on the inbound set ({context} resolved the drift)"
+        );
+    }
 
     #[derive(Clone)]
     struct RecordedUpdate {
@@ -1626,25 +1648,12 @@ mod tests {
         assert_eq!(after.body, "remote body");
         assert_eq!(after.assignees, vec!["bob".to_string()]);
         // Cross-check: the helper's view of the baseline agrees that
-        // these three fields are the inbound set. The helper is
-        // truth-at-the-call-site; the literal copy-back is the
-        // truth-at-the-mutation-site. They MUST agree. Post-pull the
+        // these three fields are the inbound set. Post-pull the
         // baseline was just re-captured from the live task, so the
-        // helper MUST return true (live task and baseline match on
-        // the three inbound fields — the drift was resolved by the
-        // pull). This is the post-condition that makes
-        // `remote_mirrors_baseline` a no-op on the *next* pull: a
-        // re-pull of the same remote must produce a `Noop` decision.
-        let baseline = after.synced_baseline.clone().expect("post-pull baseline");
-        assert!(
-            crate::inbound_mirrors_baseline(
-                &after.title,
-                &after.body,
-                &after.assignees,
-                &baseline,
-            ),
-            "post-pull task and baseline must agree on the inbound set (pull resolved the drift)"
-        );
+        // helper MUST return true — this is the post-condition that
+        // makes `remote_mirrors_baseline` a no-op on the next pull
+        // (a re-pull of the same remote must produce a `Noop`).
+        assert_inbound_set_matches_baseline(&after, "pull");
         assert_eq!(after.sync, SyncState::Synced);
     }
 
@@ -2107,16 +2116,7 @@ mod tests {
         // copied. Post-relink, the baseline was re-captured from the new
         // remote, so the helper MUST return true (live task matches the
         // new baseline on the inbound set).
-        let baseline = after.synced_baseline.clone().expect("post-relink baseline");
-        assert!(
-            crate::inbound_mirrors_baseline(
-                &after.title,
-                &after.body,
-                &after.assignees,
-                &baseline,
-            ),
-            "post-relink task and baseline must agree on the inbound set (relink resolved the drift)"
-        );
+        assert_inbound_set_matches_baseline(&after, "relink");
     }
 
     #[tokio::test]

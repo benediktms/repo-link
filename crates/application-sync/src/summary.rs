@@ -19,15 +19,15 @@ pub(crate) fn ensure_not_archived(task: &Task) -> Result<()> {
 
 /// Whether the remote snapshot's *mirrored* fields match the task's last
 /// aligned baseline. Routes through the shared `inbound_mirrors_baseline`
-/// helper so the inbound field set is a single named constant
-/// (`INBOUND_MIRROR_FIELDS`) instead of a hand-rolled `&&` chain. The
-/// `Status` exclusion (RFC 0003 §2 D7) is the explicit reason this helper
-/// exists in parallel with `MirrorField::differs`: detection on the
-/// issue-axis walks all four canonical fields, but the inbound path
-/// excludes `Status` because pull cannot map GitHub's two-state
-/// open/closed onto the local 5-state lifecycle. Comparing only mirrored
-/// fields prevents `updated_at` churn — comments, reactions, label edits —
-/// from forcing cosmetic pull_remote refreshes.
+/// helper so the inbound field set is a single named function signature
+/// instead of a hand-rolled `&&` chain. The `Status` exclusion (RFC 0003
+/// §2 D7) is the explicit reason this helper exists in parallel with
+/// `MirrorField::differs`: detection on the issue-axis walks all four
+/// canonical fields, but the inbound path excludes `Status` because pull
+/// cannot map GitHub's two-state open/closed onto the local 5-state
+/// lifecycle. Comparing only mirrored fields prevents `updated_at` churn
+/// — comments, reactions, label edits — from forcing cosmetic pull_remote
+/// refreshes.
 pub(crate) fn remote_mirrors_baseline(snap: &RemoteTaskSnapshot, baseline: &TaskSnapshot) -> bool {
     crate::inbound_mirrors_baseline(&snap.title, &snap.body, &snap.assignees, baseline)
 }
@@ -85,7 +85,6 @@ mod tests {
     use super::*;
     use domain_core::Timestamp;
     use domain_task::SnapshotSource;
-    use ports::RemoteTaskSnapshot;
 
     /// Build a baseline snapshot for the helper-under-test. The fields we
     /// care about (title, body, assignees) are the three inbound fields;

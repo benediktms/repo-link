@@ -74,19 +74,19 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
     }
 }
 
-/// The set of [`MirrorField`]s the inbound (pull) path compares and copies
-/// back. **`Status` is deliberately absent** (RFC 0003 §2 D7 — pull can't
-/// map GitHub's two-state open/closed onto the local 5-state lifecycle, and
-/// pulling the REST closed bit back into the lifecycle is explicitly
-/// out-of-scope per §3 of that RFC). The 3-field shape is encoded in the
-/// [`inbound_mirrors_baseline`] helper signature/body; the tripwires in
-/// `domain-task` and `application-sync` re-assert the shape on both sides
-/// so a divergence fails both build graphs.
-
 /// True iff the inbound mirror set of `(title, body, assignees)` matches the
 /// `baseline`'s, using order-insensitive set equality for assignees
 /// ([`assignees_equal`]). Used by `summary::remote_mirrors_baseline` and
 /// (transitively) the pull/relink copy-back sites in `service::SyncService`.
+///
+/// The 3-field shape is the inbound mirror set per RFC 0003 §2 D7 —
+/// **`Status` is deliberately absent** because pull can't map GitHub's
+/// two-state open/closed onto the local 5-state lifecycle, and pulling
+/// the REST closed bit back into the lifecycle is explicitly
+/// out-of-scope per §3 of that RFC. The shape is encoded in this
+/// helper's positional signature; the tripwires in `domain-task` and
+/// `application-sync` re-assert the 3-field literal in their own test
+/// mods so a divergence fails both build graphs.
 ///
 /// Takes the three fields directly — not a `&RemoteTaskSnapshot` — so a
 /// snapshot-struct field addition in `ports` cannot silently change the
