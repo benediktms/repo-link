@@ -29,7 +29,7 @@ mod service;
 mod summary;
 
 use domain_project::Project;
-use domain_task::{MirrorPatch, Task, TaskStatus};
+use domain_task::{MirrorPatch, Task, TaskSnapshot, TaskStatus, assignees_equal};
 use ports::{RemoteStateReason, RemoteTaskUpdate};
 
 pub use drainer::{BackoffSchedule, OutboxDrainer};
@@ -72,6 +72,45 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
             (false, Some(RemoteStateReason::Reopened))
         }
     }
+}
+
+/// The set of [`MirrorField`]s the inbound (pull) path compares and copies
+/// back. **`Status` is deliberately absent** (RFC 0003 §2 D7 — pull can't
+/// map GitHub's two-state open/closed onto the local 5-state lifecycle, and
+/// pulling the REST closed bit back into the lifecycle is explicitly
+/// out-of-scope per §3 of that RFC). The 3-field shape is encoded in the
+/// [`inbound_mirrors_baseline`] helper signature/body; the tripwires in
+/// `domain-task` and `application-sync` re-assert the shape on both sides
+/// so a divergence fails both build graphs.
+
+/// True iff the inbound mirror set of `(title, body, assignees)` matches the
+/// `baseline`'s, using order-insensitive set equality for assignees
+/// ([`assignees_equal`]). Used by `summary::remote_mirrors_baseline` and
+/// (transitively) the pull/relink copy-back sites in `service::SyncService`.
+///
+/// Takes the three fields directly — not a `&RemoteTaskSnapshot` — so a
+/// snapshot-struct field addition in `ports` cannot silently change the
+/// projection. The `Status` exclusion (D7) is the explicit reason this
+/// helper exists in parallel with [`MirrorField::differs`]: detection on
+/// the issue-axis walks all four fields, but the inbound path excludes
+/// `Status` because we cannot faithfully invert the open/closed bit.
+//
+// `#[allow(dead_code)]` is temporary scaffolding for the split-commit
+// PR shape: the helper is introduced in this commit but the call site
+// in `summary::remote_mirrors_baseline` is wired up in the follow-up
+// commit. The `inbound_mirror_tests` module exercises the helper under
+// `cargo test`; the lint is misleading on a non-test build. Remove the
+// allow once the call site lands.
+#[allow(dead_code)]
+pub(crate) fn inbound_mirrors_baseline(
+    title: &str,
+    body: &str,
+    assignees: &[String],
+    baseline: &TaskSnapshot,
+) -> bool {
+    title == baseline.title
+        && body == baseline.body
+        && assignees_equal(assignees, &baseline.assignees)
 }
 
 /// Project a [`MirrorPatch`] onto a [`RemoteTaskUpdate`]. Returns
@@ -266,5 +305,73 @@ mod build_update_from_patch_tests {
         assert_eq!(u.closed, Some(true));
         assert_eq!(u.state_reason, Some(RemoteStateReason::NotPlanned));
         assert_eq!(u.assignees, None);
+    }
+}
+
+#[cfg(test)]
+mod inbound_mirror_tests {
+    use super::*;
+    use domain_task::{MIRRORED_FIELDS, MirrorField};
+
+    /// Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7). Mirrors the
+    /// tripwire in `domain-task::task::tests::inbound_mirror_set_excludes_status_per_d7`:
+    /// if either crate's enumeration of the inbound set changes without
+    /// the other, both build graphs fail. The duplication is the assertion.
+    #[test]
+    fn inbound_mirror_field_set_excludes_status() {
+        const INBOUND: [MirrorField; 3] = [
+            MirrorField::Title,
+            MirrorField::Body,
+            MirrorField::Assignees,
+        ];
+        for f in INBOUND {
+            assert!(
+                MIRRORED_FIELDS.contains(&f),
+                "inbound field {f:?} not in canonical MIRRORED_FIELDS"
+            );
+        }
+        assert!(
+            !INBOUND.contains(&MirrorField::Status),
+            "Status must remain outbound-only (D7)"
+        );
+    }
+
+    #[test]
+    fn inbound_mirrors_baseline_matches_per_field() {
+        // Build a baseline snapshot via `Task::snapshot_view` so all the
+        // non-mirrored bookkeeping fields (sync_state, priority, remote,
+        // repo_id, filing_repo_id, captured_at) are filled in correctly.
+        // The helper reads only title/body/assignees from the snapshot; the
+        // rest is noise that exists to make the type usable end-to-end.
+        let mut baseline_task = domain_task::Task::new_draft(
+            domain_core::WorkspaceId::new(),
+            None,
+            "t".into(),
+        )
+        .unwrap();
+        baseline_task.body = "b".into();
+        baseline_task.assignees = vec!["alice".into(), "bob".into()];
+        let snap = baseline_task.snapshot_view(domain_task::SnapshotSource::Pull);
+
+        assert!(inbound_mirrors_baseline("t", "b", &["alice".into(), "bob".into()], &snap));
+        // Title differs
+        assert!(!inbound_mirrors_baseline("T", "b", &["alice".into(), "bob".into()], &snap));
+        // Body differs
+        assert!(!inbound_mirrors_baseline("t", "B", &["alice".into(), "bob".into()], &snap));
+        // Assignees differ (different set)
+        assert!(!inbound_mirrors_baseline("t", "b", &["alice".into()], &snap));
+        // Assignees reorder: still equal (order-insensitive set eq)
+        assert!(inbound_mirrors_baseline("t", "b", &["bob".into(), "alice".into()], &snap));
+        // Status on the baseline MUST NOT be consulted — change it under
+        // the helper's feet and assert the result is unchanged. This is the
+        // D7 carve-out property: the inbound path is a 3-field compare.
+        let mut snap_with_different_status = snap.clone();
+        snap_with_different_status.status = TaskStatus::Done;
+        assert!(inbound_mirrors_baseline(
+            "t",
+            "b",
+            &["alice".into(), "bob".into()],
+            &snap_with_different_status
+        ));
     }
 }
