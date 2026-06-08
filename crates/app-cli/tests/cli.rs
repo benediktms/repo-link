@@ -363,6 +363,7 @@ fn task_relate_emits_envelope_on_success_and_failure() {
         .args(["task", "relate", &a, "--kind", "related_to", "--other", &a])
         .assert()
         .failure()
+        .code(1)
         .get_output()
         .clone();
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
@@ -371,10 +372,11 @@ fn task_relate_emits_envelope_on_success_and_failure() {
         serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
     assert_eq!(v["ok"], false, "failure envelope must set ok: false");
     assert_eq!(v["error"], "a task cannot be related to itself");
-    assert!(
-        stderr.contains("a task cannot be related to itself"),
-        "expected the error message on stderr; got: {stderr}"
-    );
+    // Pin stderr to the exact single line the command emits (`eprintln!("error: {msg}")`
+    // followed by `std::process::exit(1)`). A loose `contains` check would
+    // hide duplicate-line regressions if the bin shim's Termination impl
+    // ever started re-emitting the error.
+    assert_eq!(stderr, "error: a task cannot be related to itself\n");
 
     // Failure: cycle. The earlier success case added `a blocked_by b`.
     // Now add `b blocked_by a` — which would close a deadlock loop and
@@ -383,6 +385,7 @@ fn task_relate_emits_envelope_on_success_and_failure() {
         .args(["task", "relate", &b, "--kind", "blocked_by", "--other", &a])
         .assert()
         .failure()
+        .code(1)
         .get_output()
         .clone();
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
