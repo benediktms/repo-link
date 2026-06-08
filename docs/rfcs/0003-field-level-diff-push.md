@@ -121,6 +121,7 @@ Labels touch all eight layers (a `Task` field, a `TaskSnapshot` column + migrati
 - Pulling remote open/closed back onto the 5-state lifecycle (status stays outbound-only).
 - Comments and relations — they have their own drain channels and are outside the snapshot diff.
 - The `list_changed_since` REST polling fallback (GitHub inbound change-detection runs through the Projects v2 GraphQL poll).
+- **Label mirroring (D8, decided 2026-06-08).** Labels are workflow vocabulary owned by the user's GitHub org/repo automations, not state repo-link can authoritatively mirror. See D8.
 - Activating a field-level conflict model (see §6).
 
 ## 4. Alternatives considered
