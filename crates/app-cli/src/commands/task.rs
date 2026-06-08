@@ -4,7 +4,8 @@
 use anyhow::{Result, anyhow};
 use application_sync::SyncService;
 use dto_shared::{
-    AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoveTaskRelationCmd, UpdateTaskCmd,
+    AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoveTaskRelationCmd, TaskDto,
+    UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
 
@@ -397,41 +398,79 @@ pub(crate) async fn task_dispatch(
             other,
             remove,
         } => {
-            let dto = match (remove, kind, other) {
+            // Run the service call inside a String-typed result so we can
+            // surface failures as a structured `{ok, error}` envelope on
+            // stdout (mirroring the per-row shape used by the batch
+            // lifecycle commands) rather than the bare `TaskDto` we used
+            // to emit on success. The clap-validation cases (bad arg
+            // combos) stay as `anyhow!` returns — those are caller errors
+            // that should not produce a relate-shaped envelope.
+            let result: Result<TaskDto, String> = match (remove, kind, other) {
                 // Add a single edge (the default).
-                (false, Some(k), Some(o)) => {
-                    svc.tasks
-                        .add_relation(AddTaskRelationCmd {
-                            task_id: id,
-                            kind: k.as_kind_str().to_string(),
-                            other: o,
-                        })
-                        .await?
-                }
+                (false, Some(k), Some(o)) => svc
+                    .tasks
+                    .add_relation(AddTaskRelationCmd {
+                        task_id: id,
+                        kind: k.as_kind_str().to_string(),
+                        other: o,
+                    })
+                    .await
+                    .map_err(|e| e.to_string()),
                 (false, _, _) => {
                     return Err(anyhow!(
                         "relate requires --kind and --other (or pass --remove to delete)"
                     ));
                 }
                 // Remove a single edge.
-                (true, Some(k), Some(o)) => {
-                    svc.tasks
-                        .remove_relation(RemoveTaskRelationCmd {
-                            task_id: id,
-                            kind: k.as_kind_str().to_string(),
-                            other: o,
-                        })
-                        .await?
-                }
+                (true, Some(k), Some(o)) => svc
+                    .tasks
+                    .remove_relation(RemoveTaskRelationCmd {
+                        task_id: id,
+                        kind: k.as_kind_str().to_string(),
+                        other: o,
+                    })
+                    .await
+                    .map_err(|e| e.to_string()),
                 // Remove all relations on the task.
-                (true, None, None) => svc.tasks.clear_relations(&id).await?,
+                (true, None, None) => svc
+                    .tasks
+                    .clear_relations(&id)
+                    .await
+                    .map_err(|e| e.to_string()),
                 (true, _, _) => {
                     return Err(anyhow!(
                         "--remove takes either both --kind and --other (one edge) or neither (all relations)"
                     ));
                 }
             };
-            render::task(&dto);
+
+            match result {
+                Ok(dto) => {
+                    let body = serde_json::json!({ "ok": true, "task": dto });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&body)
+                            .unwrap_or_else(|_| r#"{"ok":true}"#.to_string())
+                    );
+                }
+                Err(msg) => {
+                    let body = serde_json::json!({ "ok": false, "error": msg });
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&body)
+                            .unwrap_or_else(|_| format!(r#"{{"ok":false,"error":{msg}}}"#))
+                    );
+                    // Mirror the error on stderr and exit 1 directly
+                    // (matching `handle_ambiguous` in commands/mod.rs) so
+                    // shell pipelines see a single, clean stderr line
+                    // rather than the duplicate `Error: relate failed: ...`
+                    // line that anyhow's Termination impl would add if
+                    // we returned `Err(anyhow!(...))` and let the bin
+                    // shim's default Result handling take over.
+                    eprintln!("error: {msg}");
+                    std::process::exit(1);
+                }
+            }
         }
         TaskCmd::Snapshots { id } => {
             let snaps = svc

@@ -308,6 +308,97 @@ fn task_batch_lifecycle_commands_emit_per_task_results() {
     }
 }
 
+/// `rl task relate` (rpl-7oz) must wrap its return in a `{ok, task}` /
+/// `{ok: false, error}` envelope so a caller can tell whether the edge was
+/// actually added. The pre-fix shape was a bare `TaskDto` (success) or
+/// `Error: ...` on stderr (failure) — indistinguishable to a JSON-pipe
+/// consumer, which forced a follow-up `rl task show` to verify.
+#[test]
+fn task_relate_emits_envelope_on_success_and_failure() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let a = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "a"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "b"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Success: a blocked_by b. The envelope carries `ok: true` plus the
+    // freshly-mutated task; the relations list reflects the new edge.
+    let out = bin("repo-link", &dir)
+        .args(["task", "relate", &a, "--kind", "blocked_by", "--other", &b])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {:?}", out.stdout));
+    assert_eq!(v["ok"], true, "success envelope must set ok: true");
+    assert_eq!(v["task"]["id"], a);
+    let rels = v["task"]["relations"].as_array().expect("relations array");
+    assert!(
+        rels.iter()
+            .any(|r| r["kind"] == "blocked_by" && r["other"] == b),
+        "expected the new blocked_by edge in relations[]: {rels:?}"
+    );
+
+    // Failure: self-relation. The envelope prints to stdout, the same
+    // string lands on stderr (mirroring render::sync's split), and the
+    // process exits non-zero so a `set -e` shell sees the failure.
+    let out = bin("repo-link", &dir)
+        .args(["task", "relate", &a, "--kind", "related_to", "--other", &a])
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let stderr = String::from_utf8(out.stderr).expect("utf-8 stderr");
+    let v: Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    assert_eq!(v["ok"], false, "failure envelope must set ok: false");
+    assert_eq!(v["error"], "a task cannot be related to itself");
+    // Pin stderr to the exact single line the command emits (`eprintln!("error: {msg}")`
+    // followed by `std::process::exit(1)`). A loose `contains` check would
+    // hide duplicate-line regressions if the bin shim's Termination impl
+    // ever started re-emitting the error.
+    assert_eq!(stderr, "error: a task cannot be related to itself\n");
+
+    // Failure: cycle. The earlier success case added `a blocked_by b`.
+    // Now add `b blocked_by a` — which would close a deadlock loop and
+    // the service returns RelationCycle.
+    let out = bin("repo-link", &dir)
+        .args(["task", "relate", &b, "--kind", "blocked_by", "--other", &a])
+        .assert()
+        .failure()
+        .code(1)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let v: Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout}"));
+    assert_eq!(v["ok"], false);
+    let err = v["error"].as_str().expect("error string");
+    assert!(
+        err.contains("would create a cycle"),
+        "expected cycle message; got: {err}"
+    );
+}
+
 fn init_git_repo_with_origin(path: &std::path::Path, url: &str) {
     let status = std::process::Command::new("git")
         .args(["init", "-q"])
