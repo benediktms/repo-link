@@ -531,9 +531,18 @@ impl RepoBindingService {
                     repaired += 1;
                     row.repaired = true;
                 } else {
-                    unresolved += 1;
                     row.repaired = false;
                 }
+            }
+
+            // `unresolved` reflects "no auto-resolvable target" regardless
+            // of mode — the user needs the same audit info whether they're
+            // about to run `--repair` or just inspecting. (Originally the
+            // counter was only incremented inside the `if repair` block,
+            // which silently reported `unresolved: 0` in list-only mode
+            // even when rows had `target_repo_id: None`.)
+            if target.is_none() {
+                unresolved += 1;
             }
 
             rows.push(row);
@@ -1424,5 +1433,43 @@ mod tests {
 
         let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
         assert_eq!(summary.affected, 0);
+    }
+
+    /// In list-only mode, the `unresolved` count must reflect rows that
+    /// have no auto-resolvable target — even though no repair was
+    /// applied. The user auditing before running `--repair` needs the
+    /// same answer as the user inspecting after. Regression for the
+    /// off-by-where-the-counter-is-incremented bug.
+    #[tokio::test]
+    async fn doctor_list_only_reports_unresolved_when_no_target() {
+        let (bsvc, tasks, _bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // Create a binding for the *logical* repo, plant a task whose
+        // logical points at it but whose filing points at a *deleted*
+        // binding. Deleting the filing binding by simply never saving
+        // it works — `force_set_filing_repo_id(Some(unknown_uuid))`
+        // stores an unknown UUID that the bindings repo can never
+        // resolve. No logical-`repo_id` lookup will save us here
+        // because the task's logical *is* the live binding (so step
+        // 1 finds it and the doctor would actually repair in repair
+        // mode). To force the unresolved branch, we need a task with
+        // *no* `repo_id` set AND a dangling `filing_repo_id`. Plant
+        // a draft with no repo and force the filing.
+        let mut t = Task::new_draft(ws_id, None, "no-logical".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::new()));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        // (no bindings.save for the unknown UUID; it stays dangling)
+
+        let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
+        assert_eq!(summary.affected, 1, "the one task with no logical repo is affected");
+        assert_eq!(summary.repaired, 0);
+        assert_eq!(
+            summary.unresolved, 1,
+            "list-only mode must report unresolved: 1 when the task has no auto-target"
+        );
+        assert!(summary.rows[0].target_repo_id.is_none());
     }
 }
