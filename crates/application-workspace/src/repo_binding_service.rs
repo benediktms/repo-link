@@ -22,13 +22,13 @@ use crate::mapping::{binding_to_dto, map_prefix_conflict, workspace_to_dto};
 pub struct RepoBindingService {
     workspaces: Arc<dyn WorkspaceRepository>,
     bindings: Arc<dyn RepoBindingRepository>,
-    /// Optional task repo — the doctor flow (`rl repo doctor --repair`)
-    /// walks tasks to re-point dangling `filing_repo_id` values. When
-    /// `None`, the `doctor` method degrades to a "list only" mode that
-    /// reports affected tasks but cannot repair them; the CLI is the
-    /// only caller that wires a task repo. Keeping this optional
-    /// preserves the existing daemon / fixture call sites that don't
-    /// need it.
+    /// Optional task repo — the `doctor` method walks tasks to
+    /// re-point dangling `filing_repo_id` values (rpl-sv2). When
+    /// `None`, `doctor` returns an error regardless of mode (it
+    /// can't operate without a task repo); the CLI is the only
+    /// caller that wires one, via `with_tasks`. Keeping this
+    /// optional preserves the existing daemon / fixture call sites
+    /// that don't need it.
     tasks: Option<Arc<dyn TaskRepository>>,
 }
 
@@ -477,6 +477,17 @@ impl RepoBindingService {
                     .into(),
             )));
         };
+
+        // Validate the override target binding exists BEFORE the
+        // per-task loop, so a phantom `RepoId` (typo, stale handle,
+        // cross-workspace id mistake) fails loud and fast — never
+        // silently writes another dangling pointer, the exact bug
+        // class rpl-sv2 exists to heal. The CLI already guards
+        // this via `resolve_repo_handle_required`; this is the
+        // service-layer net for direct API callers.
+        if let Some(forced) = target_override {
+            self.bindings.get(forced).await?;
+        }
 
         let ws_tasks = tasks
             .list(ports::TaskFilter {
@@ -1371,6 +1382,13 @@ mod tests {
             "github.com/o/r-replacement".into(),
         )
         .unwrap();
+        // The override MUST exist — the doctor now pre-validates
+        // the override target before mutating any task, exactly the
+        // same defensive guard `TaskService::repoint_filing_repo`
+        // has. The test that previously saved nothing here asserted
+        // the unsound behavior; now we plant the override properly
+        // and the test verifies the override path still works.
+        bindings.save(&override_binding).await.unwrap();
 
         let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
         t.force_set_filing_repo_id(Some(old_binding.id));
@@ -1387,6 +1405,55 @@ mod tests {
             summary.rows[0].target_repo_id.as_deref(),
             Some(override_binding.id.to_string()).as_deref(),
             "override must win over the auto-target chain"
+        );
+    }
+
+    /// `doctor --repair --target` rejects an override target that
+    /// doesn't exist in the bindings table. The service-layer
+    /// pre-validation is the safety net for direct API callers
+    /// (the CLI also guards this in its handle resolver). Without
+    /// it, a phantom `RepoId` would silently re-point every
+    /// affected task to ANOTHER dangling binding — the exact
+    /// bug class rpl-sv2 exists to heal.
+    #[tokio::test]
+    async fn doctor_repair_rejects_unknown_target_override() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // Real task with a dangling filing pointer.
+        let old_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        bindings.save(&old_binding).await.unwrap();
+        let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(old_binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(old_binding.id).await.unwrap();
+
+        // Phantom override — never saved.
+        let phantom = RepoId::new();
+        let err = bsvc
+            .doctor(&ws_id.to_string(), true, Some(phantom))
+            .await
+            .expect_err("override target must be validated before per-task loop");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("NoRepo") || msg.contains("not_found"),
+            "expected a not-found error, got: {msg}"
+        );
+
+        // The task's recorded value is unchanged — the pre-validation
+        // aborted before any save.
+        let domain = tasks.get(t.id).await.unwrap();
+        assert_ne!(
+            domain.filing_repo_id,
+            Some(phantom),
+            "pre-validation must abort before persisting a dangling pointer"
         );
     }
 
