@@ -52,7 +52,13 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
         // board.
         workspaces: WorkspaceService::with_projects(workspaces_repo.clone(), projects_repo.clone())
             .with_outbox(outbox_repo.clone(), tasks_repo.clone()),
-        bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone()),
+        bindings: RepoBindingService::new(workspaces_repo.clone(), bindings_repo.clone())
+            // Wire the task repository so the doctor flow
+            // (`rl repo doctor --repair`) can re-point dangling
+            // `filing_repo_id` values. The CLI is the only call site
+            // that needs the wired task repo; daemon / fixture
+            // constructors leave it `None`.
+            .with_tasks(tasks_repo.clone()),
         // The TaskService enqueues lifecycle / edit mutations for mirror tasks
         // atomically with the task write via `TaskRepository::save_with_outbox`
         // (#54, transactional outbox); the daemon's drainer applies them. The

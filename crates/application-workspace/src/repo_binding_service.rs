@@ -11,7 +11,9 @@ use dto_shared::{
     AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, RepoAttachOutcomeDto,
     RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
 };
-use ports::{FilesystemProbe, PortError, RepoBindingRepository, WorkspaceRepository};
+use ports::{
+    FilesystemProbe, PortError, RepoBindingRepository, TaskRepository, WorkspaceRepository,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AmbiguousCandidate, Result, ServiceError};
@@ -20,6 +22,14 @@ use crate::mapping::{binding_to_dto, map_prefix_conflict, workspace_to_dto};
 pub struct RepoBindingService {
     workspaces: Arc<dyn WorkspaceRepository>,
     bindings: Arc<dyn RepoBindingRepository>,
+    /// Optional task repo — the `doctor` method walks tasks to
+    /// re-point dangling `filing_repo_id` values (rpl-sv2). When
+    /// `None`, `doctor` returns an error regardless of mode (it
+    /// can't operate without a task repo); the CLI is the only
+    /// caller that wires one, via `with_tasks`. Keeping this
+    /// optional preserves the existing daemon / fixture call sites
+    /// that don't need it.
+    tasks: Option<Arc<dyn TaskRepository>>,
 }
 
 impl RepoBindingService {
@@ -30,7 +40,16 @@ impl RepoBindingService {
         Self {
             workspaces,
             bindings,
+            tasks: None,
         }
+    }
+
+    /// Wire a task repository so the doctor flow can perform repairs.
+    /// Returns `self` for builder-style chaining. Idempotent — calling
+    /// twice replaces the prior handle.
+    pub fn with_tasks(mut self, tasks: Arc<dyn TaskRepository>) -> Self {
+        self.tasks = Some(tasks);
+        self
     }
 
     /// Idempotent: if a binding for `canonical_url` already exists in the
@@ -411,6 +430,181 @@ impl RepoBindingService {
         }
         Ok(summary)
     }
+
+    /// Inspect every task in `workspace_id` and report (or repair) any
+    /// whose recorded `filing_repo_id` references a binding that no
+    /// longer exists (rpl-sv2). Two modes:
+    ///
+    /// - `repair = false` (the default): list-only. For each affected
+    ///   task, produce a `DoctorRow` with the proposed `target_repo_id`.
+    ///   No state is mutated. This is what the user runs first to
+    ///   audit before committing.
+    /// - `repair = true`: apply the re-point. Each affected task has
+    ///   its `filing_repo_id` set to the resolved target via
+    ///   [`domain_task::Task::force_set_filing_repo_id`], and the
+    ///   resulting snapshot is tagged with
+    ///   [`SnapshotSource::FilingRepoRepair`] so the audit trail
+    ///   records every re-point.
+    ///
+    /// `target_override`, when `Some`, forces every affected task to be
+    /// re-pointed at that binding — the user knows the new home and
+    /// doesn't want auto-detection. `None` lets the doctor pick a
+    /// target per task via the resolution chain below.
+    ///
+    /// **Resolution chain (auto-target, no override):**
+    /// 1. If the task's *logical* `repo_id` still resolves to a live
+    ///    binding, use that binding. This is the common case: the
+    ///    org-move updated `repo_id` (logical) but missed
+    ///    `filing_repo_id`; the logical binding IS the new home.
+    /// 2. Otherwise, look up `remote_mappings` for the task's
+    ///    `(provider, remote_id)` and use the live binding the mapping
+    ///    points at. This is the cross-repo-import edge case.
+    /// 3. Otherwise, no resolvable target — the task is left
+    ///    untouched and reported as `unresolved`.
+    pub async fn doctor(
+        &self,
+        workspace_id: &str,
+        repair: bool,
+        target_override: Option<domain_core::RepoId>,
+    ) -> Result<DoctorSummary> {
+        let id: WorkspaceId = workspace_id.parse()?;
+        // Confirm the workspace exists; bubbles up as PortError::NotFound otherwise.
+        let _ = self.workspaces.get(id).await?;
+
+        let Some(tasks) = self.tasks.as_ref() else {
+            return Err(ServiceError::Port(PortError::Backend(
+                "doctor flow requires a wired task repository (RepoBindingService::with_tasks)"
+                    .into(),
+            )));
+        };
+
+        // Validate the override target binding exists BEFORE the
+        // per-task loop, so a phantom `RepoId` (typo, stale handle,
+        // cross-workspace id mistake) fails loud and fast — never
+        // silently writes another dangling pointer, the exact bug
+        // class rpl-sv2 exists to heal. The CLI already guards
+        // this via `resolve_repo_handle_required`; this is the
+        // service-layer net for direct API callers.
+        if let Some(forced) = target_override {
+            self.bindings.get(forced).await?;
+        }
+
+        let ws_tasks = tasks
+            .list(ports::TaskFilter {
+                workspace_id: Some(id),
+                include_archived: true,
+                ..ports::TaskFilter::default()
+            })
+            .await?;
+
+        let mut rows: Vec<DoctorRow> = Vec::new();
+        let mut repaired: usize = 0;
+        let mut unresolved: usize = 0;
+
+        for t in &ws_tasks {
+            let Some(filing_id) = t.filing_repo_id else {
+                continue; // no recorded filing repo — nothing to doctor
+            };
+
+            // Probe the binding. `Port(NotFound)` is the silent-divergence
+            // case the doctor is here to heal. Other errors propagate.
+            let dangling = match self.bindings.get(filing_id).await {
+                Ok(_) => continue, // filing binding is alive — task is fine
+                Err(PortError::NotFound(_)) => true,
+                Err(e) => return Err(e.into()),
+            };
+            if !dangling {
+                continue;
+            }
+
+            // Resolve a target. Override wins; otherwise run the chain.
+            let target = if let Some(forced) = target_override {
+                Some(forced)
+            } else {
+                Self::resolve_doctor_target(&self.bindings, t).await?
+            };
+
+            let mut row = DoctorRow {
+                task_id: t.id.to_string(),
+                title: t.title.clone(),
+                current_filing_repo_id: filing_id.to_string(),
+                target_repo_id: target.map(|r| r.to_string()),
+                repaired: false,
+            };
+
+            if repair {
+                if let Some(target_id) = target {
+                    let mut updated = tasks.get(t.id).await?;
+                    updated.force_set_filing_repo_id(Some(target_id));
+                    tasks
+                        .save(&updated, domain_task::SnapshotSource::FilingRepoRepair)
+                        .await?;
+                    repaired += 1;
+                    row.repaired = true;
+                } else {
+                    row.repaired = false;
+                }
+            }
+
+            // `unresolved` reflects "no auto-resolvable target" regardless
+            // of mode — the user needs the same audit info whether they're
+            // about to run `--repair` or just inspecting. (Originally the
+            // counter was only incremented inside the `if repair` block,
+            // which silently reported `unresolved: 0` in list-only mode
+            // even when rows had `target_repo_id: None`.)
+            if target.is_none() {
+                unresolved += 1;
+            }
+
+            rows.push(row);
+        }
+
+        Ok(DoctorSummary {
+            affected: rows.len(),
+            repaired,
+            unresolved,
+            rows,
+        })
+    }
+
+    /// Auto-detect a re-point target for a task whose recorded
+    /// `filing_repo_id` is dangling. Returns `None` when nothing
+    /// resolvable exists. See [`Self::doctor`] for the precedence.
+    async fn resolve_doctor_target(
+        bindings: &Arc<dyn RepoBindingRepository>,
+        t: &domain_task::Task,
+    ) -> Result<Option<domain_core::RepoId>> {
+        // Step 1: the task's *logical* `repo_id`, if it still resolves
+        // to a live binding. Org-moves update `repo_id` correctly
+        // (this is the divergence rpl-sv2 describes), so the live
+        // logical binding is the new filing home for the common case.
+        //
+        // Only `NotFound` is "binding gone" (→ fall through to step
+        // 2). Any other error is a real backend failure that must
+        // propagate — `is_ok()` would collapse a transient I/O error
+        // into the fallback path and let the doctor re-point the
+        // task to a different binding instead of aborting.
+        if let Some(logical) = t.repo_id {
+            match bindings.get(logical).await {
+                Ok(_) => return Ok(Some(logical)),
+                Err(PortError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Step 2: walk `remote_mappings` for (provider, remote_id). The
+        // remote issue's identity is the load-bearing signal: if
+        // `remote_mappings` says "this issue now lives in binding X",
+        // that's the new home regardless of the task's recorded axes.
+        if let Some(remote) = t.remote.as_ref()
+            && let Some(hit) = bindings
+                .find_by_remote_mapping(t.workspace_id, &remote.provider, &remote.remote_id)
+                .await?
+        {
+            return Ok(Some(hit));
+        }
+        // Step 3: nothing resolvable.
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,12 +615,47 @@ pub struct ReconcileSummary {
     pub pruned: usize,
 }
 
+/// One row in [`DoctorSummary`]. Reports a single task whose recorded
+/// `filing_repo_id` references a deleted binding, with the proposed
+/// re-point target. When the doctor ran in `--repair` mode and a
+/// resolvable target existed, `repaired` is `true`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorRow {
+    pub task_id: String,
+    pub title: String,
+    pub current_filing_repo_id: String,
+    /// `Some(uuid)` when the doctor could resolve a target binding
+    /// (either via the task's logical `repo_id`, via `remote_mappings`,
+    /// or via the `--target` override). `None` when no resolvable
+    /// target exists — the task is reported but stays untouched.
+    pub target_repo_id: Option<String>,
+    #[serde(default)]
+    pub repaired: bool,
+}
+
+/// Top-level `rl repo doctor` envelope. `affected` is the number of
+/// rows in `rows`; `repaired` is the subset whose `repaired` flag is
+/// `true`; `unresolved` is the subset with `target_repo_id = None`.
+/// In list-only mode, `repaired` is always 0 and every row's
+/// `repaired` is `false`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorSummary {
+    pub affected: usize,
+    pub repaired: usize,
+    pub unresolved: usize,
+    pub rows: Vec<DoctorRow>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::WorkspaceService;
+    use domain_task::{SnapshotSource, Task};
+    use domain_workspace::{Workspace, WorkspaceName};
     use dto_shared::CreateWorkspaceCmd;
-    use testing_fixtures::{InMemoryRepoBindingRepository, InMemoryWorkspaceRepository};
+    use testing_fixtures::{
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
+    };
 
     fn setup() -> (WorkspaceService, RepoBindingService) {
         let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
@@ -436,6 +665,28 @@ mod tests {
             WorkspaceService::new(workspaces.clone()),
             RepoBindingService::new(workspaces, bindings),
         )
+    }
+
+    /// Build a `RepoBindingService` with a wired task repository so the
+    /// doctor flow has somewhere to look. Returns all the ports the
+    /// tests need to seed state directly.
+    fn setup_with_tasks() -> (
+        RepoBindingService,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryRepoBindingRepository>,
+        Arc<InMemoryWorkspaceRepository>,
+    ) {
+        let workspaces: Arc<InMemoryWorkspaceRepository> =
+            Arc::new(InMemoryWorkspaceRepository::new());
+        let bindings: Arc<InMemoryRepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let tasks: Arc<InMemoryTaskRepository> = Arc::new(InMemoryTaskRepository::new());
+        let binding_svc = RepoBindingService::new(
+            workspaces.clone() as Arc<dyn WorkspaceRepository>,
+            bindings.clone() as Arc<dyn RepoBindingRepository>,
+        )
+        .with_tasks(tasks.clone() as Arc<dyn TaskRepository>);
+        (binding_svc, tasks, bindings, workspaces)
     }
 
     #[tokio::test]
@@ -997,5 +1248,305 @@ mod tests {
             all.is_empty(),
             "deleted workspace must not surface, got {all:?}"
         );
+    }
+
+    // ---------- Doctor (rpl-sv2) ------------------------------------------
+
+    /// Seed a workspace + a single task whose `filing_repo_id` references
+    /// a binding that's about to be deleted. The doctor flow's
+    /// `list-only` mode should surface the task with a `target_repo_id`
+    /// pointing at the *logical* `repo_id`'s binding (the common
+    /// org-move case).
+    #[tokio::test]
+    async fn doctor_lists_affected_tasks_with_auto_target() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+
+        // Seed a workspace.
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // Create two bindings: one for the (now-deleted) filing repo,
+        // one for the live logical repo the org-move re-pointed at.
+        let old_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        let new_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-neworg.git".into(),
+            "github.com/o/r-neworg".into(),
+        )
+        .unwrap();
+        bindings.save(&old_binding).await.unwrap();
+        bindings.save(&new_binding).await.unwrap();
+
+        // Create a task, set both axes (filing = old, logical = new),
+        // then delete the old binding to simulate the silent-divergence
+        // shape.
+        let mut t = Task::new_draft(ws_id, Some(new_binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(old_binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(old_binding.id).await.unwrap();
+
+        // List-only mode: no state changes, but the row is reported
+        // with the auto-target = the live logical binding.
+        let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
+        assert_eq!(summary.affected, 1, "exactly one task should be affected");
+        assert_eq!(summary.repaired, 0);
+        assert_eq!(summary.unresolved, 0);
+        assert_eq!(summary.rows.len(), 1);
+        let row = &summary.rows[0];
+        assert_eq!(row.task_id, t.id.to_string());
+        assert_eq!(row.current_filing_repo_id, old_binding.id.to_string());
+        assert_eq!(
+            row.target_repo_id.as_deref(),
+            Some(new_binding.id.to_string()).as_deref(),
+            "auto-target must be the live logical binding"
+        );
+        assert!(!row.repaired);
+    }
+
+    /// `repair = true` re-points the task's `filing_repo_id` to the
+    /// resolved target. The task row's recorded value must change; the
+    /// logical `repo_id` stays put.
+    #[tokio::test]
+    async fn doctor_repair_repairs_filing_repo_id() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        let old_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        let new_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-neworg.git".into(),
+            "github.com/o/r-neworg".into(),
+        )
+        .unwrap();
+        bindings.save(&old_binding).await.unwrap();
+        bindings.save(&new_binding).await.unwrap();
+
+        let mut t = Task::new_draft(ws_id, Some(new_binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(old_binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(old_binding.id).await.unwrap();
+
+        let summary = bsvc.doctor(&ws_id.to_string(), true, None).await.unwrap();
+        assert_eq!(summary.affected, 1);
+        assert_eq!(summary.repaired, 1);
+        assert!(summary.rows[0].repaired);
+
+        // The task is now re-pointed; load and confirm.
+        let after = tasks.get(t.id).await.unwrap();
+        assert_eq!(after.filing_repo_id, Some(new_binding.id));
+        assert_eq!(after.repo_id, Some(new_binding.id), "logical stays put");
+    }
+
+    /// `target_override` forces every affected task to that binding,
+    /// skipping the auto-target chain. The doctor pre-validates
+    /// the override target before mutating any task, so a phantom
+    /// `RepoId` is rejected up front (see
+    /// `doctor_repair_rejects_unknown_target_override` for the
+    /// rejection path).
+    #[tokio::test]
+    async fn doctor_repair_uses_target_override() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // No `new_binding` saved here. Logical = old_binding (will be
+        // deleted); the override is a brand-new binding that's never
+        // been saved. The doctor uses it anyway — the user is
+        // responsible for the override's liveness.
+        let old_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        bindings.save(&old_binding).await.unwrap();
+
+        let override_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-replacement.git".into(),
+            "github.com/o/r-replacement".into(),
+        )
+        .unwrap();
+        // The override MUST exist — the doctor now pre-validates
+        // the override target before mutating any task, exactly the
+        // same defensive guard `TaskService::repoint_filing_repo`
+        // has. The test that previously saved nothing here asserted
+        // the unsound behavior; now we plant the override properly
+        // and the test verifies the override path still works.
+        bindings.save(&override_binding).await.unwrap();
+
+        let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(old_binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(old_binding.id).await.unwrap();
+
+        let summary = bsvc
+            .doctor(&ws_id.to_string(), true, Some(override_binding.id))
+            .await
+            .unwrap();
+        assert_eq!(summary.affected, 1);
+        assert_eq!(summary.repaired, 1);
+        assert_eq!(
+            summary.rows[0].target_repo_id.as_deref(),
+            Some(override_binding.id.to_string()).as_deref(),
+            "override must win over the auto-target chain"
+        );
+    }
+
+    /// `doctor --repair --target` rejects an override target that
+    /// doesn't exist in the bindings table. The service-layer
+    /// pre-validation is the safety net for direct API callers
+    /// (the CLI also guards this in its handle resolver). Without
+    /// it, a phantom `RepoId` would silently re-point every
+    /// affected task to ANOTHER dangling binding — the exact
+    /// bug class rpl-sv2 exists to heal.
+    #[tokio::test]
+    async fn doctor_repair_rejects_unknown_target_override() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // Real task with a dangling filing pointer.
+        let old_binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        bindings.save(&old_binding).await.unwrap();
+        let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(old_binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(old_binding.id).await.unwrap();
+
+        // Phantom override — never saved.
+        let phantom = RepoId::new();
+        let err = bsvc
+            .doctor(&ws_id.to_string(), true, Some(phantom))
+            .await
+            .expect_err("override target must be validated before per-task loop");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("NoRepo") || msg.contains("not_found"),
+            "expected a not-found error, got: {msg}"
+        );
+
+        // The task's recorded value is unchanged — the pre-validation
+        // aborted before any save.
+        let domain = tasks.get(t.id).await.unwrap();
+        assert_ne!(
+            domain.filing_repo_id,
+            Some(phantom),
+            "pre-validation must abort before persisting a dangling pointer"
+        );
+    }
+
+    /// Tasks whose `filing_repo_id` is `None` (unpromoted drafts) must
+    /// be silently skipped — the doctor is for *dangling* pointers,
+    /// not for "no recorded value".
+    #[tokio::test]
+    async fn doctor_skips_unpromoted_tasks() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        let binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        // Unpromoted task: no `filing_repo_id` recorded.
+        let t = Task::new_draft(ws_id, Some(binding.id), "draft".into()).unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
+        assert_eq!(summary.affected, 0);
+        assert!(summary.rows.is_empty());
+    }
+
+    /// Tasks whose filing binding is alive must be silently skipped —
+    /// the doctor is for the *silent-divergence* case, not a general
+    /// health audit.
+    #[tokio::test]
+    async fn doctor_skips_tasks_with_live_filing_binding() {
+        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        let binding = RepoBinding::new(
+            ws_id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        bindings.save(&binding).await.unwrap();
+
+        let mut t = Task::new_draft(ws_id, Some(binding.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(binding.id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
+        assert_eq!(summary.affected, 0);
+    }
+
+    /// In list-only mode, the `unresolved` count must reflect rows that
+    /// have no auto-resolvable target — even though no repair was
+    /// applied. The user auditing before running `--repair` needs the
+    /// same answer as the user inspecting after. Regression for the
+    /// off-by-where-the-counter-is-incremented bug.
+    #[tokio::test]
+    async fn doctor_list_only_reports_unresolved_when_no_target() {
+        let (bsvc, tasks, _bindings, workspaces) = setup_with_tasks();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let ws_id = ws.id;
+        workspaces.save(&ws).await.unwrap();
+
+        // Create a binding for the *logical* repo, plant a task whose
+        // logical points at it but whose filing points at a *deleted*
+        // binding. Deleting the filing binding by simply never saving
+        // it works — `force_set_filing_repo_id(Some(unknown_uuid))`
+        // stores an unknown UUID that the bindings repo can never
+        // resolve. No logical-`repo_id` lookup will save us here
+        // because the task's logical *is* the live binding (so step
+        // 1 finds it and the doctor would actually repair in repair
+        // mode). To force the unresolved branch, we need a task with
+        // *no* `repo_id` set AND a dangling `filing_repo_id`. Plant
+        // a draft with no repo and force the filing.
+        let mut t = Task::new_draft(ws_id, None, "no-logical".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::new()));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        // (no bindings.save for the unknown UUID; it stays dangling)
+
+        let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
+        assert_eq!(
+            summary.affected, 1,
+            "the one task with no logical repo is affected"
+        );
+        assert_eq!(summary.repaired, 0);
+        assert_eq!(
+            summary.unresolved, 1,
+            "list-only mode must report unresolved: 1 when the task has no auto-target"
+        );
+        assert!(summary.rows[0].target_repo_id.is_none());
     }
 }

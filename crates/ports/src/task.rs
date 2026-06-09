@@ -38,6 +38,38 @@ pub trait RepoBindingRepository: Send + Sync {
     /// `rpl-ak7` for tasks and reuse the prefix half here) instead of a
     /// UUID.
     async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>>;
+    /// Look up the live binding that holds a particular remote issue
+    /// identity `(provider, remote_id)` within `workspace_id` via the
+    /// `remote_mappings` table (D6 rekey — `remote_mappings` is
+    /// keyed on `(filing_repo_id, provider, remote_id)` so the
+    /// lookup is effectively a join). Used by the
+    /// `rl repo doctor --repair` auto-target resolution chain
+    /// (rpl-sv2) when the task's logical `repo_id` is itself stale
+    /// and the doctor has to fall back to the remote-issue identity
+    /// as the load-bearing signal.
+    ///
+    /// Scoped to `workspace_id` so a cross-workspace import
+    /// (the same `(provider, remote_id)` happens to live in two
+    /// workspaces) doesn't silently pick an arbitrary binding. The
+    /// join against `repos` also filters out rows whose
+    /// `filing_repo_id` references a deleted binding (silent-
+    /// divergence protection — the doctor must never re-point a
+    /// task to a *second* deleted binding).
+    ///
+    /// Returns `None` when no match OR when the match is
+    /// ambiguous (multiple bindings in the same workspace hold
+    /// the same `(provider, remote_id)` — `remote_mappings` has
+    /// a `UNIQUE(provider, remote_id)` only across the cross-repo
+    /// key, not on `(provider, remote_id)` alone). The doctor
+    /// surfaces this as `unresolved` so the user can resolve
+    /// it with `--target` rather than the service arbitrarily
+    /// picking.
+    async fn find_by_remote_mapping(
+        &self,
+        workspace_id: WorkspaceId,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<RepoId>>;
     async fn delete(&self, id: RepoId) -> PortResult<()>;
 }
 

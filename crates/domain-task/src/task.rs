@@ -657,6 +657,31 @@ impl Task {
         Ok(())
     }
 
+    /// Deliberate override of a recorded `filing_repo_id`, used only by the
+    /// `rl repo doctor --repair` path (rpl-sv2 / RFC 0002 D2 repair). Unlike
+    /// [`set_filing_repo_id`], this method does NOT reject changes to a
+    /// recorded value — its sole purpose is to break the immutability guard
+    /// when a binding is deleted out from under a task (e.g. after a GitHub
+    /// org-move replaces the canonical binding with a new UUID and leaves
+    /// `tasks.filing_repo_id` pointing at the now-deleted row).
+    ///
+    /// Callers MUST be running the doctor flow, which:
+    ///   1. logs every affected task on stdout (so the user can audit
+    ///      before/after the re-point), and
+    ///   2. tags the resulting snapshot with
+    ///      [`SnapshotSource::FilingRepoRepair`] so the audit trail makes
+    ///      every re-point greppable in `task_snapshots.source`.
+    ///
+    /// Idempotent: re-setting the same value is a no-op, including
+    /// re-recording after a partial repair.
+    pub fn force_set_filing_repo_id(&mut self, filing_repo_id: Option<RepoId>) {
+        if self.filing_repo_id == filing_repo_id {
+            return;
+        }
+        self.filing_repo_id = filing_repo_id;
+        self.touch();
+    }
+
     /// Body is mirrored to the remote issue, so editing it marks the task
     /// `DirtyLocal` (when remote-backed and currently `Synced`).
     pub fn set_body(&mut self, body: String) {
@@ -1836,6 +1861,45 @@ mod tests {
         t.set_filing_repo_id(Some(repo)).unwrap();
         let before = t.updated_at;
         t.set_filing_repo_id(Some(repo)).unwrap(); // same value → Ok, no touch
+        assert_eq!(t.updated_at, before);
+    }
+
+    #[test]
+    fn force_set_filing_repo_id_repairs_a_recorded_value() {
+        // rpl-sv2: the recorded value is dangling (its binding was deleted
+        // out from under us by an org-move). The doctor flow's deliberate
+        // override path is the only way out of the immutability guard.
+        let mut t = draft();
+        let old = RepoId::new();
+        let new = RepoId::new();
+        t.set_filing_repo_id(Some(old)).unwrap();
+        assert_eq!(t.filing_repo_id, Some(old));
+        t.force_set_filing_repo_id(Some(new));
+        assert_eq!(t.filing_repo_id, Some(new));
+    }
+
+    #[test]
+    fn force_set_filing_repo_id_clears_when_target_is_none() {
+        // Doctor --repair without --target may need to clear a task whose
+        // filing binding is gone and has no resolvable replacement. (Today
+        // the doctor flow only clears when no logical-repo fallback exists;
+        // this test pins that the domain layer allows it, the service layer
+        // chooses when.)
+        let mut t = draft();
+        t.set_filing_repo_id(Some(RepoId::new())).unwrap();
+        t.force_set_filing_repo_id(None);
+        assert_eq!(t.filing_repo_id, None);
+    }
+
+    #[test]
+    fn force_set_filing_repo_id_idempotent_no_op() {
+        // Same value → no touch. Re-running the doctor on a partially
+        // repaired task must not perturb `updated_at`.
+        let mut t = draft();
+        let repo = RepoId::new();
+        t.set_filing_repo_id(Some(repo)).unwrap();
+        let before = t.updated_at;
+        t.force_set_filing_repo_id(Some(repo));
         assert_eq!(t.updated_at, before);
     }
 

@@ -91,6 +91,39 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             Err(e) => return Err(anyhow!("{e}")),
         },
         RepoCmd::Find { query } => render::find(&svc.bindings.find(&query).await?),
+        RepoCmd::Doctor {
+            ws: WorkspaceArg { workspace },
+            repair,
+            target,
+        } => {
+            // Resolve `--target` to a binding id via the same handle
+            // resolver the rest of `rl repo` uses. Ambiguous matches
+            // exit 2 with the candidate list. A `--target` that
+            // doesn't resolve to *any* binding is a hard error — the
+            // user has to know the new home for the re-point.
+            let target_uuid = match target {
+                Some(handle) => {
+                    let id_str = resolve_repo_handle_required(svc, &handle).await?;
+                    Some(
+                        id_str
+                            .parse::<domain_core::RepoId>()
+                            .map_err(|e| anyhow!("invalid --target binding id {id_str:?}: {e}"))?,
+                    )
+                }
+                None => None,
+            };
+            let summary = svc.bindings.doctor(&workspace, repair, target_uuid).await?;
+            // Serialize failure on a known-good in-memory struct is
+            // a programmer error (DoctorSummary's Serialize impl is
+            // derived, all fields are valid). Don't paper over it
+            // with a fabricated "0 results" payload that would
+            // falsely tell the user the workspace is clean — the
+            // doctor *did* find affected tasks, the JSON printer
+            // is just broken. Propagate so the failure is loud.
+            let out = serde_json::to_string_pretty(&summary)
+                .map_err(|e| anyhow!("failed to render repo doctor summary: {e}"))?;
+            println!("{out}");
+        }
         RepoCmd::Discover { path } => {
             let mut rows = Vec::new();
             for repo_path in discover_repos_under(&path) {

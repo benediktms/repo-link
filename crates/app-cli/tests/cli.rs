@@ -3440,3 +3440,62 @@ fn workspace_set_filing_repo_requires_repo_or_none() {
         "error should mention the required flags: {stderr}"
     );
 }
+
+/// `rl repo doctor` is the user-initiated repair verb for rpl-sv2 (the
+/// silent-divergence bug where a binding is deleted out from under a
+/// task's recorded `filing_repo_id`). On a healthy workspace (no
+/// affected tasks), the command emits the doctor envelope with
+/// `affected: 0` — this verifies the CLI wiring (the deeper logic
+/// lives in the `application-workspace` unit tests, which can plant a
+/// task with a `filing_repo_id` via `force_set_filing_repo_id`
+/// without needing a real GitHub promote roundtrip).
+#[test]
+fn repo_doctor_emits_zero_envelope_on_healthy_workspace() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    // Seed a binding so the workspace isn't empty, but with no tasks
+    // attached (the doctor's only interest).
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    let repo_path = repo_dir.path().display().to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--branch",
+            "main",
+            "--path",
+            &repo_path,
+        ],
+    );
+
+    // List-only mode (no `--repair`).
+    let list_only = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "doctor", "--workspace", &workspace],
+    );
+    assert_eq!(list_only["affected"], 0);
+    assert_eq!(list_only["repaired"], 0);
+    assert_eq!(list_only["unresolved"], 0);
+    assert!(list_only["rows"].as_array().unwrap().is_empty());
+
+    // With `--repair` (and no affected tasks): same envelope, no error.
+    let repair_noop = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "doctor", "--workspace", &workspace, "--repair"],
+    );
+    assert_eq!(repair_noop["affected"], 0);
+    assert_eq!(repair_noop["repaired"], 0);
+}

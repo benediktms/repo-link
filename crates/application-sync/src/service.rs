@@ -17,6 +17,7 @@ use ports::{
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
+    summary_with_note,
 };
 
 pub struct SyncService {
@@ -222,7 +223,27 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        let filing_canonical = self.filing_canonical_for(&task).await?;
+        // rpl-sv2: if the task's recorded `filing_repo_id` references a
+        // binding that's been deleted (org-move replaced the binding, but
+        // `filing_repo_id` was never re-pointed — and there's no FK),
+        // fall back to the task's *logical* `repo_id` so the pull can
+        // still reach GitHub. The dangling pointer stays on the task and
+        // the next pull will hit the same soft-fall — the durable fix is
+        // `rl repo doctor --repair`, which re-points the column. A `note`
+        // on the summary surfaces the soft-fall so a JSON-pipe consumer
+        // can see it.
+        let (filing_canonical, soft_fell_to_logical) = match self.filing_canonical_for(&task).await
+        {
+            Ok(c) => (c, false),
+            Err(SyncError::Port(ports::PortError::NotFound(_)))
+                if task.filing_repo_id.is_some() && task.repo_id.is_some() =>
+            {
+                let logical = task.repo_id.expect("checked above");
+                let binding = self.bindings.get(logical).await?;
+                (binding.canonical_url, true)
+            }
+            Err(e) => return Err(e),
+        };
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
         let prev = task.sync;
 
@@ -336,7 +357,16 @@ impl SyncService {
             return Err(SyncError::ManualMerge(tid));
         }
 
-        Ok(summary(&task, prev, decision))
+        Ok(summary_with_note(
+            &task,
+            prev,
+            decision,
+            soft_fell_to_logical.then(|| {
+                "filing_repo_id referenced a deleted binding; pulled via the logical repo instead. \
+                 Run `rl repo doctor --repair` to repair the recorded filing_repo_id."
+                    .to_string()
+            }),
+        ))
     }
 
     /// Re-wire a task to a different remote. Always Conflict by default
@@ -1765,6 +1795,115 @@ mod tests {
         // And no spurious Pull snapshot lands in history.
         let after = tasks.get(task.id).await.unwrap();
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn pull_soft_falls_to_logical_when_filing_binding_is_gone() {
+        // rpl-sv2: a `Synced` task whose `filing_repo_id` references a
+        // binding that's been deleted (e.g. an org-move replaced the
+        // binding, but the recorded UUID was never re-pointed) would
+        // historically hard-fail `sync pull` with `not found: repo
+        // <uuid>`. The soft-fall resolves via the task's *logical*
+        // `repo_id` (which is presumed to have been correctly updated at
+        // attach time) and surfaces a `note` on the summary so a
+        // JSON-pipe consumer sees the anomaly.
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // The promoted task has `filing_repo_id == repo_id` (the only
+        // binding setup created). For the soft-fall to have a *second
+        // leg* to stand on, we need a live binding for the logical
+        // path. Add one, re-point the task's logical repo to it, and
+        // delete the original.
+        let original_binding_id = task.repo_id.expect("task has a logical repo");
+        let replacement = RepoBinding::new(
+            task.workspace_id,
+            "git@github.com:o/r-neworg.git".into(),
+            "github.com/o/r-neworg".into(),
+        )
+        .unwrap();
+        let replacement_id = replacement.id;
+        bindings.save(&replacement).await.unwrap();
+
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.repo_id = Some(replacement_id);
+        // Filing repo stays pointing at the (about-to-be-deleted)
+        // original — that's the divergence we want to exercise.
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        bindings.delete(original_binding_id).await.unwrap();
+
+        // Seed a fetch fixture so the noop-decision's drift check has
+        // something to compare against. The soft-fall re-targets the
+        // fetch at the replacement canonical; we seed the same snapshot
+        // the baseline recorded so the verdict is noop.
+        let before = tasks.get(task.id).await.unwrap();
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: before.remote.as_ref().unwrap().remote_id.clone(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(
+                before.updated_at.into_inner() - chrono::Duration::seconds(10),
+            ),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "noop");
+        let note = s
+            .note
+            .as_deref()
+            .expect("soft-fall must surface a note so a JSON consumer can see it");
+        assert!(
+            note.contains("filing_repo_id referenced a deleted binding"),
+            "note should call out the soft-fall explicitly: {note}"
+        );
+        assert!(
+            note.contains("rl repo doctor --repair"),
+            "note should point the user at the doctor command: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_hard_fails_when_neither_filing_nor_logical_resolves() {
+        // rpl-sv2 follow-up: if BOTH the filing and the logical binding
+        // are gone, the soft-fall has no second leg to stand on. The
+        // pull must propagate the error so the user (or the daemon) can
+        // see the task has no resolvable home — not silently run with
+        // a fabricated canonical.
+        let (svc, tasks, bindings, task, _provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Mutate the task so `filing_repo_id` and `repo_id` differ
+        // (filing != logical) before deleting both bindings. Without
+        // this divergence the second binding doesn't exist and we can't
+        // exercise the both-gone branch.
+        let mut t = tasks.get(task.id).await.unwrap();
+        let second_binding = RepoBinding::new(
+            t.workspace_id,
+            "git@github.com:o/other.git".into(),
+            "github.com/o/other".into(),
+        )
+        .unwrap();
+        let second_id = second_binding.id;
+        bindings.save(&second_binding).await.unwrap();
+        t.repo_id = Some(second_id);
+        t.force_set_filing_repo_id(Some(second_id));
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        // Delete the (now) only binding.
+        bindings.delete(second_id).await.unwrap();
+
+        let err = svc
+            .pull(&t.id.to_string())
+            .await
+            .expect_err("pull with no resolvable binding must error");
+        assert!(
+            matches!(err, SyncError::Port(PortError::NotFound(_))),
+            "expected Port(NotFound) when both bindings are gone, got {err:?}"
+        );
     }
 
     #[tokio::test]

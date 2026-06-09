@@ -467,6 +467,51 @@ impl TaskService {
         self.plan_mirror_mutations(task, true).await
     }
 
+    /// Deliberately re-point a task's recorded `filing_repo_id` to a new
+    /// value (or `None`). Bypasses the [`Task::set_filing_repo_id`]
+    /// immutability guard via [`Task::force_set_filing_repo_id`], which is
+    /// the only place a recorded filing repo can be changed. Used by the
+    /// `rl repo doctor --repair` path (rpl-sv2) to heal tasks whose
+    /// filing binding was deleted out from under them (e.g. after a
+    /// GitHub org-move replaced the canonical binding with a new UUID
+    /// and never re-pointed the recorded column).
+    ///
+    /// The resulting snapshot is tagged with
+    /// [`SnapshotSource::FilingRepoRepair`] so the audit trail records
+    /// every re-point. No outbox entries are enqueued — `filing_repo_id`
+    /// is local sync/persistence metadata, NOT a mirrored field, so the
+    /// next `sync push/pull` has no outbound mutation to send.
+    ///
+    /// `target` may be `Some(new)` (re-point to a live binding) or `None`
+    /// (clear, for the no-resolvable-target case the doctor surfaces).
+    /// Passing the *same* value the task already has is an idempotent
+    /// no-op at the domain layer.
+    pub async fn repoint_filing_repo(
+        &self,
+        task_id: &str,
+        target: Option<RepoId>,
+    ) -> Result<TaskDto> {
+        // Validate the target binding exists before mutating the
+        // task. `force_set_filing_repo_id` is a deliberate-override
+        // domain method that accepts any RepoId without checking —
+        // its only safety net is this service-layer check. Without
+        // it, the doctor's `--target` flag could persist ANOTHER
+        // dangling pointer (the bug we're fixing, just on a
+        // different column). `None` (clear) is a separate case the
+        // user explicitly opts into and doesn't need validation.
+        if let Some(target_id) = target {
+            self.bindings.get(target_id).await?;
+        }
+        let id_str = self.resolve_id(task_id).await?;
+        let id: TaskId = id_str.parse()?;
+        let mut t = self.repo.get(id).await?;
+        t.force_set_filing_repo_id(target);
+        self.repo
+            .save_with_outbox(&t, SnapshotSource::FilingRepoRepair, &[])
+            .await?;
+        self.task_dto(&t).await
+    }
+
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
         let filter = TaskFilter {
             workspace_id: query
@@ -1067,6 +1112,29 @@ mod tests {
 
     fn svc() -> TaskService {
         svc_with_outbox().0
+    }
+
+    /// Like `svc()` but also hands back the binding port so tests
+    /// that need a real `RepoId` target (e.g. for
+    /// `repoint_filing_repo`'s pre-validation) can plant one. The
+    /// pre-validation only does `bindings.get(target)?` — saving a
+    /// binding is enough.
+    fn svc_with_bindings() -> (TaskService, Arc<InMemoryRepoBindingRepository>) {
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings: Arc<InMemoryRepoBindingRepository> =
+            Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
+        let projects: Arc<dyn ProjectRepository> = Arc::new(InMemoryProjectRepository::new());
+        let svc = TaskService::new(
+            repo,
+            snaps,
+            bindings.clone() as Arc<dyn RepoBindingRepository>,
+            workspaces,
+            projects,
+        );
+        (svc, bindings)
     }
 
     /// Build a `TaskService` over all-in-memory repos and hand back the outbox
@@ -3736,5 +3804,144 @@ mod tests {
         // Rollback to version 1 — title should revert.
         let rolled_back = svc.rollback(&original.id, 1).await.unwrap();
         assert_eq!(rolled_back.title, "original title");
+    }
+
+    /// `repoint_filing_repo` re-points the recorded `filing_repo_id` and
+    /// tags the resulting snapshot with `FilingRepoRepair` so the audit
+    /// trail makes every doctor re-point greppable. rpl-sv2.
+    #[tokio::test]
+    async fn repoint_filing_repo_writes_repair_snapshot() {
+        let (svc, bindings) = svc_with_bindings();
+        // Plant a real binding so the service-layer pre-validation
+        // (`bindings.get(target)?`) accepts the re-point target. The
+        // import_mirror call doesn't itself need a binding because
+        // the test plants the filing pointer via `force_set_filing_repo_id`
+        // after import.
+        let ws = ws_id();
+        let new_binding = domain_repo::RepoBinding::new(
+            domain_core::WorkspaceId::new(),
+            "git@github.com:o/target.git".into(),
+            "github.com/o/target".into(),
+        )
+        .unwrap();
+        let new_binding_id = new_binding.id;
+        bindings.save(&new_binding).await.unwrap();
+
+        let original = svc
+            .import_mirror(ImportMirrorCmd {
+                workspace_id: ws.clone(),
+                repo_id: None,
+                provider: "github".into(),
+                remote_id: "123".into(),
+                title: "imported".into(),
+                body: "from gh".into(),
+                assignees: vec![],
+                closed: false,
+            })
+            .await
+            .unwrap();
+
+        let resolved = svc
+            .repoint_filing_repo(&original.id, Some(new_binding_id))
+            .await
+            .unwrap();
+        // The recorded value is now the new binding.
+        let domain = svc.resolve_task(&original.id).await.unwrap();
+        assert_eq!(domain.filing_repo_id, Some(new_binding_id));
+        // D5 contract (the dto never carries filing_repo_id) is covered
+        // by the CLI test `task_show_surfaces_filing_repo_without_leaking_filing_repo_id`,
+        // not duplicated here.
+        let _ = resolved;
+    }
+
+    /// Idempotent re-point: passing the same target as the recorded
+    /// value is a no-op at the domain layer (`force_set_filing_repo_id`
+    /// early-returns on equality). The snapshot still gets a row, but
+    /// `updated_at` is untouched.
+    #[tokio::test]
+    async fn repoint_filing_repo_idempotent_on_same_target() {
+        let (svc, bindings) = svc_with_bindings();
+        // Plant a real binding for the pre-validation check.
+        let new_binding = domain_repo::RepoBinding::new(
+            domain_core::WorkspaceId::new(),
+            "git@github.com:o/idem-target.git".into(),
+            "github.com/o/idem-target".into(),
+        )
+        .unwrap();
+        let target = new_binding.id;
+        bindings.save(&new_binding).await.unwrap();
+
+        let original = svc
+            .import_mirror(ImportMirrorCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                provider: "github".into(),
+                remote_id: "456".into(),
+                title: "x".into(),
+                body: "".into(),
+                assignees: vec![],
+                closed: false,
+            })
+            .await
+            .unwrap();
+        // First re-point sets it.
+        svc.repoint_filing_repo(&original.id, Some(target))
+            .await
+            .unwrap();
+        let after_first = svc.resolve_task(&original.id).await.unwrap().updated_at;
+        // Second re-point with same target is a no-op.
+        svc.repoint_filing_repo(&original.id, Some(target))
+            .await
+            .unwrap();
+        let after_second = svc.resolve_task(&original.id).await.unwrap().updated_at;
+        assert_eq!(
+            after_first, after_second,
+            "idempotent re-point must not bump updated_at"
+        );
+    }
+
+    /// `repoint_filing_repo` must pre-validate the target binding
+    /// exists before persisting the re-point. Otherwise a typo or
+    /// stale binding handle would silently write ANOTHER dangling
+    /// pointer (the bug class rpl-sv2 exists to heal, just on a
+    /// different column). CodeRabbit review flagged this as a Major
+    /// defensive-programming miss.
+    #[tokio::test]
+    async fn repoint_filing_repo_rejects_unknown_target() {
+        let svc = svc();
+        let original = svc
+            .import_mirror(ImportMirrorCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                provider: "github".into(),
+                remote_id: "789".into(),
+                title: "validate".into(),
+                body: "".into(),
+                assignees: vec![],
+                closed: false,
+            })
+            .await
+            .unwrap();
+        // An arbitrary UUID that was never saved to the bindings
+        // repo. The pre-validation must catch this before the save
+        // would have persisted another dangling pointer.
+        let phantom_target = RepoId::new();
+        let err = svc
+            .repoint_filing_repo(&original.id, Some(phantom_target))
+            .await
+            .expect_err("repoint to a non-existent binding must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found") || msg.contains("NoRepo") || msg.contains("not_found"),
+            "expected a 'not found' error, got: {msg}"
+        );
+        // The task row must be unchanged — the pre-validation
+        // happened before the in-memory mutation.
+        let domain = svc.resolve_task(&original.id).await.unwrap();
+        assert_ne!(
+            domain.filing_repo_id,
+            Some(phantom_target),
+            "pre-validation must abort before persisting a dangling pointer"
+        );
     }
 }

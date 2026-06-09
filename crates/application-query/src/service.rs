@@ -394,7 +394,42 @@ impl QueryService {
             let (project_status, project_status_expected, project_drift) =
                 project_axis(project.as_ref(), t);
 
-            if !sync_drift && !project_drift {
+            // rpl-sv2: a third axis that catches the silent divergence
+            // where a task's recorded `filing_repo_id` references a
+            // binding that's been deleted out from under it (e.g. an
+            // org-move replaced the canonical binding with a new UUID
+            // but never re-pointed the column — and there's no FK).
+            // `Port(NotFound)` is the silent case; other errors
+            // propagate. A `Synced` task with a dangling filing
+            // binding is the load-bearing assertion (a `DirtyLocal`
+            // / `Conflict` task would already show up on the sync
+            // axis, but the filing axis is independently useful for
+            // the common case where only the filing pointer broke).
+            //
+            // Cost: one PK lookup per task. For a workspace with ~60
+            // affected tasks this is 60 extra lookups, all backed by
+            // the `repos` PK index. If a future workspace ever has
+            // thousands of tasks and the per-task probe becomes a hot
+            // path, batch this via a `bindings.list_by_ids(&[uuid; n])`
+            // port method — out of scope for the first cut.
+            let filing_drift = match t.filing_repo_id {
+                Some(filing_id) => match self.bindings.get(filing_id).await {
+                    Ok(_) => false,
+                    // The silent-divergence case: a deleted binding
+                    // is what the doctor / drift axis exists to
+                    // surface.
+                    Err(ports::PortError::NotFound(_)) => true,
+                    // Any other failure (backend I/O, decode, etc.)
+                    // is a real problem — don't silently call the
+                    // task drift-free, propagate so the operator
+                    // sees a partial-failure error rather than a
+                    // mis-leading "this workspace is clean" report.
+                    Err(e) => return Err(e.into()),
+                },
+                None => false,
+            };
+
+            if !sync_drift && !project_drift && !filing_drift {
                 continue;
             }
 
@@ -404,6 +439,9 @@ impl QueryService {
             }
             if project_drift {
                 reasons.push("project_status".to_string());
+            }
+            if filing_drift {
+                reasons.push("filing_repo".to_string());
             }
 
             rows.push(DriftRow {
@@ -1361,5 +1399,55 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].path, "/tmp/x");
         assert_eq!(rows[0].status, "missing_path");
+    }
+
+    /// rpl-sv2: a `Synced` task whose recorded `filing_repo_id`
+    /// references a binding that's been deleted (e.g. an org-move
+    /// replaced the binding, but the recorded UUID was never
+    /// re-pointed) is the load-bearing case for the new
+    /// `filing_repo` axis. Before this axis existed, such a task was
+    /// invisible to `query drift` even though `rl task show` and
+    /// `rl sync pull --task` would hard-fail. The new axis is the
+    /// tripwire that closes the silent-divergence gap.
+    #[tokio::test]
+    async fn drift_surfaces_dangling_filing_repo_id_even_when_synced() {
+        let (svc, ws, bs, ts, _ps) = svc_with_projects();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        // The recorded filing binding. Will be deleted below to
+        // simulate the silent-divergence shape.
+        let old = RepoBinding::new(
+            wid,
+            "git@github.com:o/r-oldorg.git".into(),
+            "github.com/o/r-oldorg".into(),
+        )
+        .unwrap();
+        let old_id = old.id;
+        bs.save(&old).await.unwrap();
+
+        // A `Synced` task (via promote) with `filing_repo_id`
+        // pointing at the (about-to-be-deleted) old binding. Logical
+        // is *not* set (matches the rpl-sv2 repro where the live
+        // bindings in the workspace's `repos` table no longer include
+        // `old_id`).
+        let mut t = Task::new_draft(wid, None, "dangling".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "1")).unwrap();
+        t.force_set_filing_repo_id(Some(old_id));
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+        // Delete the binding — the silent divergence is now real.
+        bs.delete(old_id).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1, "exactly the dangling task must surface");
+        let row = &rows[0];
+        assert_eq!(row.task_id, t.id.to_string());
+        assert_eq!(row.sync_state, "synced");
+        // The new axis must be the *only* reason — this is the
+        // load-bearing assertion: a `Synced` task with a dangling
+        // filing binding is invisible to drift WITHOUT this axis.
+        assert_eq!(row.reasons, vec!["filing_repo".to_string()]);
     }
 }
