@@ -567,10 +567,18 @@ impl RepoBindingService {
         // to a live binding. Org-moves update `repo_id` correctly
         // (this is the divergence rpl-sv2 describes), so the live
         // logical binding is the new filing home for the common case.
-        if let Some(logical) = t.repo_id
-            && bindings.get(logical).await.is_ok()
-        {
-            return Ok(Some(logical));
+        //
+        // Only `NotFound` is "binding gone" (→ fall through to step
+        // 2). Any other error is a real backend failure that must
+        // propagate — `is_ok()` would collapse a transient I/O error
+        // into the fallback path and let the doctor re-point the
+        // task to a different binding instead of aborting.
+        if let Some(logical) = t.repo_id {
+            match bindings.get(logical).await {
+                Ok(_) => return Ok(Some(logical)),
+                Err(PortError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         // Step 2: walk `remote_mappings` for (provider, remote_id). The
         // remote issue's identity is the load-bearing signal: if
@@ -578,7 +586,7 @@ impl RepoBindingService {
         // that's the new home regardless of the task's recorded axes.
         if let Some(remote) = t.remote.as_ref()
             && let Some(hit) = bindings
-                .find_by_remote_mapping(&remote.provider, &remote.remote_id)
+                .find_by_remote_mapping(t.workspace_id, &remote.provider, &remote.remote_id)
                 .await?
         {
             return Ok(Some(hit));

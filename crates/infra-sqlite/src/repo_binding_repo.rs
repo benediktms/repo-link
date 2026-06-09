@@ -179,39 +179,58 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
 
     async fn find_by_remote_mapping(
         &self,
+        workspace_id: WorkspaceId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<RepoId>> {
         // D6: `remote_mappings` is keyed on
         // `(filing_repo_id, provider, remote_id)` — the joined query
         // resolves the binding that *currently* holds the issue. JOIN
-        // against `repos` so a row whose `filing_repo_id` references a
-        // deleted binding is filtered out (silent-divergence
-        // protection — the doctor must never re-point a task to a
-        // *second* deleted binding). Returns the first hit when
-        // multiple bindings match; the doctor's contract is documented
-        // to accept that ambiguity and let the user `--target` it.
-        let row = sqlx::query(
+        // against `repos` (filtered by `workspace_id`) so:
+        //   - a row whose `filing_repo_id` references a deleted
+        //     binding is filtered out (silent-divergence
+        //     protection — the doctor must never re-point a task
+        //     to a *second* deleted binding), AND
+        //   - cross-workspace imports (the same `(provider,
+        //     remote_id)` happens to live in two workspaces) don't
+        //     silently pick the wrong workspace's binding.
+        //
+        // We fetch up to 2 rows: 0 = no match, 1 = unambiguous,
+        // 2+ = ambiguous within the workspace → return `None` and
+        // let the doctor surface it as `unresolved` so the user
+        // can pick with `--target` rather than the service
+        // arbitrarily picking. (An arbitrary `LIMIT 1` was the
+        // initial cut, but auto-picking an arbitrary binding
+        // during `--repair` is the exact silent-divergence class
+        // rpl-sv2 exists to heal — the join plus a LIMIT 2 makes
+        // the doctor fail-loud instead of fail-silent.)
+        let rows = sqlx::query(
             "SELECT rm.filing_repo_id \
              FROM remote_mappings rm \
              JOIN repos r ON r.id = rm.filing_repo_id \
-             WHERE rm.provider = ? AND rm.remote_id = ? \
-             LIMIT 1",
+             WHERE r.workspace_id = ? AND rm.provider = ? AND rm.remote_id = ? \
+             LIMIT 2",
         )
+        .bind(workspace_id.to_string())
         .bind(provider)
         .bind(remote_id)
-        .fetch_optional(&self.db.reads)
+        .fetch_all(&self.db.reads)
         .await
         .map_err(map_sqlx_err)?;
-        match row {
-            Some(row) => {
+        match rows.as_slice() {
+            [row] => {
                 let id_str: String = row.try_get("filing_repo_id").map_err(map_sqlx_err)?;
                 let id: RepoId = id_str.parse().map_err(|e: domain_core::IdParseError| {
                     PortError::Backend(format!("remote_mappings.filing_repo_id is malformed: {e}"))
                 })?;
                 Ok(Some(id))
             }
-            None => Ok(None),
+            // Zero rows (no match) OR ≥2 rows (ambiguous) both
+            // collapse to `None` so the doctor surfaces the
+            // situation as `unresolved`. The user can resolve the
+            // ambiguous case with `rl repo doctor --target
+            // <handle>`.
+            _ => Ok(None),
         }
     }
 

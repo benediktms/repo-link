@@ -413,10 +413,19 @@ impl QueryService {
             // path, batch this via a `bindings.list_by_ids(&[uuid; n])`
             // port method — out of scope for the first cut.
             let filing_drift = match t.filing_repo_id {
-                Some(filing_id) => matches!(
-                    self.bindings.get(filing_id).await,
-                    Err(ports::PortError::NotFound(_))
-                ),
+                Some(filing_id) => match self.bindings.get(filing_id).await {
+                    Ok(_) => false,
+                    // The silent-divergence case: a deleted binding
+                    // is what the doctor / drift axis exists to
+                    // surface.
+                    Err(ports::PortError::NotFound(_)) => true,
+                    // Any other failure (backend I/O, decode, etc.)
+                    // is a real problem — don't silently call the
+                    // task drift-free, propagate so the operator
+                    // sees a partial-failure error rather than a
+                    // mis-leading "this workspace is clean" report.
+                    Err(e) => return Err(e.into()),
+                },
                 None => false,
             };
 

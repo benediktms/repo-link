@@ -113,12 +113,16 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 None => None,
             };
             let summary = svc.bindings.doctor(&workspace, repair, target_uuid).await?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&summary).unwrap_or_else(|_| {
-                    r#"{"affected":0,"repaired":0,"unresolved":0,"rows":[]}"#.to_string()
-                },)
-            );
+            // Serialize failure on a known-good in-memory struct is
+            // a programmer error (DoctorSummary's Serialize impl is
+            // derived, all fields are valid). Don't paper over it
+            // with a fabricated "0 results" payload that would
+            // falsely tell the user the workspace is clean — the
+            // doctor *did* find affected tasks, the JSON printer
+            // is just broken. Propagate so the failure is loud.
+            let out = serde_json::to_string_pretty(&summary)
+                .map_err(|e| anyhow!("failed to render repo doctor summary: {e}"))?;
+            println!("{out}");
         }
         RepoCmd::Discover { path } => {
             let mut rows = Vec::new();

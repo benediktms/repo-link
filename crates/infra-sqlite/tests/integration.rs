@@ -2299,3 +2299,116 @@ async fn rfc0002_migration_sequence_data_integrity() {
 
     drop(dir);
 }
+
+/// rpl-sv2 follow-up: `find_by_remote_mapping` must be
+/// workspace-scoped and ambiguous (≥2 matches in the same workspace)
+/// must surface as `None` (so the doctor surfaces the situation as
+/// `unresolved` rather than arbitrarily picking a binding during
+/// `--repair`). CodeRabbit review flagged the prior `LIMIT 1` cut
+/// as a silent-divergence miss.
+#[tokio::test]
+async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none() {
+    let (_dir, ws, rb, ts) = setup().await;
+
+    // Two workspaces, each with one binding that holds the same
+    // `(provider, remote_id)` — a cross-workspace import shape.
+    let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+    let w2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+    ws.save(&w1).await.unwrap();
+    ws.save(&w2).await.unwrap();
+
+    let repo_w1 = RepoBinding::new(
+        w1.id,
+        "git@github.com:o/cross-w1.git".into(),
+        "github.com/o/cross-w1".into(),
+    )
+    .unwrap();
+    let repo_w2 = RepoBinding::new(
+        w2.id,
+        "git@github.com:o/cross-w2.git".into(),
+        "github.com/o/cross-w2".into(),
+    )
+    .unwrap();
+    // Each binding must have a unique prefix — the second
+    // `RepoBinding::new` with a same-shaped canonical would
+    // otherwise collide on the `repos.prefix` UNIQUE index.
+    // (The first auto-derives a prefix from its canonical; the
+    // second needs an explicit override.)
+    let repo_w1_id = repo_w1.id;
+    let repo_w2_id = repo_w2.id;
+    rb.save(&repo_w1).await.unwrap();
+    let mut repo_w2 = repo_w2;
+    repo_w2.set_prefix("cw2".into()).unwrap();
+    rb.save(&repo_w2).await.unwrap();
+
+    // One task per workspace, both mirroring the same github issue
+    // (legitimate cross-workspace import — different workspaces
+    // importing the same upstream issue for local tracking).
+    for (ws_id, repo_id) in [(w1.id, repo_w1_id), (w2.id, repo_w2_id)] {
+        let mut t = Task::new_draft(ws_id, Some(repo_id), "shared issue".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "shared-1"))
+            .unwrap();
+        ts.save(&t, SnapshotSource::Promote).await.unwrap();
+    }
+
+    // Cross-workspace lookup must be scoped: w1's lookup must NOT
+    // return w2's binding. (If it did, `rl repo doctor --repair`
+    // would silently re-point a w1 task to a w2 binding — a
+    // cross-workspace data corruption, the exact silent-divergence
+    // class rpl-sv2 exists to heal.)
+    let w1_hit = rb
+        .find_by_remote_mapping(w1.id, "github", "shared-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        w1_hit,
+        Some(repo_w1.id),
+        "w1 lookup must return the w1 binding, not a cross-workspace pick"
+    );
+    let w2_hit = rb
+        .find_by_remote_mapping(w2.id, "github", "shared-1")
+        .await
+        .unwrap();
+    assert_eq!(w2_hit, Some(repo_w2.id));
+
+    // Ambiguity-in-workspace case: two bindings in w1 with the
+    // same `(provider, remote_id)` row. (Reach it by saving a
+    // second task in w1 pointing at a *different* binding under
+    // the same remote_id — `remote_mappings` carries a UNIQUE on
+    // `(filing_repo_id, provider, remote_id)`, so two distinct
+    // bindings in the same workspace CAN both hold the same
+    // `(provider, remote_id)` row.)
+    let mut repo_w1_2 = RepoBinding::new(
+        w1.id,
+        "git@github.com:o/cross-w1-mirror.git".into(),
+        "github.com/o/cross-w1-mirror".into(),
+    )
+    .unwrap();
+    let repo_w1_2_id = repo_w1_2.id;
+    repo_w1_2.set_prefix("cw1m".into()).unwrap();
+    rb.save(&repo_w1_2).await.unwrap();
+    let mut t2 = Task::new_draft(w1.id, Some(repo_w1_2_id), "ambiguous".into()).unwrap();
+    t2.stage_for_sync().unwrap();
+    t2.promote_to_remote(RemoteRef::new("github", "shared-1"))
+        .unwrap();
+    ts.save(&t2, SnapshotSource::Promote).await.unwrap();
+
+    // Now w1's lookup must surface ambiguity → return `None`
+    // (doctor reports `unresolved`, user picks `--target`).
+    let ambiguous = rb
+        .find_by_remote_mapping(w1.id, "github", "shared-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        ambiguous, None,
+        "ambiguous workspace lookup must return None (not arbitrarily pick)"
+    );
+    // w2's lookup is unaffected (only one binding holds the
+    // mapping there).
+    let w2_unchanged = rb
+        .find_by_remote_mapping(w2.id, "github", "shared-1")
+        .await
+        .unwrap();
+    assert_eq!(w2_unchanged, Some(repo_w2.id));
+}
