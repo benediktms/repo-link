@@ -1464,7 +1464,10 @@ mod tests {
         // (no bindings.save for the unknown UUID; it stays dangling)
 
         let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
-        assert_eq!(summary.affected, 1, "the one task with no logical repo is affected");
+        assert_eq!(
+            summary.affected, 1,
+            "the one task with no logical repo is affected"
+        );
         assert_eq!(summary.repaired, 0);
         assert_eq!(
             summary.unresolved, 1,
