@@ -8,6 +8,7 @@ use dto_shared::{
     UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
+use ports::PortError;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
 use crate::commands::repo::{resolve_repo_handle, resolve_repo_handle_required};
@@ -276,13 +277,20 @@ pub(crate) async fn task_dispatch(
                         "name": binding.name,
                         "canonical_url": binding.canonical_url,
                     }),
-                    // A recorded filing repo whose binding was since deleted is
-                    // a legitimate dangling pointer (no FK on filing_repo_id) —
-                    // surface it as null. Any OTHER error (I/O, etc.) must
-                    // propagate, not be silently masked as "no filing repo".
-                    Err(application_workspace::ServiceError::BindingNotFound(_)) => {
-                        serde_json::Value::Null
-                    }
+                    // A recorded filing repo whose binding is gone is a
+                    // legitimate dangling pointer (no FK on
+                    // `filing_repo_id`, rpl-sv2 — org-move replaces the
+                    // binding and leaves the old UUID recorded on tasks
+                    // whose `repo_id` was correctly re-pointed). The
+                    // `bindings.get(id)` port raises `Port(NotFound)`;
+                    // `ServiceError::BindingNotFound` is the *handle*
+                    // path and never fires here. Surface both as null
+                    // so `task show` stays usable; any other error
+                    // (I/O, etc.) must propagate.
+                    Err(
+                        application_workspace::ServiceError::Port(PortError::NotFound(_))
+                        | application_workspace::ServiceError::BindingNotFound(_),
+                    ) => serde_json::Value::Null,
                     Err(e) => return Err(anyhow!("resolve filing repo binding: {e}")),
                 }
             } else {

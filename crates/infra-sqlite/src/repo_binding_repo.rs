@@ -177,6 +177,44 @@ impl RepoBindingRepository for SqliteRepoBindingRepository {
         }
     }
 
+    async fn find_by_remote_mapping(
+        &self,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<RepoId>> {
+        // D6: `remote_mappings` is keyed on
+        // `(filing_repo_id, provider, remote_id)` — the joined query
+        // resolves the binding that *currently* holds the issue. JOIN
+        // against `repos` so a row whose `filing_repo_id` references a
+        // deleted binding is filtered out (silent-divergence
+        // protection — the doctor must never re-point a task to a
+        // *second* deleted binding). Returns the first hit when
+        // multiple bindings match; the doctor's contract is documented
+        // to accept that ambiguity and let the user `--target` it.
+        let row = sqlx::query(
+            "SELECT rm.filing_repo_id \
+             FROM remote_mappings rm \
+             JOIN repos r ON r.id = rm.filing_repo_id \
+             WHERE rm.provider = ? AND rm.remote_id = ? \
+             LIMIT 1",
+        )
+        .bind(provider)
+        .bind(remote_id)
+        .fetch_optional(&self.db.reads)
+        .await
+        .map_err(map_sqlx_err)?;
+        match row {
+            Some(row) => {
+                let id_str: String = row.try_get("filing_repo_id").map_err(map_sqlx_err)?;
+                let id: RepoId = id_str.parse().map_err(|e: domain_core::IdParseError| {
+                    PortError::Backend(format!("remote_mappings.filing_repo_id is malformed: {e}"))
+                })?;
+                Ok(Some(id))
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn delete(&self, id: RepoId) -> PortResult<()> {
         sqlx::query("DELETE FROM repos WHERE id = ?")
             .bind(id.to_string())

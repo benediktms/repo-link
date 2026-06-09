@@ -52,6 +52,15 @@ pub(crate) fn link_summary(
 }
 
 pub(crate) fn summary(task: &Task, prev: SyncState, decision: SyncDecision) -> SyncSummaryDto {
+    summary_with_note(task, prev, decision, None)
+}
+
+pub(crate) fn summary_with_note(
+    task: &Task,
+    prev: SyncState,
+    decision: SyncDecision,
+    note: Option<String>,
+) -> SyncSummaryDto {
     SyncSummaryDto {
         task_id: task.id.to_string(),
         previous_state: enum_str(&prev),
@@ -61,7 +70,7 @@ pub(crate) fn summary(task: &Task, prev: SyncState, decision: SyncDecision) -> S
             provider: r.provider.clone(),
             remote_id: r.remote_id.clone(),
         }),
-        note: None,
+        note,
     }
 }
 

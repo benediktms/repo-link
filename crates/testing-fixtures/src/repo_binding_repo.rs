@@ -76,6 +76,21 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
             .cloned())
     }
 
+    async fn find_by_remote_mapping(
+        &self,
+        _provider: &str,
+        _remote_id: &str,
+    ) -> PortResult<Option<RepoId>> {
+        // The in-memory binding repo doesn't model `remote_mappings`
+        // (that table is SQLite-specific). Tests that exercise the
+        // auto-target's step 2 (`remote_mappings` lookup) need to mock
+        // this directly via a custom port impl; the rest of the doctor
+        // chain (logical-repo lookup, task save) still works because
+        // the in-memory binding repo DOES model the binding table
+        // itself.
+        Ok(None)
+    }
+
     async fn delete(&self, id: RepoId) -> PortResult<()> {
         self.inner.lock().unwrap().remove(&id);
         Ok(())

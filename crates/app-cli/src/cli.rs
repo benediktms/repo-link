@@ -266,6 +266,29 @@ pub(crate) enum RepoCmd {
     /// substring > name substring. `ambiguous` is set when more than one
     /// hit is returned.
     Find { query: String },
+    /// Inspect (and optionally repair) tasks whose recorded
+    /// `filing_repo_id` references a deleted binding (rpl-sv2). Without
+    /// `--repair`: list each affected task with the auto-resolved
+    /// target — the user audits before committing. With `--repair`:
+    /// re-point every affected task's `filing_repo_id` to the target
+    /// and tag the resulting snapshot with `FilingRepoRepair`. The
+    /// `--target <handle>` override forces every affected task to be
+    /// re-pointed at that specific binding, skipping the auto-target
+    /// chain. Run after a GitHub org-move to clean up the silent
+    /// divergence the unfix-up leaves behind.
+    Doctor {
+        #[command(flatten)]
+        ws: WorkspaceArg,
+        /// Apply the re-point. Without this flag, the command is
+        /// read-only and emits a list of affected tasks.
+        #[arg(long)]
+        repair: bool,
+        /// Force every affected task to be re-pointed at this binding
+        /// (UUID / prefix / name / alias, same forms as `rl repo show`).
+        /// Skips the auto-target chain.
+        #[arg(long)]
+        target: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

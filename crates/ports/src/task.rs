@@ -38,6 +38,23 @@ pub trait RepoBindingRepository: Send + Sync {
     /// `rpl-ak7` for tasks and reuse the prefix half here) instead of a
     /// UUID.
     async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>>;
+    /// Look up the live binding that holds a particular remote issue
+    /// identity `(provider, remote_id)` via the `remote_mappings` table
+    /// (D6 rekey — `remote_mappings` is keyed on
+    /// `(filing_repo_id, provider, remote_id)` so the lookup is
+    /// effectively a join). Used by the `rl repo doctor --repair`
+    /// auto-target resolution chain (rpl-sv2) when the task's logical
+    /// `repo_id` is itself stale and the doctor has to fall back to
+    /// the remote-issue identity as the load-bearing signal. Returns
+    /// the first hit when multiple workspaces hold a mapping for the
+    /// same `(provider, remote_id)` (rare — only happens with
+    /// cross-workspace imports); the doctor accepts that ambiguity
+    /// and the user can resolve it with `--target`.
+    async fn find_by_remote_mapping(
+        &self,
+        provider: &str,
+        remote_id: &str,
+    ) -> PortResult<Option<RepoId>>;
     async fn delete(&self, id: RepoId) -> PortResult<()>;
 }
 
