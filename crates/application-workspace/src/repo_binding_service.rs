@@ -1351,12 +1351,11 @@ mod tests {
     }
 
     /// `target_override` forces every affected task to that binding,
-    /// skipping the auto-target chain. The override binding must
-    /// already exist (otherwise the doctor's save-to-binding is moot
-    /// because the next pull will hit the same NotFound again — but
-    /// the doctor itself doesn't validate the override's liveness
-    /// because the binding can be created in the same atomic step
-    /// via `rl repo attach` + `rl repo doctor --repair`).
+    /// skipping the auto-target chain. The doctor pre-validates
+    /// the override target before mutating any task, so a phantom
+    /// `RepoId` is rejected up front (see
+    /// `doctor_repair_rejects_unknown_target_override` for the
+    /// rejection path).
     #[tokio::test]
     async fn doctor_repair_uses_target_override() {
         let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
