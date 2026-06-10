@@ -1021,9 +1021,19 @@ impl TaskService {
     /// Pin step 1 (`filing_repo_id`) on the task — promote records it
     /// automatically — to make the resolution permanent.
     async fn filing_canonical_for(&self, task: &Task) -> Result<Option<String>> {
-        let workspace = self.workspaces.get(task.workspace_id).await?;
+        // A deleted workspace row is not a hard error here: it just means
+        // step 2 of the D2 chain (workspace default) is unavailable, so
+        // resolve with `workspace_default = None` and let step 1
+        // (recorded `filing_repo_id`) or step 3 (logical `repo_id`) win.
+        // Only when the chain itself returns `None` — meaning all three
+        // inputs are absent — do we return `Ok(None)`. (CodeRabbit #191.)
+        let workspace_default = match self.workspaces.get(task.workspace_id).await {
+            Ok(ws) => ws.filing_repo_id,
+            Err(ports::PortError::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
         let Some(repo_id) =
-            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
+            resolve_filing_repo(task.filing_repo_id, workspace_default, task.repo_id)
         else {
             return Ok(None);
         };

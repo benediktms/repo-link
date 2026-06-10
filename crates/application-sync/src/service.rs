@@ -538,10 +538,19 @@ impl SyncService {
     /// mutation. Pin step 1 (`filing_repo_id`) on the task — promote
     /// records it automatically — to make the resolution permanent.
     async fn filing_canonical_for(&self, task: &Task) -> Result<String> {
-        let workspace = self.workspaces.get(task.workspace_id).await?;
-        let repo_id =
-            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
-                .ok_or(SyncError::NoRepo)?;
+        // A deleted workspace row is not a hard error here: it just means
+        // step 2 of the D2 chain (workspace default) is unavailable, so
+        // resolve with `workspace_default = None` and let step 1
+        // (recorded `filing_repo_id`) or step 3 (logical `repo_id`) win.
+        // Only when the chain itself returns `None` — meaning all three
+        // inputs are absent — do we surface `NoRepo`. (CodeRabbit #191.)
+        let workspace_default = match self.workspaces.get(task.workspace_id).await {
+            Ok(ws) => ws.filing_repo_id,
+            Err(ports::PortError::NotFound(_)) => None,
+            Err(e) => return Err(SyncError::Port(e)),
+        };
+        let repo_id = resolve_filing_repo(task.filing_repo_id, workspace_default, task.repo_id)
+            .ok_or(SyncError::NoRepo)?;
         let binding = self.bindings.get(repo_id).await?;
         Ok(binding.canonical_url)
     }
@@ -1996,6 +2005,85 @@ mod tests {
         // was written because the resolution never reached the fetch.
         let after = tasks.get(task.id).await.unwrap();
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn pull_falls_through_chain_when_workspace_row_is_deleted() {
+        // CodeRabbit #191: a deleted workspace row must not mask valid
+        // step-1/step-3 inputs. Pull should resolve through the
+        // recorded `filing_repo_id` even when the workspace row is
+        // gone, surfacing the *recorded* binding's canonical URL
+        // rather than a `NoRepo` or `NotFound("workspace ...")`.
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        // Build a workspace + binding, then promote a task on it. The
+        // promote records `filing_repo_id == repo_id == binding.id`
+        // on the task. Then delete the *workspace* row (not the
+        // binding) and pull must still succeed.
+        let workspace = Workspace::new(WorkspaceName::new("del-ws").unwrap(), None, true);
+        let binding = RepoBinding::new(
+            workspace.id,
+            "git@github.com:o/r.git".into(),
+            "github.com/o/r".into(),
+        )
+        .unwrap();
+        let binding_id = binding.id;
+        bindings.save(&binding).await.unwrap();
+        workspaces.save(&workspace).await.unwrap();
+        let task = Task::new_draft(workspace.id, Some(binding_id), "t".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+        );
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Delete the workspace row. The task and its recorded
+        // `filing_repo_id` are untouched.
+        workspaces.delete(workspace.id).await.unwrap();
+
+        // Re-read the task: promote updated the in-store task with a
+        // `remote_id: "100"` from the FakeProvider.
+        let promoted = tasks.get(task.id).await.unwrap();
+        let remote_id = promoted
+            .remote
+            .as_ref()
+            .expect("promote must have set a remote")
+            .remote_id
+            .clone();
+
+        // Seed a noop-shaped fetch against the live binding.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: remote_id.clone(),
+            node_id: None,
+            title: promoted.title.clone(),
+            body: promoted.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(
+                promoted.updated_at.into_inner() - chrono::Duration::seconds(10),
+            ),
+            assignees: promoted.assignees.clone(),
+            labels: vec![],
+        });
+
+        let _s = svc.pull(&task.id.to_string()).await.unwrap();
+        // The chain resolved to the recorded `filing_repo_id`'s
+        // binding, not a `NoRepo` error. The binding is still live.
+        let recorded = provider
+            .last_fetch_canonical
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("pull must have recorded a fetch canonical");
+        assert_eq!(
+            recorded, "github.com/o/r",
+            "chain must fall through to step 1 (recorded filing_repo_id) when the workspace row is gone"
+        );
     }
 
     #[tokio::test]
