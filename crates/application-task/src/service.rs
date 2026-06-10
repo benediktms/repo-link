@@ -8,6 +8,7 @@ use application_sync::enqueue;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, OutboxMutation, resolve_filing_repo};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
+use domain_workspace::Workspace;
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
     TaskDto, UpdateTaskCmd,
@@ -704,14 +705,22 @@ impl TaskService {
         // reciprocal edge changed — the cleared task's *forward* edge is what
         // owes the GitHub un-link, so the plan below needs every far end's
         // coords, not just the ones whose back-edge was stripped.
+        // Workspace cache: each `relation_remote_coords` call would otherwise
+        // re-fetch the neighbor's workspace; in the common case all
+        // neighbors share one workspace, so one cache slot covers the loop.
         let mut coords_by_other: HashMap<TaskId, Option<(String, String)>> = HashMap::new();
+        let mut workspace_cache: HashMap<WorkspaceId, Workspace> = HashMap::new();
         for (other_id, inv_kinds) in by_other {
             let mut other = self.repo.get(other_id).await?;
             let mut changed = false;
             for k in inv_kinds {
                 changed |= other.remove_relation(k, t.id);
             }
-            coords_by_other.insert(other.id, self.relation_remote_coords(&other).await?);
+            coords_by_other.insert(
+                other.id,
+                self.relation_remote_coords_cached(&other, &mut workspace_cache)
+                    .await?,
+            );
             if changed {
                 others_changed.push(other);
             }
@@ -722,7 +731,10 @@ impl TaskService {
         // a single canonical `RemoveSubIssue`/`RemoveBlockedBy` (the reciprocal
         // back-edge stripped above does not separately enqueue).
         let mut entries: Vec<OutboxEntry> = Vec::new();
-        if let Some(this_coords) = self.relation_remote_coords(&t).await? {
+        if let Some(this_coords) = self
+            .relation_remote_coords_cached(&t, &mut workspace_cache)
+            .await?
+        {
             for r in &removed {
                 if r.other == t.id {
                     continue;
@@ -996,21 +1008,33 @@ impl TaskService {
         ))
     }
 
-    /// Best-effort canonical-URL lookup for the repo the task's backing issue
-    /// is *filed* in (RFC 0002 D3 / #143). Mirrors
-    /// `SyncService::filing_canonical_for` but returns `Option` rather than
-    /// erroring — the `ConvertDraftToIssue` planner calls `.unwrap_or_default()`
-    /// so a truly unaddressable draft (no `filing_repo_id` and no `repo_id`)
-    /// still enqueues an empty `repo_node_id`, matching the behaviour before this
-    /// RFC.
+    /// Canonical URL of the repo the task's backing issue is *filed* in
+    /// (RFC 0002). Walks the D2 chain — recorded `filing_repo_id` →
+    /// workspace default → logical `repo_id` — via `resolve_filing_repo`,
+    /// mirroring `SyncService::filing_canonical_for`. Returns
+    /// `Ok(None)` when the chain has no inputs (board-draft orphan) so
+    /// the `ConvertDraftToIssue` planner can short-circuit to an empty
+    /// `repo_node_id`.
     ///
-    /// Prefers the recorded `filing_repo_id`, falling back to the logical
-    /// `repo_id`. Used for every issue-addressing mutation (create / update /
-    /// convert) so a cross-filed task targets the repo its issue actually lives
-    /// in. (Logical-context ops — D4 prefix / worktree / relink — resolve the
-    /// logical binding directly where they need it, not through here.)
+    /// **Caveat**: a saga task created when the workspace had no filing
+    /// default will silently flip to a later default on its next mutation.
+    /// Pin step 1 (`filing_repo_id`) on the task — promote records it
+    /// automatically — to make the resolution permanent.
     async fn filing_canonical_for(&self, task: &Task) -> Result<Option<String>> {
-        let Some(repo_id) = task.filing_repo_id.or(task.repo_id) else {
+        // A deleted workspace row is not a hard error here: it just means
+        // step 2 of the D2 chain (workspace default) is unavailable, so
+        // resolve with `workspace_default = None` and let step 1
+        // (recorded `filing_repo_id`) or step 3 (logical `repo_id`) win.
+        // Only when the chain itself returns `None` — meaning all three
+        // inputs are absent — do we return `Ok(None)`. (CodeRabbit #191.)
+        let workspace_default = match self.workspaces.get(task.workspace_id).await {
+            Ok(ws) => ws.filing_repo_id,
+            Err(ports::PortError::NotFound(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let Some(repo_id) =
+            resolve_filing_repo(task.filing_repo_id, workspace_default, task.repo_id)
+        else {
             return Ok(None);
         };
         Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
@@ -1020,6 +1044,8 @@ impl TaskService {
     /// when the task isn't issue-backed or its filing repo can't be resolved. A
     /// relation can only be projected onto GitHub when BOTH ends resolve, so the
     /// relation-sync planner treats `None` on either side as "skip enqueue".
+    /// Delegates to `filing_canonical_for` so the chain stays in lockstep with
+    /// `application-sync`.
     async fn relation_remote_coords(&self, task: &Task) -> Result<Option<(String, String)>> {
         let Some(remote) = &task.remote else {
             return Ok(None);
@@ -1027,6 +1053,47 @@ impl TaskService {
         let Some(canonical) = self.filing_canonical_for(task).await? else {
             return Ok(None);
         };
+        Ok(Some((canonical, remote.remote_id.clone())))
+    }
+
+    /// Workspace-cached chain resolution for relation endpoints. Looks up
+    /// the task's workspace in `workspace_cache` first, falling back to a
+    /// `workspaces.get` and recording the result. The chain itself runs
+    /// inline against the cached workspace so a `clear_relations` loop
+    /// over N neighbors in one workspace does *one* `workspaces.get` and
+    /// N `bindings.get`s — never N of each.
+    ///
+    /// A missing workspace is treated as "no resolvable home"
+    /// (`Ok(None)`) rather than a hard error: a task whose workspace
+    /// has been deleted has no chain step 2 to consult, and the
+    /// relation can't be projected regardless. Mirrors the pre-chain
+    /// behavior where the helper was a pure in-memory
+    /// `task.filing_repo_id.or(task.repo_id)` and never touched
+    /// `workspaces` at all.
+    async fn relation_remote_coords_cached(
+        &self,
+        task: &Task,
+        workspace_cache: &mut HashMap<WorkspaceId, Workspace>,
+    ) -> Result<Option<(String, String)>> {
+        let workspace = match workspace_cache.entry(task.workspace_id) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                match self.workspaces.get(task.workspace_id).await {
+                    Ok(ws) => v.insert(ws),
+                    Err(ports::PortError::NotFound(_)) => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        let Some(remote) = &task.remote else {
+            return Ok(None);
+        };
+        let Some(repo_id) =
+            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
+        else {
+            return Ok(None);
+        };
+        let canonical = self.bindings.get(repo_id).await?.canonical_url;
         Ok(Some((canonical, remote.remote_id.clone())))
     }
 
