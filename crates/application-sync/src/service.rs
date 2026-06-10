@@ -3,9 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::TaskId;
+use domain_core::{TaskId, WorkspaceId};
 use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
 use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
+use domain_workspace::Workspace;
 
 use crate::enqueue;
 use dto_shared::SyncSummaryDto;
@@ -17,7 +18,6 @@ use ports::{
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
-    summary_with_note,
 };
 
 pub struct SyncService {
@@ -223,27 +223,15 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        // rpl-sv2: if the task's recorded `filing_repo_id` references a
-        // binding that's been deleted (org-move replaced the binding, but
-        // `filing_repo_id` was never re-pointed — and there's no FK),
-        // fall back to the task's *logical* `repo_id` so the pull can
-        // still reach GitHub. The dangling pointer stays on the task and
-        // the next pull will hit the same soft-fall — the durable fix is
-        // `rl repo doctor --repair`, which re-points the column. A `note`
-        // on the summary surfaces the soft-fall so a JSON-pipe consumer
-        // can see it.
-        let (filing_canonical, soft_fell_to_logical) = match self.filing_canonical_for(&task).await
-        {
-            Ok(c) => (c, false),
-            Err(SyncError::Port(ports::PortError::NotFound(_)))
-                if task.filing_repo_id.is_some() && task.repo_id.is_some() =>
-            {
-                let logical = task.repo_id.expect("checked above");
-                let binding = self.bindings.get(logical).await?;
-                (binding.canonical_url, true)
-            }
-            Err(e) => return Err(e),
-        };
+        // rpl-s7k: pull resolves the filing repo via the same D2 chain as
+        // promote (recorded `filing_repo_id` → workspace default → logical
+        // `repo_id`) — see `filing_canonical_for`. A `NotFound` here means
+        // a binding has been deleted; the durable fix is `rl repo doctor
+        // --repair` to re-point the column. The previous rpl-sv2 soft-fall
+        // is gone: it could only ever look up the same `repo_id` the
+        // helper already tried, so it never resolved a binding the helper
+        // missed.
+        let filing_canonical = self.filing_canonical_for(&task).await?;
         let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
         let prev = task.sync;
 
@@ -357,16 +345,7 @@ impl SyncService {
             return Err(SyncError::ManualMerge(tid));
         }
 
-        Ok(summary_with_note(
-            &task,
-            prev,
-            decision,
-            soft_fell_to_logical.then(|| {
-                "filing_repo_id referenced a deleted binding; pulled via the logical repo instead. \
-                 Run `rl repo doctor --repair` to repair the recorded filing_repo_id."
-                    .to_string()
-            }),
-        ))
+        Ok(summary(&task, prev, decision))
     }
 
     /// Re-wire a task to a different remote. Always Conflict by default
@@ -547,36 +526,24 @@ impl SyncService {
         Ok(binding.canonical_url)
     }
 
-    /// Canonical URL of the repo the task's backing issue is *filed* in (RFC
-    /// 0002). Prefers the recorded `filing_repo_id`, falling back to the
-    /// logical `repo_id` when it is NULL — so pre-resolution tasks and rows
-    /// migrated before the filing axis existed still resolve to the same repo
-    /// they always did. Used for every remote-issue address (create / update /
-    /// fetch / comment); the logical lookup stays for logical-binding ops
-    /// (prefix / worktree / relink).
+    /// Canonical URL of the repo the task's backing issue is *filed* in
+    /// (RFC 0002). Walks the D2 chain — recorded `filing_repo_id` →
+    /// workspace default → logical `repo_id` — via `resolve_filing_repo`.
+    /// Single source of truth for every remote-issue address (create /
+    /// update / fetch / comment / relation reconcile); the logical-only
+    /// lookup stays for logical-binding ops (prefix / worktree / relink).
+    ///
+    /// **Caveat**: a saga task created when the workspace had no filing
+    /// default will silently flip to a later default on its next
+    /// mutation. Pin step 1 (`filing_repo_id`) on the task — promote
+    /// records it automatically — to make the resolution permanent.
     async fn filing_canonical_for(&self, task: &Task) -> Result<String> {
-        let repo_id = task
-            .filing_repo_id
-            .or(task.repo_id)
-            .ok_or(SyncError::NoRepo)?;
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let repo_id =
+            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
+                .ok_or(SyncError::NoRepo)?;
         let binding = self.bindings.get(repo_id).await?;
         Ok(binding.canonical_url)
-    }
-
-    /// Issue coordinates `(filing_canonical, remote_id)` for a task, or `None`
-    /// when it is not issue-backed or its filing repo can't be resolved — in
-    /// either case the relation can't be projected onto GitHub, so the caller
-    /// skips it. Read-only twin of `filing_canonical_for` that tolerates a
-    /// missing repo instead of erroring.
-    async fn relation_remote_coords(&self, task: &Task) -> Result<Option<(String, String)>> {
-        let Some(remote) = task.remote.as_ref() else {
-            return Ok(None);
-        };
-        let Some(repo_id) = task.filing_repo_id.or(task.repo_id) else {
-            return Ok(None);
-        };
-        let canonical = self.bindings.get(repo_id).await?.canonical_url;
-        Ok(Some((canonical, remote.remote_id.clone())))
     }
 
     /// Plan the outbox entries a just-promoted task owes for its existing
@@ -588,9 +555,14 @@ impl SyncService {
         this_coords: &(String, String),
     ) -> Result<Vec<OutboxEntry>> {
         let mut entries = Vec::new();
+        // One `workspaces.get` per unique neighbor workspace, not per edge.
+        let mut workspace_cache: HashMap<WorkspaceId, Workspace> = HashMap::new();
         for rel in &task.relations {
             let neighbor = self.tasks.get(rel.other).await?;
-            let Some(neighbor_coords) = self.relation_remote_coords(&neighbor).await? else {
+            let Some(neighbor_coords) = self
+                .relation_remote_coords(&neighbor, &mut workspace_cache)
+                .await?
+            else {
                 continue; // far end not issue-backed → not yet projectable
             };
             if let Some(m) =
@@ -600,6 +572,48 @@ impl SyncService {
             }
         }
         Ok(entries)
+    }
+
+    /// Issue coordinates `(filing_canonical, remote_id)` for a relation
+    /// endpoint, or `None` when the task isn't issue-backed or its filing
+    /// repo can't be resolved — in either case the relation can't be
+    /// projected onto GitHub, so the caller skips it. Errors propagate so
+    /// a transient I/O failure on `workspaces.get` / `bindings.get`
+    /// bubbles up instead of silently dropping the relation.
+    ///
+    /// The `workspace_cache` collapses repeated `workspaces.get` calls
+    /// across a backfill loop into one per unique `WorkspaceId`. The
+    /// chain itself runs inline against the cached workspace, so
+    /// `relation_backfill_entries` does one `workspaces.get` per unique
+    /// neighbor workspace, not one per relation. A missing workspace is
+    /// "no resolvable home" (`Ok(None)`) — see the pre-chain-port
+    /// behavior where the helper was a pure in-memory
+    /// `task.filing_repo_id.or(task.repo_id)`.
+    async fn relation_remote_coords(
+        &self,
+        task: &Task,
+        workspace_cache: &mut HashMap<WorkspaceId, Workspace>,
+    ) -> Result<Option<(String, String)>> {
+        let workspace = match workspace_cache.entry(task.workspace_id) {
+            std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+            std::collections::hash_map::Entry::Vacant(v) => {
+                match self.workspaces.get(task.workspace_id).await {
+                    Ok(ws) => v.insert(ws),
+                    Err(ports::PortError::NotFound(_)) => return Ok(None),
+                    Err(e) => return Err(SyncError::Port(e)),
+                }
+            }
+        };
+        let Some(remote) = task.remote.as_ref() else {
+            return Ok(None);
+        };
+        let Some(repo_id) =
+            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
+        else {
+            return Ok(None);
+        };
+        let canonical = self.bindings.get(repo_id).await?.canonical_url;
+        Ok(Some((canonical, remote.remote_id.clone())))
     }
 
     /// Inbound relation reconcile (#150): align `task`'s local parent/child and
@@ -765,7 +779,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;
-    use domain_core::{Timestamp, WorkspaceId};
+    use domain_core::{RepoId, Timestamp, WorkspaceId};
     use domain_repo::RepoBinding;
     use domain_sync::OutboxMutation;
     use domain_task::Task;
@@ -812,6 +826,14 @@ mod tests {
         last_create: Mutex<Option<String>>,
         last_create_canonical: Mutex<Option<String>>,
         last_update: Mutex<Option<RecordedUpdate>>,
+        // Canonical URL of the most recent `fetch_remote` call — pinned
+        // by the rpl-s7k tests to assert the D2 chain resolved to the
+        // expected repo (workspace default, not logical).
+        last_fetch_canonical: Mutex<Option<String>>,
+        // Canonical URL of the most recent `update_remote` call —
+        // pinned by the rpl-s7k tests to assert push's D2 chain
+        // resolved to the expected repo.
+        last_update_canonical: Mutex<Option<String>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
         comments: Mutex<Vec<RemoteComment>>,
         created_comments: Mutex<Vec<String>>,
@@ -869,6 +891,7 @@ mod tests {
         }
 
         async fn update_remote(&self, cmd: RemoteTaskUpdate<'_>) -> PortResult<RemoteTaskSnapshot> {
+            *self.last_update_canonical.lock().unwrap() = Some(cmd.canonical_repo.to_string());
             *self.last_update.lock().unwrap() = Some(RecordedUpdate {
                 remote_id: cmd.remote_id.into(),
                 title: cmd.title.map(str::to_owned),
@@ -894,6 +917,7 @@ mod tests {
             canonical: &str,
             remote_id: &str,
         ) -> PortResult<RemoteTaskSnapshot> {
+            *self.last_fetch_canonical.lock().unwrap() = Some(canonical.to_string());
             // `take()` so the staged "moved" response is one-shot — the next
             // fetch_remote after this falls through to fetch_returns.
             if let Some((to_c, to_r)) = self.fetch_moved.lock().unwrap().take() {
@@ -1318,6 +1342,148 @@ mod tests {
             provider.last_create_canonical.lock().unwrap().as_deref(),
             Some("github.com/o/filing"),
             "the issue was filed in the workspace default repo"
+        );
+    }
+
+    /// D2-chain test fixture (rpl-s7k): a workspace with a filing default
+    /// and two bindings (default + logical code), and a saga task that
+    /// lives in the default repo with a recorded `remote_id` but no
+    /// `filing_repo_id` on the task. The `default_binding_id` lets the
+    /// push test assert "promote recorded the default."
+    struct SagaFixture {
+        svc: SyncService,
+        tasks: Arc<InMemoryTaskRepository>,
+        provider: Arc<FakeProvider>,
+        task: Task,
+        default_binding_id: RepoId,
+    }
+
+    async fn setup_saga_workspace() -> SagaFixture {
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("saga-ws").unwrap(), None, true);
+        let default_binding = RepoBinding::new(
+            workspace.id,
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        let code_binding = RepoBinding::new(
+            workspace.id,
+            "git@github.com:o/code.git".into(),
+            "github.com/o/code".into(),
+        )
+        .unwrap();
+        bindings.save(&default_binding).await.unwrap();
+        bindings.save(&code_binding).await.unwrap();
+        workspace.filing_repo_id = Some(default_binding.id);
+        workspaces.save(&workspace).await.unwrap();
+
+        // Saga task: `repo_id` is the code repo, `filing_repo_id` is
+        // null, the issue itself lives in the default repo. The remote
+        // ref is pre-recorded so pull can address it without going
+        // through promote.
+        let mut task = Task::new_draft(
+            workspace.id,
+            Some(code_binding.id),
+            "saga: add a thing".into(),
+        )
+        .unwrap();
+        task.remote = Some(RemoteRef::new("github", "1409"));
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+        );
+        SagaFixture {
+            svc,
+            tasks,
+            provider,
+            task,
+            default_binding_id: default_binding.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_with_workspace_default_resolves_through_chain() {
+        // Pull's `fetch_remote` must hit the workspace default, not the
+        // logical code repo, when `filing_repo_id` is unset.
+        let SagaFixture {
+            svc,
+            tasks: _,
+            provider,
+            task,
+            default_binding_id: _,
+        } = setup_saga_workspace().await;
+
+        // A noop-shaped fetch — only `remote_id` + `title` need to match
+        // local for the drift verdict to noop; the other fields don't
+        // enter the mirror. `updated_at` is the project-poller epoch
+        // sentinel (it sorts before any real timestamp, so the test
+        // isn't clock-dependent).
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "1409".into(),
+            node_id: None,
+            title: "saga: add a thing".into(),
+            body: String::new(),
+            closed: false,
+            updated_at: Timestamp::from_utc(
+                chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+            ),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            provider.last_fetch_canonical.lock().unwrap().as_deref(),
+            Some("github.com/o/filing"),
+            "pull fetched from the workspace default, not the logical code repo (rpl-s7k)"
+        );
+        assert_eq!(s.decision, "noop");
+    }
+
+    #[tokio::test]
+    async fn push_with_workspace_default_targets_the_default_repo() {
+        // Push's `update_remote` PATCH must target the workspace default,
+        // not the logical code repo. Promote first so the task has a
+        // `synced_baseline` to diff against; the D2 chain then records
+        // the *default* on the task (step 1 hits).
+        let SagaFixture {
+            svc,
+            tasks,
+            provider,
+            task,
+            default_binding_id,
+        } = setup_saga_workspace().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let promoted = tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            promoted.filing_repo_id,
+            Some(default_binding_id),
+            "promote recorded the workspace default as the filing repo"
+        );
+
+        // Title edit + DirtyLocal so push has a diff to send.
+        let mut edited = tasks.get(task.id).await.unwrap();
+        edited.title = "saga: add a thing (revised)".into();
+        edited.mark_dirty_local().unwrap();
+        tasks
+            .save(&edited, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        let _s = svc.push(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            provider.last_update_canonical.lock().unwrap().as_deref(),
+            Some("github.com/o/filing"),
+            "push PATCH'd the workspace default, not the logical code repo (rpl-s7k)"
         );
     }
 
@@ -1798,81 +1964,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_soft_falls_to_logical_when_filing_binding_is_gone() {
-        // rpl-sv2: a `Synced` task whose `filing_repo_id` references a
-        // binding that's been deleted (e.g. an org-move replaced the
-        // binding, but the recorded UUID was never re-pointed) would
-        // historically hard-fail `sync pull` with `not found: repo
-        // <uuid>`. The soft-fall resolves via the task's *logical*
-        // `repo_id` (which is presumed to have been correctly updated at
-        // attach time) and surfaces a `note` on the summary so a
-        // JSON-pipe consumer sees the anomaly.
-        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+    async fn pull_errors_when_filing_binding_is_gone() {
+        // rpl-s7k: the rpl-sv2 soft-fall to the logical repo is gone. A
+        // dangling `filing_repo_id` (binding deleted, no live binding
+        // anywhere on the chain) surfaces as a `NotFound` error so the
+        // user runs `rl repo doctor --repair` instead of silently
+        // fetching from a fabricated canonical. The fixture below has
+        // no workspace default and no live replacement, so the chain
+        // has nothing to resolve through.
+        let (svc, tasks, bindings, task, _provider) = setup_with_bindings().await;
         svc.promote(&task.id.to_string()).await.unwrap();
 
-        // The promoted task has `filing_repo_id == repo_id` (the only
-        // binding setup created). For the soft-fall to have a *second
-        // leg* to stand on, we need a live binding for the logical
-        // path. Add one, re-point the task's logical repo to it, and
-        // delete the original.
+        // `setup_with_bindings` returns a workspace with no filing
+        // default, so the only thing on the D2 chain is the recorded
+        // `filing_repo_id` (== `repo_id` for a freshly promoted task).
+        // Delete that binding and pull must surface the missing repo
+        // rather than soft-fall to a fabricated canonical.
         let original_binding_id = task.repo_id.expect("task has a logical repo");
-        let replacement = RepoBinding::new(
-            task.workspace_id,
-            "git@github.com:o/r-neworg.git".into(),
-            "github.com/o/r-neworg".into(),
-        )
-        .unwrap();
-        let replacement_id = replacement.id;
-        bindings.save(&replacement).await.unwrap();
-
-        let mut t = tasks.get(task.id).await.unwrap();
-        t.repo_id = Some(replacement_id);
-        // Filing repo stays pointing at the (about-to-be-deleted)
-        // original — that's the divergence we want to exercise.
-        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
         bindings.delete(original_binding_id).await.unwrap();
 
-        // Seed a fetch fixture so the noop-decision's drift check has
-        // something to compare against. The soft-fall re-targets the
-        // fetch at the replacement canonical; we seed the same snapshot
-        // the baseline recorded so the verdict is noop.
-        let before = tasks.get(task.id).await.unwrap();
-        provider.set_fetch(RemoteTaskSnapshot {
-            remote_id: before.remote.as_ref().unwrap().remote_id.clone(),
-            node_id: None,
-            title: before.title.clone(),
-            body: before.body.clone(),
-            closed: false,
-            updated_at: Timestamp::from_utc(
-                before.updated_at.into_inner() - chrono::Duration::seconds(10),
-            ),
-            assignees: before.assignees.clone(),
-            labels: vec![],
-        });
+        let err = svc
+            .pull(&task.id.to_string())
+            .await
+            .expect_err("pull with a deleted filing binding must error");
+        assert!(
+            matches!(err, SyncError::Port(PortError::NotFound(_))),
+            "expected Port(NotFound) when the only D2 binding is gone, got {err:?}"
+        );
 
-        let s = svc.pull(&task.id.to_string()).await.unwrap();
-        assert_eq!(s.decision, "noop");
-        let note = s
-            .note
-            .as_deref()
-            .expect("soft-fall must surface a note so a JSON consumer can see it");
-        assert!(
-            note.contains("filing_repo_id referenced a deleted binding"),
-            "note should call out the soft-fall explicitly: {note}"
-        );
-        assert!(
-            note.contains("rl repo doctor --repair"),
-            "note should point the user at the doctor command: {note}"
-        );
+        // Sanity check: the task is unchanged — no Pull / PrePull snapshot
+        // was written because the resolution never reached the fetch.
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Synced);
     }
 
     #[tokio::test]
     async fn pull_hard_fails_when_neither_filing_nor_logical_resolves() {
-        // rpl-sv2 follow-up: if BOTH the filing and the logical binding
-        // are gone, the soft-fall has no second leg to stand on. The
-        // pull must propagate the error so the user (or the daemon) can
-        // see the task has no resolvable home — not silently run with
-        // a fabricated canonical.
+        // rpl-s7k: the rpl-sv2 soft-fall is gone, so this is now the
+        // *primary* "no resolvable home" test. With no workspace default
+        // and both the recorded `filing_repo_id` and `repo_id` pointing
+        // at a deleted binding, the D2 chain has nothing to resolve
+        // through — pull must propagate the `NotFound` so the user
+        // (or the daemon) can see the task has no GitHub home, not
+        // silently fetch from a fabricated canonical.
         let (svc, tasks, bindings, task, _provider) = setup_with_bindings().await;
         svc.promote(&task.id.to_string()).await.unwrap();
 

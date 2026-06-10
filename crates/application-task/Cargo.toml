@@ -10,6 +10,7 @@ domain-core = { workspace = true }
 domain-task = { workspace = true }
 domain-repo = { workspace = true }
 domain-sync = { workspace = true }
+domain-workspace = { workspace = true }
 application-sync = { workspace = true }
 ports = { workspace = true }
 dto-shared = { workspace = true }
@@ -21,7 +22,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 testing-fixtures = { workspace = true }
-domain-workspace = { workspace = true }
 domain-project = { workspace = true }
 tokio = { workspace = true }
 pretty_assertions = { workspace = true }
