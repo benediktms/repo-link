@@ -68,11 +68,13 @@ pub struct TaskDto {
     pub blocked_by: Vec<String>,
     /// Wall-clock time the remote was last observed for this task ("last
     /// refreshed"), from the write-through `synced_at` cache (RFC 0004 D2/D3).
-    /// Present ONLY for mirrored tasks (`sync_state != local_only`); a purely
-    /// local task has no remote to refresh, so the field is absent rather than
-    /// "never". `None` for a mirror that has not yet been observed. Additive;
-    /// defaults to null for older consumers.
-    #[serde(default)]
+    /// OMITTED from the JSON (not `null`) unless the task is a mirror
+    /// (`sync_state != local_only`) that has actually been observed: a
+    /// purely-local task has no remote to refresh, and an unobserved mirror has
+    /// no timestamp yet — both drop the key. Presence therefore means "observed
+    /// at least once"; to distinguish a never-observed mirror from a local task,
+    /// read `sync_state`. Additive; older consumers simply never see the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refreshed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

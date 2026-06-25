@@ -124,9 +124,10 @@ pub struct DriftRow {
     /// Wall-clock time the remote was last observed for this task (the
     /// write-through `synced_at`, RFC 0004 D2/D3). Lets a reader weigh a drift
     /// reason by freshness — a `project_status` drift with a 3-day-old stamp is
-    /// qualitatively different from a 30-second-old one. `None` when never
-    /// observed. Additive; defaults to null for older consumers.
-    #[serde(default)]
+    /// qualitatively different from a 30-second-old one. OMITTED from the JSON
+    /// (not `null`) when the task has never been observed. Additive; older
+    /// consumers simply never see the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refreshed_at: Option<DateTime<Utc>>,
 }
 

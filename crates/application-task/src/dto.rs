@@ -125,9 +125,22 @@ mod tests {
             "a mirrored task must surface its synced_at as last_refreshed_at"
         );
 
-        // A mirror that has never been observed: present axis, no value.
+        // A mirror that has never been observed: still no value.
         t.synced_at = None;
         assert!(task_to_dto(&t, None).last_refreshed_at.is_none());
+
+        // Serialization contract: when there's no timestamp the key is OMITTED
+        // (not `null`) — a local task and a never-observed mirror both drop it.
+        let local = Task::new_draft(WorkspaceId::new(), None, "t".into()).unwrap();
+        let json = serde_json::to_value(task_to_dto(&local, None)).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("last_refreshed_at"),
+            "last_refreshed_at must be omitted, not null, when there is no observed timestamp"
+        );
+        // …and present once observed.
+        t.synced_at = Some(Timestamp::now());
+        let json = serde_json::to_value(task_to_dto(&t, None)).unwrap();
+        assert!(json.as_object().unwrap().contains_key("last_refreshed_at"));
     }
 
     /// The flat `blocked_by` list is derived from the `blocked_by` relation
