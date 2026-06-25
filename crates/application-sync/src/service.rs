@@ -2048,6 +2048,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_propagates_issue_moved() {
+        // The CLI relies on `IssueMoved` propagating as a typed error to emit
+        // the relink guidance (instead of flattening it into a generic
+        // last_refresh_failed annotation). Pin that contract.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        provider.set_fetch_moved("github.com/o2/r2", "1506");
+
+        let err = svc.refresh(&task.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::Port(ports::PortError::IssueMoved { .. })),
+            "IssueMoved must propagate as a typed error, got {err:?}"
+        );
+        assert!(
+            tasks.get(task.id).await.unwrap().synced_at.is_none(),
+            "a moved-issue refresh must not stamp synced_at"
+        );
+    }
+
+    #[tokio::test]
     async fn pull_backfills_missing_remote_node_id_on_noop() {
         let (svc, tasks, task, provider) = setup().await;
         svc.promote(&task.id.to_string()).await.unwrap();
