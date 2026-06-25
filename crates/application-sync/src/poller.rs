@@ -54,7 +54,8 @@ use domain_task::Task;
 #[cfg(doc)]
 use ports::PollPage;
 use ports::{
-    ProjectRepository, RemoteProjectItem, RemoteProjectProvider, TaskFilter, TaskRepository,
+    ProjectRepository, RemoteProjectItem, RemoteProjectProvider, SyncedSource, TaskFilter,
+    TaskRepository,
 };
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -74,6 +75,13 @@ use crate::error::Result;
 /// `is:` filter entirely and lean on `updated:>{since}` alone.
 const POLL_QUERY: &str = "";
 
+/// Per-tick cap on the stale-task working set (RFC 0004 D3). Bounds the
+/// post-migration burst (a 1000-task workspace re-stamps ≤200/tick, the rest
+/// rotate in over subsequent ticks via the oldest-`synced_at`-first ordering)
+/// and the steady-state cost. Tasks beyond the cap defer to the next tick; they
+/// are not lost.
+const POLL_LIMIT: usize = 200;
+
 /// Outcome of one [`ProjectPoller::poll_once`] pass. Returned so the daemon
 /// loop can log progress and tests can assert reconcile counts.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -90,6 +98,10 @@ pub struct PollReport {
     /// enumerate the whole set) and were therefore treated as partial
     /// (watermark not advanced).
     pub partial_projects: usize,
+    /// Candidate tasks whose `synced_at` freshness was stamped this pass (RFC
+    /// 0004 D3). Non-zero only on a fully-clean pass; zero when any board was
+    /// truncated or errored (stamping is deferred to the next tick).
+    pub tasks_refreshed: usize,
 }
 
 /// Polls every known project for changed items and reconciles them against
@@ -133,15 +145,21 @@ impl ProjectPoller {
             return Ok(report);
         }
 
-        // One snapshot of the local tasks per pass, indexed by their
-        // `project_item_id`. Cheaper than a per-item repository round-trip and
-        // there's no project_item_id filter on `TaskFilter`. `include_archived`
-        // so a polled item whose local task is archived still correlates (so
-        // the cache write isn't skipped for it) rather than appearing
-        // unmatched. Held `mut` so the cache write updates the in-memory copy
-        // too — a duplicate item id later in the same pass then compares
-        // against the just-written value and stays idempotent.
-        let mut by_item_id = self.index_tasks_by_item_id().await?;
+        // This tick's bounded working set: the stalest project-backed tasks in
+        // active workspaces (≤ POLL_LIMIT), indexed by `project_item_id`. Held
+        // `mut` so a reconcile cache write updates the in-memory copy too — a
+        // duplicate item id later in the same pass then compares against the
+        // just-written value and stays idempotent.
+        let mut by_item_id = self.index_stale_candidates().await?;
+
+        // Freshness stamping (RFC 0004 D3) is gated on a fully-clean pass: a
+        // truncated page or a per-project poll error means we did NOT fully
+        // observe every candidate's board, so we must not advance their
+        // `synced_at` (which would wrongly mark them fresh and defer the
+        // re-poll). One flaky board defers stamping for the whole pass; the
+        // next tick retries. Correct for the common single-project case;
+        // conservative (never wrong) for multi-project.
+        let mut pass_fully_complete = true;
 
         for project in &projects {
             report.projects_polled += 1;
@@ -171,6 +189,8 @@ impl ProjectPoller {
                 Err(e) => {
                     // One board's provider hiccup must not sink the others.
                     warn!(project = %project.id.as_str(), error = %e, "project poll failed; skipping this project this cycle");
+                    // We didn't observe this board → don't stamp this pass.
+                    pass_fully_complete = false;
                     continue;
                 }
             };
@@ -195,6 +215,8 @@ impl ProjectPoller {
 
             if page.truncated {
                 report.partial_projects += 1;
+                // Partial observation → don't stamp this pass.
+                pass_fully_complete = false;
                 warn!(
                     project = %project.id.as_str(),
                     items = page.items.len(),
@@ -225,12 +247,35 @@ impl ProjectPoller {
             // drifts backward.
         }
 
+        // Stamp the working set's freshness (RFC 0004 D3) only on a fully-clean
+        // pass: every candidate's board was completely observed, so their remote
+        // state is known as-of-now — whether or not they appeared in a delta
+        // page (an unchanged task is still "observed as current"). Stamping ALL
+        // candidates (not just matched items) is what lets a stale-but-unchanged
+        // task advance its `synced_at` and stop being re-polled every tick. The
+        // targeted single-column write touches only `synced_at` (no snapshot, no
+        // sync-state change); `Polled` is the source tripwire.
+        if pass_fully_complete {
+            for task in by_item_id.values() {
+                if let Err(e) = self
+                    .tasks
+                    .cache_synced_at(task.id, Timestamp::now(), SyncedSource::Polled)
+                    .await
+                {
+                    warn!(task = %task.id, error = %e, "failed to stamp polled synced_at; will retry next cycle");
+                } else {
+                    report.tasks_refreshed += 1;
+                }
+            }
+        }
+
         info!(
             projects = report.projects_polled,
             items = report.items_seen,
             matched = report.items_matched,
             unmatched = report.items_unmatched,
             partial = report.partial_projects,
+            refreshed = report.tasks_refreshed,
             "project poll complete"
         );
         Ok(report)
@@ -308,22 +353,28 @@ impl ProjectPoller {
         }
     }
 
-    /// Snapshot of every non-`None`-`project_item_id` task, keyed by item id.
-    /// A duplicate item id (shouldn't happen — item ids are unique per board)
-    /// keeps the last writer; logged at debug so it's diagnosable.
+    /// This tick's working set: the stalest project-backed tasks in active
+    /// workspaces, capped by [`POLL_LIMIT`], keyed by `project_item_id` for
+    /// correlation against polled board items. A duplicate item id (shouldn't
+    /// happen — item ids are unique per board) keeps the last writer; logged at
+    /// debug so it's diagnosable.
     ///
-    // TODO(scale): this lists ALL tasks (unscoped, `O(all tasks)`) and filters
-    // in memory each poll because `TaskFilter` has no project-item predicate.
-    // The fix is a `TaskFilter` predicate (`has_project_item_id` / `project_id`)
-    // so the repository returns only the project-backed rows we correlate.
-    async fn index_tasks_by_item_id(&self) -> Result<HashMap<String, Task>> {
+    /// The bound is enforced in SQL (RFC 0004 D3): `has_project_item_id` +
+    /// `active_workspaces_only` + `synced_at_lt` + `limit`, ordered
+    /// oldest-`synced_at`-first so the cap rotates fairly across ticks when a
+    /// workspace has more than `POLL_LIMIT` project-backed tasks (the previous
+    /// implementation listed ALL tasks and filtered in memory). Lifecycle is
+    /// unfiltered: a closed/archived item still lives on the board and must
+    /// correlate. `synced_at_lt = now` selects everything not stamped on this
+    /// exact tick; the daemon's poll interval is the effective freshness budget.
+    async fn index_stale_candidates(&self) -> Result<HashMap<String, Task>> {
         let tasks = self
             .tasks
             .list(TaskFilter {
-                // The poller correlates every project-backed task regardless
-                // of lifecycle — closed/archived items still live on the board
-                // and must be matched — so it filters by neither open/closed.
-                is_open: None,
+                has_project_item_id: true,
+                active_workspaces_only: true,
+                synced_at_lt: Some(Timestamp::now()),
+                limit: Some(POLL_LIMIT),
                 ..TaskFilter::default()
             })
             .await?;
@@ -355,7 +406,7 @@ impl ProjectPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_core::WorkspaceId;
+    use domain_core::{TaskId, WorkspaceId};
     use domain_project::Project;
     use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
     use ports::ProjectRepository;
@@ -402,6 +453,71 @@ mod tests {
         let t: Arc<dyn TaskRepository> = tasks;
         let r: Arc<dyn RemoteProjectProvider> = remote;
         ProjectPoller::new(p, t, r)
+    }
+
+    /// Build + save a project-backed (issue-backed, project_item_id) mirror task
+    /// whose `synced_at` starts NULL — a poll candidate.
+    async fn project_backed_task(tasks: &InMemoryTaskRepository, item_id: &str) -> TaskId {
+        let mut task = Task::new_draft(WorkspaceId::new(), None, "mirror".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        task.project_item_id = Some(item_id.into());
+        let id = task.id;
+        tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+        id
+    }
+
+    /// RFC 0004 D3: a complete poll stamps `synced_at` (source `Polled`) for the
+    /// candidate working set, so background tasks gain a "last refreshed" time.
+    #[tokio::test]
+    async fn poll_once_stamps_synced_at_for_candidates() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects.save(&project("PVT_kwHO_stamp")).await.unwrap();
+        let id = project_backed_task(&tasks, "PVTI_42").await;
+        assert!(tasks.get(id).await.unwrap().synced_at.is_none());
+        remote.set_poll_items("PVT_kwHO_stamp", vec![item("PVTI_42", Some("o_wip"))]);
+
+        let report = poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.tasks_refreshed, 1);
+        assert!(
+            tasks.get(id).await.unwrap().synced_at.is_some(),
+            "a complete poll stamps the candidate's synced_at"
+        );
+        // Source tripwire: the poller must stamp `Polled` (not Pull/Push/Refresh).
+        assert_eq!(tasks.synced_stamps(), vec![(id, SyncedSource::Polled)]);
+    }
+
+    /// A truncated page means the board wasn't fully observed — `synced_at` must
+    /// NOT be stamped (else a stale task would look fresh and stop re-polling).
+    #[tokio::test]
+    async fn poll_once_does_not_stamp_on_truncated_page() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects.save(&project("PVT_kwHO_trunc")).await.unwrap();
+        let id = project_backed_task(&tasks, "PVTI_42").await;
+        remote.set_poll_items("PVT_kwHO_trunc", vec![item("PVTI_42", Some("o_wip"))]);
+        remote.set_poll_truncated("PVT_kwHO_trunc", true);
+
+        let report = poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(report.tasks_refreshed, 0, "a truncated pass must not stamp");
+        assert!(tasks.get(id).await.unwrap().synced_at.is_none());
+        assert!(tasks.synced_stamps().is_empty());
     }
 
     /// A polled item whose `item_node_id` matches a local task's

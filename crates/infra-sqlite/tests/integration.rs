@@ -502,6 +502,74 @@ async fn list_filters_compose() {
     assert_eq!(all.len(), 4);
 }
 
+/// The poller's per-tick stale-scan (RFC 0004 D3): `has_project_item_id` +
+/// `active_workspaces_only` + `synced_at_lt` + `limit`, ordered
+/// oldest-`synced_at`-first (NULLs first). Also the active-gate tripwire — a
+/// non-active workspace's tasks are excluded; a future `Deleted`/`Paused`/etc.
+/// variant stays excluded by the `status = 'active'` clause.
+#[tokio::test]
+async fn list_poll_scan_gates_and_orders() {
+    use domain_core::Timestamp;
+
+    let (_dir, ws, _rb, ts) = setup().await;
+
+    let mut active = Workspace::new(WorkspaceName::new("active").unwrap(), None, true);
+    active.activate().unwrap();
+    let created = Workspace::new(WorkspaceName::new("created").unwrap(), None, true);
+    ws.save(&active).await.unwrap();
+    ws.save(&created).await.unwrap();
+
+    // Helper: a project-backed task with an explicit synced_at, saved once
+    // (INSERT persists synced_at).
+    let mk = |wsid, title: &str, item: Option<&str>, synced: Option<Timestamp>| {
+        let mut t = Task::new_draft(wsid, None, title.into()).unwrap();
+        t.project_item_id = item.map(str::to_string);
+        t.synced_at = synced;
+        t
+    };
+    let now = Timestamp::now();
+    let old = Timestamp::from_utc(now.into_inner() - chrono::Duration::hours(1));
+
+    let never = mk(active.id, "never-observed", Some("PVTI_never"), None);
+    let stale = mk(active.id, "stale", Some("PVTI_stale"), Some(old));
+    let no_item = mk(active.id, "no-item", None, None);
+    let inactive = mk(created.id, "inactive-ws", Some("PVTI_inact"), None);
+    for t in [&never, &stale, &no_item, &inactive] {
+        ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+    }
+
+    let scan = ts
+        .list(TaskFilter {
+            has_project_item_id: true,
+            active_workspaces_only: true,
+            synced_at_lt: Some(now),
+            limit: Some(10),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // Only the two active + project-backed + stale tasks; ordered NULLs first.
+    assert_eq!(
+        scan.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+        vec!["never-observed", "stale"],
+        "active+project-backed+stale only, oldest-synced first"
+    );
+
+    // The LIMIT caps the scan, keeping the stalest (NULL synced_at) first.
+    let capped = ts
+        .list(TaskFilter {
+            has_project_item_id: true,
+            active_workspaces_only: true,
+            synced_at_lt: Some(now),
+            limit: Some(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(capped.len(), 1);
+    assert_eq!(capped[0].title, "never-observed");
+}
+
 #[tokio::test]
 async fn deleting_workspace_cascades_to_tasks() {
     let (_dir, ws, _rb, ts) = setup().await;

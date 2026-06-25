@@ -140,13 +140,33 @@ impl TaskRepository for SqliteTaskRepository {
     }
 
     async fn list(&self, filter: TaskFilter) -> PortResult<Vec<Task>> {
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(format!("SELECT {TASK_COLS} FROM tasks WHERE 1=1"));
+        // Columns are `tasks.`-qualified so the optional `JOIN workspaces` (for
+        // the active-workspace gate) can't make `id`/`created_at`/`status`/etc.
+        // ambiguous. Column ORDER is unchanged, so `row_to_task` (index-based)
+        // is unaffected.
+        let cols = TASK_COLS
+            .split(", ")
+            .map(|c| format!("tasks.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut from = format!("SELECT {cols} FROM tasks");
+        if filter.active_workspaces_only {
+            from.push_str(" JOIN workspaces ON workspaces.id = tasks.workspace_id");
+        }
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(from);
+        qb.push(" WHERE 1=1");
+        if filter.active_workspaces_only {
+            // Poller gate (RFC 0004 D3): only `active` workspaces are polled.
+            // A future `Deleted`/`Paused`/etc. variant stays excluded by this
+            // explicit equality — the tripwire test pins the clause.
+            qb.push(" AND workspaces.status = 'active'");
+        }
         if let Some(w) = filter.workspace_id {
-            qb.push(" AND workspace_id = ").push_bind(w.to_string());
+            qb.push(" AND tasks.workspace_id = ")
+                .push_bind(w.to_string());
         }
         if let Some(r) = filter.repo_id {
-            qb.push(" AND repo_id = ").push_bind(r.to_string());
+            qb.push(" AND tasks.repo_id = ").push_bind(r.to_string());
         }
         if let Some(open) = filter.is_open {
             // Filter on the open/closed bit (RFC 0004 D1). open ⇒
@@ -154,15 +174,35 @@ impl TaskRepository for SqliteTaskRepository {
             // both — there is no longer an implicit "hide archived" default
             // (the Archived status is gone; a closed task is just closed).
             if open {
-                qb.push(" AND lifecycle IN ('open', 'reopened')");
+                qb.push(" AND tasks.lifecycle IN ('open', 'reopened')");
             } else {
-                qb.push(" AND lifecycle IN ('completed', 'not_planned')");
+                qb.push(" AND tasks.lifecycle IN ('completed', 'not_planned')");
             }
         }
         if let Some(s) = filter.sync_state {
-            qb.push(" AND sync_state = ").push_bind(enum_to_str(&s)?);
+            qb.push(" AND tasks.sync_state = ")
+                .push_bind(enum_to_str(&s)?);
         }
-        qb.push(" ORDER BY created_at");
+        if filter.has_project_item_id {
+            qb.push(" AND tasks.project_item_id IS NOT NULL");
+        }
+        if let Some(ts) = filter.synced_at_lt {
+            // Stale-scan: never-observed (NULL) or older than the threshold.
+            qb.push(" AND (tasks.synced_at IS NULL OR tasks.synced_at < ")
+                .push_bind(ts.into_inner())
+                .push(")");
+        }
+        // In stale-scan mode order oldest-observed first (SQLite sorts NULLs
+        // first in ASC — exactly the "never observed first" we want under the
+        // LIMIT); otherwise keep the default creation order.
+        if filter.synced_at_lt.is_some() {
+            qb.push(" ORDER BY tasks.synced_at ASC");
+        } else {
+            qb.push(" ORDER BY tasks.created_at");
+        }
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ").push_bind(limit as i64);
+        }
 
         let rows = qb
             .build()
@@ -682,9 +722,6 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         project_item_id,
         project_status_option_id,
         synced_at: synced_at.map(Timestamp::from_utc),
-        // Monotonic companion is in-memory only — never persisted, so it reads
-        // back None on load (treated as stale by the poller's first tick).
-        synced_instant: None,
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),

@@ -24,6 +24,10 @@ pub struct InMemoryTaskRepository {
     /// for plain `new()` repos that never exercise `save_with_outbox` with a
     /// non-empty entry slice.
     outbox: Option<OutboxStore>,
+    /// Records every `cache_synced_at(task_id, _, source)` call, so a test can
+    /// assert the per-site freshness `source` (the RFC 0004 D3 tripwire: the
+    /// poller must stamp `Polled`). Append-only.
+    synced_stamps: Mutex<Vec<(TaskId, SyncedSource)>>,
 }
 
 impl InMemoryTaskRepository {
@@ -33,6 +37,7 @@ impl InMemoryTaskRepository {
             snapshots: Arc::new(Mutex::new(HashMap::new())),
             comments: Mutex::new(HashMap::new()),
             outbox: None,
+            synced_stamps: Mutex::new(Vec::new()),
         }
     }
 
@@ -48,11 +53,18 @@ impl InMemoryTaskRepository {
             snapshots: Arc::new(Mutex::new(HashMap::new())),
             comments: Mutex::new(HashMap::new()),
             outbox: Some(outbox.store_handle()),
+            synced_stamps: Mutex::new(Vec::new()),
         }
     }
 
     pub fn snapshots_handle(&self) -> Arc<Mutex<HashMap<TaskId, Vec<TaskSnapshot>>>> {
         Arc::clone(&self.snapshots)
+    }
+
+    /// The `(task_id, source)` of every `cache_synced_at` call so far, oldest
+    /// first. Lets a test assert which tasks were stamped and with what source.
+    pub fn synced_stamps(&self) -> Vec<(TaskId, SyncedSource)> {
+        self.synced_stamps.lock().unwrap().clone()
     }
 }
 
@@ -198,6 +210,16 @@ impl TaskRepository for InMemoryTaskRepository {
                 Some(s) => t.sync == s,
                 None => true,
             })
+            // `has_project_item_id`: keep only project-backed tasks.
+            .filter(|t| !filter.has_project_item_id || t.project_item_id.is_some())
+            // `synced_at_lt`: never-observed (None) or older than the threshold.
+            .filter(|t| match filter.synced_at_lt {
+                Some(ts) => t.synced_at.is_none_or(|s| s < ts),
+                None => true,
+            })
+            // NOTE: `active_workspaces_only` is a no-op here — the in-memory
+            // task repo has no workspace-status data, so test tasks are treated
+            // as active. The active-gate clause is verified at the SQL layer.
             .map(|t| {
                 let mut task = t.clone();
                 task.synced_baseline = snaps
@@ -206,7 +228,16 @@ impl TaskRepository for InMemoryTaskRepository {
                 task
             })
             .collect();
-        rows.sort_by_key(|t| t.created_at);
+        // Stale-scan mode orders oldest-observed first (None before Some);
+        // otherwise creation order.
+        if filter.synced_at_lt.is_some() {
+            rows.sort_by_key(|t| (t.synced_at.is_some(), t.synced_at));
+        } else {
+            rows.sort_by_key(|t| t.created_at);
+        }
+        if let Some(limit) = filter.limit {
+            rows.truncate(limit);
+        }
         Ok(rows)
     }
 
@@ -400,13 +431,15 @@ impl TaskRepository for InMemoryTaskRepository {
         &self,
         task_id: TaskId,
         synced_at: Timestamp,
-        _source: SyncedSource,
+        source: SyncedSource,
     ) -> PortResult<()> {
         // Targeted single-column write (RFC 0004 D3): stamp ONLY `synced_at`,
         // preserving every other field — no snapshot, no version bump, no
-        // `sync` change. `source` is not stored. Absent task is a benign no-op.
+        // `sync` change. Absent task is a benign no-op. Record (id, source) so
+        // tests can assert the per-site source tripwire.
         if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
             task.synced_at = Some(synced_at);
+            self.synced_stamps.lock().unwrap().push((task_id, source));
         }
         Ok(())
     }

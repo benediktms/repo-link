@@ -160,6 +160,21 @@ function; the service that composes it does the relations query.
 
 ### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
 
+> **Implementation note (Phase 4):** the in-memory monotonic
+> `Task.synced_instant` companion, the `needs_refetch(synced_instant, now, budget)`
+> threshold, and the `mark_synced` "single funnel" described below were **dropped**.
+> `synced_instant` was never read by any consumer: the poller selects stale tasks
+> via the persisted wall-clock `synced_at` SQL filter (`TaskFilter { synced_at_lt,
+> has_project_item_id, active_workspaces_only, limit }`), and `task show --refresh`
+> always fetches (no read-through budget). With nothing reading it, the funnel's
+> only job (keeping `synced_at` + `synced_instant` atomic) protected nothing, so
+> `cache_synced_at(.., source)` is the single stamp primitive, called directly with
+> a per-call-site `SyncedSource` (`Polled` / `Refresh` / future `Pull`/`Push`) that
+> a recording-repo test asserts. `synced_at` is the one freshness signal — display
+> and the poller's SQL filter both read it. The clock-skew mitigation is the
+> poller's existing watermark `−1s` margin plus the `NULLS FIRST` ordering, not a
+> monotonic clock.
+
 The `tasks` table gains a `synced_at: Option<Timestamp>` column. The
 column is genuinely fresh — no prior column carried this signal. The
 existing `project_status_option_id` cache is a value-only column
