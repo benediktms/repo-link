@@ -59,6 +59,21 @@ pub struct TaskDto {
     /// Additive; defaults to null for older consumers.
     #[serde(default)]
     pub project_status: Option<String>,
+    /// Composite display IDs (`prefix-hash`) of the tasks this one is
+    /// `blocked_by` — the derived "blocked" view (RFC 0004 D1/D2; "blocked" is
+    /// no longer a stored state). Empty when nothing blocks it. Mirrors the
+    /// `blocked_by` edges already present in `relations`, surfaced as a flat
+    /// convenience list. Additive; defaults to empty for older consumers.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+    /// Wall-clock time the remote was last observed for this task ("last
+    /// refreshed"), from the write-through `synced_at` cache (RFC 0004 D2/D3).
+    /// Present ONLY for mirrored tasks (`sync_state != local_only`); a purely
+    /// local task has no remote to refresh, so the field is absent rather than
+    /// "never". `None` for a mirror that has not yet been observed. Additive;
+    /// defaults to null for older consumers.
+    #[serde(default)]
+    pub last_refreshed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

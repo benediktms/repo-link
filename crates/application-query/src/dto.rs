@@ -121,6 +121,13 @@ pub struct DriftRow {
     /// (the #39 acceptance: expected-vs-actual is explicit).
     #[serde(default)]
     pub project_status_expected: Option<String>,
+    /// Wall-clock time the remote was last observed for this task (the
+    /// write-through `synced_at`, RFC 0004 D2/D3). Lets a reader weigh a drift
+    /// reason by freshness — a `project_status` drift with a 3-day-old stamp is
+    /// qualitatively different from a 30-second-old one. `None` when never
+    /// observed. Additive; defaults to null for older consumers.
+    #[serde(default)]
+    pub last_refreshed_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -147,6 +154,7 @@ mod tests {
                     reasons: vec!["sync".into()],
                     project_status: None,
                     project_status_expected: None,
+                    last_refreshed_at: None,
                 })
                 .unwrap(),
             ),
