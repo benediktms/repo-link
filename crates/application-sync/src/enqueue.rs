@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use domain_project::Project;
 use domain_sync::{OutboxEntry, OutboxMutation};
-use domain_task::{RelationKind, SyncState, Task};
+use domain_task::{RelationKind, Task};
 use domain_workspace::Workspace;
 use ports::{OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository};
 
@@ -86,9 +86,10 @@ pub fn relation_mutation(
 }
 
 /// Is this task a mirror (i.e. not purely local)? Only mirror tasks owe
-/// outbound mutations. Mirrors RFC 0001 §3 D2: `sync_state != LocalOnly`.
+/// outbound mutations. Delegates to [`Task::is_mirror`] so the predicate has a
+/// single definition (RFC 0001 §3 D2: `sync_state != LocalOnly`).
 pub fn is_mirror(task: &Task) -> bool {
-    task.sync != SyncState::LocalOnly
+    task.is_mirror()
 }
 
 /// The single funnel for stamping a task's write-through "remote observed"

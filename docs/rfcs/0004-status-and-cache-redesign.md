@@ -119,6 +119,15 @@ directly") becomes a valid transition.
 
 ### D2 — Display DTO is opaque; freshness annotation only on mirrored tasks
 
+> **Implementation note (Phase 2):** shipped as **flat additive `TaskDto`
+> fields** rather than a composed `DisplayStatus` object — `blocked_by`
+> (derived from the `BlockedBy` relation edges) and `last_refreshed_at` (the
+> `synced_at` wall-clock, surfaced only when `task.is_mirror()`), alongside the
+> existing `is_open` / `state_reason` / `project_status`. The CLI emits JSON, so
+> humanization ("30s ago") and any board-column-vs-lifecycle precedence is a
+> presentation concern for the consumer, not the DTO. The `derive_display_status`
+> helper below was not introduced; the freshness gate lives in `task_to_dto`.
+
 The DTO is no longer a 1:1 mirror of the aggregate. A new layer
 (`derive_display_status(&Task, relations: &[TaskRelation], &Project) -> DisplayStatus`) composes:
 

@@ -110,6 +110,12 @@ impl TaskService {
         for (rendered, source) in dto.relations.iter_mut().zip(t.relations.iter()) {
             rendered.other = self.compose_id_for(source.other).await?;
         }
+        // Upgrade the flat `blocked_by` list (UUIDs from the pure conversion) to
+        // composite display IDs, same as the relation `other` ends above.
+        dto.blocked_by.clear();
+        for id in t.blocked_by() {
+            dto.blocked_by.push(self.compose_id_for(id).await?);
+        }
         // Overlay the cached project-board status display name (RFC 0001
         // Stage 8, closes #39). CACHED only — resolve `task → workspace →
         // project → option name` with NO network: `resolve_project` reads the

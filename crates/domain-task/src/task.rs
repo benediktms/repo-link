@@ -736,6 +736,13 @@ impl Task {
             .any(|r| r.kind == RelationKind::BlockedBy)
     }
 
+    /// Whether this task has a remote representation (issue- or draft-backed) —
+    /// i.e. it is not purely local (RFC 0001 §3 D2: `sync_state != LocalOnly`).
+    /// Only mirrored tasks carry remote-freshness annotations (RFC 0004 D2).
+    pub fn is_mirror(&self) -> bool {
+        self.sync != SyncState::LocalOnly
+    }
+
     /// Diff the current task against [`Task::synced_baseline`] and
     /// reconcile the sync state. Called by every mutation that touches
     /// remote-observable state.

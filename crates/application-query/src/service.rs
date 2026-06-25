@@ -486,6 +486,7 @@ impl QueryService {
                 reasons,
                 project_status,
                 project_status_expected,
+                last_refreshed_at: t.synced_at.map(Into::into),
             });
         }
         Ok(rows)
@@ -1098,6 +1099,35 @@ mod tests {
         assert_eq!(rows[0].reasons, vec!["sync".to_string()]);
         assert_eq!(rows[0].project_status, None);
         assert_eq!(rows[0].project_status_expected, None);
+        // Never observed → no freshness stamp.
+        assert_eq!(rows[0].last_refreshed_at, None);
+    }
+
+    #[tokio::test]
+    async fn drift_row_carries_last_refreshed_at_from_synced_at() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut dirty = Task::new_draft(wid, None, "edited locally".into()).unwrap();
+        dirty.stage_for_sync().unwrap();
+        dirty
+            .promote_to_remote(domain_task::RemoteRef::new("github", "42"))
+            .unwrap();
+        dirty.mark_dirty_local().unwrap();
+        // The task was observed against the remote at some point.
+        let observed = domain_core::Timestamp::now();
+        dirty.synced_at = Some(observed);
+        ts.save(&dirty, SnapshotSource::LocalEdit).await.unwrap();
+
+        let rows = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].last_refreshed_at,
+            Some(observed.into_inner()),
+            "drift row surfaces the task's synced_at as last_refreshed_at"
+        );
     }
 
     /// Build a project attached to `ws` with a Backlog/In progress/Done option
