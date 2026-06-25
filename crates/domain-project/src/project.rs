@@ -2,7 +2,6 @@
 
 use crate::status::{StatusMapping, StatusOption};
 use domain_core::{DomainError, ProjectId, Result, Timestamp};
-use domain_task::TaskStatus;
 use serde::{Deserialize, Serialize};
 
 /// Mirror of a GitHub Projects v2 board.
@@ -76,34 +75,26 @@ impl Project {
         self.updated_at = now;
     }
 
-    pub fn option_id_for(&self, status: TaskStatus) -> Option<&str> {
+    pub fn option_id_for(&self, is_open: bool) -> Option<&str> {
         self.status_mappings
             .iter()
-            .find(|m| m.status == status)
+            .find(|m| m.is_open == is_open)
             .map(|m| m.option_id.as_str())
     }
 
-    /// The canonical local-status → project-option resolver, applying the
-    /// RFC §3 absence-of-row rule: a `Blocked` task on a board with no
-    /// Blocked-like option (so no `blocked` mapping row was stored) resolves
-    /// to the `Open` option. Returns `None` only when even `Open` is unmapped
-    /// (an option-less board) — or for `Archived`, which is never mapped to a
-    /// project option (REST `close as not_planned` handles it).
+    /// The canonical local-lifecycle → project-option resolver. Keyed on the
+    /// open/closed bit (RFC 0004 D1): an open task maps to one board option, a
+    /// closed task to another. Returns `None` when that bit is unmapped (e.g.
+    /// an option-less board).
     ///
-    /// This is the single definition of the fallback shared by the outbox
-    /// enqueue/drain paths (via `application_sync::option_id_for_status_with_fallback`,
-    /// which delegates here) AND Stage 8 drift detection, so the "what option
-    /// does this status map to?" question has exactly one answer everywhere.
-    pub fn resolved_option_id_for(&self, status: TaskStatus) -> Option<&str> {
-        if let Some(opt) = self.option_id_for(status) {
-            return Some(opt);
-        }
-        if status == TaskStatus::Blocked {
-            // No row for Blocked ⇒ resolve to the Open option (app-level
-            // fallback; never stored as a row — see RFC §3).
-            return self.option_id_for(TaskStatus::Open);
-        }
-        None
+    /// "Blocked" is no longer a status — it became a relation (RFC 0004 D1) —
+    /// so the old `Blocked → Open` fallback branch is gone; this method now
+    /// simply delegates to `option_id_for`. It remains the single canonical
+    /// resolver shared by the outbox enqueue/drain paths AND Stage 8 drift
+    /// detection, so the "what option does this lifecycle bit map to?" question
+    /// has exactly one answer everywhere.
+    pub fn resolved_option_id_for(&self, is_open: bool) -> Option<&str> {
+        self.option_id_for(is_open)
     }
 
     /// Resolve a cached `option_id` to its human-readable display name (e.g.
@@ -119,7 +110,7 @@ impl Project {
     }
 
     fn validate_mappings(mappings: &[StatusMapping], options: &[StatusOption]) -> Result<()> {
-        let mut seen_statuses = std::collections::HashSet::new();
+        let mut seen_bits = std::collections::HashSet::new();
         for m in mappings {
             if !options.iter().any(|o| o.option_id == m.option_id) {
                 return Err(DomainError::validation(format!(
@@ -127,15 +118,14 @@ impl Project {
                     m.option_id
                 )));
             }
-            // Multiple statuses MAY share one option_id (e.g. Open + Blocked
-            // → "Backlog"), but a single status cannot legitimately map to
-            // two options — `option_id_for` returns the first match and the
+            // A single open/closed value cannot legitimately map to two
+            // options — `option_id_for` returns the first match and the
             // result would otherwise depend on insertion order, masking a
             // user error as a sometimes-works lookup.
-            if !seen_statuses.insert(m.status) {
+            if !seen_bits.insert(m.is_open) {
                 return Err(DomainError::validation(format!(
-                    "duplicate status mapping for '{:?}'",
-                    m.status
+                    "duplicate status mapping for is_open={}",
+                    m.is_open
                 )));
             }
         }
@@ -186,7 +176,7 @@ mod tests {
             "PVTSSF_field".into(),
             vec![opt("o1", "Backlog", 0)],
             vec![StatusMapping {
-                status: TaskStatus::Open,
+                is_open: true,
                 option_id: "ghost".into(),
             }],
             false,
@@ -207,11 +197,11 @@ mod tests {
             vec![opt("o1", "Backlog", 0), opt("o2", "Done", 1)],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o1".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o2".into(),
                 },
             ],
@@ -219,16 +209,15 @@ mod tests {
             Timestamp::now(),
         )
         .unwrap();
-        assert_eq!(p.option_id_for(TaskStatus::Open), Some("o1"));
-        assert_eq!(p.option_id_for(TaskStatus::Done), Some("o2"));
-        assert_eq!(p.option_id_for(TaskStatus::InProgress), None);
+        assert_eq!(p.option_id_for(true), Some("o1"));
+        assert_eq!(p.option_id_for(false), Some("o2"));
     }
 
     #[test]
-    fn resolved_option_id_for_normal_mapping_and_blocked_fallback() {
-        // Open + Done are mapped; Blocked is intentionally NOT mapped (no
-        // Blocked-like option on the board), so it must resolve to the Open
-        // option via the §3 fallback — not None.
+    fn resolved_option_id_for_open_and_closed() {
+        // Both lifecycle buckets are mapped; the resolver returns each
+        // bucket's own option. With a bucket unmapped, it returns None
+        // (the old Blocked→Open fallback is gone — RFC 0004 D1).
         let p = Project::new(
             pid(),
             "acme".into(),
@@ -238,11 +227,11 @@ mod tests {
             vec![opt("o_open", "Backlog", 0), opt("o_done", "Done", 1)],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o_open".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o_done".into(),
                 },
             ],
@@ -250,47 +239,31 @@ mod tests {
             Timestamp::now(),
         )
         .unwrap();
-        // Normal mapping resolves to its own option.
-        assert_eq!(p.resolved_option_id_for(TaskStatus::Done), Some("o_done"));
-        // Blocked has no row → falls back to the Open option.
-        assert_eq!(
-            p.resolved_option_id_for(TaskStatus::Blocked),
-            Some("o_open")
-        );
-        // InProgress has no row and no fallback → None.
-        assert_eq!(p.resolved_option_id_for(TaskStatus::InProgress), None);
-        // Archived is never mapped to a project option.
-        assert_eq!(p.resolved_option_id_for(TaskStatus::Archived), None);
+        assert_eq!(p.resolved_option_id_for(true), Some("o_open"));
+        assert_eq!(p.resolved_option_id_for(false), Some("o_done"));
     }
 
     #[test]
-    fn resolved_option_id_for_blocked_with_explicit_mapping_uses_it() {
-        // When a Blocked row *is* stored, it wins over the Open fallback.
+    fn resolved_option_id_for_unmapped_bucket_is_none() {
+        // Only the open bucket is mapped → resolving the closed bucket is None
+        // (no fallback). An option-less board likewise yields None for open.
         let p = Project::new(
             pid(),
             "acme".into(),
             7,
             "Repo Link".into(),
             "PVTSSF_field".into(),
-            vec![opt("o_open", "Backlog", 0), opt("o_block", "Blocked", 1)],
-            vec![
-                StatusMapping {
-                    status: TaskStatus::Open,
-                    option_id: "o_open".into(),
-                },
-                StatusMapping {
-                    status: TaskStatus::Blocked,
-                    option_id: "o_block".into(),
-                },
-            ],
+            vec![opt("o_open", "Backlog", 0)],
+            vec![StatusMapping {
+                is_open: true,
+                option_id: "o_open".into(),
+            }],
             false,
             Timestamp::now(),
         )
         .unwrap();
-        assert_eq!(
-            p.resolved_option_id_for(TaskStatus::Blocked),
-            Some("o_block")
-        );
+        assert_eq!(p.resolved_option_id_for(true), Some("o_open"));
+        assert_eq!(p.resolved_option_id_for(false), None);
     }
 
     #[test]
@@ -314,8 +287,8 @@ mod tests {
 
     #[test]
     fn new_rejects_duplicate_status_mappings() {
-        // Same status mapped twice — option_id_for would return the first
-        // match and silently mask the user error. Reject at construction.
+        // Same open/closed bit mapped twice — option_id_for would return the
+        // first match and silently mask the user error. Reject at construction.
         let err = Project::new(
             pid(),
             "acme".into(),
@@ -325,11 +298,11 @@ mod tests {
             vec![opt("o1", "Backlog", 0), opt("o2", "In Progress", 1)],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o1".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o2".into(),
                 },
             ],
@@ -351,11 +324,11 @@ mod tests {
             vec![opt("o1", "Backlog", 0), opt("o2", "Done", 1)],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o1".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o2".into(),
                 },
             ],

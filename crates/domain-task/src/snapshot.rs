@@ -3,7 +3,7 @@
 use domain_core::{RepoId, TaskId, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::enums::{Priority, SyncState, TaskStatus};
+use crate::enums::{Lifecycle, Priority, SyncState};
 use crate::relation::RemoteRef;
 
 /// Why a snapshot was captured. Only events that confirm remote alignment
@@ -74,7 +74,9 @@ pub struct TaskSnapshot {
     pub version: u64,
     pub title: String,
     pub body: String,
-    pub status: TaskStatus,
+    /// The lifecycle axis at capture time — a single [`Lifecycle`] value
+    /// (RFC 0004 D1), replacing the old `TaskStatus`.
+    pub lifecycle: Lifecycle,
     pub sync_state: SyncState,
     pub priority: Priority,
     pub assignees: Vec<String>,

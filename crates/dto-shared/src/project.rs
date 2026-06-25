@@ -8,9 +8,10 @@ pub struct StatusOptionDto {
     pub option_id: String,
     pub name: String,
     pub ordinal: u32,
-    /// The local `TaskStatus` this option is the default for, if any.
-    /// Mirrored from the project's `status_mappings` collection on
-    /// serialization so the CLI can show "Backlog → Open" in one view.
+    /// The local lifecycle bucket this option is the default for, if any
+    /// (`"open"` / `"closed"`). Mirrored from the project's `status_mappings`
+    /// collection on serialization so the CLI can show "Backlog → open" in
+    /// one view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_for: Option<String>,
 }
@@ -57,7 +58,7 @@ pub struct LinkProjectCmd {
 pub struct MapStatusCmd {
     /// Project node id (`PVT_…`) or `owner/number` spec.
     pub project_spec: String,
-    /// Local `TaskStatus` value as the snake-case string.
+    /// Local lifecycle bucket as a snake-case string (`"open"` / `"closed"`).
     pub status: String,
     pub option_id: String,
 }

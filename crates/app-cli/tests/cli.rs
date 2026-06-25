@@ -102,7 +102,8 @@ fn task_create_list_includes_state_filter() {
         ],
     );
     let task_id = task["id"].as_str().unwrap().to_string();
-    assert_eq!(task["status"], "open");
+    assert_eq!(task["is_open"], true);
+    assert_eq!(task["state_reason"], serde_json::Value::Null);
     assert_eq!(task["sync_state"], "local_only");
 
     // Stage takes Vec<task ids> now → returns a batch array.
@@ -205,7 +206,8 @@ fn task_show_surfaces_filing_repo_without_leaking_filing_repo_id() {
     );
     // Base TaskDto shape intact.
     assert_eq!(shown["id"], task_id);
-    assert_eq!(shown["status"], "open");
+    assert_eq!(shown["is_open"], true);
+    assert_eq!(shown["state_reason"], Value::Null);
     assert_eq!(shown["repo_id"], Value::Null);
     // list keeps the byte-identical TaskDto shape — no show-only overlay.
     let listed = run_json(&mut bin("repo-link", &dir), &["task", "list"]);
@@ -304,7 +306,7 @@ fn task_batch_lifecycle_commands_emit_per_task_results() {
     assert_eq!(rows.len(), 3);
     for row in rows {
         assert_eq!(row["ok"], true);
-        assert_eq!(row["task"]["status"], "in_progress");
+        assert_eq!(row["task"]["is_open"], true);
     }
 }
 
@@ -945,9 +947,10 @@ fn task_snapshots_lists_history_after_edits() {
     );
     let task_id = task["id"].as_str().unwrap().to_string();
 
-    // Start the task — produces a second snapshot.
+    // Complete the task — a real lifecycle transition produces a second
+    // snapshot (`start` on an open task is a no-op and appends nothing).
     bin("repo-link", &dir)
-        .args(["task", "start", &task_id])
+        .args(["task", "complete", &task_id])
         .assert()
         .success();
 
@@ -2054,15 +2057,37 @@ fn task_create_writes_snapshot_with_source_created() {
     assert_eq!(rows.len(), 1, "creation writes exactly one snapshot");
     assert_eq!(rows[0]["version"], 1);
     assert_eq!(rows[0]["source"], "created");
-    assert_eq!(rows[0]["status"], "open");
+    assert_eq!(rows[0]["lifecycle"], "open");
     assert_eq!(rows[0]["sync_state"], "local_only");
 }
 
 #[test]
-fn task_start_writes_local_edit_snapshot_with_in_progress_status() {
+fn task_start_on_open_task_is_a_noop() {
+    // RFC 0004: `start` no longer has an `InProgress` target — it just asserts
+    // the open state. On an already-open task it is a true no-op: it appends NO
+    // snapshot and does not flip sync state, so a redundant `rl task start`
+    // never enqueues outbound churn.
     let dir = TempDir::new().unwrap();
     let id = fresh_task(&dir, "t");
     run_verb(&dir, &["task", "start", &id]);
+    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
+        .as_array()
+        .cloned()
+        .unwrap();
+    // Only the v1 `created` snapshot — `start` appended nothing.
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["version"], 1);
+    assert_eq!(rows[0]["lifecycle"], "open");
+}
+
+#[test]
+fn task_complete_writes_local_edit_snapshot_with_completed_status() {
+    // `complete` closes the task as `Completed` (RFC 0004). `start` on an open
+    // task is a no-op (appends nothing), so the sequence is just
+    // v1=created → v2=local_edit/complete.
+    let dir = TempDir::new().unwrap();
+    let id = fresh_task(&dir, "t");
+    run_verb(&dir, &["task", "complete", &id]);
     let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
         .as_array()
         .cloned()
@@ -2071,17 +2096,18 @@ fn task_start_writes_local_edit_snapshot_with_in_progress_status() {
     let v2 = &rows[1];
     assert_eq!(v2["version"], 2);
     assert_eq!(v2["source"], "local_edit");
-    assert_eq!(v2["status"], "in_progress");
+    assert_eq!(v2["lifecycle"], "completed");
 }
 
 #[test]
-fn task_complete_writes_local_edit_snapshot_with_done_status() {
-    // `complete` requires InProgress, so the snapshot sequence is
-    // v1=created → v2=local_edit/start → v3=local_edit/complete.
+fn task_reopen_writes_local_edit_snapshot_with_reopened_status() {
+    // `reopen` transitions a closed task back to open with the distinct
+    // `Reopened` marker (RFC 0004). Walks open → completed → reopened (`start`
+    // is a no-op and is omitted).
     let dir = TempDir::new().unwrap();
     let id = fresh_task(&dir, "t");
-    run_verb(&dir, &["task", "start", &id]);
     run_verb(&dir, &["task", "complete", &id]);
+    run_verb(&dir, &["task", "reopen", &id]);
     let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
         .as_array()
         .cloned()
@@ -2090,69 +2116,13 @@ fn task_complete_writes_local_edit_snapshot_with_done_status() {
     let v3 = &rows[2];
     assert_eq!(v3["version"], 3);
     assert_eq!(v3["source"], "local_edit");
-    assert_eq!(v3["status"], "done");
+    assert_eq!(v3["lifecycle"], "reopened");
 }
 
 #[test]
-fn task_reopen_writes_local_edit_snapshot_with_open_status() {
-    // `reopen` requires Done, so this walks Open → InProgress → Done → Open.
-    // The reopen target is `Open`, not `InProgress` — pinning that so a
-    // future "reopen restores prior status" change can't pass silently.
-    let dir = TempDir::new().unwrap();
-    let id = fresh_task(&dir, "t");
-    run_verb(&dir, &["task", "start", &id]);
-    run_verb(&dir, &["task", "complete", &id]);
-    run_verb(&dir, &["task", "reopen", &id]);
-    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
-        .as_array()
-        .cloned()
-        .unwrap();
-    assert_eq!(rows.len(), 4);
-    let v4 = &rows[3];
-    assert_eq!(v4["version"], 4);
-    assert_eq!(v4["source"], "local_edit");
-    assert_eq!(v4["status"], "open");
-}
-
-#[test]
-fn task_block_writes_local_edit_snapshot_with_blocked_status() {
-    let dir = TempDir::new().unwrap();
-    let id = fresh_task(&dir, "t");
-    run_verb(&dir, &["task", "block", &id]);
-    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
-        .as_array()
-        .cloned()
-        .unwrap();
-    assert_eq!(rows.len(), 2);
-    let v2 = &rows[1];
-    assert_eq!(v2["source"], "local_edit");
-    assert_eq!(v2["status"], "blocked");
-}
-
-#[test]
-fn task_unblock_writes_local_edit_snapshot_with_open_status() {
-    // Walks Open → Blocked → Open. Same "back to Open, not prior status"
-    // contract as `reopen`.
-    let dir = TempDir::new().unwrap();
-    let id = fresh_task(&dir, "t");
-    run_verb(&dir, &["task", "block", &id]);
-    run_verb(&dir, &["task", "unblock", &id]);
-    let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
-        .as_array()
-        .cloned()
-        .unwrap();
-    assert_eq!(rows.len(), 3);
-    let v3 = &rows[2];
-    assert_eq!(v3["source"], "local_edit");
-    assert_eq!(v3["status"], "open");
-}
-
-#[test]
-fn task_archive_writes_local_edit_snapshot_with_archived_status() {
-    // Archive accepts any non-Archived status, so we go straight from Open
-    // → Archived without intermediate steps. (The domain-layer test
-    // `lifecycle_mutations_on_synced_remote_task_flip_to_dirty_local`
-    // already covers the sync-state flip for remote-backed tasks.)
+fn task_archive_writes_local_edit_snapshot_with_not_planned_status() {
+    // RFC 0004: archive folds into the closed/`not_planned` lifecycle. We go
+    // straight from open → not_planned without intermediate steps.
     let dir = TempDir::new().unwrap();
     let id = fresh_task(&dir, "t");
     run_verb(&dir, &["task", "archive", &id]);
@@ -2163,7 +2133,7 @@ fn task_archive_writes_local_edit_snapshot_with_archived_status() {
     assert_eq!(rows.len(), 2);
     let v2 = &rows[1];
     assert_eq!(v2["source"], "local_edit");
-    assert_eq!(v2["status"], "archived");
+    assert_eq!(v2["lifecycle"], "not_planned");
 }
 
 #[test]
@@ -2183,30 +2153,32 @@ fn task_stage_writes_local_edit_snapshot_with_staged_sync_state() {
     let v2 = &rows[1];
     assert_eq!(v2["source"], "local_edit");
     assert_eq!(v2["sync_state"], "staged");
-    // Status is unchanged — lifecycle and sync are orthogonal.
-    assert_eq!(v2["status"], "open");
+    // Lifecycle is unchanged — lifecycle and sync are orthogonal.
+    assert_eq!(v2["lifecycle"], "open");
 }
 
 #[test]
 fn task_rollback_restores_status_across_lifecycle_transition() {
     // The rollback contract this PR is most about: rolling back across a
-    // status transition correctly restores the prior status. Without
+    // lifecycle transition correctly restores the prior state. Without
     // complete snapshot coverage at every verb, a rollback could silently
     // skip a transition and leave the task in an inconsistent state.
     let dir = TempDir::new().unwrap();
     let id = fresh_task(&dir, "lifecycle rollback");
-    run_verb(&dir, &["task", "start", &id]);
-    let after_start = run_json(&mut bin("repo-link", &dir), &["task", "show", &id]);
-    assert_eq!(after_start["status"], "in_progress");
+    run_verb(&dir, &["task", "complete", &id]);
+    let after_complete = run_json(&mut bin("repo-link", &dir), &["task", "show", &id]);
+    assert_eq!(after_complete["is_open"], false);
+    assert_eq!(after_complete["state_reason"], "completed");
 
     let rolled_back = run_json(
         &mut bin("repo-link", &dir),
         &["task", "rollback", &id, "--to-version", "1"],
     );
-    assert_eq!(rolled_back["status"], "open");
+    assert_eq!(rolled_back["is_open"], true);
+    assert_eq!(rolled_back["state_reason"], serde_json::Value::Null);
 
     // Confirm the rollback itself appended a snapshot (source = rollback),
-    // so the history is v1=created, v2=local_edit/start, v3=rollback/open.
+    // so the history is v1=created, v2=local_edit/complete, v3=rollback/open.
     let rows = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", &id])
         .as_array()
         .cloned()
@@ -2215,7 +2187,7 @@ fn task_rollback_restores_status_across_lifecycle_transition() {
     assert_eq!(rows[0]["source"], "created");
     assert_eq!(rows[1]["source"], "local_edit");
     assert_eq!(rows[2]["source"], "rollback");
-    assert_eq!(rows[2]["status"], "open");
+    assert_eq!(rows[2]["lifecycle"], "open");
 }
 
 // ---- Friendly task IDs ---------------------------------------------------
@@ -2908,7 +2880,7 @@ fn task_claim_local_only_assigns_and_starts_skipping_push() {
     let row = &arr[0];
     assert_eq!(row["ok"], true);
     assert_eq!(row["push"], "skipped: --no-sync");
-    assert_eq!(row["task"]["status"], "in_progress");
+    assert_eq!(row["task"]["is_open"], true);
     let assignees: Vec<&str> = row["task"]["assignees"]
         .as_array()
         .unwrap()
@@ -2983,8 +2955,7 @@ fn task_claim_refuses_done_task() {
         ],
     );
     let task_id = task["id"].as_str().unwrap().to_string();
-    // Drive the task all the way to Done.
-    run_json(&mut bin("rl", &dir), &["task", "start", &task_id]);
+    // Drive the task to a closed (completed) state.
     run_json(&mut bin("rl", &dir), &["task", "complete", &task_id]);
 
     let mut cmd = bin("rl", &dir);
@@ -3005,8 +2976,8 @@ fn task_claim_refuses_done_task() {
     assert_eq!(row["ok"], false);
     let err_msg = row["error"].as_str().unwrap();
     assert!(
-        err_msg.contains("done") && err_msg.contains("reopen"),
-        "expected 'done; reopen' hint; got: {err_msg}"
+        err_msg.contains("closed") && err_msg.contains("reopen"),
+        "expected 'closed; reopen' hint; got: {err_msg}"
     );
 }
 
@@ -3043,7 +3014,7 @@ fn task_claim_is_idempotent_when_already_claimed() {
     let first_updated_at = first[0]["task"]["updated_at"].clone();
     let first_assignees = first[0]["task"]["assignees"].clone();
 
-    // Second invocation must not mutate the task — already in_progress and
+    // Second invocation must not mutate the task — already open and
     // the cached login is already in `assignees`, so both branches in
     // `claim_one` are skipped. `updated_at` is the cheap idempotency probe.
     let mut cmd2 = bin("rl", &dir);
@@ -3052,7 +3023,7 @@ fn task_claim_is_idempotent_when_already_claimed() {
     cmd2.env_remove("GITHUB_TOKEN");
     let second = run_json(&mut cmd2, &["task", "claim", "--no-sync", &task_id]);
     assert_eq!(second[0]["ok"], true);
-    assert_eq!(second[0]["task"]["status"], "in_progress");
+    assert_eq!(second[0]["task"]["is_open"], true);
     assert_eq!(second[0]["task"]["assignees"], first_assignees);
     assert_eq!(
         second[0]["task"]["updated_at"], first_updated_at,
@@ -3167,21 +3138,22 @@ fn project_map_appends_then_overwrites() {
     let dir = TempDir::new().unwrap();
     link_demo_project(&dir);
 
-    // Auto-derivation seeds open→o1 and done→o2 (2 rows). `in_progress` has
-    // no matching option, so mapping it is a genuine append → 3 rows.
-    let after_append = run_json(
+    // RFC 0004: the mapping axis is now the open/closed bit, so a board has at
+    // most two mapping rows. Auto-derivation seeds open→o1 and closed→o2.
+    // Re-mapping an existing bit overwrites in place — it never appends.
+    let after_first = run_json(
         &mut bin("repo-link", &dir),
         &[
             "project",
             "map",
             "acme/7",
             "--local",
-            "in_progress",
+            "closed",
             "--option-id",
-            "o2",
+            "o1",
         ],
     );
-    assert_eq!(after_append["status_mappings"].as_array().unwrap().len(), 3);
+    assert_eq!(after_first["status_mappings"].as_array().unwrap().len(), 2);
 
     // open→o2 overwrites the existing open→o1 mapping — no new row.
     let after_overwrite = run_json(
@@ -3201,7 +3173,7 @@ fn project_map_appends_then_overwrites() {
     assert_eq!(open_mapping["option_id"], "o2");
     assert_eq!(
         mappings.len(),
-        3,
+        2,
         "overwrite must not append a duplicate row"
     );
 }

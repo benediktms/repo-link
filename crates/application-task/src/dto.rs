@@ -49,7 +49,9 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
         repo_id: t.repo_id.map(|r| r.to_string()),
         title: t.title.clone(),
         body: t.body.clone(),
-        status: enum_str(&t.status),
+        is_open: t.is_open(),
+        // Canonical reason projection lives on the enum (RFC 0004 D1).
+        state_reason: t.lifecycle.state_reason().map(str::to_string),
         sync_state: enum_str(&t.sync),
         priority: enum_str(&t.priority),
         assignees: t.assignees.clone(),

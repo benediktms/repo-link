@@ -2,21 +2,49 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Where the task is in the human workflow.
+/// The task lifecycle axis (RFC 0004 D1): the open/closed bit fused with its
+/// GitHub `state_reason` into a single closed set of legal states, so an
+/// illegal combination (e.g. "open but completed") is unrepresentable. The
+/// old 5-state `TaskStatus` is gone; "Blocked" is no longer a state — it is
+/// derived from `blocked_by` relations ([`crate::task::Task::is_blocked`]).
+///
+/// Decomposes to GitHub's two REST fields at the outbound boundary
+/// (`application-sync`): `is_open()` is the `state` bit, and the closed
+/// variants carry the `state_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    /// Created but no one has started it.
+pub enum Lifecycle {
+    /// Open, no reason — the "open since creation" state of a fresh task.
     Open,
-    /// Actively being worked on.
-    InProgress,
-    /// Stuck on an external dependency.
-    Blocked,
-    /// Work is complete. Distinct from `Archived` — done tasks stay
-    /// visible in dashboards; archived ones are out of sight.
-    Done,
-    /// Terminal — dropped, deferred indefinitely, or post-done cleanup.
-    Archived,
+    /// Open again after having been closed (the closed→open transition
+    /// marker, distinct from `Open`). Maps to GitHub `state_reason = reopened`.
+    Reopened,
+    /// Closed, work finished as planned. GitHub `state_reason = completed`.
+    Completed,
+    /// Closed without completing — dropped, deferred, won't-do. GitHub
+    /// `state_reason = not_planned`. (The old "archived" notion folds here.)
+    NotPlanned,
+}
+
+impl Lifecycle {
+    /// The open/closed bit (GitHub REST `state`): `Open`/`Reopened` are open,
+    /// `Completed`/`NotPlanned` are closed.
+    pub fn is_open(self) -> bool {
+        matches!(self, Lifecycle::Open | Lifecycle::Reopened)
+    }
+
+    /// The GitHub REST `state_reason` string for this lifecycle, or `None` for
+    /// a fresh `Open` (open-since-creation carries no reason). The single
+    /// canonical source for the reason projection — DTOs and the outbound
+    /// mapping derive from this rather than re-listing the strings.
+    pub fn state_reason(self) -> Option<&'static str> {
+        match self {
+            Lifecycle::Open => None,
+            Lifecycle::Reopened => Some("reopened"),
+            Lifecycle::Completed => Some("completed"),
+            Lifecycle::NotPlanned => Some("not_planned"),
+        }
+    }
 }
 
 /// How the local copy of the task relates to its remote counterpart.

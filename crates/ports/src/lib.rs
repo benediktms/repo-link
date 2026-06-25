@@ -23,5 +23,6 @@ pub use remote_task::{
     RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 pub use task::{
-    RepoBindingRepository, TaskFilter, TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
+    RepoBindingRepository, SyncedSource, TaskFilter, TaskRepository, TaskSnapshotRepository,
+    WorkspaceRepository,
 };

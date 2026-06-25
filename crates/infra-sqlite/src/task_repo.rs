@@ -3,10 +3,10 @@ use chrono::{DateTime, Utc};
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{
-    Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment, TaskRelation,
-    TaskSnapshot, TaskStatus,
+    Lifecycle, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment,
+    TaskRelation, TaskSnapshot,
 };
-use ports::{PortError, PortResult, RemoteComment, TaskFilter, TaskRepository};
+use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::Db;
@@ -28,7 +28,11 @@ impl SqliteTaskRepository {
 // (the const must name every live column, see #110) but is NOT yet read by
 // `row_to_task` — the domain `Task` gains the field in #116. Selecting an
 // unmapped column is harmless: `row_to_task` extracts by name and ignores it.
-pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id";
+// The legacy `status` column is still listed (it remains a live NOT NULL column,
+// per the #110 every-live-column contract) but `row_to_task` no longer reads it —
+// the lifecycle axis is read from `lifecycle` (RFC 0004 D1). `synced_at` is the
+// RFC 0004 D3 write-through cache column.
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
@@ -144,12 +148,16 @@ impl TaskRepository for SqliteTaskRepository {
         if let Some(r) = filter.repo_id {
             qb.push(" AND repo_id = ").push_bind(r.to_string());
         }
-        if let Some(s) = filter.status {
-            qb.push(" AND status = ").push_bind(enum_to_str(&s)?);
-        } else if !filter.include_archived {
-            // Explicit status filter takes precedence; otherwise default to
-            // hiding Archived rows.
-            qb.push(" AND status != 'archived'");
+        if let Some(open) = filter.is_open {
+            // Filter on the open/closed bit (RFC 0004 D1). open ⇒
+            // open|reopened, closed ⇒ completed|not_planned. `None` returns
+            // both — there is no longer an implicit "hide archived" default
+            // (the Archived status is gone; a closed task is just closed).
+            if open {
+                qb.push(" AND lifecycle IN ('open', 'reopened')");
+            } else {
+                qb.push(" AND lifecycle IN ('completed', 'not_planned')");
+            }
         }
         if let Some(s) = filter.sync_state {
             qb.push(" AND sync_state = ").push_bind(enum_to_str(&s)?);
@@ -397,6 +405,27 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn cache_synced_at(
+        &self,
+        task_id: TaskId,
+        synced_at: Timestamp,
+        _source: SyncedSource,
+    ) -> PortResult<()> {
+        // Targeted single-column write (RFC 0004 D3) — same family as
+        // `cache_project_status` / `cache_remote_node_id`: stamp ONLY the
+        // `synced_at` cache column, never the whole row, so observing the
+        // remote can't clobber a concurrent CLI edit or perturb dirty
+        // detection. `source` is not persisted (no column) — it exists only so
+        // `mark_synced` can assert the call site. Zero-row match is benign.
+        sqlx::query("UPDATE tasks SET synced_at = ? WHERE id = ?")
+            .bind(synced_at.into_inner())
+            .bind(task_id.to_string())
+            .execute(&self.db.writes)
+            .await
+            .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn delete(&self, id: TaskId) -> PortResult<()> {
         sqlx::query("DELETE FROM tasks WHERE id = ?")
             .bind(id.to_string())
@@ -430,8 +459,8 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_id, filing_repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tasks (id, workspace_id, repo_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             repo_id = excluded.repo_id,
@@ -439,6 +468,7 @@ async fn write_task_in_tx(
             title = excluded.title,
             body = excluded.body,
             status = excluded.status,
+            lifecycle = excluded.lifecycle,
             sync_state = excluded.sync_state,
             priority = excluded.priority,
             assignees_json = excluded.assignees_json,
@@ -451,6 +481,13 @@ async fn write_task_in_tx(
             -- the DO UPDATE half (the row already exists). Omitting this clause
             -- is the silent-never-persists bug class.
             project_status_option_id = excluded.project_status_option_id,
+            -- RFC 0004 D3: `synced_at` is a write-through cache on a separate
+            -- axis, stamped ONLY by the targeted `cache_synced_at`. It is
+            -- deliberately NOT in this DO UPDATE set: a whole-row save carries a
+            -- possibly-stale in-memory `synced_at` (e.g. loaded before the
+            -- poller observed the remote), so updating it here would clobber a
+            -- fresher stamp with an older value. New rows still get it via the
+            -- INSERT column above (NULL = never observed).
             hash = excluded.hash,
             updated_at = excluded.updated_at
         "#,
@@ -461,7 +498,10 @@ async fn write_task_in_tx(
     .bind(t.filing_repo_id.map(|r| r.to_string()))
     .bind(&t.title)
     .bind(&t.body)
-    .bind(enum_to_str(&t.status)?)
+    // Legacy `status` column (RFC 0004 D1): still written to satisfy its
+    // NOT NULL CHECK, derived from the canonical `lifecycle`. No longer read.
+    .bind(legacy_status_str(t.lifecycle))
+    .bind(enum_to_str(&t.lifecycle)?)
     .bind(enum_to_str(&t.sync)?)
     .bind(enum_to_str(&t.priority)?)
     .bind(json_to_string(&t.assignees)?)
@@ -470,6 +510,7 @@ async fn write_task_in_tx(
     .bind(t.remote.as_ref().and_then(|r| r.node_id.clone()))
     .bind(t.project_item_id.as_deref())
     .bind(t.project_status_option_id.as_deref())
+    .bind(t.synced_at.map(|ts| ts.into_inner()))
     .bind(&t.hash)
     .bind(t.created_at.into_inner())
     .bind(t.updated_at.into_inner())
@@ -485,15 +526,18 @@ async fn write_task_in_tx(
     // restores it.
     sqlx::query(
         r#"
-        INSERT INTO task_snapshots (task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        INSERT INTO task_snapshots (task_id, version, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
         "#,
     )
     .bind(t.id.to_string())
     .bind(next_version)
     .bind(&t.title)
     .bind(&t.body)
-    .bind(enum_to_str(&t.status)?)
+    // Legacy `status` column derived from `lifecycle` (RFC 0004 D1); kept to
+    // satisfy its NOT NULL CHECK, no longer read.
+    .bind(legacy_status_str(t.lifecycle))
+    .bind(enum_to_str(&t.lifecycle)?)
     .bind(enum_to_str(&t.sync)?)
     .bind(enum_to_str(&t.priority)?)
     .bind(json_to_string(&t.assignees)?)
@@ -563,13 +607,26 @@ async fn write_task_in_tx(
     Ok(())
 }
 
+/// Map the canonical [`Lifecycle`] back to a value in the legacy `status`
+/// column's CHECK set (`open|in_progress|blocked|done|archived`). The column is
+/// no longer read (RFC 0004 D1), but it is NOT NULL, so writes must still
+/// supply a valid legacy value until a future migration retires the column.
+fn legacy_status_str(lifecycle: Lifecycle) -> &'static str {
+    match lifecycle {
+        Lifecycle::Open | Lifecycle::Reopened => "open",
+        Lifecycle::Completed => "done",
+        Lifecycle::NotPlanned => "archived",
+    }
+}
+
 fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let id_str: String = row.try_get("id").map_err(map_sqlx_err)?;
     let workspace_id_str: String = row.try_get("workspace_id").map_err(map_sqlx_err)?;
     let repo_id_str: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
     let body: String = row.try_get("body").map_err(map_sqlx_err)?;
-    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    // RFC 0004 D1: read the canonical `lifecycle`; legacy `status` is no longer read.
+    let lifecycle: String = row.try_get("lifecycle").map_err(map_sqlx_err)?;
     let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
     let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
@@ -583,6 +640,8 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let hash: String = row.try_get("hash").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
+    // RFC 0004 D3: write-through "remote last observed" stamp. NULL = never observed.
+    let synced_at: Option<DateTime<Utc>> = row.try_get("synced_at").map_err(map_sqlx_err)?;
 
     let repo_id = repo_id_str
         .as_deref()
@@ -613,7 +672,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         filing_repo_id,
         title,
         body,
-        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        lifecycle: enum_from_str::<Lifecycle>("task lifecycle", &lifecycle)?,
         sync: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
@@ -622,6 +681,10 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         comments: Vec::new(),
         project_item_id,
         project_status_option_id,
+        synced_at: synced_at.map(Timestamp::from_utc),
+        // Monotonic companion is in-memory only — never persisted, so it reads
+        // back None on load (treated as stale by the poller's first tick).
+        synced_instant: None,
         hash,
         synced_baseline: None,
         created_at: Timestamp::from_utc(created_at),
@@ -686,7 +749,7 @@ async fn load_latest_baseline(
 ) -> PortResult<Option<TaskSnapshot>> {
     let row = sqlx::query(
         r#"
-        SELECT version, title, body, status, sync_state, priority,
+        SELECT version, title, body, lifecycle, sync_state, priority,
                assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded,
                filing_repo_id, source, captured_at
         FROM task_snapshots
@@ -714,7 +777,8 @@ async fn load_latest_baseline(
     let version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
     let body: String = row.try_get("body").map_err(map_sqlx_err)?;
-    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    // RFC 0004 D1: read the canonical `lifecycle`; legacy `status` is no longer read.
+    let lifecycle: String = row.try_get("lifecycle").map_err(map_sqlx_err)?;
     let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
     let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
@@ -748,7 +812,7 @@ async fn load_latest_baseline(
         version: version as u64,
         title,
         body,
-        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        lifecycle: enum_from_str::<Lifecycle>("task lifecycle", &lifecycle)?,
         sync_state: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,

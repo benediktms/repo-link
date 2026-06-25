@@ -3,8 +3,8 @@
 //!
 //! Local SQLite is authoritative for draft state; once a task has been
 //! pushed, GitHub becomes the source of truth. Sync transitions follow
-//! [`SyncState`]; lifecycle ([`TaskStatus`]) is orthogonal and only
-//! consulted to skip Archived tasks.
+//! [`SyncState`]; lifecycle ([`Lifecycle`]) is orthogonal and only
+//! consulted to skip closed/archived tasks.
 //!
 //! Two outbound paths coexist within this stage:
 //! - [`SyncService::push`] — the synchronous path kept for `rl task claim`'s
@@ -29,7 +29,7 @@ mod service;
 mod summary;
 
 use domain_project::Project;
-use domain_task::{MirrorPatch, Task, TaskSnapshot, TaskStatus, assignees_equal};
+use domain_task::{Lifecycle, MirrorPatch, Task, TaskSnapshot, assignees_equal};
 use ports::{RemoteStateReason, RemoteTaskUpdate};
 
 pub use drainer::{BackoffSchedule, OutboxDrainer};
@@ -37,40 +37,41 @@ pub use error::{Result, SyncError};
 pub use poller::{PollReport, ProjectPoller};
 pub use service::SyncService;
 
-/// Resolve a task's lifecycle status to a project Status option id, applying
-/// the RFC §3 absence-of-row rule: a `Blocked` task on a board with no
-/// Blocked-like option (so no `blocked` mapping row was stored) falls back to
-/// the `Open` option. Returns `None` only when even `Open` is unmapped (an
-/// option-less board) — the caller then enqueues no `SetProjectStatus`.
+/// Resolve a task's open/closed bit to a project Status option id (RFC 0004
+/// D1): an open task maps to one board option, a closed task to another.
+/// Returns `None` when that bucket is unmapped (an option-less board) — the
+/// caller then enqueues no `SetProjectStatus`.
 ///
 /// Shared by the drainer's `AddItem` follow-up and the lifecycle / set-project
-/// enqueue helpers so the fallback is applied identically at enqueue time.
+/// enqueue helpers so resolution is applied identically at enqueue time.
 ///
 /// Delegates to the canonical [`Project::resolved_option_id_for`] so the
 /// outbox enqueue/drain paths and Stage 8 drift detection (which calls the
-/// domain resolver directly) can never diverge on the fallback definition —
-/// there is exactly ONE Blocked→Open rule, and it lives in `domain-project`.
-/// Keeps the `Option<String>` shape its callers expect by mapping the `&str`.
-pub fn option_id_for_status_with_fallback(project: &Project, status: TaskStatus) -> Option<String> {
-    project.resolved_option_id_for(status).map(str::to_string)
+/// domain resolver directly) can never diverge — there is exactly ONE
+/// open/closed → option rule, and it lives in `domain-project`. Keeps the
+/// `Option<String>` shape its callers expect by mapping the `&str`.
+pub fn board_option_for_lifecycle(project: &Project, is_open: bool) -> Option<String> {
+    project.resolved_option_id_for(is_open).map(str::to_string)
 }
 
-/// Map a local lifecycle status onto the remote issue's open/closed bit plus
-/// `state_reason`. `Done` closes as `Completed`; `Archived` closes as
-/// `NotPlanned`; any open status reopens (we don't track whether the remote
-/// was previously closed — sending `Reopened` unconditionally is harmless on
-/// GitHub when the issue is already open and informative otherwise).
+/// Decompose a [`Lifecycle`] into the remote issue's open/closed bit plus
+/// `state_reason` (RFC 0004 D1): `Completed`/`NotPlanned` close with the
+/// matching reason; `Reopened` is open with the closed→open marker; a fresh
+/// `Open` is open with no reason (omitted from the PATCH).
 ///
 /// Shared by [`SyncService::push`] and the [`OutboxDrainer`] so the two
 /// outbound paths can never diverge on how a lifecycle change maps to the
 /// remote.
-pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<RemoteStateReason>) {
-    match status {
-        TaskStatus::Done => (true, Some(RemoteStateReason::Completed)),
-        TaskStatus::Archived => (true, Some(RemoteStateReason::NotPlanned)),
-        TaskStatus::Open | TaskStatus::InProgress | TaskStatus::Blocked => {
-            (false, Some(RemoteStateReason::Reopened))
-        }
+pub(crate) fn lifecycle_to_remote_state(lifecycle: Lifecycle) -> (bool, Option<RemoteStateReason>) {
+    // Decompose the single Lifecycle value into GitHub's two REST fields
+    // `(closed, state_reason)` (RFC 0004 D1). `closed = !is_open`.
+    match lifecycle {
+        Lifecycle::Completed => (true, Some(RemoteStateReason::Completed)),
+        Lifecycle::NotPlanned => (true, Some(RemoteStateReason::NotPlanned)),
+        // Reopened carries the closed→open marker; a fresh Open carries no
+        // reason (state_reason omitted from the PATCH).
+        Lifecycle::Reopened => (false, Some(RemoteStateReason::Reopened)),
+        Lifecycle::Open => (false, None),
     }
 }
 
@@ -81,7 +82,7 @@ pub(crate) fn lifecycle_to_remote_state(status: TaskStatus) -> (bool, Option<Rem
 ///
 /// The 3-field shape is the inbound mirror set per RFC 0003 §2 D7 —
 /// **`Status` is deliberately absent** because pull can't map GitHub's
-/// two-state open/closed onto the local 5-state lifecycle, and pulling
+/// two-state open/closed onto the local lifecycle, and pulling
 /// the REST closed bit back into the lifecycle is explicitly
 /// out-of-scope per §3 of that RFC. The shape is encoded in this
 /// helper's positional signature; the tripwires in `domain-task` and
@@ -121,7 +122,7 @@ pub(crate) fn inbound_mirrors_baseline(
 /// detection against the *old* baseline would be a self-defeating
 /// no-op. `Status` is deliberately NOT copied (D7: pull can't
 /// faithfully map GitHub's two-state open/closed onto the local
-/// 5-state lifecycle).
+/// lifecycle).
 pub(crate) fn copy_inbound_mirror_from_snap(
     task: &mut Task,
     remote_title: &str,
@@ -176,7 +177,6 @@ pub(crate) fn build_update_from_patch<'a>(
 #[cfg(test)]
 mod build_update_from_patch_tests {
     use super::*;
-    use domain_task::TaskStatus;
 
     // A trivial Task — the helper ignores everything except the patch, so the
     // task value itself is never inspected.
@@ -224,12 +224,12 @@ mod build_update_from_patch_tests {
 
     #[test]
     fn status_done_projects_to_closed_completed() {
-        // A status-only diff: patch.status = Done ⇒ helper runs
+        // A status-only diff: patch.status = Completed ⇒ helper runs
         // lifecycle_to_remote_state, gets (true, Some(Completed)) ⇒ sets
         // closed=Some(true) and state_reason=Some(Completed). Title/body/
         // assignees stay None (status is the only changed field).
         let patch = MirrorPatch {
-            status: Some(TaskStatus::Done),
+            status: Some(Lifecycle::Completed),
             ..Default::default()
         };
         let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
@@ -242,12 +242,12 @@ mod build_update_from_patch_tests {
     }
 
     #[test]
-    fn status_blocked_projects_to_closed_false_reopened() {
-        // Status=Blocked is an OPEN status on our side, so the remote
+    fn status_reopened_projects_to_closed_false_reopened() {
+        // Lifecycle::Reopened is an OPEN status on our side, so the remote
         // projection is closed=false with Reopened (lifecycle_to_remote_state).
-        // Guards the non-Done branch of the helper's status projection.
+        // Guards the non-Completed branch of the helper's status projection.
         let patch = MirrorPatch {
-            status: Some(TaskStatus::Blocked),
+            status: Some(Lifecycle::Reopened),
             ..Default::default()
         };
         let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")
@@ -312,10 +312,10 @@ mod build_update_from_patch_tests {
     }
 
     #[test]
-    fn status_archived_projects_to_closed_not_planned() {
-        // Archived → (true, NotPlanned) per `lifecycle_to_remote_state`.
+    fn status_not_planned_projects_to_closed_not_planned() {
+        // NotPlanned → (true, NotPlanned) per `lifecycle_to_remote_state`.
         let patch = MirrorPatch {
-            status: Some(TaskStatus::Archived),
+            status: Some(Lifecycle::NotPlanned),
             ..Default::default()
         };
         let u = build_update_from_patch(&any_task(), &patch, "github.com/o/r", "1")

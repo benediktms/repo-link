@@ -31,8 +31,16 @@ pub struct TaskDto {
     pub repo_id: Option<String>,
     pub title: String,
     pub body: String,
-    /// Lifecycle status: `open` / `in_progress` / `blocked` / `done` / `archived`.
-    pub status: String,
+    /// Lifecycle open/closed bit (RFC 0004 D1): `true` for `Lifecycle::Open` /
+    /// `Reopened`, `false` for `Completed` / `NotPlanned`. The old 5-state
+    /// `status: String` is gone; "blocked" is no longer a state (it's derived
+    /// from relations).
+    pub is_open: bool,
+    /// The GitHub-style close reason, decomposed from the `Lifecycle` so JSON
+    /// consumers keep both axes: `Some("completed")` for `Completed`,
+    /// `Some("not_planned")` for `NotPlanned`, `Some("reopened")` for
+    /// `Reopened`, and `None` for `Open`.
+    pub state_reason: Option<String>,
     /// Sync state: `local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`.
     pub sync_state: String,
     pub priority: String,
@@ -136,7 +144,7 @@ pub struct RemoveTaskRelationCmd {
 pub struct ListTasksQuery {
     pub workspace_id: Option<String>,
     pub repo_id: Option<String>,
+    /// Lifecycle filter (RFC 0004 D1): `"open"` / `"closed"`, or `None` for all.
     pub status: Option<String>,
     pub sync_state: Option<String>,
-    pub include_archived: bool,
 }

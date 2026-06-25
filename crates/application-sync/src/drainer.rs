@@ -584,7 +584,7 @@ impl OutboxDrainer {
             return Ok(());
         };
         let project = self.projects.get(project_id).await?;
-        let Some(option_id) = crate::option_id_for_status_with_fallback(&project, task.status)
+        let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open())
         else {
             return Ok(());
         };
@@ -608,7 +608,7 @@ mod tests {
     use domain_core::{ProjectId, Timestamp, WorkspaceId};
     use domain_project::{Project, StatusMapping, StatusOption};
     use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
-    use domain_task::{RemoteRef, SyncState, Task, TaskStatus};
+    use domain_task::{RemoteRef, SyncState, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
         OutboxRepository, ProjectRepository, RemoteStateReason, TaskRepository, WorkspaceRepository,
@@ -711,15 +711,11 @@ mod tests {
             ],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o_backlog".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::InProgress,
-                    option_id: "o_wip".into(),
-                },
-                StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o_done".into(),
                 },
             ],
@@ -823,7 +819,7 @@ mod tests {
             "body baseline entry must be unchanged (rpl-xq6 happy path; \
              rpl-vvf nails the byte-identical assertion across the wire)"
         );
-        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.lifecycle, pre_baseline.lifecycle);
         assert_eq!(post_baseline.assignees, pre_baseline.assignees);
         assert_eq!(
             post_baseline.source,
@@ -909,7 +905,7 @@ mod tests {
         let post_baseline = post.synced_baseline.clone().expect("baseline");
         assert_eq!(post_baseline.title, pre_baseline.title);
         assert_eq!(post_baseline.body, pre_baseline.body);
-        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.lifecycle, pre_baseline.lifecycle);
         assert_eq!(post_baseline.assignees, pre_baseline.assignees);
         assert_eq!(post_baseline.source, SnapshotSource::Push);
 
@@ -1730,13 +1726,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_update_remote_drains_with_closed_false() {
-        // Drainer-level proof that a Blocked task's UpdateRemote never closes
-        // the issue: lifecycle_to_remote_state(Blocked) = (false, Reopened).
+    async fn reopened_update_remote_drains_with_closed_false() {
+        // Drainer-level proof that a Reopened task's UpdateRemote re-opens the
+        // issue rather than closing it: lifecycle_to_remote_state(Reopened) =
+        // (false, Reopened). (Pre-RFC-0004 this exercised the Blocked status;
+        // "blocked" is now a relation, so the open-but-non-fresh lifecycle that
+        // drains to (false, Reopened) is Reopened.)
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
         let mut task = seed_issue_task(&h, ws, "1").await;
-        task.mark_blocked().unwrap();
+        task.reopen().unwrap();
         h.tasks
             .save(&task, SnapshotSource::LocalEdit)
             .await
@@ -1761,12 +1760,12 @@ mod tests {
         assert_eq!(
             updates[0].closed,
             Some(false),
-            "Blocked must drain with closed=false, never closing the issue"
+            "Reopened must drain with closed=false, never closing the issue"
         );
         assert_eq!(
             updates[0].state_reason,
             Some(RemoteStateReason::Reopened),
-            "Blocked must drain with state_reason=Reopened (lifecycle_to_remote_state)"
+            "Reopened must drain with state_reason=Reopened (lifecycle_to_remote_state)"
         );
     }
 

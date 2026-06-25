@@ -320,7 +320,10 @@ impl ProjectPoller {
         let tasks = self
             .tasks
             .list(TaskFilter {
-                include_archived: true,
+                // The poller correlates every project-backed task regardless
+                // of lifecycle — closed/archived items still live on the board
+                // and must be matched — so it filters by neither open/closed.
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;

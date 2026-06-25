@@ -14,7 +14,7 @@ pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
                 .status_mappings
                 .iter()
                 .find(|m| m.option_id == o.option_id)
-                .map(|m| status_to_str(m.status).to_string());
+                .map(|m| status_to_str(m.is_open).to_string());
             StatusOptionDto {
                 option_id: o.option_id.clone(),
                 name: o.name.clone(),
@@ -35,7 +35,7 @@ pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
             .status_mappings
             .iter()
             .map(|m| StatusMappingDto {
-                status: status_to_str(m.status).to_string(),
+                status: status_to_str(m.is_open).to_string(),
                 option_id: m.option_id.clone(),
             })
             .collect(),

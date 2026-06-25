@@ -125,8 +125,8 @@ The same rule applies to commit trailers, changelog entries, and any other artif
 ### Useful filters and views
 
 ```bash
-rl query blocked      --workspace <id>   # tasks in Blocked state
-rl query stale        --workspace <id>   # InProgress tasks untouched for a while
+rl query blocked      --workspace <id>   # open tasks blocked by an open dependency (BlockedBy)
+rl query stale        --workspace <id>   # open tasks untouched for a while
 rl query contributors --workspace <id>   # who has touched which tasks
 rl task snapshots <task-id>              # full version history of one task
 ```
