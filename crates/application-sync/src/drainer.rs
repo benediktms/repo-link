@@ -584,8 +584,7 @@ impl OutboxDrainer {
             return Ok(());
         };
         let project = self.projects.get(project_id).await?;
-        let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open())
-        else {
+        let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open()) else {
             return Ok(());
         };
         let entry = OutboxEntry::new(

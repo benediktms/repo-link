@@ -537,7 +537,7 @@ impl TaskService {
                     return Err(ServiceError::BadEnum {
                         field: "status",
                         value: other.to_string(),
-                    })
+                    });
                 }
             },
             sync_state: query

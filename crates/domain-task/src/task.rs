@@ -1715,8 +1715,16 @@ mod tests {
         let before = t.updated_at();
         t.complete().unwrap(); // already Completed → must be a no-op
         assert_eq!(t.lifecycle, Lifecycle::Completed);
-        assert_eq!(t.sync, SyncState::Synced, "redundant complete re-dirtied a synced task");
-        assert_eq!(t.updated_at(), before, "redundant complete bumped updated_at");
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "redundant complete re-dirtied a synced task"
+        );
+        assert_eq!(
+            t.updated_at(),
+            before,
+            "redundant complete bumped updated_at"
+        );
     }
 
     #[test]
