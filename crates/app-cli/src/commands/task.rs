@@ -266,7 +266,7 @@ pub(crate) async fn task_dispatch(
             // relink hint (like `sync pull`), while any other fetch failure
             // degrades to a non-fatal `last_refresh_failed` annotation so the
             // cached value (incl. a dangling filing binding) is still shown.
-            let refresh_failed = if refresh && domain_task.remote.is_some() {
+            let refresh_failed = if refresh && domain_task.is_issue_backed() {
                 let sync = build_sync_service(cfg, svc, "task show --refresh")?;
                 match sync.refresh(&domain_task.id.to_string()).await {
                     Ok(RefreshOutcome::Stamped | RefreshOutcome::NotIssueBacked) => None,

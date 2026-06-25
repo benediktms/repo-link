@@ -107,9 +107,10 @@ pub fn mark_synced(task: &mut Task, _source: ports::SyncedSource) {
     task.synced_at = Some(domain_core::Timestamp::now());
 }
 
-/// Is the mirror issue-backed (has a real REST issue)?
+/// Is the mirror issue-backed (has a real REST issue)? Delegates to
+/// [`Task::is_issue_backed`] so the predicate has a single definition.
 pub fn is_issue_backed(task: &Task) -> bool {
-    task.remote.is_some()
+    task.is_issue_backed()
 }
 
 /// Is the mirror draft-backed (a project draft with no REST issue)?

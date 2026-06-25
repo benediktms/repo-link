@@ -743,6 +743,13 @@ impl Task {
         self.sync != SyncState::LocalOnly
     }
 
+    /// Whether this task is backed by a real REST issue (`remote.is_some()`), as
+    /// opposed to purely local or draft-backed. Only an issue-backed task has an
+    /// issue to fetch — e.g. `rl task show --refresh` (RFC 0004 D4).
+    pub fn is_issue_backed(&self) -> bool {
+        self.remote.is_some()
+    }
+
     /// Diff the current task against [`Task::synced_baseline`] and
     /// reconcile the sync state. Called by every mutation that touches
     /// remote-observable state.
