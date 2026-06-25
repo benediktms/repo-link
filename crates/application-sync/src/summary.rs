@@ -20,16 +20,20 @@ pub(crate) fn ensure_not_archived(task: &Task) -> Result<()> {
 /// Whether the remote snapshot's *mirrored* fields match the task's last
 /// aligned baseline. Routes through the shared `inbound_mirrors_baseline`
 /// helper so the inbound field set is a single named function signature
-/// instead of a hand-rolled `&&` chain. The `Status` exclusion (RFC 0003
-/// §2 D7) is the explicit reason this helper exists in parallel with
-/// `MirrorField::differs`: detection on the issue-axis walks all four
-/// canonical fields, but the inbound path excludes `Status` because pull
-/// cannot map GitHub's two-state open/closed onto the local 5-state
-/// lifecycle. Comparing only mirrored fields prevents `updated_at` churn
-/// — comments, reactions, label edits — from forcing cosmetic pull_remote
-/// refreshes.
+/// instead of a hand-rolled `&&` chain. The inbound set is title / body /
+/// assignees / open-closed: RFC 0004 D1 made `is_open` the 1:1 inverse of the
+/// REST `closed` bit, so the open/closed axis is now reflected on pull
+/// (reversing the RFC 0003 §2 D7 carve-out). Comparing only mirrored fields
+/// still prevents `updated_at` churn — comments, reactions, label edits — from
+/// forcing cosmetic pull_remote refreshes.
 pub(crate) fn remote_mirrors_baseline(snap: &RemoteTaskSnapshot, baseline: &TaskSnapshot) -> bool {
-    crate::inbound_mirrors_baseline(&snap.title, &snap.body, &snap.assignees, baseline)
+    crate::inbound_mirrors_baseline(
+        &snap.title,
+        &snap.body,
+        &snap.assignees,
+        snap.closed,
+        baseline,
+    )
 }
 
 pub(crate) fn link_summary(
@@ -95,10 +99,10 @@ mod tests {
     use domain_core::Timestamp;
     use domain_task::SnapshotSource;
 
-    /// Build a baseline snapshot for the helper-under-test. The fields we
-    /// care about (title, body, assignees) are the three inbound fields;
-    /// lifecycle is set explicitly to make the `ignores_status` test's intent
-    /// visible (the helper must NOT consult this field).
+    /// Build a baseline snapshot for the helper-under-test. The inbound fields
+    /// are title, body, assignees, and the open/closed bit; lifecycle is set
+    /// explicitly so the `reflects_status` test can flip the remote `closed`
+    /// bit against a known baseline open state.
     fn baseline(lifecycle: Lifecycle) -> TaskSnapshot {
         let mut t = domain_task::Task::new_draft(domain_core::WorkspaceId::new(), None, "t".into())
             .unwrap();
@@ -126,23 +130,13 @@ mod tests {
         }
     }
 
-    /// Build a `RemoteTaskSnapshot` whose `closed` differs from the baseline's
-    /// open lifecycle. The drift check (D7) must IGNORE that — pulling
-    /// open/closed back into the 5-state lifecycle is out of scope. If a
-    /// future refactor folds `closed` into the comparison, this test fails
-    /// and forces a re-think.
-    ///
-    /// The load-bearing assertion is that `closed=true` and `closed=false`
-    /// produce the *same* result: the helper chain reads
-    /// `title/body/assignees` and never `closed`, so flipping `closed`
-    /// cannot change the answer. The earlier version of this test only
-    /// checked `closed=true` against the baseline, which would pass
-    /// identically for `closed=false` — vacuous, since the helper
-    /// can't tell the difference. Parameterizing over both `closed`
-    /// values makes the D7 carve-out an actual property of the
-    /// comparison rather than of the literal.
+    /// Tripwire: the drift check now REFLECTS the open/closed bit.
+    /// RFC 0004 D1 made `is_open` the 1:1 inverse of the REST `closed` bit, so
+    /// against an `Open` baseline a `closed=true` remote is drift while a
+    /// `closed=false` remote is not. (This reverses the earlier D7 carve-out
+    /// where `closed` was ignored.)
     #[test]
-    fn remote_mirrors_baseline_ignores_status() {
+    fn remote_mirrors_baseline_reflects_status() {
         let base = baseline(Lifecycle::Open);
         let snap_closed = any_remote_snap(
             base.title.clone(),
@@ -156,19 +150,22 @@ mod tests {
             base.assignees.clone(),
             false,
         );
-        assert_eq!(
-            remote_mirrors_baseline(&snap_closed, &base),
+        // Remote open matches the open baseline (no drift on the status axis).
+        assert!(
             remote_mirrors_baseline(&snap_open, &base),
-            "closed must not affect the drift verdict (D7)"
+            "remote open vs local open must not be drift"
         );
-        // And: a real field change (title) must still trip the check,
-        // independent of `closed`. Use the closed=true form to exercise
-        // the harder-of-two inputs.
+        // Remote closed against an open baseline IS drift — the bug this fixes.
+        assert!(
+            !remote_mirrors_baseline(&snap_closed, &base),
+            "remote closed vs local open must surface as drift"
+        );
+        // And: a real field change (title) must still trip the check.
         let snap_title_differs = any_remote_snap(
             "different".into(),
             base.body.clone(),
             base.assignees.clone(),
-            true,
+            false,
         );
         assert!(
             !remote_mirrors_baseline(&snap_title_differs, &base),
