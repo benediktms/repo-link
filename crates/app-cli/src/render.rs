@@ -75,7 +75,17 @@ pub fn tasks(rows: &[TaskDto]) {
 /// `task()` and `tasks()` (list / query) are unchanged — this path is used
 /// ONLY by `rl task show`, keeping the shared `TaskDto` contract byte-
 /// identical for all other consumers.
-pub fn task_show(dto: &TaskDto, filing_repo: serde_json::Value) {
+///
+/// `refresh_failed` carries the `--refresh` non-fatal annotation (RFC 0004 D4):
+/// `Some({at, error})` when a `--refresh` fetch failed, injected as an additive
+/// `last_refresh_failed` key so the user sees the cached value WAS shown and why
+/// it isn't fresher. `None` (the default `show` path, or a successful refresh)
+/// omits the key entirely.
+pub fn task_show(
+    dto: &TaskDto,
+    filing_repo: serde_json::Value,
+    refresh_failed: Option<serde_json::Value>,
+) {
     let mut obj = match serde_json::to_value(dto) {
         Ok(v) => v,
         Err(e) => {
@@ -85,6 +95,9 @@ pub fn task_show(dto: &TaskDto, filing_repo: serde_json::Value) {
     };
     if let Some(map) = obj.as_object_mut() {
         map.insert("filing_repo".to_string(), filing_repo);
+        if let Some(rf) = refresh_failed {
+            map.insert("last_refresh_failed".to_string(), rf);
+        }
     }
     match serde_json::to_string_pretty(&obj) {
         Ok(s) => println!("{s}"),

@@ -314,6 +314,9 @@ pub enum SyncedSource {
     Push,
     /// The background project poller, after a successful per-task fetch.
     Polled,
+    /// The on-demand `rl task show --refresh` observe (RFC 0004 D4): fetches
+    /// the remote to stamp freshness only, without reconciling content.
+    Refresh,
 }
 
 /// History queries over [`TaskSnapshot`] rows. Reads only — appends are

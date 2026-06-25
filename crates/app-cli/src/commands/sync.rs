@@ -15,7 +15,10 @@ use crate::services::{Services, build_github_provider, require_github_token};
 /// If a sync verb (push / pull / promote) failed because the issue was
 /// transferred on GitHub, suffix the bare port error with the exact
 /// `rl task link --relink` command the user should run next.
-fn enrich_issue_moved(task_ref: &str, err: application_sync::SyncError) -> anyhow::Error {
+pub(crate) fn enrich_issue_moved(
+    task_ref: &str,
+    err: application_sync::SyncError,
+) -> anyhow::Error {
     if let application_sync::SyncError::Port(ports::PortError::IssueMoved {
         to_canonical,
         to_remote_id,

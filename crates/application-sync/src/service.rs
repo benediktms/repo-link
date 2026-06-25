@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::{TaskId, WorkspaceId};
+use domain_core::{TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
 use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
@@ -11,14 +11,27 @@ use domain_workspace::Workspace;
 use crate::enqueue;
 use dto_shared::SyncSummaryDto;
 use ports::{
-    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, TaskRepository,
-    WorkspaceRepository,
+    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, SyncedSource,
+    TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
 };
+
+/// Outcome of [`SyncService::refresh`] (`rl task show --refresh`, RFC 0004 D4).
+/// A *fetch* failure propagates as `Err` so the caller can decide whether it's
+/// fatal (e.g. `IssueMoved` is actionable) or should degrade to a cached render.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The task has no REST issue to observe — purely local, or draft-backed
+    /// (whose board freshness is the poller's job, not `--refresh`). No fetch
+    /// was attempted and nothing was stamped.
+    NotIssueBacked,
+    /// The remote was observed and `synced_at` was stamped.
+    Stamped,
+}
 
 pub struct SyncService {
     tasks: Arc<dyn TaskRepository>,
@@ -347,6 +360,45 @@ impl SyncService {
         }
 
         Ok(summary(&task, prev, decision))
+    }
+
+    /// `rl task show --refresh` (RFC 0004 D4): observe the remote to stamp
+    /// `synced_at`, WITHOUT reconciling content. The distinction from
+    /// [`SyncService::pull`] is deliberate — `--refresh` never overwrites local
+    /// title/body/assignees/lifecycle; it only refreshes the freshness clock so
+    /// a subsequent offline `task show` reports an up-to-date "last refreshed".
+    ///
+    /// Errors PROPAGATE (fetch failure, deleted filing binding, `IssueMoved`):
+    /// the caller decides which are fatal (e.g. `IssueMoved` is actionable —
+    /// the link is wrong) and which should degrade to rendering the cached
+    /// value with a `last_refresh_failed` annotation. Keeping that policy at the
+    /// CLI mirrors `sync pull`'s `IssueMoved` enrichment instead of flattening
+    /// every failure into a generic note.
+    ///
+    /// No `ensure_not_archived` guard (unlike `pull`): refresh is observe-only,
+    /// so stamping an archived task's freshness clock is harmless — there is no
+    /// content resurrection to guard against.
+    pub async fn refresh(&self, task_id: &str) -> Result<RefreshOutcome> {
+        let id: TaskId = task_id.parse()?;
+        let task = self.tasks.get(id).await?;
+        // Only an issue-backed task has a REST issue to observe. A purely-local
+        // or draft-backed task (`remote.is_none()`) has nothing to fetch.
+        let Some(remote) = task.remote.as_ref() else {
+            return Ok(RefreshOutcome::NotIssueBacked);
+        };
+        let remote_id = remote.remote_id.clone();
+        let filing_canonical = self.filing_canonical_for(&task).await?;
+        // Observe-only: a successful fetch stamps freshness via the targeted
+        // single-column write; the snapshot's content is intentionally
+        // discarded (reconciling it is `sync pull`, not `--refresh`). Any fetch
+        // error propagates for the caller to classify.
+        self.provider
+            .fetch_remote(&filing_canonical, &remote_id)
+            .await?;
+        self.tasks
+            .cache_synced_at(id, Timestamp::now(), SyncedSource::Refresh)
+            .await?;
+        Ok(RefreshOutcome::Stamped)
     }
 
     /// Re-wire a task to a different remote. Always Conflict by default
@@ -1936,6 +1988,83 @@ mod tests {
         assert_eq!(after.lifecycle, domain_task::Lifecycle::Reopened);
         assert!(after.is_open());
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn refresh_stamps_synced_at_on_success() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert!(tasks.get(task.id).await.unwrap().synced_at.is_none());
+
+        let before = tasks.get(task.id).await.unwrap();
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let outcome = svc.refresh(&task.id.to_string()).await.unwrap();
+        assert_eq!(outcome, RefreshOutcome::Stamped);
+        // Observed → freshness stamped; content untouched.
+        let after = tasks.get(task.id).await.unwrap();
+        assert!(after.synced_at.is_some(), "refresh stamps synced_at");
+        assert_eq!(
+            after.title, before.title,
+            "refresh must NOT reconcile content"
+        );
+        assert_eq!(after.sync, before.sync);
+    }
+
+    #[tokio::test]
+    async fn refresh_propagates_fetch_error_and_does_not_stamp() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        // No fetch fixture set → the provider returns an error.
+        let _ = &provider;
+
+        // The fetch error PROPAGATES (the caller classifies it); freshness is
+        // not stamped on a failed observe.
+        assert!(
+            svc.refresh(&task.id.to_string()).await.is_err(),
+            "a fetch error must propagate for the caller to classify"
+        );
+        assert!(
+            tasks.get(task.id).await.unwrap().synced_at.is_none(),
+            "a failed refresh must not stamp synced_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_a_task_with_no_issue() {
+        let (svc, _tasks, task, _provider) = setup().await;
+        // Never promoted → no REST issue to observe.
+        let outcome = svc.refresh(&task.id.to_string()).await.unwrap();
+        assert_eq!(outcome, RefreshOutcome::NotIssueBacked);
+    }
+
+    #[tokio::test]
+    async fn refresh_propagates_issue_moved() {
+        // The CLI relies on `IssueMoved` propagating as a typed error to emit
+        // the relink guidance (instead of flattening it into a generic
+        // last_refresh_failed annotation). Pin that contract.
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        provider.set_fetch_moved("github.com/o2/r2", "1506");
+
+        let err = svc.refresh(&task.id.to_string()).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::Port(ports::PortError::IssueMoved { .. })),
+            "IssueMoved must propagate as a typed error, got {err:?}"
+        );
+        assert!(
+            tasks.get(task.id).await.unwrap().synced_at.is_none(),
+            "a moved-issue refresh must not stamp synced_at"
+        );
     }
 
     #[tokio::test]
