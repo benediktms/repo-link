@@ -161,22 +161,17 @@ async fn claim_one(
     let task_id = svc.tasks.resolve_id(task_ref).await?;
     let mut dto = svc.tasks.show(&task_id).await?;
 
-    match dto.status.as_str() {
-        "done" => {
-            return Err(anyhow!(
-                "task {task_ref} is done; reopen it before claiming"
-            ));
-        }
-        "archived" => {
-            return Err(anyhow!(
-                "task {task_ref} is archived; unarchive it before claiming"
-            ));
-        }
-        _ => {}
+    if !dto.is_open {
+        return Err(anyhow!(
+            "task {task_ref} is closed; reopen it before claiming"
+        ));
     }
 
+    // The task is guaranteed open here (closed tasks errored above), and
+    // `start()` is a no-op on an open task (RFC 0004 D1) — so claim only owes
+    // an assignment, never a lifecycle transition. Re-claiming an already-owned
+    // open task therefore correctly reports `noop` (no spurious push).
     let need_assign = !dto.assignees.iter().any(|a| a == login);
-    let need_start = matches!(dto.status.as_str(), "open" | "blocked");
 
     if need_assign {
         let mut next = dto.assignees.clone();
@@ -194,18 +189,11 @@ async fn claim_one(
             .await
             .map_err(|e| anyhow!("{e}"))?;
     }
-    if need_start {
-        dto = svc
-            .tasks
-            .start(&task_id)
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
-    }
 
     let push = match sync {
         None => "skipped: --no-sync".to_string(),
         Some(_) if dto.remote.is_none() => "skipped: not promoted".to_string(),
-        Some(_) if !need_assign && !need_start => "noop".to_string(),
+        Some(_) if !need_assign => "noop".to_string(),
         Some(s) => match s.push(&task_id).await {
             Ok(_) => "synced".to_string(),
             Err(e) => format!("failed: {e}"),
@@ -340,7 +328,6 @@ pub(crate) async fn task_dispatch(
             workspace,
             status,
             sync_state,
-            include_archived,
         } => {
             let rows = svc
                 .tasks
@@ -349,7 +336,6 @@ pub(crate) async fn task_dispatch(
                     repo_id: None,
                     status,
                     sync_state,
-                    include_archived,
                 })
                 .await?;
             render::tasks(&rows);
@@ -369,12 +355,6 @@ pub(crate) async fn task_dispatch(
         }
         TaskCmd::Reopen { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.reopen(&id).await }).await?;
-        }
-        TaskCmd::Block { tasks } => {
-            batch_task_op(tasks, |id| async move { svc.tasks.mark_blocked(&id).await }).await?;
-        }
-        TaskCmd::Unblock { tasks } => {
-            batch_task_op(tasks, |id| async move { svc.tasks.unblock(&id).await }).await?;
         }
         TaskCmd::Archive { tasks } => {
             batch_task_op(tasks, |id| async move { svc.tasks.archive(&id).await }).await?;

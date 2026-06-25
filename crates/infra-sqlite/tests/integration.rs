@@ -457,16 +457,17 @@ async fn task_with_relations_and_remote_roundtrip() {
         Some("o/r#42")
     );
 
-    // Default list excludes archived.
-    let live = ts.list(TaskFilter::default()).await.unwrap();
-    assert_eq!(live.len(), 1);
-    let all = ts
+    // Open-only list excludes the closed (archived) task (RFC 0004 D1: no
+    // implicit archived-hiding anymore — filter on the open/closed bit).
+    let live = ts
         .list(TaskFilter {
-            include_archived: true,
+            is_open: Some(true),
             ..Default::default()
         })
         .await
         .unwrap();
+    assert_eq!(live.len(), 1);
+    let all = ts.list(TaskFilter::default()).await.unwrap();
     assert_eq!(all.len(), 2);
 }
 
@@ -596,7 +597,7 @@ async fn save_with_outbox_persists_task_snapshot_and_entries_in_one_tx() {
     let mut t = Task::new_draft(w.id, None, "atomic".into()).unwrap();
     t.stage_for_sync().unwrap();
     t.promote_to_remote(RemoteRef::new("github", "42")).unwrap();
-    t.start().unwrap();
+    t.complete().unwrap();
 
     let entries = vec![
         OutboxEntry::new(
@@ -625,7 +626,7 @@ async fn save_with_outbox_persists_task_snapshot_and_entries_in_one_tx() {
 
     // Task row round-trips with the lifecycle change.
     let back = ts.get(t.id).await.unwrap();
-    assert_eq!(back.status, domain_task::TaskStatus::InProgress);
+    assert_eq!(back.lifecycle, domain_task::Lifecycle::Completed);
     // Snapshot history recorded the write.
     let snaps = infra_sqlite::SqliteTaskSnapshotRepository::new(db.clone())
         .list(t.id)
@@ -951,7 +952,6 @@ async fn aliases_check_rejects_non_array_json() {
 async fn project_roundtrip_preserves_options_and_default_mapping() {
     use domain_core::{ProjectId, Timestamp};
     use domain_project::{Project, StatusMapping, StatusOption};
-    use domain_task::TaskStatus;
     use infra_sqlite::SqliteProjectRepository;
     use ports::ProjectRepository;
 
@@ -983,11 +983,11 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
         ],
         vec![
             StatusMapping {
-                status: TaskStatus::Open,
+                is_open: true,
                 option_id: "o1".into(),
             },
             StatusMapping {
-                status: TaskStatus::Done,
+                is_open: false,
                 option_id: "o2".into(),
             },
         ],
@@ -1018,9 +1018,8 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
 
     // The two real mappings round-trip; the "Triage" option stays unmapped
     // (no project_status_mappings row) exactly as it was saved.
-    assert_eq!(loaded.option_id_for(TaskStatus::Open), Some("o1"));
-    assert_eq!(loaded.option_id_for(TaskStatus::Done), Some("o2"));
-    assert_eq!(loaded.option_id_for(TaskStatus::InProgress), None);
+    assert_eq!(loaded.option_id_for(true), Some("o1"));
+    assert_eq!(loaded.option_id_for(false), Some("o2"));
 }
 
 #[tokio::test]
@@ -1032,7 +1031,6 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
     // pins that they survive the round-trip.
     use domain_core::{ProjectId, Timestamp};
     use domain_project::{Project, StatusMapping, StatusOption};
-    use domain_task::TaskStatus;
     use infra_sqlite::SqliteProjectRepository;
     use ports::ProjectRepository;
 
@@ -1062,19 +1060,11 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
         ],
         vec![
             StatusMapping {
-                status: TaskStatus::Open,
+                is_open: true,
                 option_id: "backlog".into(),
             },
             StatusMapping {
-                status: TaskStatus::Blocked,
-                option_id: "backlog".into(),
-            },
-            StatusMapping {
-                status: TaskStatus::InProgress,
-                option_id: "done".into(),
-            },
-            StatusMapping {
-                status: TaskStatus::Done,
+                is_open: false,
                 option_id: "done".into(),
             },
         ],
@@ -1086,12 +1076,11 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
     projects.save(&saved).await.unwrap();
     let loaded = projects.get(id).await.unwrap();
 
-    // All four mappings round-trip — not just the first one per option.
-    assert_eq!(loaded.status_mappings.len(), 4);
-    assert_eq!(loaded.option_id_for(TaskStatus::Open), Some("backlog"));
-    assert_eq!(loaded.option_id_for(TaskStatus::Blocked), Some("backlog"));
-    assert_eq!(loaded.option_id_for(TaskStatus::InProgress), Some("done"));
-    assert_eq!(loaded.option_id_for(TaskStatus::Done), Some("done"));
+    // Both open/closed mappings round-trip (RFC 0004 D1: the lifecycle
+    // collapsed to the open/closed bit, so there are at most two rows).
+    assert_eq!(loaded.status_mappings.len(), 2);
+    assert_eq!(loaded.option_id_for(true), Some("backlog"));
+    assert_eq!(loaded.option_id_for(false), Some("done"));
 }
 
 #[tokio::test]
@@ -1621,7 +1610,7 @@ async fn cache_project_status_writes_only_the_cache_column() {
     // Every other column is byte-for-byte the pre-call value.
     assert_eq!(after.title, before.title, "title unchanged");
     assert_eq!(after.body, before.body, "body unchanged");
-    assert_eq!(after.status, before.status, "status unchanged");
+    assert_eq!(after.lifecycle, before.lifecycle, "lifecycle unchanged");
     assert_eq!(after.sync, before.sync, "sync_state unchanged");
 
     // None clears the column.

@@ -359,7 +359,7 @@ impl Daemon {
             .tasks
             .list(TaskFilter {
                 sync_state: Some(SyncState::DirtyLocal),
-                include_archived: true,
+                // All lifecycle states (incl. closed) can be dirty and owe a push.
                 ..TaskFilter::default()
             })
             .await?;

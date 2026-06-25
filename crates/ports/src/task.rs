@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::RepoBinding;
 use domain_sync::OutboxEntry;
-use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot, TaskStatus};
+use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot};
 use domain_workspace::Workspace;
 
 use crate::error::PortResult;
@@ -79,14 +79,14 @@ pub trait RepoBindingRepository: Send + Sync {
 pub struct TaskFilter {
     pub workspace_id: Option<WorkspaceId>,
     pub repo_id: Option<RepoId>,
-    /// Filter by lifecycle status. When `None`, callers usually want
-    /// non-archived rows only — see `include_archived`.
-    pub status: Option<TaskStatus>,
+    /// Filter by the open/closed lifecycle bit (RFC 0004 D1). `Some(true)` =
+    /// open only, `Some(false)` = closed only, `None` = both. Replaces the old
+    /// `status: Option<TaskStatus>` filter; "blocked" is no longer a status
+    /// (it's a relation), so blocked-filtering is done by the caller via
+    /// [`domain_task::Task::is_blocked`] after loading.
+    pub is_open: Option<bool>,
     /// Filter by sync state.
     pub sync_state: Option<SyncState>,
-    /// When `status` is `None`, include `Archived` rows. Ignored if
-    /// `status` is set explicitly.
-    pub include_archived: bool,
 }
 
 #[async_trait]
@@ -273,7 +273,47 @@ pub trait TaskRepository: Send + Sync {
     /// `node_id` on a row that has no remote. A zero-row match (task absent OR
     /// remote-less) is therefore benign.
     async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()>;
+    /// Stamp ONLY the `synced_at` cache column for one task — the
+    /// write-through "remote last observed" timestamp (RFC 0004 D3). A
+    /// targeted single-column write in the same family as
+    /// [`cache_project_status`](Self::cache_project_status) and
+    /// [`cache_remote_node_id`](Self::cache_remote_node_id): it must NOT touch
+    /// any other column, append a snapshot, bump the `version`, or change
+    /// `sync_state` — observing the remote is on a separate axis from the
+    /// mirrored content, so it can never flip dirty detection.
+    ///
+    /// Stamped by exactly three callers, each after a *confirmed* network
+    /// response: the pull path, the drainer (push), and the poller. The
+    /// `source` records which one; it is NOT persisted (there is no column for
+    /// it) — it is carried so those write-through call sites (wired in later
+    /// RFC 0004 phases) route through the `mark_synced` helper in
+    /// `application-sync` with their own variant.
+    ///
+    /// A zero-row match (task absent) is a benign no-op — return `Ok`.
+    async fn cache_synced_at(
+        &self,
+        task_id: TaskId,
+        synced_at: Timestamp,
+        source: SyncedSource,
+    ) -> PortResult<()>;
     async fn delete(&self, id: TaskId) -> PortResult<()>;
+}
+
+/// Which of the three write-through callers stamped [`Task::synced_at`]
+/// (RFC 0004 D3). Carried into [`TaskRepository::cache_synced_at`] via the
+/// `mark_synced` helper in `application-sync` (the single funnel for the
+/// stamp). Not persisted. The pull/push/poll call sites that pass these
+/// variants are wired in later RFC 0004 phases.
+///
+/// [`Task::synced_at`]: domain_task::Task::synced_at
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncedSource {
+    /// The `sync pull` path, after a successful fetch + apply.
+    Pull,
+    /// The outbox drainer, after a confirmed outbound mutation response.
+    Push,
+    /// The background project poller, after a successful per-task fetch.
+    Polled,
 }
 
 /// History queries over [`TaskSnapshot`] rows. Reads only — appends are

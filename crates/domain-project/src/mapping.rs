@@ -7,7 +7,6 @@
 //! `rl project map`.
 
 use crate::status::{StatusMapping, StatusOption};
-use domain_task::TaskStatus;
 
 /// Normalize an option name for vocabulary matching: lowercase and drop
 /// whitespace plus `-`/`_` separators.
@@ -39,32 +38,34 @@ fn first_matching<'a>(options: &'a [StatusOption], vocab: &[&str]) -> Option<&'a
         .find(|o| vocab.contains(&normalize(&o.name).as_str()))
 }
 
-fn push_mapping(out: &mut Vec<StatusMapping>, status: TaskStatus, opt: Option<&StatusOption>) {
+fn push_mapping(out: &mut Vec<StatusMapping>, is_open: bool, opt: Option<&StatusOption>) {
     if let Some(o) = opt {
         out.push(StatusMapping {
-            status,
+            is_open,
             option_id: o.option_id.clone(),
         });
     }
 }
 
-/// Seed the local-status → option mapping from a freshly-fetched option
-/// catalog, following the RFC 0001 §3 table:
+/// Seed the local-lifecycle → option mapping from a freshly-fetched option
+/// catalog, keyed on the open/closed bit (RFC 0004 D1):
 ///
-/// | local status | name match | fallback |
+/// | lifecycle | name match | fallback |
 /// |---|---|---|
-/// | `Open` | backlog / todo / open / new | first option |
-/// | `InProgress` | in progress / doing / wip | — (left unmapped) |
-/// | `Blocked` | blocked / on hold / waiting | — (left unmapped; the app resolves Blocked to the Open option at lookup time) |
-/// | `Done` | done / complete / closed / shipped | last option |
+/// | open (`is_open = true`) | backlog / todo / open / new — else in progress / doing / wip / ready | first option |
+/// | closed (`is_open = false`) | done / complete / closed / shipped | last option |
 ///
-/// `Archived` is never mapped — it leaves the sync surface entirely. An
-/// empty option list yields no mappings (and `Project::new` accepts that).
+/// The open bucket prefers a backlog/todo column over an in-progress one (and
+/// only falls back to in-progress when the board has no backlog/todo/open/new
+/// column), so a freshly-created task lands in the backlog regardless of the
+/// board's column order.
+///
+/// An empty option list yields no mappings (and `Project::new` accepts that).
 ///
 /// The result satisfies `Project`'s invariants directly: every entry
-/// references an option in `options`, and each status appears at most once.
-/// Two statuses *may* share one option (e.g. a single-option board maps
-/// both `Open`→first and `Done`→last to the same row) — that many-to-one
+/// references an option in `options`, and each open/closed bit appears at most
+/// once. The two buckets *may* share one option (e.g. a single-option board
+/// maps both open→first and closed→last to the same row) — that many-to-one
 /// shape is valid by design.
 pub fn derive_status_mappings(options: &[StatusOption]) -> Vec<StatusMapping> {
     if options.is_empty() {
@@ -74,22 +75,21 @@ pub fn derive_status_mappings(options: &[StatusOption]) -> Vec<StatusMapping> {
 
     push_mapping(
         &mut out,
-        TaskStatus::Open,
-        first_matching(options, &["backlog", "todo", "open", "new"]).or_else(|| options.first()),
+        true,
+        // Prefer a true "backlog/open" column; only fall back to an
+        // in-progress-style column when the board has none. `first_matching`
+        // keys on board *order*, so a single fused vocab would map open tasks
+        // to whichever of "Todo"/"In Progress" sits first on the board —
+        // placing freshly-created tasks mid-flow on boards ordered
+        // ["In Progress", "Todo", …]. Splitting the lookup makes the choice
+        // order-independent: a backlog/todo column wins wherever it sits.
+        first_matching(options, &["backlog", "todo", "open", "new"])
+            .or_else(|| first_matching(options, &["inprogress", "doing", "wip", "ready"]))
+            .or_else(|| options.first()),
     );
     push_mapping(
         &mut out,
-        TaskStatus::InProgress,
-        first_matching(options, &["inprogress", "doing", "wip"]),
-    );
-    push_mapping(
-        &mut out,
-        TaskStatus::Blocked,
-        first_matching(options, &["blocked", "onhold", "waiting"]),
-    );
-    push_mapping(
-        &mut out,
-        TaskStatus::Done,
+        false,
         first_matching(options, &["done", "complete", "closed", "shipped"])
             .or_else(|| options.last()),
     );
@@ -113,23 +113,20 @@ mod tests {
             .collect()
     }
 
-    /// Helper: the option_id mapped to `status`, if any.
-    fn mapped(m: &[StatusMapping], status: TaskStatus) -> Option<&str> {
+    /// Helper: the option_id mapped to the open/closed bit, if any.
+    fn mapped(m: &[StatusMapping], is_open: bool) -> Option<&str> {
         m.iter()
-            .find(|x| x.status == status)
+            .find(|x| x.is_open == is_open)
             .map(|x| x.option_id.as_str())
     }
 
     #[test]
     fn repo_link_shape_maps_by_name() {
-        // The live `repo-link` board (RFC §2.2): no "Blocked"-like option.
+        // The live `repo-link` board (RFC §2.2).
         let o = opts(&["Backlog", "Ready", "In progress", "In review", "Done"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0")); // Backlog
-        assert_eq!(mapped(&m, TaskStatus::InProgress), Some("o2")); // In progress
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o4")); // Done
-        // No option matches the Blocked vocabulary → deliberately unmapped.
-        assert_eq!(mapped(&m, TaskStatus::Blocked), None);
+        assert_eq!(mapped(&m, true), Some("o0")); // Backlog
+        assert_eq!(mapped(&m, false), Some("o4")); // Done
     }
 
     #[test]
@@ -137,68 +134,83 @@ mod tests {
         // GitHub's default board (RFC §2.2): Todo → In Progress → Done.
         let o = opts(&["Todo", "In Progress", "Done"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0")); // Todo
-        assert_eq!(mapped(&m, TaskStatus::InProgress), Some("o1")); // In Progress
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o2")); // Done
-        assert_eq!(mapped(&m, TaskStatus::Blocked), None);
+        assert_eq!(mapped(&m, true), Some("o0")); // Todo
+        assert_eq!(mapped(&m, false), Some("o2")); // Done
     }
 
     #[test]
-    fn fully_custom_shape_matches_all_four() {
-        // A board that happens to name every vocabulary, incl. Blocked.
-        let o = opts(&["New", "Doing", "Blocked", "Shipped"]);
+    fn open_prefers_backlog_over_an_earlier_in_progress_column() {
+        // Board whose in-progress column sits *before* the backlog column.
+        // The open bucket must still land on Backlog, not In Progress — the
+        // choice is by vocabulary preference, not board order (regression: a
+        // single fused open vocab + order-sensitive `first_matching` mapped
+        // freshly-created open tasks onto the In Progress column here).
+        let o = opts(&["In Progress", "Backlog", "Done"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0")); // New
-        assert_eq!(mapped(&m, TaskStatus::InProgress), Some("o1")); // Doing
-        assert_eq!(mapped(&m, TaskStatus::Blocked), Some("o2")); // Blocked
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o3")); // Shipped
+        assert_eq!(mapped(&m, true), Some("o1")); // Backlog, not In Progress (o0)
+        assert_eq!(mapped(&m, false), Some("o2")); // Done
+    }
+
+    #[test]
+    fn open_falls_back_to_in_progress_when_no_backlog_column() {
+        // No backlog/todo/open/new column → the open bucket falls back to an
+        // in-progress-style column before the first-option fallback.
+        let o = opts(&["In Progress", "In Review", "Done"]);
+        let m = derive_status_mappings(&o);
+        assert_eq!(mapped(&m, true), Some("o0")); // In Progress (fallback vocab)
+        assert_eq!(mapped(&m, false), Some("o2")); // Done
+    }
+
+    #[test]
+    fn closed_matches_done_vocabulary() {
+        // A board where the open bucket lands on the first option and the
+        // closed bucket matches a Done-vocabulary name.
+        let o = opts(&["New", "Doing", "Shipped"]);
+        let m = derive_status_mappings(&o);
+        assert_eq!(mapped(&m, true), Some("o0")); // New
+        assert_eq!(mapped(&m, false), Some("o2")); // Shipped
     }
 
     #[test]
     fn separator_and_case_variants_normalize() {
-        // "in-progress", "ON_HOLD" etc. must hit the same vocabulary as the
-        // spaced forms — this is the regex `.` separator equivalence.
-        let o = opts(&["open", "in-progress", "ON_HOLD", "Done"]);
+        // "in-progress" must hit the open vocabulary as the spaced form would —
+        // this is the regex `.` separator equivalence.
+        let o = opts(&["in-progress", "Done"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0"));
-        assert_eq!(mapped(&m, TaskStatus::InProgress), Some("o1"));
-        assert_eq!(mapped(&m, TaskStatus::Blocked), Some("o2"));
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o3"));
+        assert_eq!(mapped(&m, true), Some("o0")); // in-progress (open vocab)
+        assert_eq!(mapped(&m, false), Some("o1")); // Done
     }
 
     #[test]
     fn normalize_divergence_from_regex_is_locked_in() {
-        // "Inprogress" (no separator) matches — MORE lenient than the regex `.`.
-        let m = derive_status_mappings(&opts(&["Backlog", "Inprogress"]));
-        assert_eq!(mapped(&m, TaskStatus::InProgress), Some("o1"));
+        // "Inprogress" (no separator) matches the open vocab — MORE lenient
+        // than the regex `.`.
+        let m = derive_status_mappings(&opts(&["Inprogress", "Done"]));
+        assert_eq!(mapped(&m, true), Some("o0"));
 
         // "in.progress" (a non-separator gap char) does NOT match — STRICTER
-        // than the regex `.`. InProgress is left unmapped; Done falls back to
-        // the last option.
-        let m2 = derive_status_mappings(&opts(&["Backlog", "in.progress"]));
-        assert_eq!(mapped(&m2, TaskStatus::InProgress), None);
-        assert_eq!(mapped(&m2, TaskStatus::Done), Some("o1"));
+        // than the regex `.`. The open bucket falls back to the first option.
+        let m2 = derive_status_mappings(&opts(&["in.progress", "Done"]));
+        assert_eq!(mapped(&m2, true), Some("o0")); // first-option fallback
+        assert_eq!(mapped(&m2, false), Some("o1"));
     }
 
     #[test]
     fn unrecognised_names_fall_back_to_first_and_last() {
-        // No name matches any vocabulary → Open=first, Done=last, the two
-        // middle statuses stay unmapped.
+        // No name matches any vocabulary → open=first, closed=last.
         let o = opts(&["Alpha", "Beta", "Gamma"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0")); // first
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o2")); // last
-        assert_eq!(mapped(&m, TaskStatus::InProgress), None);
-        assert_eq!(mapped(&m, TaskStatus::Blocked), None);
+        assert_eq!(mapped(&m, true), Some("o0")); // first
+        assert_eq!(mapped(&m, false), Some("o2")); // last
     }
 
     #[test]
-    fn single_option_maps_open_and_done_to_it() {
-        // Many-to-one fallback: one column gets both Open and Done.
+    fn single_option_maps_open_and_closed_to_it() {
+        // Many-to-one fallback: one column gets both open and closed.
         let o = opts(&["Only"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0"));
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o0"));
+        assert_eq!(mapped(&m, true), Some("o0"));
+        assert_eq!(mapped(&m, false), Some("o0"));
         assert_eq!(m.len(), 2);
     }
 
@@ -210,12 +222,11 @@ mod tests {
     #[test]
     fn anchored_match_rejects_substrings() {
         // "Not done" must NOT satisfy the Done vocabulary (anchored/full-name
-        // match), so Done falls back to the last option instead.
+        // match), so the closed bucket falls back to the last option instead.
         let o = opts(&["Open", "Not done"]);
         let m = derive_status_mappings(&o);
-        assert_eq!(mapped(&m, TaskStatus::Open), Some("o0"));
-        // "Not done" normalizes to "notdone" ∉ vocab → Done falls back to last.
-        assert_eq!(mapped(&m, TaskStatus::Done), Some("o1"));
-        assert_eq!(mapped(&m, TaskStatus::InProgress), None);
+        assert_eq!(mapped(&m, true), Some("o0")); // Open (open vocab)
+        // "Not done" normalizes to "notdone" ∉ vocab → closed falls back to last.
+        assert_eq!(mapped(&m, false), Some("o1"));
     }
 }

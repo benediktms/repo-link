@@ -410,27 +410,28 @@ pub(crate) enum TaskCmd {
     List {
         #[arg(short = 'w', long)]
         workspace: Option<String>,
-        /// Filter by lifecycle status (`open` / `in_progress` / `blocked` / `done` / `archived`).
+        /// Filter by lifecycle status (`open` / `closed` / `all`). Defaults to
+        /// `open` — pass `all` to include completed and dropped tasks.
         #[arg(short = 's', long)]
         status: Option<String>,
         /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
         #[arg(long)]
         sync_state: Option<String>,
-        #[arg(long)]
-        include_archived: bool,
     },
     /// Stage one or more tasks for sync.
     Stage {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
-    /// Local-only lifecycle nudge: Open|Blocked → InProgress.
+    /// Assert the task is open (no-op if already open).
     ///
-    /// Flips the task to `InProgress` so your local queries (`query ready`,
-    /// `query mine`) reflect reality. Does NOT touch `assignees` and does NOT
-    /// push to GitHub — teammates won't see anything change. Works on purely-
-    /// local tasks. Offline-safe. Use `task claim` instead when you want to
-    /// announce externally that you've picked up the task.
+    /// Ensures the task is in the open state so your local queries
+    /// (`query ready`, `query mine`) reflect reality. No-op if the task is
+    /// already open; errors if the task is closed (reopen it first). Does NOT
+    /// touch `assignees` and does NOT push to GitHub — teammates won't see
+    /// anything change. Works on purely-local tasks. Offline-safe. Use
+    /// `task claim` instead when you want to announce externally that you've
+    /// picked up the task.
     Start {
         #[arg(required = true)]
         tasks: Vec<String>,
@@ -442,16 +443,6 @@ pub(crate) enum TaskCmd {
     },
     /// Reopen one or more `Done` tasks back to `Open`.
     Reopen {
-        #[arg(required = true)]
-        tasks: Vec<String>,
-    },
-    /// Move one or more tasks to `Blocked`.
-    Block {
-        #[arg(required = true)]
-        tasks: Vec<String>,
-    },
-    /// Move one or more `Blocked` tasks back to `Open`.
-    Unblock {
         #[arg(required = true)]
         tasks: Vec<String>,
     },
@@ -471,13 +462,12 @@ pub(crate) enum TaskCmd {
     /// Pipeline (per task):
     /// 1. Add the authenticated GitHub user to `assignees` (merge — leaves
     ///    teammates intact; no-op if you're already an assignee).
-    /// 2. Transition `Open`|`Blocked` → `InProgress` (no-op if already
-    ///    in-progress).
+    /// 2. Assert the task is open (no-op if already open).
     /// 3. Best-effort `sync push` to mirror the new state to the remote
     ///    issue. Local-only / staged tasks skip the push with a hint to
     ///    promote first.
     ///
-    /// Refuses on `Done` / `Archived`. Requires the cached GitHub login
+    /// Refuses on closed tasks (reopen first). Requires the cached GitHub login
     /// (`rl gh auth` populates it); without one, errors with a re-auth
     /// hint before touching any task state.
     Claim {
@@ -653,7 +643,7 @@ pub(crate) enum ProjectCmd {
     /// Set a local TaskStatus → project option mapping.
     Map {
         spec: String,
-        /// Local task status (`open` / `in_progress` / `blocked` / `done`).
+        /// Local task status (`open` / `closed`).
         #[arg(long)]
         local: String,
         /// Option ID on the project's Status field.

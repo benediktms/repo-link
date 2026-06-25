@@ -5,7 +5,7 @@ use chrono::Utc;
 use domain_core::{TaskId, WorkspaceId};
 use domain_project::Project;
 use domain_repo::LinkStatus;
-use domain_task::{RelationKind, SyncState, Task, TaskStatus};
+use domain_task::{Lifecycle, RelationKind, SyncState, Task};
 use ports::{
     ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
 };
@@ -48,7 +48,9 @@ impl QueryService {
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                include_archived: false,
+                // An overview is a "show everything" view, so include both open
+                // and closed tasks (`is_open: None`).
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
@@ -63,7 +65,7 @@ impl QueryService {
         let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
         let mut by_sync: BTreeMap<String, usize> = BTreeMap::new();
         for t in &tasks {
-            *by_status.entry(enum_str(&t.status)).or_insert(0) += 1;
+            *by_status.entry(enum_str(&t.lifecycle)).or_insert(0) += 1;
             *by_sync.entry(enum_str(&t.sync)).or_insert(0) += 1;
         }
         let unsynced_task_count = tasks.iter().filter(|t| is_unsynced(t.sync)).count();
@@ -84,26 +86,35 @@ impl QueryService {
 
     pub async fn blocked_tasks(&self, workspace_id: &str) -> Result<Vec<BlockedTaskRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
+        // "Blocked" is no longer a stored status (RFC 0004 D1) — it's derived
+        // from `BlockedBy` relations. A blocker that is itself closed no longer
+        // blocks (consistent with `ready_tasks`/`assigned_to`), so load the
+        // whole workspace, note which tasks are open, and report an open task as
+        // blocked only when it has a `BlockedBy` edge to a still-open task.
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                status: Some(TaskStatus::Blocked),
                 ..TaskFilter::default()
             })
             .await?;
+        let open_ids: HashSet<TaskId> =
+            tasks.iter().filter(|t| t.is_open()).map(|t| t.id).collect();
         Ok(tasks
             .iter()
-            .map(|t| BlockedTaskRow {
-                task_id: t.id.to_string(),
-                title: t.title.clone(),
-                priority: enum_str(&t.priority),
-                blocked_by: t
-                    .relations
-                    .iter()
-                    .filter(|r| r.kind == domain_task::RelationKind::BlockedBy)
-                    .map(|r| r.other.to_string())
-                    .collect(),
+            .filter(|t| t.is_open())
+            .filter_map(|t| {
+                let blockers: Vec<String> = t
+                    .blocked_by()
+                    .filter(|b| open_ids.contains(b))
+                    .map(|id| id.to_string())
+                    .collect();
+                (!blockers.is_empty()).then(|| BlockedTaskRow {
+                    task_id: t.id.to_string(),
+                    title: t.title.clone(),
+                    priority: enum_str(&t.priority),
+                    blocked_by: blockers,
+                })
             })
             .collect())
     }
@@ -135,8 +146,8 @@ impl QueryService {
 
         // Reverse direction: any task carrying `child_of` -> parent. Scanned
         // across all workspaces (`workspace_id: None`) so cross-repo children
-        // aren't missed; archived rows are excluded (`include_archived` stays
-        // false in the default filter).
+        // aren't missed; archived (now `NotPlanned`) rows are dropped below by
+        // lifecycle, alongside the children reached via the parent's edges.
         let all_tasks = self.tasks.list(TaskFilter::default()).await?;
         for t in &all_tasks {
             if t.relations
@@ -156,23 +167,24 @@ impl QueryService {
         for id in child_ids {
             let c = self.tasks.get(id).await?;
             // Children reached via the parent's `parent_of` edges are loaded
-            // unconditionally; drop archived ones here so the rollup matches
-            // the archived-excluding reverse scan above.
-            if c.status == TaskStatus::Archived {
+            // unconditionally; drop archived (now `NotPlanned`) ones here so the
+            // rollup tracks active work and matches the reverse scan above.
+            if c.lifecycle == Lifecycle::NotPlanned {
                 continue;
             }
             children.push(ChildTaskRow {
                 task_id: c.id.to_string(),
                 title: c.title.clone(),
-                status: enum_str(&c.status),
+                status: enum_str(&c.lifecycle),
             });
         }
         // Outstanding work first, completed (`done`) last, then by title, with
         // task_id as a final tie-breaker so the order is fully deterministic
         // (the source `child_ids` is a HashSet). The `done` predicate matches
         // the `done` count below so ordering and the rollup stay consistent.
+        // A "done" child is one whose lifecycle serialises to `completed`.
         children.sort_by(|a, b| {
-            let is_done = |s: &str| s == "done";
+            let is_done = |s: &str| s == "completed";
             is_done(&a.status)
                 .cmp(&is_done(&b.status))
                 .then_with(|| a.title.cmp(&b.title))
@@ -180,7 +192,7 @@ impl QueryService {
         });
 
         let total = children.len();
-        let done = children.iter().filter(|c| c.status == "done").count();
+        let done = children.iter().filter(|c| c.status == "completed").count();
         Ok(ChildrenRollup {
             parent_id: parent.id.to_string(),
             total,
@@ -218,11 +230,14 @@ impl QueryService {
         use std::collections::HashMap;
 
         let id: WorkspaceId = workspace_id.parse()?;
+        // Load both open and closed (`is_open: None`) so a blocker's open/closed
+        // state can be evaluated; the assigned rows themselves are filtered to
+        // open tasks below.
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                include_archived: true,
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
@@ -231,20 +246,21 @@ impl QueryService {
 
         let mut rows: Vec<AssignedTaskRow> = tasks
             .iter()
-            .filter(|t| t.status != TaskStatus::Archived)
+            .filter(|t| t.is_open())
             .filter(|t| t.assignees.iter().any(|a| a == assignee))
             .map(|t| {
-                let blocked = t.relations.iter().any(|r| {
-                    r.kind == domain_task::RelationKind::BlockedBy
-                        && by_id
-                            .get(&r.other)
-                            .map(|other| !is_done_or_archived(other.status))
-                            .unwrap_or(false)
+                // A task is blocked when it has a `BlockedBy` edge to a blocker
+                // that is still open (a closed blocker no longer blocks).
+                let blocked = t.blocked_by().any(|other_id| {
+                    by_id
+                        .get(&other_id)
+                        .map(|other| other.is_open())
+                        .unwrap_or(false)
                 });
                 AssignedTaskRow {
                     task_id: t.id.to_string(),
                     title: t.title.clone(),
-                    status: enum_str(&t.status),
+                    status: enum_str(&t.lifecycle),
                     sync_state: enum_str(&t.sync),
                     priority: enum_str(&t.priority),
                     blocked,
@@ -268,25 +284,25 @@ impl QueryService {
         use std::collections::HashMap;
 
         let id: WorkspaceId = workspace_id.parse()?;
+        // Load both open and closed (`is_open: None`) so a blocker's open/closed
+        // state is available to the transitive-blocker traversal.
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                include_archived: true, // need them to evaluate blocker status
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
 
         let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
 
-        let is_open_or_in_progress = |t: &domain_task::Task| {
-            matches!(t.status, TaskStatus::Open | TaskStatus::InProgress)
-                && t.sync != SyncState::Conflict
-        };
+        // Ready = open, not (transitively) blocked, and not in conflict.
+        let is_ready = |t: &domain_task::Task| t.is_open() && t.sync != SyncState::Conflict;
 
         let mut ready: Vec<&domain_task::Task> = tasks
             .iter()
-            .filter(|t| is_open_or_in_progress(t))
+            .filter(|t| is_ready(t))
             .filter(|t| !is_transitively_blocked(t.id, &by_id))
             .collect();
 
@@ -301,7 +317,7 @@ impl QueryService {
             .map(|t| ReadyTaskRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
-                status: enum_str(&t.status),
+                status: enum_str(&t.lifecycle),
                 sync_state: enum_str(&t.sync),
                 priority: enum_str(&t.priority),
                 assignees: t.assignees.clone(),
@@ -310,13 +326,15 @@ impl QueryService {
     }
 
     /// Group non-archived tasks by assignee with lifecycle-status counts.
-    /// Tasks with no assignee land under "(unassigned)".
+    /// Tasks with no assignee land under "(unassigned)". "Archived" now folds
+    /// into the `NotPlanned` lifecycle, which is filtered out below.
     pub async fn contributors(&self, workspace_id: &str) -> Result<Vec<ContributorRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
@@ -324,7 +342,12 @@ impl QueryService {
         use std::collections::HashMap;
         let mut buckets: HashMap<String, (usize, BTreeMap<String, usize>)> = HashMap::new();
         for t in &tasks {
-            let status = enum_str(&t.status);
+            // Drop archived (now `NotPlanned`) tasks: a contributor rollup tracks
+            // live + completed work, not dropped work.
+            if t.lifecycle == Lifecycle::NotPlanned {
+                continue;
+            }
+            let status = enum_str(&t.lifecycle);
             let assignees: Vec<String> = if t.assignees.is_empty() {
                 vec!["(unassigned)".into()]
             } else {
@@ -369,13 +392,19 @@ impl QueryService {
     /// (`project_status_option_id`) and the resolved expected option are
     /// `Some` and differ: a NULL cache means "not yet polled" (never flagged),
     /// a projectless task has no expected option (never flagged), and
-    /// `Archived` is excluded from project mappings (never flagged).
+    /// archived (`NotPlanned`) tasks are skipped before the axis runs (never
+    /// flagged).
     pub async fn drift(&self, workspace_id: &str) -> Result<Vec<DriftRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
+        // Load both open and closed (`is_open: None`); archived (now
+        // `NotPlanned`) tasks are skipped per-task below so a dropped task never
+        // surfaces as drift, while genuinely-done (`Completed`) tasks stay in
+        // scope (they can still be sync-dirty or carry a dangling filing repo).
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
@@ -385,6 +414,11 @@ impl QueryService {
 
         let mut rows = Vec::new();
         for t in &tasks {
+            // Archived (now `NotPlanned`) tasks never surface as drift — a
+            // dropped task is intentionally divergent.
+            if t.lifecycle == Lifecycle::NotPlanned {
+                continue;
+            }
             let sync_drift = matches!(
                 t.sync,
                 SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
@@ -516,20 +550,20 @@ fn is_unsynced(sync: SyncState) -> bool {
 ///
 /// - `actual_name`: the cached remote board status (`task.project_status_option_id`)
 ///   resolved to a display name. `None` when projectless or unpolled.
-/// - `expected_name`: the option the task's local lifecycle status maps to
-///   (via [`Project::resolved_option_id_for`], the SAME Blocked→Open fallback
-///   the outbox enqueue path uses), resolved to a display name.
+/// - `expected_name`: the option the task's open/closed bit maps to (via
+///   [`Project::resolved_option_id_for`], keyed on `task.is_open()` — the SAME
+///   resolver the outbox enqueue path uses), resolved to a display name.
 /// - `is_drift`: `true` only when BOTH the actual and expected option ids are
 ///   `Some` and differ. A NULL cache (`None` actual) is "not yet polled" — not
-///   a mismatch. `Archived` resolves to no expected option, so it's never
-///   flagged.
+///   a mismatch. Archived (`NotPlanned`) tasks are skipped by the caller before
+///   this axis runs, so they're never flagged.
 fn project_axis(project: Option<&Project>, task: &Task) -> (Option<String>, Option<String>, bool) {
     let Some(project) = project else {
         return (None, None, false);
     };
 
     let actual_id = task.project_status_option_id.as_deref();
-    let expected_id = project.resolved_option_id_for(task.status);
+    let expected_id = project.resolved_option_id_for(task.is_open());
 
     let actual_name = actual_id.and_then(|id| project.option_name_for(id).map(str::to_string));
     let expected_name = expected_id.and_then(|id| project.option_name_for(id).map(str::to_string));
@@ -544,16 +578,13 @@ fn project_axis(project: Option<&Project>, task: &Task) -> (Option<String>, Opti
     (actual_name, expected_name, is_drift)
 }
 
-fn is_done_or_archived(status: TaskStatus) -> bool {
-    matches!(status, TaskStatus::Done | TaskStatus::Archived)
-}
-
 /// Whether `task_id` is blocked by any task reachable through a chain of
-/// `BlockedBy` relations whose status is not `Done`/`Archived`.
+/// `BlockedBy` relations that is still open (not closed — `Completed`/
+/// `NotPlanned`).
 ///
-/// DFS over `BlockedBy` edges only. A resolved (done/archived) blocker does not
-/// block on its own, but the chain behind it is still followed — the contract
-/// is "any *reachable* active blocker", so `A → B(done) → C(open)` leaves `A`
+/// DFS over `BlockedBy` edges only. A resolved (closed) blocker does not block
+/// on its own, but the chain behind it is still followed — the contract is
+/// "any *reachable* open blocker", so `A → B(closed) → C(open)` leaves `A`
 /// blocked. A relation cycle (`A ↔ A`, `A ↔ B`) is bounded by `visited`.
 fn is_transitively_blocked(
     task_id: domain_core::TaskId,
@@ -562,15 +593,10 @@ fn is_transitively_blocked(
     use std::collections::HashSet;
 
     let mut visited: HashSet<domain_core::TaskId> = HashSet::new();
-    // Seed with the start task's direct blockers — the task's own status never
+    // Seed with the start task's direct blockers — the task's own state never
     // blocks itself, but a self-`BlockedBy` edge (re-)enqueues it below.
     let mut stack: Vec<domain_core::TaskId> = match by_id.get(&task_id) {
-        Some(start) => start
-            .relations
-            .iter()
-            .filter(|r| r.kind == domain_task::RelationKind::BlockedBy)
-            .map(|r| r.other)
-            .collect(),
+        Some(start) => start.blocked_by().collect(),
         None => return false,
     };
 
@@ -579,17 +605,12 @@ fn is_transitively_blocked(
             continue; // already explored — breaks cycles
         }
         match by_id.get(&current) {
-            // An active blocker we can reach → blocked.
-            Some(blocker) if !is_done_or_archived(blocker.status) => return true,
-            // Resolved blocker: doesn't block, but keep following its chain.
-            Some(blocker) => stack.extend(
-                blocker
-                    .relations
-                    .iter()
-                    .filter(|r| r.kind == domain_task::RelationKind::BlockedBy)
-                    .map(|r| r.other),
-            ),
-            // Unknown id (e.g. archived-and-pruned) → treat as non-blocking.
+            // An open blocker we can reach → blocked.
+            Some(blocker) if blocker.is_open() => return true,
+            // Resolved (closed) blocker: doesn't block, but keep following its
+            // chain.
+            Some(blocker) => stack.extend(blocker.blocked_by()),
+            // Unknown id (e.g. pruned) → treat as non-blocking.
             None => {}
         }
     }
@@ -714,8 +735,9 @@ mod tests {
 
         let other = Task::new_draft(wid, None, "blocker".into()).unwrap();
         let mut blocked = Task::new_draft(wid, None, "the work".into()).unwrap();
+        // "Blocked" is derived from the `BlockedBy` relation (RFC 0004 D1) — no
+        // explicit status transition is needed.
         blocked.add_relation(domain_task::RelationKind::BlockedBy, other.id);
-        blocked.mark_blocked().unwrap();
         ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&blocked, SnapshotSource::LocalEdit).await.unwrap();
 
@@ -758,7 +780,7 @@ mod tests {
         assert_eq!(rollup.children[0].task_id, child_open.id.to_string());
         assert_eq!(rollup.children[0].status, "open");
         assert_eq!(rollup.children[1].task_id, child_done.id.to_string());
-        assert_eq!(rollup.children[1].status, "done");
+        assert_eq!(rollup.children[1].status, "completed");
     }
 
     #[tokio::test]
@@ -833,7 +855,7 @@ mod tests {
         assert_eq!(rollup.total, 1);
         assert_eq!(rollup.done, 1);
         assert_eq!(rollup.children[0].task_id, cross.id.to_string());
-        assert_eq!(rollup.children[0].status, "done");
+        assert_eq!(rollup.children[0].status, "completed");
     }
 
     #[tokio::test]
@@ -1079,9 +1101,9 @@ mod tests {
     }
 
     /// Build a project attached to `ws` with a Backlog/In progress/Done option
-    /// set and the standard Open→Backlog, InProgress→In progress, Done→Done
-    /// mapping (Blocked intentionally unmapped, so it falls back to Open per
-    /// §3). Saves it and wires `workspace.project_id`.
+    /// set and the open/closed mapping (RFC 0004 D1): open→Backlog,
+    /// closed→Done. The "In progress" option is intentionally left unmapped.
+    /// Saves it and wires `workspace.project_id`.
     async fn attach_project(
         ws: &mut Workspace,
         ws_repo: &Arc<InMemoryWorkspaceRepository>,
@@ -1108,15 +1130,11 @@ mod tests {
             ],
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
+                    is_open: true,
                     option_id: "o_backlog".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::InProgress,
-                    option_id: "o_wip".into(),
-                },
-                StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o_done".into(),
                 },
             ],
@@ -1176,7 +1194,7 @@ mod tests {
         t.complete().unwrap();
         t.confirm_synced(SnapshotSource::Push).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
-        assert_eq!(t.status, TaskStatus::Done);
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
         t.set_project_status_option_id(Some("o_wip".into()));
         ts.save(&t, SnapshotSource::Push).await.unwrap();
 
@@ -1246,32 +1264,38 @@ mod tests {
         assert!(rows.is_empty(), "a NULL cache is unpolled, not a mismatch");
     }
 
-    /// #39 case (f): a Blocked task with no Blocked option resolves to Open's
-    /// option via the §3 fallback — so a board cached at that same Open option
-    /// must NOT report phantom drift.
+    /// #39 case (f): a blocked task is still *open* (RFC 0004 D1 — "blocked" is
+    /// derived from a `BlockedBy` relation, not a status), so it maps to the
+    /// open option ("Backlog"). A board cached at that same option must NOT
+    /// report phantom drift.
     #[tokio::test]
     async fn drift_blocked_with_no_blocked_option_no_phantom_drift() {
         let (svc, ws, _bs, ts, ps) = svc_with_projects();
         let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
         ws.save(&workspace).await.unwrap();
-        // The board has NO Blocked option (only Backlog/In progress/Done), so
-        // Blocked falls back to Open → "Backlog".
         attach_project(&mut workspace, &ws, &ps).await;
+
+        let blocker = Task::new_draft(wid, None, "the gate".into()).unwrap();
+        ts.save(&blocker, SnapshotSource::LocalEdit).await.unwrap();
 
         let mut t = Task::new_draft(wid, None, "blocked, board at backlog".into()).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", "12")).unwrap();
-        t.mark_blocked().unwrap();
-        t.confirm_synced(SnapshotSource::Push).unwrap();
-        // Board card is at the Open/Backlog option — matches the fallback.
+        // Blocked = an open task carrying a `BlockedBy` edge. Relations aren't
+        // a mirrored field, so the task stays `Synced` after promote — no
+        // `confirm_synced` needed (and it would error from `Synced`).
+        t.add_relation(domain_task::RelationKind::BlockedBy, blocker.id);
+        assert_eq!(t.sync, SyncState::Synced);
+        assert!(t.is_blocked() && t.is_open());
+        // Board card is at the open/Backlog option — matches the mapping.
         t.set_project_status_option_id(Some("o_backlog".into()));
         ts.save(&t, SnapshotSource::Push).await.unwrap();
 
         let rows = svc.drift(&wid.to_string()).await.unwrap();
         assert!(
             rows.is_empty(),
-            "Blocked→Open fallback must agree with a board cached at the Open option (no phantom drift)"
+            "an open blocked task agrees with a board cached at the open option (no phantom drift)"
         );
     }
 
@@ -1306,52 +1330,36 @@ mod tests {
         assert_eq!(row.project_status_expected.as_deref(), Some("Backlog"));
     }
 
-    /// #39 case: an `Archived` task with a cached project option is never
-    /// flagged by the project axis. Two layers protect this and this test
-    /// pins BOTH:
-    ///
-    /// 1. **Integration layer** — `drift()` lists with `include_archived:
-    ///    false`, so an archived task never even reaches the axis (asserted via
-    ///    `svc.drift` returning empty).
-    /// 2. **Axis layer** — even if an archived task *did* reach it,
-    ///    `project_axis` returns `is_drift == false` because
-    ///    `resolved_option_id_for(Archived)` is `None` (no expected option).
-    ///    Asserted by calling `project_axis` directly with a cached option id,
-    ///    which the list filter would otherwise hide.
+    /// An archived (now `NotPlanned`, RFC 0004 D1) task is never flagged by
+    /// the drift report. Archived now folds into the closed lifecycle, which IS
+    /// mappable to a project option, so the old "no expected option" axis-level
+    /// guarantee is gone — the protection is now the integration layer:
+    /// `drift()` skips `NotPlanned` tasks before the project axis runs. This
+    /// pins that even a cached option that WOULD otherwise drift never surfaces.
     #[tokio::test]
     async fn drift_archived_task_not_flagged() {
         let (svc, ws, _bs, ts, ps) = svc_with_projects();
         let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
         ws.save(&workspace).await.unwrap();
-        let project = attach_project(&mut workspace, &ws, &ps).await;
+        attach_project(&mut workspace, &ws, &ps).await;
 
+        // Closed task maps to the closed option "Done"; cache it at "Backlog"
+        // so the project axis WOULD drift if the task ever reached it.
         let mut t = Task::new_draft(wid, None, "archived with cached option".into()).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", "15")).unwrap();
-        t.set_project_status_option_id(Some("o_done".into()));
+        t.set_project_status_option_id(Some("o_backlog".into()));
         t.archive().unwrap();
+        assert_eq!(t.lifecycle, Lifecycle::NotPlanned);
         ts.save(&t, SnapshotSource::Push).await.unwrap();
 
-        // Layer 1: the archived task is filtered out of the drift list entirely.
+        // The archived (NotPlanned) task is filtered out of the drift list
+        // entirely, so the otherwise-drifting cached option never surfaces.
         let rows = svc.drift(&wid.to_string()).await.unwrap();
         assert!(
             rows.is_empty(),
-            "an Archived task is excluded from the drift list"
-        );
-
-        // Layer 2: even reaching the axis directly, Archived has no expected
-        // option (`resolved_option_id_for(Archived) == None`) → no drift.
-        let (actual, expected, is_drift) = project_axis(Some(&project), &t);
-        assert!(
-            !is_drift,
-            "Archived → no expected option → never a mismatch"
-        );
-        assert_eq!(expected, None, "Archived maps to no project option");
-        assert_eq!(
-            actual.as_deref(),
-            Some("Done"),
-            "the cached actual name still resolves; only the expected side is None"
+            "a NotPlanned (archived) task is excluded from the drift report"
         );
     }
 

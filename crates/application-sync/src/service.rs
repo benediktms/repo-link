@@ -1726,7 +1726,7 @@ mod tests {
             pre_baseline.body, pre.body,
             "baseline body == live body post-promote"
         );
-        assert_eq!(pre_baseline.status, pre.status);
+        assert_eq!(pre_baseline.lifecycle, pre.lifecycle);
         assert_eq!(pre_baseline.assignees, pre.assignees);
 
         // Title-only edit: diff = {title: Some("renamed")},
@@ -1750,7 +1750,7 @@ mod tests {
             post_baseline.body, pre_baseline.body,
             "body baseline entry must be unchanged after a title-only push"
         );
-        assert_eq!(post_baseline.status, pre_baseline.status);
+        assert_eq!(post_baseline.lifecycle, pre_baseline.lifecycle);
         assert_eq!(post_baseline.assignees, pre_baseline.assignees);
         assert_eq!(
             post_baseline.source,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use application_sync::enqueue;
 use domain_core::{ProjectId, WorkspaceId};
 use domain_sync::OutboxMutation;
-use domain_task::{SnapshotSource, TaskStatus};
+use domain_task::SnapshotSource;
 use domain_workspace::{Workspace, WorkspaceName};
 use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery, WorkspaceDto};
 use ports::{
@@ -92,10 +92,10 @@ impl WorkspaceService {
     /// `set_project(None)` enqueues nothing. Backfill is a no-op unless the
     /// service was built with [`with_outbox`](Self::with_outbox).
     ///
-    /// Scope: terminal tasks (`Done` / `Archived`) are NOT back-filled —
+    /// Scope: closed tasks (`Completed` / `NotPlanned`) are NOT back-filled —
     /// attaching a project is "put my *active* work on the board", not "drag
     /// my entire closed history onto a fresh board". Their AddItem would also
-    /// produce no useful SetProjectStatus (Done/Archived map to no option on a
+    /// produce no useful SetProjectStatus (closed tasks map to no option on a
     /// default board). Re-running attach (idempotent retry, or before the
     /// daemon drains) is deduped: a task that already has a pending `AddItem`
     /// is skipped, so a double-attach can't enqueue a second AddItem +
@@ -157,7 +157,9 @@ impl WorkspaceService {
             let workspace_tasks = tasks
                 .list(TaskFilter {
                     workspace_id: Some(id),
-                    include_archived: true,
+                    // `is_open: None` = both open and closed: the scrub must
+                    // clear residual project ids off every task regardless of
+                    // lifecycle.
                     ..TaskFilter::default()
                 })
                 .await?;
@@ -181,23 +183,17 @@ impl WorkspaceService {
             (resolved, &self.outbox, &self.tasks, &self.projects)
         {
             let project = projects.get(project_id).await?;
-            // `include_archived: false` keeps Archived rows out; Done is
-            // filtered explicitly below (the filter has no "exclude Done"
-            // knob, and we want both terminal states excluded).
+            // `is_open: Some(true)` keeps only open tasks: attach back-fills
+            // *active* work, not closed history (both closed lifecycle
+            // variants — Completed and NotPlanned — are excluded by the filter).
             let workspace_tasks = tasks
                 .list(TaskFilter {
                     workspace_id: Some(id),
-                    include_archived: false,
+                    is_open: Some(true),
                     ..TaskFilter::default()
                 })
                 .await?;
             for task in workspace_tasks {
-                // Skip terminal tasks — attach back-fills *active* work, not
-                // closed history (Archived is already excluded by the filter;
-                // guard Done here too).
-                if matches!(task.status, TaskStatus::Done | TaskStatus::Archived) {
-                    continue;
-                }
                 // Issue-backed (has a GraphQL node id to attach) AND not yet a
                 // board item. Drafts have no issue node id, so they can't be
                 // `AddItem`'d — they're created directly via CreateDraftIssue
@@ -454,7 +450,7 @@ mod tests {
     // ---------- Stage 6 (#54): eager set-project backfill ------------------
 
     use domain_project::{Project, StatusMapping, StatusOption};
-    use domain_task::{RemoteRef, SnapshotSource, Task, TaskStatus};
+    use domain_task::{RemoteRef, SnapshotSource, Task};
     use ports::OutboxRepository;
     use testing_fixtures::{
         InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryTaskRepository,
@@ -473,7 +469,7 @@ mod tests {
                 ordinal: 0,
             }],
             vec![StatusMapping {
-                status: TaskStatus::Open,
+                is_open: true,
                 option_id: "o1".into(),
             }],
             false,

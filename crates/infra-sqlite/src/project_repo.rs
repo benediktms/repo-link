@@ -2,12 +2,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
 use domain_project::{Project, StatusMapping, StatusOption};
-use domain_task::TaskStatus;
 use ports::{PortError, PortResult, ProjectRepository};
 use sqlx::Row;
 
 use crate::Db;
-use crate::mapping::{enum_from_str, enum_to_str, map_sqlx_err};
+use crate::mapping::map_sqlx_err;
 
 pub(crate) const PROJECT_COLS: &str =
     "id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at";
@@ -118,12 +117,12 @@ impl ProjectRepository for SqliteProjectRepository {
             sqlx::query(
                 r#"
                 INSERT INTO project_status_mappings
-                    (project_id, status, option_id)
+                    (project_id, is_open, option_id)
                 VALUES (?, ?, ?)
                 "#,
             )
             .bind(project.id.as_str())
-            .bind(enum_to_str(&m.status)?)
+            .bind(i64::from(m.is_open))
             .bind(&m.option_id)
             .execute(&mut *tx)
             .await
@@ -260,17 +259,13 @@ async fn row_to_project(
     // many-to-one option (e.g. Open + Blocked → "Backlog") would otherwise
     // surface an unstable status across reads. Lowest workflow status wins,
     // which reads as the option's primary status.
+    // Order open (is_open=1) before closed (0) for a stable read order.
     let mapping_rows = sqlx::query(
         r#"
-        SELECT status, option_id
+        SELECT is_open, option_id
           FROM project_status_mappings
          WHERE project_id = ?
-         ORDER BY CASE status
-             WHEN 'open'        THEN 0
-             WHEN 'in_progress' THEN 1
-             WHEN 'blocked'     THEN 2
-             WHEN 'done'        THEN 3
-         END
+         ORDER BY is_open DESC
         "#,
     )
     .bind(id.as_str())
@@ -280,10 +275,10 @@ async fn row_to_project(
 
     let mut status_mappings = Vec::with_capacity(mapping_rows.len());
     for m in mapping_rows.iter() {
-        let status_str: String = m.try_get("status").map_err(map_sqlx_err)?;
+        let is_open: i64 = m.try_get("is_open").map_err(map_sqlx_err)?;
         let option_id: String = m.try_get("option_id").map_err(map_sqlx_err)?;
         status_mappings.push(StatusMapping {
-            status: enum_from_str::<TaskStatus>("project_status_mappings.status", &status_str)?,
+            is_open: is_open != 0,
             option_id,
         });
     }

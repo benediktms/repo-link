@@ -1,9 +1,11 @@
 //! The `Task` aggregate: struct, lifecycle + sync state machines.
 
+use std::time::Instant;
+
 use domain_core::{Aggregate, DomainError, RepoId, Result, TaskId, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
-use crate::enums::{Priority, RelationKind, SyncState, TaskStatus};
+use crate::enums::{Lifecycle, Priority, RelationKind, SyncState};
 use crate::relation::{RemoteRef, TaskComment, TaskRelation};
 use crate::snapshot::{SnapshotSource, TaskSnapshot};
 
@@ -28,7 +30,13 @@ pub struct Task {
     pub filing_repo_id: Option<RepoId>,
     pub title: String,
     pub body: String,
-    pub status: TaskStatus,
+    /// The task lifecycle (RFC 0004 D1): the open/closed bit fused with its
+    /// `state_reason` into a single [`Lifecycle`] value, so illegal
+    /// combinations are unrepresentable. Replaces the old 5-state
+    /// `TaskStatus`. "Blocked" is no longer a state — see [`Task::is_blocked`],
+    /// derived from `blocked_by` relations. This is the single mirrored
+    /// lifecycle axis ([`MirrorField::Status`]).
+    pub lifecycle: Lifecycle,
     pub sync: SyncState,
     pub priority: Priority,
     pub assignees: Vec<String>,
@@ -58,6 +66,23 @@ pub struct Task {
     /// Drift surfacing compares it to the option the task's local lifecycle
     /// status maps to, independently of `sync_state`.
     pub project_status_option_id: Option<String>,
+    /// Wall-clock time the remote was last *observed* for this task — stamped
+    /// write-through after a confirmed network response (pull / push / poll)
+    /// via [`crate::enums`]'s `SyncedSource` plumbing (RFC 0004 D3). `None`
+    /// means "never observed." Like [`Task::project_status_option_id`] this is
+    /// a write-through cache column on a **separate axis**: it is deliberately
+    /// EXCLUDED from [`Task::snapshot_view`] and dirty detection, so observing
+    /// the remote never flips `sync_state`. The wall-clock value is for display
+    /// ("Last refreshed: 30s ago", Phase 2); freshness *deltas* use the
+    /// monotonic [`Task::synced_instant`] to stay clock-skew-safe.
+    pub synced_at: Option<Timestamp>,
+    /// Monotonic companion to [`Task::synced_at`], used for threshold checks
+    /// (clock-skew-safe per RFC 0004 D3). In-memory only: never persisted
+    /// (`#[serde(skip)]`), so it reads back `None` on process restart — which
+    /// is treated as "stale" by the poller's first tick. Written atomically
+    /// with `synced_at` by the `mark_synced` helper.
+    #[serde(skip)]
+    pub synced_instant: Option<Instant>,
     /// Short globally-unique hash used to assemble the friendly composite
     /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
     /// (grown by the persistence layer on collision). Empty string is the
@@ -94,7 +119,8 @@ impl Task {
             filing_repo_id: None,
             title,
             body: String::new(),
-            status: TaskStatus::Open,
+            // Fresh draft: open since creation (distinct from Reopened).
+            lifecycle: Lifecycle::Open,
             sync: SyncState::LocalOnly,
             priority: Priority::P3,
             assignees: Vec::new(),
@@ -103,6 +129,9 @@ impl Task {
             comments: Vec::new(),
             project_item_id: None,
             project_status_option_id: None,
+            // Never observed remotely (RFC 0004 D3).
+            synced_at: None,
+            synced_instant: None,
             // Empty until the persistence layer mints a unique base32
             // hash on first save. Domain stays agnostic to randomness
             // and DB-backed uniqueness retries.
@@ -144,10 +173,13 @@ impl Task {
             filing_repo_id: repo_id,
             title,
             body,
-            status: if closed {
-                TaskStatus::Done
+            // Mirror the remote's open/closed bit. A closed issue imported
+            // cold is treated as Completed (the common case); NotPlanned is
+            // only reachable via an explicit lifecycle edit afterwards.
+            lifecycle: if closed {
+                Lifecycle::Completed
             } else {
-                TaskStatus::Open
+                Lifecycle::Open
             },
             sync: SyncState::Synced,
             priority: Priority::P3,
@@ -157,6 +189,8 @@ impl Task {
             comments: Vec::new(),
             project_item_id: None,
             project_status_option_id: None,
+            synced_at: None,
+            synced_instant: None,
             hash: String::new(),
             created_at: now,
             updated_at: now,
@@ -190,7 +224,7 @@ impl Task {
             version: 0,
             title: self.title.clone(),
             body: self.body.clone(),
-            status: self.status,
+            lifecycle: self.lifecycle,
             sync_state: self.sync,
             priority: self.priority,
             assignees: self.assignees.clone(),
@@ -343,8 +377,8 @@ impl Task {
         if let Some(body) = &patch.body {
             merged.body = body.clone();
         }
-        if let Some(status) = patch.status {
-            merged.status = status;
+        if let Some(lifecycle) = patch.status {
+            merged.lifecycle = lifecycle;
         }
         if let Some(assignees) = &patch.assignees {
             merged.assignees = assignees.clone();
@@ -436,89 +470,56 @@ impl Task {
     // The CLI command returns as soon as the local store is updated;
     // the daemon picks up `DirtyLocal` tasks on its next tick.
 
-    /// Move `Open` or `Blocked` into `InProgress` (signal start of work).
-    pub fn start(&mut self) -> Result<()> {
-        match self.status {
-            TaskStatus::Open | TaskStatus::Blocked => {
-                self.status = TaskStatus::InProgress;
-                self.touch();
-                self.reconcile_dirty_against_baseline();
-                Ok(())
-            }
-            other => Err(DomainError::transition(format!(
-                "cannot start from status={other:?}"
-            ))),
+    /// Set the [`Lifecycle`] state, then touch + reconcile (a lifecycle edit
+    /// is a mirrored change). The lifecycle is **editorial** (RFC 0004 D1):
+    /// any state may transition to any other — there are no ordering guards,
+    /// and illegal combinations are unrepresentable by construction. The
+    /// public verbs below are shorthands for the four common transitions.
+    ///
+    /// Re-issuing the *same* lifecycle is a true no-op: it returns without
+    /// touching `updated_at` or reconciling, so a redundant
+    /// `complete`/`archive`/`reopen` on an already-in-state task enqueues no
+    /// outbox churn (matching the early-return idempotence of [`Task::start`]).
+    fn set_lifecycle(&mut self, lifecycle: Lifecycle) {
+        if self.lifecycle == lifecycle {
+            return;
         }
-    }
-
-    /// Move into `Blocked` from `Open` or `InProgress`.
-    pub fn mark_blocked(&mut self) -> Result<()> {
-        match self.status {
-            TaskStatus::Open | TaskStatus::InProgress => {
-                self.status = TaskStatus::Blocked;
-                self.touch();
-                self.reconcile_dirty_against_baseline();
-                Ok(())
-            }
-            other => Err(DomainError::transition(format!(
-                "cannot block from status={other:?}"
-            ))),
-        }
-    }
-
-    /// Move `Blocked` back to `Open`. Caller can `start()` again explicitly.
-    pub fn unblock(&mut self) -> Result<()> {
-        match self.status {
-            TaskStatus::Blocked => {
-                self.status = TaskStatus::Open;
-                self.touch();
-                self.reconcile_dirty_against_baseline();
-                Ok(())
-            }
-            other => Err(DomainError::transition(format!(
-                "cannot unblock from status={other:?}"
-            ))),
-        }
-    }
-
-    /// Mark `InProgress` task as `Done`.
-    pub fn complete(&mut self) -> Result<()> {
-        match self.status {
-            TaskStatus::InProgress => {
-                self.status = TaskStatus::Done;
-                self.touch();
-                self.reconcile_dirty_against_baseline();
-                Ok(())
-            }
-            other => Err(DomainError::transition(format!(
-                "cannot complete from status={other:?}"
-            ))),
-        }
-    }
-
-    /// Move a `Done` task back to `Open` — used when work was marked done
-    /// prematurely and needs to be reopened.
-    pub fn reopen(&mut self) -> Result<()> {
-        match self.status {
-            TaskStatus::Done => {
-                self.status = TaskStatus::Open;
-                self.touch();
-                self.reconcile_dirty_against_baseline();
-                Ok(())
-            }
-            other => Err(DomainError::transition(format!(
-                "cannot reopen from status={other:?}"
-            ))),
-        }
-    }
-
-    pub fn archive(&mut self) -> Result<()> {
-        if self.status == TaskStatus::Archived {
-            return Err(DomainError::transition("already archived"));
-        }
-        self.status = TaskStatus::Archived;
+        self.lifecycle = lifecycle;
         self.touch();
         self.reconcile_dirty_against_baseline();
+    }
+
+    /// `rl task start` — assert the fresh `Open` state. A no-op on an
+    /// already-open task; on a closed task it errors (use [`Task::reopen`] to
+    /// transition a closed task back to open). RFC 0004 D4.
+    pub fn start(&mut self) -> Result<()> {
+        if self.is_open() {
+            return Ok(());
+        }
+        Err(DomainError::transition(
+            "cannot start a closed task — use `rl task reopen` to transition it to open",
+        ))
+    }
+
+    /// `rl task complete` — close as done ([`Lifecycle::Completed`]). RFC 0004 D4.
+    pub fn complete(&mut self) -> Result<()> {
+        self.set_lifecycle(Lifecycle::Completed);
+        Ok(())
+    }
+
+    /// `rl task archive` — close as not-planned ([`Lifecycle::NotPlanned`]).
+    /// Folds the old `Archived` status into the closed/not-planned state.
+    /// RFC 0004 D4.
+    pub fn archive(&mut self) -> Result<()> {
+        self.set_lifecycle(Lifecycle::NotPlanned);
+        Ok(())
+    }
+
+    /// `rl task reopen` — transition a closed task back to open with the
+    /// [`Lifecycle::Reopened`] marker (records *why* a task is open again,
+    /// distinct from open-since-creation). RFC 0004 D4.
+    pub fn reopen(&mut self) -> Result<()> {
+        self.set_lifecycle(Lifecycle::Reopened);
         Ok(())
     }
 
@@ -712,6 +713,29 @@ impl Task {
         self.remote.is_some()
     }
 
+    /// The open/closed bit, derived from [`Task::lifecycle`] (RFC 0004 D1).
+    pub fn is_open(&self) -> bool {
+        self.lifecycle.is_open()
+    }
+
+    /// The tasks this one is `blocked_by` (RFC 0004 D1). "Blocked" is no
+    /// longer a stored lifecycle state — it is derived from the relation
+    /// edges, so it cannot drift from the relation graph.
+    pub fn blocked_by(&self) -> impl Iterator<Item = TaskId> + '_ {
+        self.relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::BlockedBy)
+            .map(|r| r.other)
+    }
+
+    /// Whether this task is blocked — derived from `blocked_by` relations
+    /// (RFC 0004 D1). Replaces the old "Blocked" lifecycle variant.
+    pub fn is_blocked(&self) -> bool {
+        self.relations
+            .iter()
+            .any(|r| r.kind == RelationKind::BlockedBy)
+    }
+
     /// Diff the current task against [`Task::synced_baseline`] and
     /// reconcile the sync state. Called by every mutation that touches
     /// remote-observable state.
@@ -770,7 +794,7 @@ impl Task {
                 .then(|| self.body.clone()),
             status: MirrorField::Status
                 .differs(self, baseline)
-                .then_some(self.status),
+                .then_some(self.lifecycle),
             assignees: MirrorField::Assignees
                 .differs(self, baseline)
                 .then(|| self.assignees.clone()),
@@ -820,7 +844,8 @@ impl MirrorField {
         match self {
             MirrorField::Title => task.title != baseline.title,
             MirrorField::Body => task.body != baseline.body,
-            MirrorField::Status => task.status != baseline.status,
+            // The lifecycle axis is the single Lifecycle value (RFC 0004 D1).
+            MirrorField::Status => task.lifecycle != baseline.lifecycle,
             MirrorField::Assignees => !assignees_equal(&task.assignees, &baseline.assignees),
         }
     }
@@ -830,13 +855,13 @@ impl MirrorField {
 /// `Some(current value)` iff it differs from the baseline (per
 /// [`MirrorField::differs`]), else `None`. Built by [`Task::diff_against_baseline`]
 /// so the outbound push (rpl-x2v / rpl-47f) can send only the fields that changed.
-/// Carries domain values — `status` stays a [`TaskStatus`]; the open/closed mapping
-/// happens at the outbound boundary, not here.
+/// Carries domain values — `status` is the [`Lifecycle`] value; the open/closed +
+/// state_reason → REST mapping happens at the outbound boundary, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MirrorPatch {
     pub title: Option<String>,
     pub body: Option<String>,
-    pub status: Option<TaskStatus>,
+    pub status: Option<Lifecycle>,
     pub assignees: Option<Vec<String>>,
 }
 
@@ -908,7 +933,8 @@ mod tests {
     #[test]
     fn happy_path_local_only_to_synced() {
         let mut t = draft();
-        assert_eq!(t.status, TaskStatus::Open);
+        assert!(t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Open);
         assert_eq!(t.sync, SyncState::LocalOnly);
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
@@ -936,7 +962,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.sync, SyncState::Synced);
-        assert_eq!(t.status, TaskStatus::Done); // closed → Done
+        assert!(!t.is_open()); // closed
+        assert_eq!(t.lifecycle, Lifecycle::Completed); // closed → Completed
         assert!(t.is_remote_backed());
         assert_eq!(t.assignees, vec!["alice".to_string()]);
         // Baseline captured from the remote, so a fresh import is NOT dirty.
@@ -1046,7 +1073,7 @@ mod tests {
         assert_only(MirrorField::Body, &body);
 
         let mut status = t.clone();
-        status.status = TaskStatus::Done;
+        status.lifecycle = Lifecycle::Completed;
         assert_only(MirrorField::Status, &status);
 
         let mut assignees = t.clone();
@@ -1088,7 +1115,7 @@ mod tests {
         }
         {
             let mut t = synced();
-            t.start().unwrap(); // Open → InProgress
+            t.complete().unwrap(); // lifecycle change flips the status pair
             assert_eq!(t.sync, SyncState::DirtyLocal, "status");
         }
         {
@@ -1131,11 +1158,11 @@ mod tests {
         assert_eq!(p.body.as_deref(), Some("new body"));
         assert!(p.title.is_none() && p.status.is_none() && p.assignees.is_none());
 
-        // Status (Open → InProgress).
+        // Status (open → closed+Completed).
         let mut t = synced();
-        t.start().unwrap();
+        t.complete().unwrap();
         let p = t.diff_against_baseline();
-        assert_eq!(p.status, Some(TaskStatus::InProgress));
+        assert_eq!(p.status, Some(Lifecycle::Completed));
         assert!(p.title.is_none() && p.body.is_none() && p.assignees.is_none());
 
         // Assignees.
@@ -1204,7 +1231,7 @@ mod tests {
         assert_eq!(post.title, "new title");
         assert_eq!(post.body, pre.body, "body baseline entry must be unchanged");
         assert_eq!(
-            post.status, pre.status,
+            post.lifecycle, pre.lifecycle,
             "status baseline entry must be unchanged"
         );
         assert_eq!(
@@ -1230,7 +1257,7 @@ mod tests {
             (
                 "status",
                 Box::new(|t: &mut Task| {
-                    t.start().unwrap();
+                    t.complete().unwrap();
                 }),
             ),
             (
@@ -1251,7 +1278,7 @@ mod tests {
                     let mut p = MirrorPatch::default();
                     match label {
                         "body" => p.body = Some("revised".into()),
-                        "status" => p.status = Some(TaskStatus::InProgress),
+                        "status" => p.status = Some(Lifecycle::Completed),
                         "assignees" => p.assignees = Some(vec!["zoe".into()]),
                         _ => unreachable!(),
                     }
@@ -1271,11 +1298,11 @@ mod tests {
                 "body" => {
                     assert_eq!(post.body, "revised");
                     assert_eq!(post.title, pre.title);
-                    assert_eq!(post.status, pre.status);
+                    assert_eq!(post.lifecycle, pre.lifecycle);
                     assert_eq!(post.assignees, pre.assignees);
                 }
                 "status" => {
-                    assert_eq!(post.status, TaskStatus::InProgress);
+                    assert_eq!(post.lifecycle, Lifecycle::Completed);
                     assert_eq!(post.title, pre.title);
                     assert_eq!(post.body, pre.body);
                     assert_eq!(post.assignees, pre.assignees);
@@ -1284,7 +1311,7 @@ mod tests {
                     assert_eq!(post.assignees, vec!["zoe".to_string()]);
                     assert_eq!(post.title, pre.title);
                     assert_eq!(post.body, pre.body);
-                    assert_eq!(post.status, pre.status);
+                    assert_eq!(post.lifecycle, pre.lifecycle);
                 }
                 _ => unreachable!(),
             }
@@ -1299,7 +1326,7 @@ mod tests {
         let mut t = synced();
         t.set_title("full t".into()).unwrap();
         t.set_body("full b".into());
-        t.start().unwrap();
+        t.complete().unwrap();
         t.set_assignees(vec!["alice".into(), "bob".into()]);
         let patch = t.diff_against_baseline();
         assert!(!patch.is_empty());
@@ -1311,7 +1338,7 @@ mod tests {
         let post = t.synced_baseline.clone().expect("baseline");
         assert_eq!(post.title, "full t");
         assert_eq!(post.body, "full b");
-        assert_eq!(post.status, TaskStatus::InProgress);
+        assert_eq!(post.lifecycle, Lifecycle::Completed);
         assert_eq!(post.assignees, vec!["alice".to_string(), "bob".to_string()]);
         // The patch was the WHOLE diff, so reconcile sees no remaining
         // delta and the task stays Synced.
@@ -1350,7 +1377,7 @@ mod tests {
         let post = t.synced_baseline.clone().expect("baseline");
         assert_eq!(post.title, pre.title);
         assert_eq!(post.body, pre.body);
-        assert_eq!(post.status, pre.status);
+        assert_eq!(post.lifecycle, pre.lifecycle);
         assert_eq!(post.assignees, pre.assignees);
         assert_eq!(post.source, SnapshotSource::Push);
     }
@@ -1541,7 +1568,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(t.status, TaskStatus::Open);
+        assert!(t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Open);
         assert_eq!(t.sync, SyncState::Synced);
     }
 
@@ -1573,29 +1601,41 @@ mod tests {
 
     #[test]
     fn lifecycle_and_sync_are_independent() {
-        // A task can be Blocked + DirtyLocal at the same time. Blocking
-        // doesn't roll back sync; staging doesn't unblock.
+        // The lifecycle axis (is_open/state_reason) and the sync axis move
+        // independently. A lifecycle edit flips Synced → DirtyLocal, but the
+        // sync axis is not otherwise coupled to the lifecycle pair: here the
+        // task is already DirtyLocal and a `complete()` lifecycle change keeps
+        // it DirtyLocal (it doesn't roll sync back or forward on its own).
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
         t.mark_dirty_local().unwrap();
-        t.mark_blocked().unwrap();
-        assert_eq!(t.status, TaskStatus::Blocked);
+        t.complete().unwrap();
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
         assert_eq!(t.sync, SyncState::DirtyLocal);
     }
 
     #[test]
-    fn status_transitions_open_inprogress_blocked() {
+    fn lifecycle_transitions_are_editorial() {
+        // The lifecycle is editorial (RFC 0004 D1/D4): any verb is allowed
+        // from any state, with no ordering guards. Walk complete → reopen →
+        // archive and assert the (is_open, state_reason) pair after each hop.
         let mut t = draft();
-        t.start().unwrap();
-        assert_eq!(t.status, TaskStatus::InProgress);
-        t.mark_blocked().unwrap();
-        assert_eq!(t.status, TaskStatus::Blocked);
-        t.start().unwrap();
-        assert_eq!(t.status, TaskStatus::InProgress);
-        t.mark_blocked().unwrap();
-        t.unblock().unwrap();
-        assert_eq!(t.status, TaskStatus::Open);
+        assert!(t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Open);
+
+        t.complete().unwrap();
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
+
+        t.reopen().unwrap();
+        assert!(t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Reopened);
+
+        t.archive().unwrap();
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::NotPlanned);
     }
 
     #[test]
@@ -1606,25 +1646,27 @@ mod tests {
     }
 
     #[test]
-    fn complete_requires_in_progress_and_reopen_returns_to_open() {
+    fn complete_then_reopen_roundtrip() {
+        // Completion no longer requires any prior state (the lifecycle is
+        // editorial): `complete()` from a fresh open task works, and
+        // `reopen()` returns it to open with the Reopened marker.
         let mut t = draft();
-        // Can't complete an Open task — must start it first.
-        assert!(t.complete().is_err());
-        t.start().unwrap();
         t.complete().unwrap();
-        assert_eq!(t.status, TaskStatus::Done);
-        // Done is not Archived: still visible, still mutable.
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
+        // Completed is not terminal-locked: still reopenable.
         t.reopen().unwrap();
-        assert_eq!(t.status, TaskStatus::Open);
+        assert!(t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::Reopened);
     }
 
     #[test]
     fn done_tasks_can_still_be_archived() {
         let mut t = draft();
-        t.start().unwrap();
         t.complete().unwrap();
         t.archive().unwrap();
-        assert_eq!(t.status, TaskStatus::Archived);
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::NotPlanned);
     }
 
     /// The whole point of the auto-dirty behavior: a lifecycle transition
@@ -1639,13 +1681,10 @@ mod tests {
         t.promote_to_remote(remote_ref()).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
 
-        // Each lifecycle hop should leave the task DirtyLocal so the
-        // daemon picks it up on its next push tick.
-        t.start().unwrap();
-        assert_eq!(t.sync, SyncState::DirtyLocal);
-        // mark_synced re-syncs so we can exercise the next transition.
-        t.confirm_synced(SnapshotSource::Push).unwrap();
-
+        // Each lifecycle hop that changes the (is_open, state_reason) pair
+        // should leave the task DirtyLocal so the daemon picks it up on its
+        // next push tick. `confirm_synced` re-baselines between hops so the
+        // next transition starts from Synced.
         t.complete().unwrap();
         assert_eq!(t.sync, SyncState::DirtyLocal);
         t.confirm_synced(SnapshotSource::Push).unwrap();
@@ -1654,12 +1693,38 @@ mod tests {
         assert_eq!(t.sync, SyncState::DirtyLocal);
         t.confirm_synced(SnapshotSource::Push).unwrap();
 
-        t.mark_blocked().unwrap();
+        t.archive().unwrap();
         assert_eq!(t.sync, SyncState::DirtyLocal);
         t.confirm_synced(SnapshotSource::Push).unwrap();
+    }
 
-        t.unblock().unwrap();
+    #[test]
+    fn redundant_lifecycle_verb_on_synced_task_is_a_true_no_op() {
+        // Tripwire (review #1): set_lifecycle early-returns when the target
+        // lifecycle equals the current one, so re-issuing the *same* closing
+        // verb on an already-in-state synced task neither bumps updated_at nor
+        // flips sync back to DirtyLocal — i.e. it enqueues no outbox churn.
+        // Without the guard, complete/archive/reopen always touch() and the
+        // updated_at-based no-op detection upstream never fires for them.
+        let mut t = synced();
+        t.complete().unwrap();
         assert_eq!(t.sync, SyncState::DirtyLocal);
+        t.confirm_synced(SnapshotSource::Push).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        let before = t.updated_at();
+        t.complete().unwrap(); // already Completed → must be a no-op
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
+        assert_eq!(
+            t.sync,
+            SyncState::Synced,
+            "redundant complete re-dirtied a synced task"
+        );
+        assert_eq!(
+            t.updated_at(),
+            before,
+            "redundant complete bumped updated_at"
+        );
     }
 
     #[test]
@@ -1668,7 +1733,6 @@ mod tests {
         // there's nothing to push.
         let mut t = draft();
         assert_eq!(t.sync, SyncState::LocalOnly);
-        t.start().unwrap();
         t.complete().unwrap();
         assert_eq!(t.sync, SyncState::LocalOnly);
     }
@@ -1995,7 +2059,7 @@ mod tests {
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
         t.mark_dirty_remote().unwrap();
-        t.start().unwrap();
+        t.complete().unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
     }
 
@@ -2009,7 +2073,7 @@ mod tests {
         t.mark_conflicted().unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
         t.set_body("trying anyway".into());
-        t.start().unwrap();
+        t.complete().unwrap();
         t.set_assignees(vec!["alice".into()]);
         assert_eq!(t.sync, SyncState::Conflict);
     }
@@ -2045,9 +2109,137 @@ mod tests {
     }
 
     #[test]
-    fn archive_is_terminal() {
+    fn archive_is_idempotent_and_editorial() {
+        // Archiving is no longer terminal (the old "already archived" guard
+        // was removed): calling it twice succeeds and the task stays
+        // closed + NotPlanned.
         let mut t = draft();
         t.archive().unwrap();
-        assert!(t.archive().is_err());
+        t.archive().unwrap();
+        assert!(!t.is_open());
+        assert_eq!(t.lifecycle, Lifecycle::NotPlanned);
+    }
+
+    #[test]
+    fn lifecycle_pairs_are_exhaustive() {
+        // RFC 0004 D1: illegal open/closed + reason combinations are now
+        // unrepresentable by construction — `Lifecycle` fuses the two into a
+        // single enum, so there is no runtime invariant left to enforce.
+        // Instead we pin the open/closed classification of each variant…
+        assert!(Lifecycle::Open.is_open());
+        assert!(Lifecycle::Reopened.is_open());
+        assert!(!Lifecycle::Completed.is_open());
+        assert!(!Lifecycle::NotPlanned.is_open());
+
+        // …and that the public verbs land on the expected variants.
+        let mut t = synced();
+        t.complete().unwrap();
+        assert_eq!(t.lifecycle, Lifecycle::Completed);
+        assert!(!t.is_open());
+
+        t.reopen().unwrap();
+        assert_eq!(t.lifecycle, Lifecycle::Reopened);
+        assert!(t.is_open());
+
+        // start() on an open task is a no-op: a reopened task stays open with
+        // the (non-terminal) Reopened marker.
+        t.start().unwrap();
+        assert_eq!(t.lifecycle, Lifecycle::Reopened);
+        assert!(t.is_open());
+
+        let mut t = synced();
+        t.archive().unwrap();
+        assert_eq!(t.lifecycle, Lifecycle::NotPlanned);
+        assert!(!t.is_open());
+    }
+
+    #[test]
+    fn is_blocked_is_derived_from_relations() {
+        // "Blocked" is no longer a lifecycle state — it is derived from
+        // BlockedBy relations (RFC 0004 D1).
+        let mut t = draft();
+        assert!(!t.is_blocked());
+        assert_eq!(t.blocked_by().count(), 0);
+
+        let other = TaskId::new();
+        t.add_relation(RelationKind::BlockedBy, other);
+        assert!(t.is_blocked());
+        assert_eq!(t.blocked_by().collect::<Vec<_>>(), vec![other]);
+
+        // A non-BlockedBy relation does not mark the task blocked.
+        let mut u = draft();
+        u.add_relation(RelationKind::Blocks, TaskId::new());
+        u.add_relation(RelationKind::RelatedTo, TaskId::new());
+        assert!(!u.is_blocked());
+        assert_eq!(u.blocked_by().count(), 0);
+    }
+
+    #[test]
+    fn task_status_enum_is_deleted() {
+        // Tripwire: the old `TaskStatus` enum (RFC 0004 deletes it) must not
+        // be *used* anywhere in the workspace's crate sources. Walk from this
+        // crate's manifest dir up to the workspace root, then recursively scan
+        // every `crates/*/src/**/*.rs` for a variant reference (the enum name
+        // followed by a path separator). The needle is assembled from two
+        // string literals via `concat!` so this test's own source does NOT
+        // contain the contiguous needle and can't self-trip; the bare *type
+        // name* in a doc comment is allowed — only a re-introduced variant use
+        // fails the build.
+        use std::path::{Path, PathBuf};
+
+        let needle = concat!("TaskStatus", "::");
+
+        fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Skip build output.
+                    if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                        continue;
+                    }
+                    collect_rs(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // crates/domain-task → crates → workspace root.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root two levels above the crate manifest");
+        let crates_dir = workspace_root.join("crates");
+
+        let mut offenders = Vec::new();
+        let mut all_rs = Vec::new();
+        let Ok(crate_entries) = std::fs::read_dir(&crates_dir) else {
+            panic!("crates dir not found at {}", crates_dir.display());
+        };
+        for entry in crate_entries.flatten() {
+            let src = entry.path().join("src");
+            if src.is_dir() {
+                collect_rs(&src, &mut all_rs);
+            }
+        }
+
+        for path in all_rs {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if contents.contains(needle) {
+                offenders.push(path);
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "the old TaskStatus enum is deleted (RFC 0004) but a variant use \
+             ({needle}) still appears in: {offenders:#?}"
+        );
     }
 }

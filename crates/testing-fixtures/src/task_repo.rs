@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
-use ports::{PortError, PortResult, RemoteComment, TaskFilter, TaskRepository};
+use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 
 use crate::InMemoryOutboxRepository;
 use crate::outbox_repo::OutboxStore;
@@ -75,7 +75,7 @@ impl InMemoryTaskRepository {
             version: next_version,
             title: task.title.clone(),
             body: task.body.clone(),
-            status: task.status,
+            lifecycle: task.lifecycle,
             sync_state: task.sync,
             priority: task.priority,
             assignees: task.assignees.clone(),
@@ -189,20 +189,14 @@ impl TaskRepository for InMemoryTaskRepository {
                 Some(r) => t.repo_id == Some(r),
                 None => true,
             })
-            .filter(|t| match filter.status {
-                Some(s) => t.status == s,
+            .filter(|t| match filter.is_open {
+                // Filter on the open/closed bit (RFC 0004 D1). None = both.
+                Some(open) => t.is_open() == open,
                 None => true,
             })
             .filter(|t| match filter.sync_state {
                 Some(s) => t.sync == s,
                 None => true,
-            })
-            .filter(|t| match (filter.status, filter.include_archived) {
-                // Explicit status filter is authoritative.
-                (Some(_), _) => true,
-                // No status filter + include_archived=false → exclude Archived.
-                (None, false) => t.status != domain_task::TaskStatus::Archived,
-                (None, true) => true,
             })
             .map(|t| {
                 let mut task = t.clone();
@@ -398,6 +392,21 @@ impl TaskRepository for InMemoryTaskRepository {
             .and_then(|t| t.remote.as_mut())
         {
             remote.node_id = Some(node_id);
+        }
+        Ok(())
+    }
+
+    async fn cache_synced_at(
+        &self,
+        task_id: TaskId,
+        synced_at: Timestamp,
+        _source: SyncedSource,
+    ) -> PortResult<()> {
+        // Targeted single-column write (RFC 0004 D3): stamp ONLY `synced_at`,
+        // preserving every other field — no snapshot, no version bump, no
+        // `sync` change. `source` is not stored. Absent task is a benign no-op.
+        if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
+            task.synced_at = Some(synced_at);
         }
         Ok(())
     }

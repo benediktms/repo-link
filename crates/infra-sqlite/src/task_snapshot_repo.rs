@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{RepoId, TaskId, Timestamp};
-use domain_task::{Priority, RemoteRef, SnapshotSource, SyncState, TaskSnapshot, TaskStatus};
+use domain_task::{Lifecycle, Priority, RemoteRef, SnapshotSource, SyncState, TaskSnapshot};
 use ports::{PortError, PortResult, TaskSnapshotRepository};
 use sqlx::Row;
 
@@ -18,7 +18,7 @@ impl SqliteTaskSnapshotRepository {
     }
 }
 
-pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at";
+pub(crate) const TASK_SNAPSHOT_COLS: &str = "task_id, version, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at";
 
 #[async_trait]
 impl TaskSnapshotRepository for SqliteTaskSnapshotRepository {
@@ -58,7 +58,8 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
     let version: i64 = row.try_get("version").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
     let body: String = row.try_get("body").map_err(map_sqlx_err)?;
-    let status: String = row.try_get("status").map_err(map_sqlx_err)?;
+    // RFC 0004 D1: canonical lifecycle; legacy `status` no longer read.
+    let lifecycle: String = row.try_get("lifecycle").map_err(map_sqlx_err)?;
     let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
     let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
@@ -98,7 +99,7 @@ fn row_to_snapshot(task_id: TaskId, row: &sqlx::sqlite::SqliteRow) -> PortResult
         version: version_u64,
         title,
         body,
-        status: enum_from_str::<TaskStatus>("task status", &status)?,
+        lifecycle: enum_from_str::<Lifecycle>("task lifecycle", &lifecycle)?,
         sync_state: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,

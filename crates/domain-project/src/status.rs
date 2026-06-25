@@ -1,7 +1,6 @@
 //! Status field value objects: the option catalog and the
 //! local-status → option mapping rows.
 
-use domain_task::TaskStatus;
 use serde::{Deserialize, Serialize};
 
 /// One option on a Project's single-select Status field.
@@ -17,12 +16,12 @@ pub struct StatusOption {
     pub ordinal: u32,
 }
 
-/// One row of the local-status → project-option mapping. Built once at
-/// `rl project link` time (auto-seeded by name match) and editable via
-/// `rl project map`. Multiple `TaskStatus` values may legitimately map to
-/// the same `option_id` (e.g. `Open` and `Blocked` both → "Backlog").
+/// One row of the local lifecycle → project-option mapping. Keyed on the
+/// open/closed bit (RFC 0004 D1): an open task maps to one board option, a
+/// closed task to another. Built once at `rl project link` (auto-seeded by
+/// name) and editable via `rl project map`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusMapping {
-    pub status: TaskStatus,
+    pub is_open: bool,
     pub option_id: String,
 }

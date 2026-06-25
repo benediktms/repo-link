@@ -2,7 +2,7 @@
 //! functions shared by [`crate::service::SyncService`].
 
 use domain_sync::SyncDecision;
-use domain_task::{SyncState, Task, TaskSnapshot, TaskStatus};
+use domain_task::{Lifecycle, SyncState, Task, TaskSnapshot};
 use dto_shared::{RemoteRefDto, SyncSummaryDto};
 use ports::RemoteTaskSnapshot;
 use serde::Serialize;
@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::error::{Result, SyncError};
 
 pub(crate) fn ensure_not_archived(task: &Task) -> Result<()> {
-    if task.status == TaskStatus::Archived {
+    if task.lifecycle == Lifecycle::NotPlanned {
         Err(SyncError::Archived)
     } else {
         Ok(())
@@ -97,14 +97,14 @@ mod tests {
 
     /// Build a baseline snapshot for the helper-under-test. The fields we
     /// care about (title, body, assignees) are the three inbound fields;
-    /// status is set explicitly to make the `ignores_status` test's intent
+    /// lifecycle is set explicitly to make the `ignores_status` test's intent
     /// visible (the helper must NOT consult this field).
-    fn baseline(status: TaskStatus) -> TaskSnapshot {
+    fn baseline(lifecycle: Lifecycle) -> TaskSnapshot {
         let mut t = domain_task::Task::new_draft(domain_core::WorkspaceId::new(), None, "t".into())
             .unwrap();
         t.body = "b".into();
         t.assignees = vec!["alice".into(), "bob".into()];
-        t.status = status;
+        t.lifecycle = lifecycle;
         t.snapshot_view(SnapshotSource::Pull)
     }
 
@@ -143,7 +143,7 @@ mod tests {
     /// comparison rather than of the literal.
     #[test]
     fn remote_mirrors_baseline_ignores_status() {
-        let base = baseline(TaskStatus::Open);
+        let base = baseline(Lifecycle::Open);
         let snap_closed = any_remote_snap(
             base.title.clone(),
             base.body.clone(),
@@ -181,7 +181,7 @@ mod tests {
     /// case. Guards against a typo in the helper body.
     #[test]
     fn remote_mirrors_baseline_agrees_on_equal_fields() {
-        let base = baseline(TaskStatus::InProgress);
+        let base = baseline(Lifecycle::Reopened);
         let snap = any_remote_snap(
             base.title.clone(),
             base.body.clone(),

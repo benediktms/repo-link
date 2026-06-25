@@ -492,7 +492,8 @@ impl RepoBindingService {
         let ws_tasks = tasks
             .list(ports::TaskFilter {
                 workspace_id: Some(id),
-                include_archived: true,
+                // Doctor inspects every task regardless of lifecycle, so leave
+                // `is_open` at its `None` default (both open and closed).
                 ..ports::TaskFilter::default()
             })
             .await?;

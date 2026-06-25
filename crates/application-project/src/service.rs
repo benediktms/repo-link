@@ -82,7 +82,7 @@ impl ProjectService {
             .into_iter()
             .map(|m| {
                 Ok(StatusMapping {
-                    status: parse_status(&m.status)?,
+                    is_open: parse_status(&m.status)?,
                     option_id: m.option_id,
                 })
             })
@@ -153,13 +153,12 @@ impl ProjectService {
         Ok(())
     }
 
-    /// Replace the mapping for one local `TaskStatus`. If a mapping for the
-    /// same status existed, it is overwritten; otherwise it is appended.
-    /// Many-to-one mappings (multiple statuses → same option) are valid in
-    /// the domain but a known storage limitation today — see issue #80.
+    /// Replace the mapping for one open/closed bucket. If a mapping for the
+    /// same bucket existed, it is overwritten; otherwise it is appended. With
+    /// only two buckets (open / closed) the collection holds at most two rows.
     pub async fn map_status(&self, cmd: MapStatusCmd) -> Result<ProjectDto> {
         let mut project = resolve_project(&self.repo, &cmd.project_spec).await?;
-        let status = parse_status(&cmd.status)?;
+        let is_open = parse_status(&cmd.status)?;
         if !project
             .status_options
             .iter()
@@ -171,11 +170,11 @@ impl ProjectService {
             ));
         }
         let mut mappings = project.status_mappings.clone();
-        if let Some(existing) = mappings.iter_mut().find(|m| m.status == status) {
+        if let Some(existing) = mappings.iter_mut().find(|m| m.is_open == is_open) {
             existing.option_id = cmd.option_id;
         } else {
             mappings.push(StatusMapping {
-                status,
+                is_open,
                 option_id: cmd.option_id,
             });
         }
@@ -310,7 +309,7 @@ mod tests {
         let dto = svc
             .map_status(MapStatusCmd {
                 project_spec: "acme/7".into(),
-                status: "done".into(),
+                status: "closed".into(),
                 option_id: "o2".into(),
             })
             .await
@@ -397,12 +396,12 @@ mod tests {
                 .find(|x| x.status == s)
                 .map(|x| x.option_id.as_str())
         };
-        // Backlog→open, In progress→in_progress, Done→done; no Blocked option
-        // on this board, so blocked stays unmapped.
+        // RFC 0004: at most two rows. Open maps to the first open-like option
+        // (Backlog), closed maps to the last closed-like option (Done). The
+        // middle "In progress" option is not a derived target.
+        assert_eq!(dto.status_mappings.len(), 2);
         assert_eq!(m("open"), Some("f7"));
-        assert_eq!(m("in_progress"), Some("47"));
-        assert_eq!(m("done"), Some("98"));
-        assert_eq!(m("blocked"), None);
+        assert_eq!(m("closed"), Some("98"));
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use application_sync::enqueue;
 use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, OutboxMutation, resolve_filing_repo};
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskStatus};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
@@ -525,17 +525,26 @@ impl TaskService {
                 .as_deref()
                 .map(|s| s.parse::<RepoId>())
                 .transpose()?,
-            status: query
-                .status
-                .as_deref()
-                .map(|s| parse_enum::<TaskStatus>("status", s))
-                .transpose()?,
+            // Default to open-only when no `--status` is given, so `rl task
+            // list` shows actionable work and doesn't bury it under completed
+            // and dropped (not_planned) tasks. `--status all` opts back into
+            // every lifecycle; `open`/`closed` filter explicitly.
+            is_open: match query.status.as_deref() {
+                None | Some("open") => Some(true),
+                Some("closed") => Some(false),
+                Some("all") => None,
+                Some(other) => {
+                    return Err(ServiceError::BadEnum {
+                        field: "status",
+                        value: other.to_string(),
+                    });
+                }
+            },
             sync_state: query
                 .sync_state
                 .as_deref()
                 .map(|s| parse_enum::<SyncState>("sync_state", s))
                 .transpose()?,
-            include_archived: query.include_archived,
         };
         let rows = self.repo.list(filter).await?;
         // One binding lookup per task — fine at current scales (dozens
@@ -568,14 +577,6 @@ impl TaskService {
 
     pub async fn reopen(&self, id: &str) -> Result<TaskDto> {
         self.transition_mirror(id, |t| t.reopen()).await
-    }
-
-    pub async fn mark_blocked(&self, id: &str) -> Result<TaskDto> {
-        self.transition_mirror(id, |t| t.mark_blocked()).await
-    }
-
-    pub async fn unblock(&self, id: &str) -> Result<TaskDto> {
-        self.transition_mirror(id, |t| t.unblock()).await
     }
 
     pub async fn archive(&self, id: &str) -> Result<TaskDto> {
@@ -782,7 +783,9 @@ impl TaskService {
         let all = self
             .repo
             .list(TaskFilter {
-                include_archived: true,
+                // No lifecycle filter — the cycle check must see every task,
+                // open or closed.
+                is_open: None,
                 ..TaskFilter::default()
             })
             .await?;
@@ -835,7 +838,7 @@ impl TaskService {
         let snapshot = self.snapshots.get(task.id, to_version).await?;
         task.title = snapshot.title;
         task.body = snapshot.body;
-        task.status = snapshot.status;
+        task.lifecycle = snapshot.lifecycle;
         task.sync = snapshot.sync_state;
         task.priority = snapshot.priority;
         task.assignees = snapshot.assignees;
@@ -891,15 +894,24 @@ impl TaskService {
 
     /// Like [`transition`](Self::transition) but, after persisting, enqueues
     /// the outbound mutations a mirror task owes (RFC 0001 Stage 6). Used by
-    /// the lifecycle verbs (start / complete / reopen / block / unblock /
-    /// archive) where the change is remote-observable. `LocalOnly` tasks
+    /// the lifecycle verbs (start / complete / reopen / archive) where the
+    /// change is remote-observable. `LocalOnly` tasks
     /// enqueue nothing (the mirror guard short-circuits).
     async fn transition_mirror<F>(&self, query: &str, op: F) -> Result<TaskDto>
     where
         F: FnOnce(&mut Task) -> domain_core::Result<()>,
     {
         let mut t = self.resolve_task(query).await?;
+        let before = t.updated_at;
         op(&mut t)?;
+        // A no-op transition (e.g. `start()` on an already-open task, RFC 0004
+        // D1) leaves the task untouched — `updated_at` is unchanged. Skip the
+        // plan + atomic write entirely so a redundant `rl task start`/`claim`
+        // on an open mirror doesn't enqueue churn (no-op SetProjectStatus /
+        // UpdateRemote) into the outbox.
+        if t.updated_at == before {
+            return self.task_dto(&t).await;
+        }
         // Plan the outbound mutations FIRST (lifecycle-only transition — no
         // title/body change, so a draft-backed mirror owes no `UpdateDraftIssue`;
         // its card move rides on `SetProjectStatus`), then commit the task AND
@@ -923,7 +935,7 @@ impl TaskService {
     /// a single atomic `save_with_outbox` (#54) rather than enqueuing inline.
     ///
     /// `content_changed` is `false` for lifecycle-only transitions
-    /// (start/complete/block/archive) and `true` for title/body edits — it
+    /// (start/complete/reopen/archive) and `true` for title/body edits — it
     /// gates the draft-backed `UpdateDraftIssue` so a lifecycle move doesn't
     /// enqueue a no-op draft content write (the card move via
     /// `SetProjectStatus` carries the lifecycle change for drafts).
@@ -1243,7 +1255,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dto.sync_state, "synced");
-        assert_eq!(dto.status, "open");
+        assert!(dto.is_open);
+        assert_eq!(dto.state_reason, None);
         assert_eq!(dto.remote.as_ref().unwrap().remote_id, "123");
         assert_eq!(dto.assignees, vec!["alice".to_string()]);
         // Hash was minted on save, so the friendly id is a non-empty bare hash.
@@ -1267,7 +1280,8 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(dto.status, "open");
+        assert!(dto.is_open);
+        assert_eq!(dto.state_reason, None);
         assert_eq!(dto.sync_state, "local_only");
         assert_eq!(dto.priority, "p1");
         let updated = svc
@@ -1341,6 +1355,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(staged.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_defaults_to_open_and_all_opts_into_closed() {
+        let svc = svc();
+        let workspace = ws_id();
+        let mk = |title: &'static str| CreateTaskCmd {
+            workspace_id: workspace.clone(),
+            repo_id: None,
+            title: title.into(),
+            body: None,
+            priority: None,
+            filing_repo_override: None,
+        };
+        let keep_open = svc.create(mk("open")).await.unwrap();
+        let to_close = svc.create(mk("done")).await.unwrap();
+        svc.complete(&to_close.id).await.unwrap();
+
+        // Default (no --status) hides closed tasks — only the open one shows.
+        let default = svc.list(ListTasksQuery::default()).await.unwrap();
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].id, keep_open.id);
+
+        // `--status all` opts back into every lifecycle.
+        let all = svc
+            .list(ListTasksQuery {
+                status: Some("all".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+
+        // `--status closed` shows only the closed one.
+        let closed = svc
+            .list(ListTasksQuery {
+                status: Some("closed".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, to_close.id);
     }
 
     #[tokio::test]
@@ -1660,32 +1717,65 @@ mod tests {
             })
             .await
             .unwrap();
+        // start() is a no-op on an already-open task (RFC 0004 D1): the task
+        // stays open.
         let started = svc.start(&t.id).await.unwrap();
-        assert_eq!(started.status, "in_progress");
+        assert!(started.is_open);
+        assert_eq!(started.state_reason, None);
         let done = svc.complete(&t.id).await.unwrap();
-        assert_eq!(done.status, "done");
+        assert!(!done.is_open);
+        assert_eq!(done.state_reason.as_deref(), Some("completed"));
         let archived = svc.archive(&t.id).await.unwrap();
-        assert_eq!(archived.status, "archived");
+        assert!(!archived.is_open);
+        assert_eq!(archived.state_reason.as_deref(), Some("not_planned"));
     }
 
+    /// Blocking is no longer a lifecycle verb (RFC 0004 D1): it is derived from
+    /// a `BlockedBy` relation. Adding the relation makes `is_blocked()` true
+    /// without changing the open/closed bit.
     #[tokio::test]
-    async fn block_and_unblock() {
+    async fn blocked_is_derived_from_relations() {
         let svc = svc();
         let t = svc
             .create(CreateTaskCmd {
                 workspace_id: ws_id(),
                 repo_id: None,
-                title: "t".into(),
+                title: "blocked".into(),
                 body: None,
                 priority: None,
                 filing_repo_override: None,
             })
             .await
             .unwrap();
-        let blocked = svc.mark_blocked(&t.id).await.unwrap();
-        assert_eq!(blocked.status, "blocked");
-        let unblocked = svc.unblock(&t.id).await.unwrap();
-        assert_eq!(unblocked.status, "open");
+        let blocker = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "blocker".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: None,
+            })
+            .await
+            .unwrap();
+        svc.add_relation(AddTaskRelationCmd {
+            task_id: t.id.clone(),
+            kind: "blocked_by".into(),
+            other: blocker.id.clone(),
+        })
+        .await
+        .unwrap();
+        let reloaded = svc.show(&t.id).await.unwrap();
+        // Still open — blocking does not flip the lifecycle bit.
+        assert!(reloaded.is_open);
+        assert!(
+            reloaded
+                .relations
+                .iter()
+                .any(|r| r.kind == "blocked_by" && r.other == blocker.id),
+            "the blocked_by relation is recorded: {:?}",
+            reloaded.relations
+        );
     }
 
     #[tokio::test]
@@ -2042,17 +2132,15 @@ mod tests {
                     ordinal: 2,
                 },
             ],
+            // RFC 0004 D1: mappings are keyed on the open/closed bit. Open
+            // tasks land on the WIP option, closed tasks on Done.
             vec![
                 StatusMapping {
-                    status: TaskStatus::Open,
-                    option_id: "o_backlog".into(),
-                },
-                StatusMapping {
-                    status: TaskStatus::InProgress,
+                    is_open: true,
                     option_id: "o_wip".into(),
                 },
                 StatusMapping {
-                    status: TaskStatus::Done,
+                    is_open: false,
                     option_id: "o_done".into(),
                 },
             ],
@@ -2222,11 +2310,13 @@ mod tests {
         t.repo_id = Some(binding.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        // `start()` is a no-op on an open task (RFC 0004 D1); use `complete()`
+        // so a genuine lifecycle change happens and is durable.
+        svc.complete(&t.id.to_string()).await.unwrap();
 
-        // Task side: the status change is durable.
+        // Task side: the lifecycle change is durable.
         let reloaded = repo.get(t.id).await.unwrap();
-        assert_eq!(reloaded.status, TaskStatus::InProgress);
+        assert!(!reloaded.is_open());
         // Outbox side: a SetProjectStatus entry landed in the same op.
         let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
         assert!(
@@ -2402,11 +2492,13 @@ mod tests {
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         assert!(outbox.all().is_empty(), "no entries before the transition");
-        svc.start(&t.id.to_string()).await.unwrap();
+        // `start()` is a no-op on an open task; `complete()` makes a real
+        // lifecycle change so the combined write is observable.
+        svc.complete(&t.id.to_string()).await.unwrap();
 
-        // Exactly one combined write happened: task in-progress + one
+        // Exactly one combined write happened: task closed + one
         // UpdateRemote, in the shared store.
-        assert_eq!(repo.get(t.id).await.unwrap().status, TaskStatus::InProgress);
+        assert!(!repo.get(t.id).await.unwrap().is_open());
         assert_eq!(outbox.all().len(), 1);
         assert_eq!(outbox.all()[0].mutation.kind(), "update_remote");
     }
@@ -2436,7 +2528,7 @@ mod tests {
         t.repo_id = Some(binding.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         let all = outbox.all();
         assert_eq!(all.len(), 1, "exactly one mutation enqueued");
@@ -2444,8 +2536,14 @@ mod tests {
         assert_eq!(all[0].status, OutboxStatus::Pending);
     }
 
+    /// RFC 0004 D1: blocking is no longer a lifecycle verb, but the invariant
+    /// it protected still holds — a lifecycle transition that keeps a project
+    /// mirror OPEN moves the card (`SetProjectStatus`) and updates the issue
+    /// (`UpdateRemote`) without ever enqueuing a close (`closed: Some(true)`).
+    /// We exercise it with `start()` (a no-op on an open task, but it still
+    /// re-plans the mirror's outbound mutations).
     #[tokio::test]
-    async fn lifecycle_project_mirror_block_enqueues_set_status_not_close() {
+    async fn lifecycle_reopen_project_mirror_enqueues_set_status_not_close() {
         let RichSvc {
             svc,
             repo,
@@ -2463,8 +2561,8 @@ mod tests {
         // BOUND issue-backed project mirror (the real-world case): it has a
         // repo binding, so an UpdateRemote *is* formed, AND it's already a
         // board item (project_item_id set), so a SetProjectStatus is formed
-        // too. This is the shape that actually exercises "block moves the card
-        // but does NOT close the issue".
+        // too. This is the shape that exercises "an open-keeping transition
+        // moves the card but does NOT close the issue".
         let binding = domain_repo::RepoBinding::new(
             ws.id,
             "git@github.com:o/r.git".into(),
@@ -2476,27 +2574,29 @@ mod tests {
         t.repo_id = Some(binding.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
-        svc.mark_blocked(&t.id.to_string()).await.unwrap();
+        // `reopen()` is an open-keeping transition that genuinely changes the
+        // lifecycle (Open → Reopened), so it enqueues a card move. (`start()`
+        // on an already-open task is a no-op and correctly enqueues nothing.)
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         let entries = outbox.all();
         let kinds: Vec<&str> = entries.iter().map(|e| e.mutation.kind()).collect();
         assert!(
             kinds.contains(&"set_project_status"),
-            "block on a project mirror moves the card: {kinds:?}"
+            "an open project mirror transition moves the card: {kinds:?}"
         );
         assert!(
             kinds.contains(&"update_remote"),
             "a bound issue-backed mirror also enqueues UpdateRemote: {kinds:?}"
         );
-        // No close: every enqueued UpdateRemote carries `closed: None` (the
-        // drainer re-derives Blocked → not-closed via lifecycle_to_remote_state)
-        // — never a close-the-issue `closed: Some(true)`.
+        // No close: an open-keeping transition never enqueues a
+        // close-the-issue `closed: Some(true)` UpdateRemote.
         for e in &entries {
             if let OutboxMutation::UpdateRemote { closed, .. } = &e.mutation {
                 assert_ne!(
                     *closed,
                     Some(true),
-                    "block must never enqueue a close-the-issue UpdateRemote"
+                    "an open task must never enqueue a close-the-issue UpdateRemote"
                 );
             }
         }
@@ -3426,7 +3526,7 @@ mod tests {
         t.repo_id = Some(binding.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
         // UpdateRemote (issue state) + AddItem (lazy net). SetProjectStatus
@@ -3472,7 +3572,7 @@ mod tests {
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // Trigger the first-board-filing path via a lifecycle transition.
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         // The filing repo must be recorded before the AddItem lands.
         let reloaded = repo.get(t.id).await.unwrap();
@@ -3536,7 +3636,7 @@ mod tests {
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // Lifecycle transition → plan_mirror_mutations → UpdateRemote.
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         let canonical = outbox
             .all()
@@ -3587,7 +3687,7 @@ mod tests {
         // project_item_id is None → first-filing precondition met
         repo.save(&t, SnapshotSource::Pull).await.unwrap();
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         // Step 4: filing_repo_id stays None (legitimate board draft).
         let reloaded = repo.get(t.id).await.unwrap();
@@ -3647,7 +3747,7 @@ mod tests {
         t.remote = None;
         repo.save(&t, SnapshotSource::Pull).await.unwrap();
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         // Step 2: workspace default wins over the absent logical repo.
         let reloaded = repo.get(t.id).await.unwrap();
@@ -3707,7 +3807,7 @@ mod tests {
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
         let filing_before = t.filing_repo_id;
 
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
 
         let reloaded = repo.get(t.id).await.unwrap();
         // filing_repo_id must be unchanged — already-attached card skips first-filing.
@@ -3819,7 +3919,7 @@ mod tests {
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // First transition: records filing_repo_id.
-        svc.start(&t.id.to_string()).await.unwrap();
+        svc.reopen(&t.id.to_string()).await.unwrap();
         let after_first = repo.get(t.id).await.unwrap();
         assert_eq!(after_first.filing_repo_id, Some(binding.id));
 
