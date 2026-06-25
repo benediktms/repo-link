@@ -35,7 +35,7 @@ use ports::{RemoteStateReason, RemoteTaskUpdate};
 pub use drainer::{BackoffSchedule, OutboxDrainer};
 pub use error::{Result, SyncError};
 pub use poller::{PollReport, ProjectPoller};
-pub use service::SyncService;
+pub use service::{RefreshOutcome, SyncService};
 
 /// Resolve a task's open/closed bit to a project Status option id (RFC 0004
 /// D1): an open task maps to one board option, a closed task to another.

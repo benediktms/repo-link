@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::{TaskId, WorkspaceId};
+use domain_core::{TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
 use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
@@ -11,14 +11,27 @@ use domain_workspace::Workspace;
 use crate::enqueue;
 use dto_shared::SyncSummaryDto;
 use ports::{
-    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, TaskRepository,
-    WorkspaceRepository,
+    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, SyncedSource,
+    TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
 };
+
+/// Outcome of [`SyncService::refresh`] (`rl task show --refresh`, RFC 0004 D4).
+/// The flag is best-effort, so a fetch failure is a value here, not an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// The task has no remote (purely local) — nothing to refresh.
+    NotMirrored,
+    /// The remote was observed and `synced_at` was stamped.
+    Stamped,
+    /// The fetch failed; the caller should render the cached value with this
+    /// annotation. Carries when it failed and the error text.
+    Failed { at: Timestamp, error: String },
+}
 
 pub struct SyncService {
     tasks: Arc<dyn TaskRepository>,
@@ -347,6 +360,47 @@ impl SyncService {
         }
 
         Ok(summary(&task, prev, decision))
+    }
+
+    /// `rl task show --refresh` (RFC 0004 D4): observe the remote to stamp
+    /// `synced_at`, WITHOUT reconciling content. The distinction from
+    /// [`SyncService::pull`] is deliberate — `--refresh` never overwrites local
+    /// title/body/assignees/lifecycle; it only refreshes the freshness clock so
+    /// a subsequent offline `task show` reports an up-to-date "last refreshed".
+    ///
+    /// Best-effort: a fetch failure (network, rate limit, GitHub down) is
+    /// returned as [`RefreshOutcome::Failed`], never propagated, so the caller
+    /// can still render the cached value with a failure annotation. Local
+    /// errors (unknown task, deleted filing binding) DO propagate — they are
+    /// actionable config problems, not transient network ones.
+    pub async fn refresh(&self, task_id: &str) -> Result<RefreshOutcome> {
+        let id: TaskId = task_id.parse()?;
+        let task = self.tasks.get(id).await?;
+        // A purely-local task has no remote to observe.
+        let Some(remote) = task.remote.as_ref() else {
+            return Ok(RefreshOutcome::NotMirrored);
+        };
+        let remote_id = remote.remote_id.clone();
+        let filing_canonical = self.filing_canonical_for(&task).await?;
+        match self
+            .provider
+            .fetch_remote(&filing_canonical, &remote_id)
+            .await
+        {
+            // Observe-only: stamp freshness via the targeted single-column
+            // write. The fetched snapshot's content is intentionally discarded
+            // (reconciling it is `sync pull`, not `--refresh`).
+            Ok(_snap) => {
+                self.tasks
+                    .cache_synced_at(id, Timestamp::now(), SyncedSource::Refresh)
+                    .await?;
+                Ok(RefreshOutcome::Stamped)
+            }
+            Err(e) => Ok(RefreshOutcome::Failed {
+                at: Timestamp::now(),
+                error: e.to_string(),
+            }),
+        }
     }
 
     /// Re-wire a task to a different remote. Always Conflict by default
@@ -1936,6 +1990,62 @@ mod tests {
         assert_eq!(after.lifecycle, domain_task::Lifecycle::Reopened);
         assert!(after.is_open());
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn refresh_stamps_synced_at_on_success() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert!(tasks.get(task.id).await.unwrap().synced_at.is_none());
+
+        let before = tasks.get(task.id).await.unwrap();
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let outcome = svc.refresh(&task.id.to_string()).await.unwrap();
+        assert_eq!(outcome, RefreshOutcome::Stamped);
+        // Observed → freshness stamped; content untouched.
+        let after = tasks.get(task.id).await.unwrap();
+        assert!(after.synced_at.is_some(), "refresh stamps synced_at");
+        assert_eq!(
+            after.title, before.title,
+            "refresh must NOT reconcile content"
+        );
+        assert_eq!(after.sync, before.sync);
+    }
+
+    #[tokio::test]
+    async fn refresh_returns_failed_and_does_not_stamp_on_fetch_error() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        // No fetch fixture set → the provider returns an error.
+        let _ = &provider;
+
+        let outcome = svc.refresh(&task.id.to_string()).await.unwrap();
+        assert!(
+            matches!(outcome, RefreshOutcome::Failed { .. }),
+            "a fetch error becomes a non-fatal Failed outcome, got {outcome:?}"
+        );
+        assert!(
+            tasks.get(task.id).await.unwrap().synced_at.is_none(),
+            "a failed refresh must not stamp synced_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_a_local_only_task() {
+        let (svc, _tasks, task, _provider) = setup().await;
+        // Never promoted → no remote to observe.
+        let outcome = svc.refresh(&task.id.to_string()).await.unwrap();
+        assert_eq!(outcome, RefreshOutcome::NotMirrored);
     }
 
     #[tokio::test]

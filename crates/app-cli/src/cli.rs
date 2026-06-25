@@ -377,6 +377,13 @@ pub(crate) enum TaskCmd {
     },
     Show {
         id: String,
+        /// Opt in to a network fetch: observe the remote and refresh the
+        /// "last refreshed" stamp before rendering (RFC 0004 D4). Default
+        /// `show` is offline. A fetch failure is non-fatal — the cached value
+        /// is rendered with a `last_refresh_failed` annotation. Does NOT
+        /// reconcile content (use `rl sync pull` for that).
+        #[arg(long)]
+        refresh: bool,
     },
     /// Edit a task in place. Writes a new snapshot at `version = max + 1`
     /// with `source = local_edit`; preserves the task's identity (UUID and
@@ -479,10 +486,7 @@ pub(crate) enum TaskCmd {
     },
     /// Add a pending local comment to a task. Pushed to the remote issue on
     /// the next `sync push` (a separate axis — does not dirty the task).
-    Comment {
-        id: String,
-        body: String,
-    },
+    Comment { id: String, body: String },
     /// Re-wire a task to a different remote issue. Always flips the task to
     /// `Conflict` (linking is destructive on remote identity; snapshots are
     /// the audit trail). Pass `--relink/-r` to declare the URL is the verified
@@ -512,9 +516,7 @@ pub(crate) enum TaskCmd {
         remove: bool,
     },
     /// List the full snapshot history for a task.
-    Snapshots {
-        id: String,
-    },
+    Snapshots { id: String },
     /// Roll a task back to a historical snapshot version.
     Rollback {
         id: String,

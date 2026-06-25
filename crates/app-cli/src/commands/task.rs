@@ -2,7 +2,7 @@
 //! `git_user_name` helper (also used by `query mine`).
 
 use anyhow::{Result, anyhow};
-use application_sync::SyncService;
+use application_sync::{RefreshOutcome, SyncService};
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoveTaskRelationCmd, TaskDto,
     UpdateTaskCmd,
@@ -250,7 +250,26 @@ pub(crate) async fn task_dispatch(
                 .await?;
             render::task(&dto);
         }
-        TaskCmd::Show { id } => {
+        TaskCmd::Show { id, refresh } => {
+            // `--refresh` (RFC 0004 D4): an explicit network opt-in. Observe the
+            // remote and stamp `synced_at` BEFORE rendering, so the offline read
+            // below sees an up-to-date "last refreshed". Best-effort — a fetch
+            // failure becomes a non-fatal `last_refresh_failed` annotation, not
+            // an error. Requires a GitHub token (the network opt-in), like
+            // `task claim`; a missing token is a config error and propagates.
+            let refresh_failed = if refresh {
+                let resolved = svc.tasks.resolve_id(&id).await?;
+                let sync = build_sync_service(cfg, svc, "task show --refresh")?;
+                match sync.refresh(&resolved).await? {
+                    RefreshOutcome::Failed { at, error } => Some(serde_json::json!({
+                        "at": at.into_inner(),
+                        "error": error,
+                    })),
+                    RefreshOutcome::Stamped | RefreshOutcome::NotMirrored => None,
+                }
+            } else {
+                None
+            };
             // Show-specific display path (RFC 0002 D5 / #122): read the
             // domain Task directly for the internal `filing_repo_id` axis,
             // then overlay an additive `filing_repo` block on top of the
@@ -284,7 +303,7 @@ pub(crate) async fn task_dispatch(
             } else {
                 serde_json::Value::Null
             };
-            render::task_show(&base, filing_repo_block);
+            render::task_show(&base, filing_repo_block, refresh_failed);
         }
         TaskCmd::Edit {
             id,
