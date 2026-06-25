@@ -251,21 +251,36 @@ pub(crate) async fn task_dispatch(
             render::task(&dto);
         }
         TaskCmd::Show { id, refresh } => {
+            // Resolve the domain task once: it gates `--refresh` (issue-backed?)
+            // and supplies the internal `filing_repo_id` axis for the block
+            // below.
+            let domain_task = svc.tasks.resolve_task(&id).await?;
             // `--refresh` (RFC 0004 D4): an explicit network opt-in. Observe the
             // remote and stamp `synced_at` BEFORE rendering, so the offline read
-            // below sees an up-to-date "last refreshed". Best-effort — a fetch
-            // failure becomes a non-fatal `last_refresh_failed` annotation, not
-            // an error. Requires a GitHub token (the network opt-in), like
-            // `task claim`; a missing token is a config error and propagates.
-            let refresh_failed = if refresh {
-                let resolved = svc.tasks.resolve_id(&id).await?;
+            // below sees an up-to-date "last refreshed".
+            //
+            // Only issue-backed tasks have a REST issue to observe, so a
+            // purely-local or draft-backed task short-circuits BEFORE the GitHub
+            // token is required — `--refresh` on such a task still renders.
+            // Otherwise it's best-effort: an `IssueMoved` is surfaced with the
+            // relink hint (like `sync pull`), while any other fetch failure
+            // degrades to a non-fatal `last_refresh_failed` annotation so the
+            // cached value (incl. a dangling filing binding) is still shown.
+            let refresh_failed = if refresh && domain_task.remote.is_some() {
                 let sync = build_sync_service(cfg, svc, "task show --refresh")?;
-                match sync.refresh(&resolved).await? {
-                    RefreshOutcome::Failed { at, error } => Some(serde_json::json!({
-                        "at": at.into_inner(),
-                        "error": error,
+                match sync.refresh(&domain_task.id.to_string()).await {
+                    Ok(RefreshOutcome::Stamped | RefreshOutcome::NotIssueBacked) => None,
+                    // A transferred issue is actionable (the local link is
+                    // wrong) — surface it with the relink hint, like `sync pull`.
+                    Err(e @ application_sync::SyncError::Port(PortError::IssueMoved { .. })) => {
+                        return Err(crate::commands::sync::enrich_issue_moved(&id, e));
+                    }
+                    // Any other fetch failure is non-fatal: render the cached
+                    // value with the annotation rather than hiding the task.
+                    Err(e) => Some(serde_json::json!({
+                        "at": domain_core::Timestamp::now().into_inner(),
+                        "error": e.to_string(),
                     })),
-                    RefreshOutcome::Stamped | RefreshOutcome::NotMirrored => None,
                 }
             } else {
                 None
@@ -276,7 +291,6 @@ pub(crate) async fn task_dispatch(
             // base TaskDto — without extending TaskDto itself. The base
             // shape (and all list/query shapes) remain byte-identical.
             let base = svc.tasks.show(&id).await?;
-            let domain_task = svc.tasks.resolve_task(&id).await?;
             let filing_repo_block = if let Some(filing_id) = domain_task.filing_repo_id {
                 match svc.bindings.show(&filing_id.to_string()).await {
                     Ok(binding) => serde_json::json!({
