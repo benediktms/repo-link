@@ -285,17 +285,18 @@ impl SyncService {
                 // source (it requires Staged | DirtyLocal | DirtyRemote).
                 task.mark_dirty_remote()?;
                 // Direct field assignment (bypassing setter helpers that would
-                // re-trigger dirty detection against the OLD baseline). Status is
-                // intentionally NOT overwritten — GitHub's open/closed doesn't
-                // map onto our 5-state lifecycle cleanly. Routed through
-                // `copy_inbound_mirror_from_snap` so the 3-field copy
-                // shape is a single function signature, not a literal
-                // hand-rolled at two call sites.
+                // re-trigger dirty detection against the OLD baseline). The
+                // inbound set now includes the open/closed bit (RFC 0004 D1):
+                // `copy_inbound_mirror_from_snap` reconciles the lifecycle from
+                // `snap.closed` via `remote_state_to_lifecycle`. Routed through
+                // the shared helper so the inbound copy shape is one function
+                // signature, not a literal hand-rolled at two call sites.
                 crate::copy_inbound_mirror_from_snap(
                     &mut task,
                     &snap.title,
                     &snap.body,
                     &snap.assignees,
+                    snap.closed,
                 );
                 task.confirm_synced(SnapshotSource::Pull)?;
                 self.tasks.save(&task, SnapshotSource::Pull).await?;
@@ -456,6 +457,7 @@ impl SyncService {
                 &snap.title,
                 &snap.body,
                 &snap.assignees,
+                snap.closed,
             );
             // The fetched snapshot is the authoritative target, so carry its
             // node id onto the relinked ref — a relinked task should be just as
@@ -815,7 +817,13 @@ mod tests {
             .clone()
             .unwrap_or_else(|| panic!("post-{context} baseline"));
         assert!(
-            crate::inbound_mirrors_baseline(&after.title, &after.body, &after.assignees, &baseline,),
+            crate::inbound_mirrors_baseline(
+                &after.title,
+                &after.body,
+                &after.assignees,
+                !after.lifecycle.is_open(),
+                &baseline,
+            ),
             "post-{context} task and baseline must agree on the inbound set ({context} resolved the drift)"
         );
     }
@@ -1789,41 +1797,32 @@ mod tests {
         assert_eq!(after.sync, SyncState::Synced);
     }
 
-    /// Pins down the D7 inbound-mirror-set contract on the pull copy-back
-    /// site. The pull decision copies exactly three fields onto the local
-    /// task: `title`, `body`, `assignees`. This test asserts the
-    /// `inbound_mirrors_baseline` helper sees the same three fields on the
-    /// same task — so a future PR that adds a new field to the helper's
-    /// signature but forgets to update the copy-back literal fails here
-    /// (the helper's 4-field compare would not match the literal's 3-field
-    /// shape, and the test asserts "the helper disagrees, the literal
-    /// disagrees, both on the same fields").
+    /// Pins down the inbound-mirror-set contract on the pull copy-back site.
+    /// The pull decision copies four fields onto the local task: `title`,
+    /// `body`, `assignees`, and the open/closed lifecycle bit (RFC 0004 D1).
+    /// This test asserts the `inbound_mirrors_baseline` helper sees
+    /// the same set on the same task — so a future PR that changes the helper's
+    /// signature but forgets to update the copy-back literal fails here.
     ///
     /// Concretely: build a remote snapshot whose `closed` differs from the
-    /// baseline's open lifecycle (a "drift" the inbound path MUST ignore
-    /// per D7). The helper returns `false` (drift detected, because
-    /// title differs). The copy-back literal at the pull site then runs
-    /// and overwrites the local task's title. The post-pull local task
-    /// should reflect the new title (the literal ran) AND the helper
-    /// should have disagreed (the drift-detection was live). Both halves
-    /// of the contract are exercised in one test.
+    /// baseline's open lifecycle. The helper returns `false` (drift). The
+    /// copy-back then runs and overwrites title/body/assignees AND adopts the
+    /// remote's closed bit (Open → Completed). Both halves of the contract are
+    /// exercised in one test.
     #[tokio::test]
     async fn pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline() {
         let (svc, tasks, task, provider) = setup().await;
         svc.promote(&task.id.to_string()).await.unwrap();
 
-        // A different title — the helper WILL detect drift on this. The
-        // closed bit is also flipped to closed=true to exercise the D7
-        // property end-to-end: the helper must NOT consult `closed`, so
-        // the only reason the helper returns false is the title change.
+        // A different title — the helper WILL detect drift. The closed bit is
+        // also flipped to closed=true; the inbound path now adopts it.
         let later = Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60));
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
             node_id: None,
             title: "different title".into(),
             body: "remote body".into(),
-            // closed differs from the local Open lifecycle — helper must
-            // ignore it (D7).
+            // closed differs from the local Open lifecycle — pull adopts it.
             closed: true,
             updated_at: later,
             assignees: vec!["bob".into()],
@@ -1833,12 +1832,13 @@ mod tests {
         let s = svc.pull(&task.id.to_string()).await.unwrap();
         assert_eq!(s.decision, "pull_remote");
         let after = tasks.get(task.id).await.unwrap();
-        // Copy-back ran: title/body/assignees reflect the remote. Status
-        // is NOT copied (D7) — after.status is whatever the local
-        // lifecycle was before pull, not the remote's closed bit.
+        // Copy-back ran: title/body/assignees reflect the remote, and the
+        // lifecycle adopted the remote close (Open → Completed).
         assert_eq!(after.title, "different title");
         assert_eq!(after.body, "remote body");
         assert_eq!(after.assignees, vec!["bob".to_string()]);
+        assert_eq!(after.lifecycle, domain_task::Lifecycle::Completed);
+        assert!(!after.is_open());
         // Cross-check: the helper's view of the baseline agrees that
         // these three fields are the inbound set. Post-pull the
         // baseline was just re-captured from the live task, so the
@@ -1846,6 +1846,95 @@ mod tests {
         // makes `remote_mirrors_baseline` a no-op on the next pull
         // (a re-pull of the same remote must produce a `Noop`).
         assert_inbound_set_matches_baseline(&after, "pull");
+        assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    /// The core bug: an issue closed on GitHub with NO other change
+    /// (title/body/assignees identical) must reconcile the local lifecycle to
+    /// closed. Previously this returned `noop` and the task stayed open
+    /// indefinitely. Re-pulling the same closed snapshot is then a clean `noop`.
+    #[tokio::test]
+    async fn pull_adopts_remote_close_and_is_idempotent() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let before = tasks.get(task.id).await.unwrap();
+        assert!(before.is_open());
+
+        // Only the open/closed bit differs from the local baseline.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: true,
+            updated_at: Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60)),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "pull_remote");
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.lifecycle, domain_task::Lifecycle::Completed);
+        assert!(!after.is_open());
+        assert_eq!(after.sync, SyncState::Synced);
+
+        // Re-pull the same closed state — nothing left to reconcile.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: true,
+            updated_at: Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(120)),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+        let s2 = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s2.decision, "noop");
+    }
+
+    /// A locally-closed task whose issue was reopened on GitHub reconciles back
+    /// to open with the reopened marker (Completed -> Reopened).
+    #[tokio::test]
+    async fn pull_reopens_a_locally_closed_task() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let before = tasks.get(task.id).await.unwrap();
+
+        // First close it via a pull (sets Completed + a fresh Synced baseline).
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: true,
+            updated_at: Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(60)),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+        svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().lifecycle,
+            domain_task::Lifecycle::Completed
+        );
+
+        // Now the issue is reopened on GitHub.
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now() + chrono::Duration::seconds(120)),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "pull_remote");
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.lifecycle, domain_task::Lifecycle::Reopened);
+        assert!(after.is_open());
         assert_eq!(after.sync, SyncState::Synced);
     }
 
@@ -2435,8 +2524,8 @@ mod tests {
         attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
 
         provider.set_move_target("github.com/o2/r2", "1506");
-        // Closed differs from the local Open lifecycle — the helper must
-        // ignore it (D7) and the literal copy-back must not touch status.
+        // Closed differs from the local Open lifecycle — relink adopts the new
+        // remote's open/closed bit along with the rest of the inbound set.
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "1506".into(),
             node_id: Some("I_kwDOrelink1506".into()),
@@ -2460,10 +2549,11 @@ mod tests {
             after.assignees,
             vec!["alice".to_string(), "carol".to_string()]
         );
-        // Cross-check: helper sees the same three fields the literal just
-        // copied. Post-relink, the baseline was re-captured from the new
-        // remote, so the helper MUST return true (live task matches the
-        // new baseline on the inbound set).
+        // Relink adopted the new remote's closed bit (Open → Completed).
+        assert_eq!(after.lifecycle, domain_task::Lifecycle::Completed);
+        // Cross-check: helper sees the same inbound set the copy just wrote.
+        // Post-relink the baseline was re-captured from the new remote, so the
+        // helper MUST return true (live task matches the new baseline).
         assert_inbound_set_matches_baseline(&after, "relink");
     }
 

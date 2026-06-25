@@ -428,10 +428,18 @@ explain the gap.
   the freshness source for tasks nobody is looking at; the
   read-through is the freshness source for tasks the user is
   actively looking at. Both are needed.
-- **Activate `ConflictKind::StatusMismatch`.** Rejected: the design
-  doesn't ship it for the same reason it didn't ship the first
-  time — there's no faithful inverse from GitHub's two-state
-  open/closed onto the local lifecycle. The variant is deleted.
+- **Reconcile the issue open/closed state on pull.** **Adopted** (amends RFC
+  0003 §2 D7 "Status stays outbound-only"). The original carve-out reasoned there
+  was "no faithful inverse from GitHub's two-state open/closed onto the local
+  lifecycle" — but that was a property of the old 5-state `TaskStatus`. D1
+  collapses the lifecycle so `is_open` is the 1:1 inverse of the REST `closed`
+  bit, so pull now folds the open/closed bit into the inbound mirror set and
+  adopts it (open→closed defaults to `Completed`; the `NotPlanned` distinction
+  needs the issue `state_reason`, which is not fetched inbound — a later
+  follow-up). A local lifecycle edit vs. a remote flip is handled by the
+  existing generic `decide()` conflict path (`RequireManualMerge`), so the
+  unused `ConflictKind::StatusMismatch` variant stays dormant — no per-kind
+  conflict plumbing is introduced.
 - **The poller does a single `updated:>` floor without a per-task
   decision.** This is the status quo. Rejected: a remote move on
   one task forces the poller to re-fetch every task in the same

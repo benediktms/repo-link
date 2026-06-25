@@ -75,63 +75,94 @@ pub(crate) fn lifecycle_to_remote_state(lifecycle: Lifecycle) -> (bool, Option<R
     }
 }
 
-/// True iff the inbound mirror set of `(title, body, assignees)` matches the
-/// `baseline`'s, using order-insensitive set equality for assignees
+/// Invert a remote issue's open/closed bit back onto a [`Lifecycle`] — the
+/// inbound mutual inverse of [`lifecycle_to_remote_state`] (RFC 0004 D1, which
+/// makes `is_open` the 1:1 counterpart of the REST `closed` bit).
+///
+/// `current` is the task's existing lifecycle; it is preserved when the bit
+/// hasn't flipped, so a pull that changes only title/body/assignees never
+/// disturbs the lifecycle, and a `NotPlanned` task observed still-closed stays
+/// `NotPlanned` (rather than being clobbered to `Completed`).
+///
+/// On an actual flip, the issue `state_reason` is **not** fetched inbound
+/// (`RemoteTaskSnapshot` carries only `closed`), so:
+/// - closed → open  ⇒ [`Lifecycle::Reopened`] (a closed→open transition is a
+///   reopen; this round-trips `state_reason=reopened` on the next push, where
+///   `Open` would silently drop the marker).
+/// - open → closed  ⇒ [`Lifecycle::Completed`] (the `NotPlanned` distinction is
+///   unrecoverable without `state_reason`; fetching it is a later follow-up).
+pub(crate) fn remote_state_to_lifecycle(remote_closed: bool, current: Lifecycle) -> Lifecycle {
+    match (remote_closed, current.is_open()) {
+        // No flip — the remote bit agrees with the local lifecycle. Preserve the
+        // exact variant (Completed vs NotPlanned, Open vs Reopened).
+        (true, false) | (false, true) => current,
+        // open → closed.
+        (true, true) => Lifecycle::Completed,
+        // closed → open.
+        (false, false) => Lifecycle::Reopened,
+    }
+}
+
+/// True iff the inbound mirror set of `(title, body, assignees, open/closed)`
+/// matches the `baseline`'s, using order-insensitive set equality for assignees
 /// ([`assignees_equal`]). Used by `summary::remote_mirrors_baseline` and
 /// (transitively) the pull/relink copy-back sites in `service::SyncService`.
 ///
-/// The 3-field shape is the inbound mirror set per RFC 0003 §2 D7 —
-/// **`Status` is deliberately absent** because pull can't map GitHub's
-/// two-state open/closed onto the local lifecycle, and pulling
-/// the REST closed bit back into the lifecycle is explicitly
-/// out-of-scope per §3 of that RFC. The shape is encoded in this
-/// helper's positional signature; the tripwires in `domain-task` and
-/// `application-sync` re-assert the 3-field literal in their own test
-/// mods so a divergence fails both build graphs.
+/// The open/closed bit is part of the inbound set: RFC 0004 D1 collapsed the
+/// lifecycle so `is_open` is the 1:1 inverse of the REST `closed` bit, so pull
+/// **can** faithfully reflect a remote open/close (reversing the earlier RFC
+/// 0003 §2 D7 / RFC 0004 §4 "Status stays outbound-only" carve-out). `remote_closed`
+/// is compared against `baseline.lifecycle.is_open()`; the lossy
+/// completed-vs-not_planned reason is handled at copy time by
+/// [`remote_state_to_lifecycle`], not here.
 ///
-/// Takes the three fields directly — not a `&RemoteTaskSnapshot` — so a
-/// snapshot-struct field addition in `ports` cannot silently change the
-/// projection. The `Status` exclusion (D7) is the explicit reason this
-/// helper exists in parallel with [`MirrorField::differs`]: detection on
-/// the issue-axis walks all four fields, but the inbound path excludes
-/// `Status` because we cannot faithfully invert the open/closed bit.
+/// Takes the fields directly — not a `&RemoteTaskSnapshot` — so a snapshot-struct
+/// field addition in `ports` cannot silently change the projection. Tripwires in
+/// `domain-task` and `application-sync` re-assert the inbound field set so a
+/// divergence fails both build graphs.
 pub(crate) fn inbound_mirrors_baseline(
     title: &str,
     body: &str,
     assignees: &[String],
+    remote_closed: bool,
     baseline: &TaskSnapshot,
 ) -> bool {
     title == baseline.title
         && body == baseline.body
         && assignees_equal(assignees, &baseline.assignees)
+        // remote open = !remote_closed; equal to the baseline's open bit iff the
+        // closed bit differs from the baseline's open bit.
+        && remote_closed != baseline.lifecycle.is_open()
 }
 
-/// Copy the inbound mirror set (title, body, assignees) from a remote
-/// snapshot onto a live `Task`. Single source of truth for the 3-field
-/// copy shape — both the pull path and the relink path call this so a
-/// future PR that adds a field to the inbound set gets a compile error
-/// in **one** function signature, not two hand-rolled copy literals
-/// that drift independently.
+/// Copy the inbound mirror set (title, body, assignees, open/closed) from a
+/// remote snapshot onto a live `Task`. Single source of truth for the copy
+/// shape — both the pull path and the relink path call this so a future PR that
+/// adds a field to the inbound set gets a compile error in **one** function
+/// signature, not two hand-rolled copy literals that drift independently.
 ///
-/// Direct field assignment (bypassing setters) is intentional: the
-/// pull and relink paths both have already committed to the decision
-/// that the remote content is authoritative for these fields (the
-/// pull path went through `remote_mirrors_baseline` + `decide()` to
-/// reach this point; the relink path overwrites unconditionally per
-/// its verified-redirect contract). Re-running the per-field dirty
-/// detection against the *old* baseline would be a self-defeating
-/// no-op. `Status` is deliberately NOT copied (D7: pull can't
-/// faithfully map GitHub's two-state open/closed onto the local
-/// lifecycle).
+/// Direct field assignment (bypassing setters) is intentional: the pull and
+/// relink paths both have already committed to the decision that the remote
+/// content is authoritative for these fields (the pull path went through
+/// `remote_mirrors_baseline` + `decide()` to reach this point; the relink path
+/// overwrites unconditionally per its verified-redirect contract). Re-running
+/// the per-field dirty detection against the *old* baseline would be a
+/// self-defeating no-op.
+///
+/// The lifecycle is reconciled via [`remote_state_to_lifecycle`] (RFC 0004 D1):
+/// it adopts the remote open/closed bit while preserving the local variant when
+/// the bit hasn't flipped, so a title-only pull never disturbs the lifecycle.
 pub(crate) fn copy_inbound_mirror_from_snap(
     task: &mut Task,
     remote_title: &str,
     remote_body: &str,
     remote_assignees: &[String],
+    remote_closed: bool,
 ) {
     task.title = remote_title.to_string();
     task.body = remote_body.to_string();
     task.assignees = remote_assignees.to_vec();
+    task.lifecycle = remote_state_to_lifecycle(remote_closed, task.lifecycle);
 }
 
 /// Project a [`MirrorPatch`] onto a [`RemoteTaskUpdate`]. Returns
@@ -338,26 +369,20 @@ mod inbound_mirror_tests {
     /// if either crate's enumeration of the inbound set changes without
     /// the other, both build graphs fail. The duplication is the assertion.
     #[test]
-    fn inbound_mirror_field_set_excludes_status() {
-        // Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7). The
-        // inbound path excludes `Status` per D7 — the canonical
-        // `MIRRORED_FIELDS` set is `{Title, Body, Status, Assignees}`,
-        // the inbound subset is `{Title, Body, Assignees}`. Two
-        // assertions pin both halves of the property so a future PR
-        // that adds a new `MirrorField` (canonical growth) or removes
-        // an inbound field (carve-out drift) fails the test.
-        //
-        // The `MIRRORED_FIELDS.len() == 4` half catches canonical-set
-        // expansion (e.g. adding `MirrorField::Labels` would push the
-        // canonical set to 5 and force a deliberate decision about
-        // whether the new field is inbound or not). The
-        // `MIRRORED_FIELDS.contains(&Status)` half pins the property
-        // "Status is canonical but excluded from inbound" — a
-        // hand-rolled `INBOUND` slice without `Status` is necessary
-        // but not sufficient; this assertion makes it explicit.
-        const INBOUND: [MirrorField; 3] = [
+    fn inbound_mirror_field_set_includes_status() {
+        // Tripwire: RFC 0004 D1 made `is_open` the 1:1 inverse of the
+        // REST `closed` bit, so the inbound mirror set now INCLUDES `Status`,
+        // reversing the RFC 0003 §2 D7 carve-out. The inbound subset equals the
+        // full canonical `MIRRORED_FIELDS` set. The mirror tripwire in
+        // `domain-task` (`inbound_mirror_set_includes_status_per_d1`) re-asserts
+        // the same literal so a divergence between the two crates fails both
+        // build graphs. The `len() == 4` half still catches canonical-set
+        // expansion (e.g. adding `MirrorField::Labels` would force a deliberate
+        // decision about whether the new field is inbound).
+        const INBOUND: [MirrorField; 4] = [
             MirrorField::Title,
             MirrorField::Body,
+            MirrorField::Status,
             MirrorField::Assignees,
         ];
         assert_eq!(
@@ -372,12 +397,8 @@ mod inbound_mirror_tests {
             );
         }
         assert!(
-            MIRRORED_FIELDS.contains(&MirrorField::Status),
-            "Status is canonical but excluded from inbound — D7 carve-out, not a missing field"
-        );
-        assert!(
-            !INBOUND.contains(&MirrorField::Status),
-            "Status must remain outbound-only (D7)"
+            INBOUND.contains(&MirrorField::Status),
+            "Status is part of the inbound set (RFC 0004 D1) — pull reflects the remote open/closed bit"
         );
     }
 
@@ -393,26 +414,32 @@ mod inbound_mirror_tests {
                 .unwrap();
         baseline_task.body = "b".into();
         baseline_task.assignees = vec!["alice".into(), "bob".into()];
+        // A fresh draft is `Open`, so the baseline is open; remote_closed=false
+        // (remote open) matches it, remote_closed=true (remote closed) diverges.
         let snap = baseline_task.snapshot_view(domain_task::SnapshotSource::Pull);
+        let assignees = || vec!["alice".to_string(), "bob".to_string()];
 
         assert!(inbound_mirrors_baseline(
             "t",
             "b",
-            &["alice".into(), "bob".into()],
+            &assignees(),
+            false,
             &snap
         ));
         // Title differs
         assert!(!inbound_mirrors_baseline(
             "T",
             "b",
-            &["alice".into(), "bob".into()],
+            &assignees(),
+            false,
             &snap
         ));
         // Body differs
         assert!(!inbound_mirrors_baseline(
             "t",
             "B",
-            &["alice".into(), "bob".into()],
+            &assignees(),
+            false,
             &snap
         ));
         // Assignees differ (different set)
@@ -420,6 +447,7 @@ mod inbound_mirror_tests {
             "t",
             "b",
             &["alice".into()],
+            false,
             &snap
         ));
         // Assignees reorder: still equal (order-insensitive set eq)
@@ -427,12 +455,16 @@ mod inbound_mirror_tests {
             "t",
             "b",
             &["bob".into(), "alice".into()],
+            false,
             &snap
         ));
-        // D7 carve-out is structurally guaranteed by the helper's
-        // signature (no `status` parameter); the tripwire test
-        // `inbound_mirror_field_set_excludes_status` pins it. Mutating
-        // `baseline.status` and re-asserting here was vacuous — the
-        // helper has no way to consult a field it doesn't take.
+        // Open/closed bit differs: baseline is open, remote reports closed.
+        assert!(!inbound_mirrors_baseline(
+            "t",
+            "b",
+            &assignees(),
+            true,
+            &snap
+        ));
     }
 }

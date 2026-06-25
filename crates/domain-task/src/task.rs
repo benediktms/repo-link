@@ -990,30 +990,24 @@ mod tests {
     }
 
     #[test]
-    fn inbound_mirror_set_excludes_status_per_d7() {
-        // Tripwire for the D7 inbound carve-out (RFC 0003 §2 D7, rpl-47f):
-        // the inbound (pull) path excludes `Status` because pull cannot
-        // map GitHub's two-state open/closed onto the local 5-state
-        // lifecycle. The 3-field shape is re-encoded inline below on
-        // purpose: the `application-sync` side re-encodes the same
-        // literal in its own tripwire test, and the duplication IS the
-        // assertion — a divergence in either crate fails both build
-        // graphs. If a future PR adds a new `MirrorField` to the
-        // canonical set and wants it on the inbound path, this test is
-        // the place that decision gets encoded: extend the `INBOUND`
-        // slice here AND extend the matching literal in
-        // `application-sync`'s `inbound_mirror_field_set_excludes_status`.
+    fn inbound_mirror_set_includes_status_per_d1() {
+        // Tripwire: the inbound (pull) path now INCLUDES `Status`.
+        // RFC 0004 D1 collapsed the lifecycle so `is_open` is the 1:1 inverse
+        // of the REST `closed` bit, so pull can faithfully reflect a remote
+        // open/close — reversing the earlier RFC 0003 §2 D7 carve-out. The
+        // inbound set equals the full canonical `MIRRORED_FIELDS`. The literal
+        // is re-encoded inline on purpose: `application-sync` re-encodes the
+        // same set in its own tripwire (`inbound_mirror_field_set_includes_status`),
+        // and the duplication IS the assertion — a divergence in either crate
+        // fails both build graphs.
         //
-        // `MIRRORED_FIELDS.len() == 4` pins canonical-set growth: a
-        // 5th `MirrorField` (e.g. `Labels` from RFC 0003 D8) would
-        // force a deliberate decision about whether the new field is
-        // inbound. The `MIRRORED_FIELDS.contains(&Status)` half pins
-        // "Status is canonical but excluded from inbound" — a
-        // hand-rolled INBOUND without Status is necessary but not
-        // sufficient; the assertion makes the carve-out explicit.
-        const INBOUND: [MirrorField; 3] = [
+        // `MIRRORED_FIELDS.len() == 4` still pins canonical-set growth: a 5th
+        // `MirrorField` (e.g. `Labels` from RFC 0003 D8) would force a deliberate
+        // decision about whether the new field is inbound.
+        const INBOUND: [MirrorField; 4] = [
             MirrorField::Title,
             MirrorField::Body,
+            MirrorField::Status,
             MirrorField::Assignees,
         ];
         assert_eq!(
@@ -1028,12 +1022,8 @@ mod tests {
             );
         }
         assert!(
-            MIRRORED_FIELDS.contains(&MirrorField::Status),
-            "Status is canonical but excluded from inbound — D7 carve-out, not a missing field"
-        );
-        assert!(
-            !INBOUND.contains(&MirrorField::Status),
-            "Status must remain outbound-only (D7) — pulling the REST closed bit into the local 5-state lifecycle is out of scope"
+            INBOUND.contains(&MirrorField::Status),
+            "Status is part of the inbound set (RFC 0004 D1) — pull reflects the remote open/closed bit"
         );
     }
 
