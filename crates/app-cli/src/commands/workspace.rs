@@ -1,7 +1,7 @@
 //! `rl workspace` dispatch.
 
 use anyhow::{Result, anyhow};
-use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery};
+use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery, UpdateWorkspaceCmd};
 
 use crate::cli::WorkspaceCmd;
 use crate::commands::repo::resolve_repo_handle_required;
@@ -86,6 +86,26 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
             render::workspaces(&rows);
         }
         WorkspaceCmd::Show { id } => render::workspace(&svc.workspaces.show(&id).await?),
+        WorkspaceCmd::Edit {
+            id,
+            name,
+            description,
+        } => {
+            if name.is_none() && description.is_none() {
+                return Err(anyhow!(
+                    "rl workspace edit requires at least one of --name, --description"
+                ));
+            }
+            let dto = svc
+                .workspaces
+                .edit(UpdateWorkspaceCmd {
+                    workspace_id: id,
+                    name,
+                    description,
+                })
+                .await?;
+            render::workspace(&dto);
+        }
         WorkspaceCmd::Activate { id } => render::workspace(&svc.workspaces.activate(&id).await?),
         WorkspaceCmd::Pause { id } => render::workspace(&svc.workspaces.pause(&id).await?),
         WorkspaceCmd::Archive { id } => render::workspace(&svc.workspaces.archive(&id).await?),

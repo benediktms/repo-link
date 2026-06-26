@@ -114,6 +114,18 @@ impl Workspace {
         self.touch();
     }
 
+    /// Update mutable display metadata. Name validation happens before this
+    /// via [`WorkspaceName`]; callers decide whether description was supplied.
+    pub fn edit(&mut self, name: Option<WorkspaceName>, description: Option<String>) {
+        if let Some(name) = name {
+            self.name = name;
+        }
+        if let Some(description) = description {
+            self.description = Some(description);
+        }
+        self.touch();
+    }
+
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }

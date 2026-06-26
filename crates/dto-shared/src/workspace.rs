@@ -38,6 +38,13 @@ pub struct CreateWorkspaceCmd {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateWorkspaceCmd {
+    pub workspace_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListWorkspacesQuery {
     pub include_archived: bool,
 }

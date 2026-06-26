@@ -34,6 +34,111 @@ fn workspace_create_show_list_roundtrip() {
     assert_eq!(shown["id"], id);
 }
 
+#[test]
+fn workspace_edit_updates_mutable_fields_by_name() {
+    let dir = TempDir::new().unwrap();
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "scratch", "--local-only"],
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let edited = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "edit",
+            "scratch",
+            "--name",
+            "renamed",
+            "--description",
+            "new description",
+        ],
+    );
+
+    assert_eq!(edited["id"], id);
+    assert_eq!(edited["name"], "renamed");
+    assert_eq!(edited["description"], "new description");
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["workspace", "show", &id]);
+    assert_eq!(shown["name"], "renamed");
+    assert_eq!(shown["description"], "new description");
+}
+
+#[test]
+fn workspace_edit_falls_back_for_uuid_shaped_name() {
+    let dir = TempDir::new().unwrap();
+    let name = "00000000-0000-0000-0000-000000000000";
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", name, "--local-only"],
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+
+    let edited = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "edit",
+            name,
+            "--description",
+            "uuid-looking name still resolves",
+        ],
+    );
+
+    assert_eq!(edited["id"], id);
+    assert_eq!(edited["name"], name);
+    assert_eq!(edited["description"], "uuid-looking name still resolves");
+}
+
+#[test]
+fn workspace_edit_rejects_empty_flag_set() {
+    let dir = TempDir::new().unwrap();
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "scratch", "--local-only"],
+    );
+    let id = created["id"].as_str().expect("id");
+
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "edit", id])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("requires at least one"),
+        "expected 'requires at least one' in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn workspace_edit_rejects_duplicate_name() {
+    let dir = TempDir::new().unwrap();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    );
+    let b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    );
+    let b_id = b["id"].as_str().expect("id");
+
+    let output = bin("repo-link", &dir)
+        .args(["workspace", "edit", b_id, "--name", "a"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("workspace name already in use: a"),
+        "expected friendly duplicate-name error, got: {stderr}"
+    );
+}
+
 /// RFC 0002 §4 (#121): a workspace filing default must be one of THAT
 /// workspace's own bindings. The repo-handle resolver searches all workspaces,
 /// so `set-filing-repo` rejects a binding owned by a different workspace; a
