@@ -100,8 +100,17 @@ impl WorkspaceService {
             None => None,
         };
 
+        let duplicate_name = name.as_ref().map(|n| n.as_str().to_string());
         w.edit(name, cmd.description);
-        self.repo.save(&w).await?;
+        match self.repo.save(&w).await {
+            Ok(()) => {}
+            Err(e) if e.conflict_target() == Some("workspaces.name") => {
+                return Err(ServiceError::DuplicateName(
+                    duplicate_name.unwrap_or_else(|| w.name.as_str().to_string()),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(workspace_to_dto(&w))
     }
 

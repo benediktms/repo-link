@@ -42,6 +42,8 @@ fn workspace_edit_updates_mutable_fields_by_name() {
         &["workspace", "create", "scratch", "--local-only"],
     );
     let id = created["id"].as_str().expect("id").to_string();
+    let created_at = created["created_at"].clone();
+    let updated_at = created["updated_at"].clone();
 
     let edited = run_json(
         &mut bin("repo-link", &dir),
@@ -59,10 +61,14 @@ fn workspace_edit_updates_mutable_fields_by_name() {
     assert_eq!(edited["id"], id);
     assert_eq!(edited["name"], "renamed");
     assert_eq!(edited["description"], "new description");
+    assert_eq!(edited["created_at"], created_at);
+    assert_ne!(edited["updated_at"], updated_at);
 
     let shown = run_json(&mut bin("repo-link", &dir), &["workspace", "show", &id]);
     assert_eq!(shown["name"], "renamed");
     assert_eq!(shown["description"], "new description");
+    assert_eq!(shown["created_at"], created_at);
+    assert_eq!(shown["updated_at"], edited["updated_at"]);
 }
 
 #[test]
@@ -74,6 +80,8 @@ fn workspace_edit_falls_back_for_uuid_shaped_name() {
         &["workspace", "create", name, "--local-only"],
     );
     let id = created["id"].as_str().expect("id").to_string();
+    let created_at = created["created_at"].clone();
+    let updated_at = created["updated_at"].clone();
 
     let edited = run_json(
         &mut bin("repo-link", &dir),
@@ -89,6 +97,11 @@ fn workspace_edit_falls_back_for_uuid_shaped_name() {
     assert_eq!(edited["id"], id);
     assert_eq!(edited["name"], name);
     assert_eq!(edited["description"], "uuid-looking name still resolves");
+    assert_eq!(edited["created_at"], created_at);
+    assert_ne!(edited["updated_at"], updated_at);
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["workspace", "show", &id]);
+    assert_eq!(shown["updated_at"], edited["updated_at"]);
 }
 
 #[test]
@@ -137,6 +150,9 @@ fn workspace_edit_rejects_duplicate_name() {
         stderr.contains("workspace name already in use: a"),
         "expected friendly duplicate-name error, got: {stderr}"
     );
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["workspace", "show", b_id]);
+    assert_eq!(shown["name"], "b");
 }
 
 /// RFC 0002 §4 (#121): a workspace filing default must be one of THAT
