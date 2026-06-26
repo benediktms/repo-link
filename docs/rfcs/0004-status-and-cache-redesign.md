@@ -160,6 +160,21 @@ function; the service that composes it does the relations query.
 
 ### D3 — Write-through `synced_at`; per-workspace active gate; poller is the only SQL filter
 
+> **Implementation note (Phase 4):** the in-memory monotonic
+> `Task.synced_instant` companion, the `needs_refetch(synced_instant, now, budget)`
+> threshold, and the `mark_synced` "single funnel" described below were **dropped**.
+> `synced_instant` was never read by any consumer: the poller selects stale tasks
+> via the persisted wall-clock `synced_at` SQL filter (`TaskFilter { synced_at_lt,
+> has_project_item_id, active_workspaces_only, limit }`), and `task show --refresh`
+> always fetches (no read-through budget). With nothing reading it, the funnel's
+> only job (keeping `synced_at` + `synced_instant` atomic) protected nothing, so
+> `cache_synced_at(.., source)` is the single stamp primitive, called directly with
+> a per-call-site `SyncedSource` (`Polled` / `Refresh` / future `Pull`/`Push`) that
+> a recording-repo test asserts. `synced_at` is the one freshness signal — display
+> and the poller's SQL filter both read it. The clock-skew mitigation is the
+> poller's existing watermark `−1s` margin plus the `NULLS FIRST` ordering, not a
+> monotonic clock.
+
 The `tasks` table gains a `synced_at: Option<Timestamp>` column. The
 column is genuinely fresh — no prior column carried this signal. The
 existing `project_status_option_id` cache is a value-only column
@@ -195,36 +210,34 @@ through the existing `confirm_synced_fields` mechanism (RFC 0003 §2
 D5) — never from the PATCH response (which reflects `assignees=[]`
 when the PATCH didn't set them, per D5).
 
-**Poller is the only SQL filter on `synced_at`.** The poller uses
-it to decide per-task whether to fetch. Other readers (the DTO
-freshness annotation, the `--refresh` flag's threshold check, the
-failed-refresh annotation) read the column as a per-row projection
-on an already-loaded task — no JOIN, no extra query. The unified abstraction is `needs_refetch(synced_instant, now_instant, budget) -> bool`.
-The **threshold delta** uses `std::time::Instant` (monotonic,
-clock-skew-safe) carried in-memory as `Task.synced_instant:
-Option<Instant>`. The **display string** uses the wall-clock
-`Timestamp` carried on the `tasks` row as `synced_at: Option<Timestamp>`
-(written *atomically* with the `Instant`: same `cache_synced_at`
-repository call writes both). The named budgets (poller: 5min;
-`--refresh`: 60s) live as `pub const` next to the function. The
-`needs_refetch` helper takes `Instant` and `Duration`, never
-`Timestamp` and `now()`. On process restart, `synced_instant` is
-`None` (treated as stale) — the poller's first tick refreshes
-everything, which is the same shape as the post-migration burst.
+**Poller is the only SQL filter on `synced_at`.** The poller uses it
+to select stale tasks (the query below). Other readers — the DTO
+freshness annotation and the failed-refresh annotation — read the
+column as a per-row projection on an already-loaded task (no JOIN, no
+extra query). `synced_at` (wall-clock `Timestamp`, persisted) is the
+single freshness signal for both selection and display; it is stamped
+by the targeted `cache_synced_at(task_id, ts, source)` repository call
+(see the Phase-4 note above — the earlier monotonic `synced_instant` /
+`needs_refetch` / `mark_synced` design was dropped as unused). On
+process restart nothing is lost: `synced_at` is persisted, so the poller
+resumes from each task's last stamp rather than re-fetching everything.
 
 ```sql
 SELECT tasks.* FROM tasks
 JOIN workspaces ON workspaces.id = tasks.workspace_id
 WHERE workspaces.status = 'active'
+  AND workspaces.project_id IS NOT NULL
   AND tasks.project_item_id IS NOT NULL
   AND (tasks.synced_at IS NULL OR tasks.synced_at < ?)
 ORDER BY tasks.synced_at ASC NULLS FIRST
 LIMIT 200
 ```
 
-The `?` is the poller's tick boundary — `now() - poll_budget`. Tasks
-recently stamped (by any of the three writers above) are skipped on
-the next tick.
+The `?` is the poller's freshness threshold. The implementation binds
+`now()` (every task not stamped on this exact tick is a candidate); the
+daemon's poll interval is the effective freshness budget, and the `LIMIT`
+plus oldest-first ordering rotate the work when a workspace has more than
+`LIMIT` project-backed tasks.
 
 The query is implemented as a **`TaskFilter` extension**, not as a
 new in-memory helper. The poller already has an explicit
@@ -236,16 +249,15 @@ closes the poller's existing TODO, and reuses the new SQL filter
 for both the poller and any future per-task query that needs the
 same shape.
 
-**Per-workspace gate.** The poller skips tasks whose workspace is
-not `WorkspaceStatus::Active`. A workspace in `Created` (initial
-state, never reached in practice for project-attached workspaces),
-`Paused` (user paused), or `Archived` (terminal) is not polled.
-`WorkspaceStatus` is a 4-variant state machine today
-(`Created | Active | Paused | Archived`); the poller gate is
-`status = 'active'` only. A future `Deleted` variant (e.g. for
-detached workspaces) must extend the gate explicitly — the tripwire
-test asserts the JOIN clause filters on the active status, so a
-silent regression where `Deleted` is omitted will fail the test.
+**Per-workspace gate.** A workspace is *pollable* iff it is
+`WorkspaceStatus::Active` **and** project-attached (`project_id IS NOT
+NULL`). A `Created` / `Paused` / `Archived` / `Deleted` workspace is not
+polled (the gate is `status = 'active'` only, so any non-active variant
+stays excluded); a projectless workspace is also skipped — a task there
+with a stale `project_item_id` can never be reconciled or stamped, so
+including it would park it at the front of the stale-scan forever. The
+tripwire test asserts both halves of the JOIN clause, so a silent
+regression dropping either fails the test.
 
 **Thresholds and rate-limit math.** Two budgets, named:
 
@@ -366,18 +378,19 @@ behaviour — the alternative (fire-and-forget without stamp) would
 mean every draft update leaves the cache stale, and the poller
 re-fetches on every tick.
 
-**`mark_synced` is the single write path.** All 10 arms funnel
+**`cache_synced_at` is the single stamp path.** Every stamp goes
 through `TaskRepository::cache_synced_at(task_id, ts, source: SyncedSource)`
-— a new repository method next to the existing
-`cache_project_status` and `cache_remote_node_id`, both of which
-established the "single-column UPDATE, no whole-row save" pattern.
-The `SyncedSource` enum is `Pull | Push | Polled`; a debug-mode
-assertion pins the source to the call site (drainer arms can only
-stamp `Push`, poller can only stamp `Polled`, pull path can only
-stamp `Pull`). The shape of `cache_synced_at` is `UPDATE tasks SET
-synced_at = ? WHERE id = ?` — same rationale as
-`cache_project_status` (no whole-row clobber, no version bump, no
-snapshot append, no concurrent-CLI-edit race).
+— a repository method next to the existing `cache_project_status` and
+`cache_remote_node_id`, both of which established the "single-column
+UPDATE, no whole-row save" pattern. The `SyncedSource` enum is
+`Pull | Push | Polled | Refresh`; each call site passes its own variant
+(poller → `Polled`, `task show --refresh` → `Refresh`, future
+drainer/pull → `Push`/`Pull`), and a recording-repo test asserts the
+source per site (the earlier `mark_synced` funnel was dropped — see the
+§D3 Phase-4 note). The shape of `cache_synced_at` is `UPDATE tasks SET
+synced_at = ? WHERE id = ?` — same rationale as `cache_project_status`
+(no whole-row clobber, no version bump, no snapshot append, no
+concurrent-CLI-edit race).
 
 **`Conflict` transitions need a `ConflictKind`.** A `SetProjectStatus`
 whose response returns the wrong `option_id` is a real
@@ -513,24 +526,17 @@ explain the gap.
 - **The DTO freshness annotation wording.** "Last refreshed: 30s
   ago" is clear, but the wording for "refresh failed" or "never
   refreshed" is TBD. Small UX risk; the design is honest either way.
-- **Clock skew.** `Timestamp` is `DateTime<Utc>` from `chrono`
-  (wall-clock, not monotonic). A backwards jump (NTP correction,
-  manual `date -s`, VM clock drift) would make `synced_at` appear
-  *in the future* relative to `now()`, so the threshold check
-  `synced_at + budget < now()` always returns true and the
-  poller re-fetches every task on every tick. A forward jump
-  (e.g. NTP slew) makes the threshold fire too late, leaving
-  stale data longer than expected. Mitigation: the freshness
-  comparison uses `std::time::Instant` (monotonic) for the
-  *delta*, stored alongside `Timestamp` (wall-clock) for the
-  *display*. The schema column is `synced_at: Timestamp`; the
-  in-memory `Task` carries a `synced_instant: Option<Instant>`
-  for threshold checks. On process restart, `synced_instant` is
-  `None` (treated as stale) — the poller's first tick refreshes
-  everything, which is the same shape as the post-migration
-  burst. Alternative mitigation (out of scope): clamp negative
-  deltas to "stale" (force refresh) and treat a forward jump
-  exceeding the threshold as "stale" too.
+- **Clock skew.** `synced_at` is `DateTime<Utc>` (wall-clock). A
+  backwards jump (NTP correction, manual `date -s`, VM drift) makes
+  `synced_at` look *in the future* relative to `now()`, so the poller's
+  `synced_at < now()` filter still selects it (the task is re-polled —
+  idempotent, the safe direction). A forward jump leaves a task selected
+  one extra tick at worst. The monotonic-`Instant` mitigation originally
+  proposed here was dropped along with `synced_instant` (see the §D3
+  Phase-4 note): with the budget effectively the daemon's poll interval
+  and the filter being `synced_at < now()`, a skew only changes *when* a
+  task is re-polled by at most a tick, never correctness — re-polling is
+  idempotent, so erring toward "stale" is harmless.
 
 ## 6. Testing strategy
 
@@ -539,13 +545,11 @@ explain the gap.
 - **`TaskStatus` enum deletion:** a test in `domain-task` that
   greps the workspace for `TaskStatus::` and asserts zero matches.
   Catches any reintroduction.
-- **`synced_at` stamp discipline:** a test in `application-sync`
-  that any code path stamping `synced_at` must be in a small set
-  (the three writers). Achieved by a `mark_synced(&mut task,
-  source: SyncedSource)` helper that takes a `SyncedSource` enum
-  variant (`Pull | Push | Polled`) and asserts the source at
-  runtime if a `cfg!(debug_assertions)` flag is on. The helper is
-  the only way to write the column.
+- **`synced_at` stamp source discipline:** the in-memory test
+  `TaskRepository` records the `SyncedSource` passed to every
+  `cache_synced_at` call; a per-site test asserts the source
+  (poller → `Polled`, `task show --refresh` → `Refresh`). Guards
+  against a call site stamping the wrong source.
 - **Poller gate:** a test in `application-sync::poller` that
   asserts the SQL query filters on `workspaces.status =
   'active'`. A future refactor that drops the JOIN fails the
@@ -668,12 +672,13 @@ an answer. (Risks and non-goals cover the rest.)
 
 ### Phase 4 — Poller
 
-- Extend `ports::TaskFilter` with `synced_at_lt: Option<Timestamp>`
-  and `has_project_item_id: bool`. The poller's per-tick query
-  becomes a SQL-level filter (replacing the in-memory
-  `index_tasks_by_item_id` filter and its `TODO(scale)`); the
-  `WHERE` clause is JOIN on `workspaces` + `status = 'active'` +
-  `has_project_item_id` + `synced_at_lt`. Add a composite index
+- Extend `ports::TaskFilter` with `synced_at_lt: Option<Timestamp>`,
+  `has_project_item_id: bool`, `pollable_workspaces_only: bool`, and
+  `limit`. The poller's per-tick query becomes a SQL-level filter
+  (replacing the in-memory `index_tasks_by_item_id` filter and its
+  `TODO(scale)`); the `WHERE` clause is JOIN on `workspaces` +
+  `status = 'active' AND project_id IS NOT NULL` + `has_project_item_id`
+  + `synced_at_lt`. Add a composite index
   `CREATE INDEX idx_tasks_poll ON tasks(workspace_id,
   project_item_id, synced_at) WHERE project_item_id IS NOT NULL`
   so the per-tick cost is O(log N + stale_count), not O(N).
@@ -681,13 +686,14 @@ an answer. (Risks and non-goals cover the rest.)
   burst on a 1000-task workspace and the steady-state cost
   above 400 tasks per workspace. Tasks beyond the `LIMIT` defer
   to the next tick; they are not lost.
-- Per-task: on successful fetch, route through the
-  `mark_synced(task_id, SyncedSource::Polled, synced_instant)` helper
-  (added in Phase 1 alongside `TaskRepository::cache_synced_at`).
-  The helper is the **only** call site for the per-task stamp; the
-  runtime assertion that `source == SyncedSource::Polled` at this
-  call site is the tripwire. Direct `cache_synced_at` calls
-  bypass the tripwire and are forbidden (a code review rule).
+- Per-project: after a board is **completely** observed (poll
+  succeeded, page not truncated), stamp `synced_at` for that project's
+  candidate tasks via `cache_synced_at(task_id, now, SyncedSource::Polled)`
+  — stamping the working set, not just matched items, so a
+  stale-but-unchanged task advances and stops being re-polled. The
+  tripwire is a recording-repo test asserting the source is `Polled`; a
+  per-project test asserts a truncated board defers its own tasks while a
+  clean board in the same tick still stamps.
 
 ### Phase 5 — Drainer
 
@@ -699,9 +705,9 @@ an answer. (Risks and non-goals cover the rest.)
   the right disposition.
 - Replace the existing fire-and-forget `?` with a
   `match response { ... -> ApplyDisposition }` block in each
-  arm. The new `mark_synced` helper routes through
-  `TaskRepository::cache_synced_at`; the disposition machine
-  determines whether the cache write fires.
+  arm. The drainer stamps via `TaskRepository::cache_synced_at(..,
+  SyncedSource::Push)`; the disposition machine determines whether the
+  cache write fires.
 - Add `ConflictKind::ProjectStatusMismatch` (or
   `ConflictKind::ProjectItemMismatch`, depending on the
   mutation's semantics) for the arms that can detect a
@@ -736,12 +742,13 @@ an answer. (Risks and non-goals cover the rest.)
   one per locked decision:
   1. `TaskStatus` enum deletion — grep the workspace for
      `TaskStatus::` and assert zero matches.
-  2. `synced_at` stamp discipline — a `mark_synced` helper is the
-     **only** call site; runtime assertion that `source` matches
-     the call site (drainer = `Push`, poller = `Polled`, pull path
-     = `Pull`).
-  3. Poller gate — the SQL `JOIN workspaces … WHERE status = 'active'`
-     clause is present and correct.
+  2. `synced_at` stamp source discipline — every stamp goes through
+     `cache_synced_at(.., source)`; a recording-repo test asserts the
+     source per call site (poller = `Polled`, `--refresh` = `Refresh`,
+     future drainer/pull = `Push`/`Pull`).
+  3. Poller gate — the SQL `JOIN workspaces … WHERE status = 'active'
+     AND project_id IS NOT NULL` clause is present and correct (both
+     halves: active and project-attached).
   4. Drainer response inspection — for each of the 10
      `OutboxMutation` arms, a per-arm tripwire (the D5 table) that
      injects a port returning the wrong response and asserts the
@@ -749,9 +756,10 @@ an answer. (Risks and non-goals cover the rest.)
   5. `last_refreshed_at` on `DriftRow` — guard against the field
      being dropped from the drift view (the prior /code-review
      pass raised this).
-  6. `synced_instant` vs `synced_at` discipline — guard against the
-     threshold check being moved to `synced_at` (the clock-skew
-     mitigation).
+  6. *(removed)* — the monotonic `synced_instant` threshold was
+     dropped (see the §D3 Phase-4 note); freshness uses the persisted
+     wall-clock `synced_at` only, so there is no `synced_instant`
+     discipline to guard.
   7. "No re-baseline from response" — guard against a future
      drainer that re-baselines from the PATCH response (RFC 0003
      D5's invariant).

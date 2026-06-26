@@ -92,21 +92,6 @@ pub fn is_mirror(task: &Task) -> bool {
     task.is_mirror()
 }
 
-/// The single funnel for stamping a task's write-through "remote observed"
-/// freshness (RFC 0004 D3). Sets the in-memory monotonic `synced_instant` and
-/// its wall-clock companion `synced_at`. `source` records which of the three
-/// writers (pull/push/poll) stamped it, for the matching
-/// [`ports::TaskRepository::cache_synced_at`] persistence.
-///
-/// NOTE: not yet wired to any production caller — the pull / drainer / poller
-/// call sites land in later RFC 0004 phases. `source` is accepted now so the
-/// signature is stable for those callers; it is currently unused (the persist
-/// step that consumes it is added with the callers).
-pub fn mark_synced(task: &mut Task, _source: ports::SyncedSource) {
-    task.synced_instant = Some(std::time::Instant::now());
-    task.synced_at = Some(domain_core::Timestamp::now());
-}
-
 /// Is the mirror issue-backed (has a real REST issue)? Delegates to
 /// [`Task::is_issue_backed`] so the predicate has a single definition.
 pub fn is_issue_backed(task: &Task) -> bool {
@@ -491,19 +476,6 @@ mod tests {
     }
 
     // --- local-only tasks are always silent ---------------------------------
-
-    #[test]
-    fn mark_synced_stamps_freshness() {
-        // RFC 0004 D3: the single funnel sets both the monotonic
-        // `synced_instant` and its wall-clock companion `synced_at`. A fresh
-        // task carries neither; after one `mark_synced` call both are `Some`.
-        let mut t = Task::new_draft(WorkspaceId::new(), None, "freshness".into()).unwrap();
-        assert!(t.synced_instant.is_none());
-        assert!(t.synced_at.is_none());
-        mark_synced(&mut t, ports::SyncedSource::Polled);
-        assert!(t.synced_instant.is_some());
-        assert!(t.synced_at.is_some());
-    }
 
     #[test]
     fn local_only_task_emits_nothing() {

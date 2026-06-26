@@ -87,6 +87,26 @@ pub struct TaskFilter {
     pub is_open: Option<bool>,
     /// Filter by sync state.
     pub sync_state: Option<SyncState>,
+    /// Stale-scan predicate (RFC 0004 D3, poller): keep only tasks whose
+    /// `synced_at` is NULL (never observed) or strictly older than this. When
+    /// `Some`, `list` also orders by `synced_at ASC NULLS FIRST` so a `limit`
+    /// takes the *stalest* first. `None` = no freshness filter, default order.
+    pub synced_at_lt: Option<Timestamp>,
+    /// Keep only project-backed tasks (`project_item_id IS NOT NULL`). The
+    /// poller correlates these against polled board items.
+    pub has_project_item_id: bool,
+    /// JOIN `workspaces` and keep only tasks in a *pollable* workspace: `active`
+    /// AND project-attached (`project_id IS NOT NULL`). The poller gate (RFC
+    /// 0004 D3). Excluding projectless workspaces matters: a task with a stale
+    /// `project_item_id` whose workspace has no project can never be reconciled
+    /// or freshness-stamped, so without this gate it would sit at the front of
+    /// the stale-scan forever, crowding out real candidates. `false` = no
+    /// workspace filter.
+    pub pollable_workspaces_only: bool,
+    /// Cap the row count (RFC 0004 D3 poller `LIMIT`, default 200 at the call
+    /// site). `None` = unbounded. Pairs with `synced_at_lt`'s ordering so the
+    /// cap defers the freshest, not an arbitrary slice.
+    pub limit: Option<usize>,
 }
 
 #[async_trait]

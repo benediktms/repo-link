@@ -551,6 +551,9 @@ impl TaskService {
                 .as_deref()
                 .map(|s| parse_enum::<SyncState>("sync_state", s))
                 .transpose()?,
+            // Poller-only knobs (stale-scan / active-gate / limit) stay off for
+            // the user-facing `rl task list`.
+            ..TaskFilter::default()
         };
         let rows = self.repo.list(filter).await?;
         // One binding lookup per task — fine at current scales (dozens

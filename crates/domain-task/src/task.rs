@@ -1,7 +1,5 @@
 //! The `Task` aggregate: struct, lifecycle + sync state machines.
 
-use std::time::Instant;
-
 use domain_core::{Aggregate, DomainError, RepoId, Result, TaskId, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
@@ -67,22 +65,17 @@ pub struct Task {
     /// status maps to, independently of `sync_state`.
     pub project_status_option_id: Option<String>,
     /// Wall-clock time the remote was last *observed* for this task — stamped
-    /// write-through after a confirmed network response (pull / push / poll)
-    /// via [`crate::enums`]'s `SyncedSource` plumbing (RFC 0004 D3). `None`
-    /// means "never observed." Like [`Task::project_status_option_id`] this is
-    /// a write-through cache column on a **separate axis**: it is deliberately
-    /// EXCLUDED from [`Task::snapshot_view`] and dirty detection, so observing
-    /// the remote never flips `sync_state`. The wall-clock value is for display
-    /// ("Last refreshed: 30s ago", Phase 2); freshness *deltas* use the
-    /// monotonic [`Task::synced_instant`] to stay clock-skew-safe.
+    /// write-through after a confirmed network response (pull / push / poll /
+    /// `--refresh`) via [`TaskRepository::cache_synced_at`] (RFC 0004 D3).
+    /// `None` means "never observed." Like [`Task::project_status_option_id`]
+    /// this is a write-through cache column on a **separate axis**: it is
+    /// deliberately EXCLUDED from [`Task::snapshot_view`] and dirty detection,
+    /// so observing the remote never flips `sync_state`. It is the single
+    /// freshness signal — both the display ("Last refreshed: 30s ago") and the
+    /// poller's stale-scan SQL filter read it.
+    ///
+    /// [`TaskRepository::cache_synced_at`]: ports::TaskRepository::cache_synced_at
     pub synced_at: Option<Timestamp>,
-    /// Monotonic companion to [`Task::synced_at`], used for threshold checks
-    /// (clock-skew-safe per RFC 0004 D3). In-memory only: never persisted
-    /// (`#[serde(skip)]`), so it reads back `None` on process restart — which
-    /// is treated as "stale" by the poller's first tick. Written atomically
-    /// with `synced_at` by the `mark_synced` helper.
-    #[serde(skip)]
-    pub synced_instant: Option<Instant>,
     /// Short globally-unique hash used to assemble the friendly composite
     /// ID (`{repo.prefix}-{hash}`). Lowercase RFC 4648 base32, length 3+
     /// (grown by the persistence layer on collision). Empty string is the
@@ -130,9 +123,7 @@ impl Task {
             project_item_id: None,
             project_status_option_id: None,
             // Never observed remotely (RFC 0004 D3).
-            synced_at: None,
-            synced_instant: None,
-            // Empty until the persistence layer mints a unique base32
+            synced_at: None, // Empty until the persistence layer mints a unique base32
             // hash on first save. Domain stays agnostic to randomness
             // and DB-backed uniqueness retries.
             hash: String::new(),
@@ -190,7 +181,6 @@ impl Task {
             project_item_id: None,
             project_status_option_id: None,
             synced_at: None,
-            synced_instant: None,
             hash: String::new(),
             created_at: now,
             updated_at: now,
