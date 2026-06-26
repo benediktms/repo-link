@@ -113,6 +113,50 @@ impl RelationKind {
 mod tests {
     use super::*;
 
+    /// Every `Lifecycle` variant, for the D1-invariant tests below.
+    const ALL_LIFECYCLES: [Lifecycle; 4] = [
+        Lifecycle::Open,
+        Lifecycle::Reopened,
+        Lifecycle::Completed,
+        Lifecycle::NotPlanned,
+    ];
+
+    /// RFC 0004 D1 invariant — *closed-with-reason*: a closed lifecycle always
+    /// projects a `state_reason`. The fused enum makes the inverse
+    /// ("closed but no reason") unrepresentable; this locks the projection so a
+    /// future variant or `state_reason()` edit can't reintroduce it.
+    #[test]
+    fn closed_lifecycle_always_has_a_state_reason() {
+        for lc in ALL_LIFECYCLES {
+            if !lc.is_open() {
+                assert!(
+                    lc.state_reason().is_some(),
+                    "{lc:?} is closed but projects no state_reason"
+                );
+            }
+        }
+    }
+
+    /// RFC 0004 D1 invariant — *not-planned-cannot-be-open*: no open lifecycle
+    /// projects the `not_planned` reason, and `NotPlanned` itself is closed.
+    /// (The old "open but not_planned" 5-state combination is unrepresentable.)
+    #[test]
+    fn open_lifecycle_is_never_not_planned() {
+        assert!(
+            !Lifecycle::NotPlanned.is_open(),
+            "NotPlanned must be closed"
+        );
+        for lc in ALL_LIFECYCLES {
+            if lc.is_open() {
+                assert_ne!(
+                    lc.state_reason(),
+                    Some("not_planned"),
+                    "{lc:?} is open but projects the not_planned reason"
+                );
+            }
+        }
+    }
+
     #[test]
     fn relation_inverse_is_an_involution() {
         // Applying inverse twice returns the original kind for every variant,

@@ -934,6 +934,27 @@ mod tests {
         assert!(Task::new_draft(WorkspaceId::new(), None, "  ".into()).is_err());
     }
 
+    /// RFC 0004 D1 invariant — *LocalOnly-must-not-have-remote*. A fresh draft
+    /// is `LocalOnly` with no remote, and the lifecycle API gives no path to
+    /// attach a remote while still `LocalOnly`: `promote_to_remote` requires the
+    /// task to be `Staged` first. (The only way to reach `LocalOnly + remote` is
+    /// the explicit, audited `link_to_remote(.., force_conflict = true)`, which
+    /// deliberately flips the task to `Conflict` — never leaving it `LocalOnly`.)
+    #[test]
+    fn local_only_has_no_remote_and_cannot_promote_directly() {
+        let mut t = draft();
+        assert_eq!(t.sync, SyncState::LocalOnly);
+        assert!(t.remote.is_none(), "a fresh LocalOnly draft has no remote");
+        assert!(
+            t.promote_to_remote(remote_ref()).is_err(),
+            "promoting straight from LocalOnly must fail (stage first)"
+        );
+        assert!(
+            t.remote.is_none(),
+            "a rejected promote must not leave a remote on a LocalOnly task"
+        );
+    }
+
     #[test]
     fn happy_path_local_only_to_synced() {
         let mut t = draft();

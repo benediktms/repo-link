@@ -2506,3 +2506,29 @@ async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none()
         .unwrap();
     assert_eq!(w2_unchanged, Some(repo_w2.id));
 }
+
+/// RFC 0004 D1 invariant — *blocked_by referential integrity*. The storage
+/// layer is the primary enforcement: `task_relations.other_task_id` carries an
+/// FK → `tasks(id)`, so persisting a relation whose target task does not exist
+/// is rejected. (The aggregate `add_relation` is offline and does not validate
+/// the target — the DB FK is the safety net, per the RFC.)
+#[tokio::test]
+async fn blocked_by_to_nonexistent_task_is_rejected_by_fk() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let mut t = Task::new_draft(w.id, None, "blocked task".into()).unwrap();
+    // Point the blocker at a TaskId that was never persisted.
+    t.add_relation(RelationKind::BlockedBy, domain_core::TaskId::new());
+
+    let err = ts
+        .save(&t, SnapshotSource::Created)
+        .await
+        .expect_err("a relation to a non-existent task must violate the FK");
+    let msg = format!("{err:?}").to_lowercase();
+    assert!(
+        msg.contains("foreign") || msg.contains("constraint"),
+        "expected a foreign-key violation, got: {err:?}"
+    );
+}
