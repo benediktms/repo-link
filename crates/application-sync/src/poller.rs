@@ -46,10 +46,10 @@
 //! never infer "an item we didn't see is gone/stale" from a poll: absence in a
 //! (possibly truncated) page is not evidence of remote deletion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::{ProjectId, Timestamp};
+use domain_core::{ProjectId, Timestamp, WorkspaceId};
 use domain_task::Task;
 #[cfg(doc)]
 use ports::PollPage;
@@ -152,14 +152,13 @@ impl ProjectPoller {
         // just-written value and stays idempotent.
         let mut by_item_id = self.index_stale_candidates().await?;
 
-        // Freshness stamping (RFC 0004 D3) is gated on a fully-clean pass: a
-        // truncated page or a per-project poll error means we did NOT fully
-        // observe every candidate's board, so we must not advance their
-        // `synced_at` (which would wrongly mark them fresh and defer the
-        // re-poll). One flaky board defers stamping for the whole pass; the
-        // next tick retries. Correct for the common single-project case;
-        // conservative (never wrong) for multi-project.
-        let mut pass_fully_complete = true;
+        // Freshness stamping (RFC 0004 D3) is scoped per-project: only the
+        // projects whose board was COMPLETELY observed this pass (poll
+        // succeeded, page not truncated) are eligible, so one flaky board
+        // doesn't suppress `synced_at` updates for tasks on other, healthy
+        // boards. A candidate is stamped below iff its workspace's project is in
+        // this set.
+        let mut completed_projects: HashSet<ProjectId> = HashSet::new();
 
         for project in &projects {
             report.projects_polled += 1;
@@ -188,9 +187,9 @@ impl ProjectPoller {
                 Ok(page) => page,
                 Err(e) => {
                     // One board's provider hiccup must not sink the others.
+                    // Not observed → not eligible for stamping (not inserted
+                    // into `completed_projects`).
                     warn!(project = %project.id.as_str(), error = %e, "project poll failed; skipping this project this cycle");
-                    // We didn't observe this board → don't stamp this pass.
-                    pass_fully_complete = false;
                     continue;
                 }
             };
@@ -215,57 +214,78 @@ impl ProjectPoller {
 
             if page.truncated {
                 report.partial_projects += 1;
-                // Partial observation → don't stamp this pass.
-                pass_fully_complete = false;
+                // Partial observation → not eligible for stamping; watermark not
+                // advanced (absence from a truncated page is not deletion).
                 warn!(
                     project = %project.id.as_str(),
                     items = page.items.len(),
                     "poll page truncated; watermark not advanced, will refetch next cycle"
                 );
-                // Deliberately do NOT advance the watermark or mark anything
-                // stale — absence from a truncated page is not deletion.
-            } else if max_seen > since {
-                // Advance only on a strictly-newer item. The 1s safety margin
-                // (M-p1) pulls the watermark back one second before the next
-                // strict `updated:>` query: GitHub's `updated:>` is
-                // strict-greater, so advancing to exactly `max_seen` would drop
-                // any sibling that shares the same second as the newest item we
-                // saw. Re-reading is idempotent (Stage 7 reconcile is inert;
-                // Stage 8's cache write will be idempotent), so over-fetching one
-                // second is strictly safer than under-fetching same-second
-                // deltas. `max(since, …)` clamps the margin so it can never move
-                // the watermark *below* the current `since` — a complete page
-                // whose newest item is only one second past `since` keeps
-                // `since`, never regresses. (Without the `max_seen > since`
-                // guard, an empty / nothing-newer page would set the watermark
-                // to `since - 1s` and drift `since` backward 1s every poll,
-                // re-widening the fetch window each cycle.)
-                self.set_watermark(project_id, since.max(max_seen.minus_one_second()));
+            } else {
+                // Complete observation of this board → its candidates may be
+                // stamped below.
+                completed_projects.insert(project_id.clone());
+                if max_seen > since {
+                    // Advance only on a strictly-newer item. The 1s safety margin
+                    // (M-p1) pulls the watermark back one second before the next
+                    // strict `updated:>` query: GitHub's `updated:>` is
+                    // strict-greater, so advancing to exactly `max_seen` would
+                    // drop any sibling sharing the newest item's second.
+                    // Re-reading is idempotent, so over-fetching one second is
+                    // safer than under-fetching same-second deltas. `max(since,
+                    // …)` clamps the margin so a complete page whose newest item
+                    // is only one second past `since` keeps `since`, never
+                    // regresses. (Without the `max_seen > since` guard, an empty /
+                    // nothing-newer page would set the watermark to `since - 1s`
+                    // and drift it backward every poll.)
+                    self.set_watermark(project_id, since.max(max_seen.minus_one_second()));
+                }
+                // else: complete page with nothing strictly newer than `since`
+                // — leave the watermark unchanged so it never drifts backward.
             }
-            // else: complete page with nothing strictly newer than `since`
-            // (`max_seen == since`) — leave the watermark unchanged so it never
-            // drifts backward.
         }
 
-        // Stamp the working set's freshness (RFC 0004 D3) only on a fully-clean
-        // pass: every candidate's board was completely observed, so their remote
-        // state is known as-of-now — whether or not they appeared in a delta
-        // page (an unchanged task is still "observed as current"). Stamping ALL
+        // Stamp the working set's freshness (RFC 0004 D3), scoped to candidates
+        // whose board was completely observed this pass: their remote state is
+        // known as-of-now — whether or not they appeared in a delta page (an
+        // unchanged task is still "observed as current"). Stamping ALL such
         // candidates (not just matched items) is what lets a stale-but-unchanged
         // task advance its `synced_at` and stop being re-polled every tick. The
         // targeted single-column write touches only `synced_at` (no snapshot, no
         // sync-state change); `Polled` is the source tripwire.
-        if pass_fully_complete {
-            for task in by_item_id.values() {
-                if let Err(e) = self
-                    .tasks
-                    .cache_synced_at(task.id, Timestamp::now(), SyncedSource::Polled)
-                    .await
-                {
-                    warn!(task = %task.id, error = %e, "failed to stamp polled synced_at; will retry next cycle");
-                } else {
-                    report.tasks_refreshed += 1;
+        //
+        // A candidate's project is its workspace's project, resolved once per
+        // distinct workspace (`list_by_workspace`) and memoized; the candidate
+        // is stamped iff that project is in `completed_projects`.
+        let mut ws_project: HashMap<WorkspaceId, Option<ProjectId>> = HashMap::new();
+        for task in by_item_id.values() {
+            let project_id = match ws_project.get(&task.workspace_id) {
+                Some(p) => p.clone(),
+                None => {
+                    let resolved = self
+                        .projects
+                        .list_by_workspace(task.workspace_id)
+                        .await
+                        .ok()
+                        .and_then(|ps| ps.into_iter().next().map(|p| p.id));
+                    ws_project.insert(task.workspace_id, resolved.clone());
+                    resolved
                 }
+            };
+            let Some(project_id) = project_id else {
+                continue;
+            };
+            if !completed_projects.contains(&project_id) {
+                continue;
+            }
+            if let Err(e) = self
+                .tasks
+                .cache_synced_at(task.id, Timestamp::now(), SyncedSource::Polled)
+                .await
+            {
+                warn!(task = %task.id, error = %e, "failed to stamp polled synced_at; will retry next cycle");
+            } else {
+                report.tasks_refreshed += 1;
             }
         }
 
@@ -456,14 +476,21 @@ mod tests {
     }
 
     /// Build + save a project-backed (issue-backed, project_item_id) mirror task
-    /// whose `synced_at` starts NULL — a poll candidate.
-    async fn project_backed_task(tasks: &InMemoryTaskRepository, item_id: &str) -> TaskId {
+    /// whose `synced_at` starts NULL — a poll candidate — and link its workspace
+    /// to `project_id` so the per-project stamping can resolve its board.
+    async fn project_backed_task(
+        tasks: &InMemoryTaskRepository,
+        projects: &InMemoryProjectRepository,
+        project_id: &str,
+        item_id: &str,
+    ) -> TaskId {
         let mut task = Task::new_draft(WorkspaceId::new(), None, "mirror".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(RemoteRef::new("github", "1"))
             .unwrap();
         task.project_item_id = Some(item_id.into());
         let id = task.id;
+        projects.link_workspace(task.workspace_id, ProjectId::parse(project_id).unwrap());
         tasks.save(&task, SnapshotSource::Promote).await.unwrap();
         id
     }
@@ -477,7 +504,7 @@ mod tests {
         let remote = Arc::new(InMemoryRemoteProjectProvider::new());
 
         projects.save(&project("PVT_kwHO_stamp")).await.unwrap();
-        let id = project_backed_task(&tasks, "PVTI_42").await;
+        let id = project_backed_task(&tasks, &projects, "PVT_kwHO_stamp", "PVTI_42").await;
         assert!(tasks.get(id).await.unwrap().synced_at.is_none());
         remote.set_poll_items("PVT_kwHO_stamp", vec![item("PVTI_42", Some("o_wip"))]);
 
@@ -505,7 +532,7 @@ mod tests {
         let remote = Arc::new(InMemoryRemoteProjectProvider::new());
 
         projects.save(&project("PVT_kwHO_trunc")).await.unwrap();
-        let id = project_backed_task(&tasks, "PVTI_42").await;
+        let id = project_backed_task(&tasks, &projects, "PVT_kwHO_trunc", "PVTI_42").await;
         remote.set_poll_items("PVT_kwHO_trunc", vec![item("PVTI_42", Some("o_wip"))]);
         remote.set_poll_truncated("PVT_kwHO_trunc", true);
 
@@ -518,6 +545,44 @@ mod tests {
         assert_eq!(report.tasks_refreshed, 0, "a truncated pass must not stamp");
         assert!(tasks.get(id).await.unwrap().synced_at.is_none());
         assert!(tasks.synced_stamps().is_empty());
+    }
+
+    /// Per-project scoping: a task on a board that polled cleanly is stamped even
+    /// when ANOTHER board in the same tick truncated. One flaky board must not
+    /// freeze the freshness of unrelated, fully-observed boards.
+    #[tokio::test]
+    async fn poll_once_stamps_clean_project_when_another_truncates() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects.save(&project("PVT_clean")).await.unwrap();
+        projects.save(&project("PVT_trunc")).await.unwrap();
+        let clean = project_backed_task(&tasks, &projects, "PVT_clean", "PVTI_clean").await;
+        let trunc = project_backed_task(&tasks, &projects, "PVT_trunc", "PVTI_trunc").await;
+        remote.set_poll_items("PVT_clean", vec![item("PVTI_clean", Some("o_a"))]);
+        remote.set_poll_items("PVT_trunc", vec![item("PVTI_trunc", Some("o_b"))]);
+        remote.set_poll_truncated("PVT_trunc", true);
+
+        let report = poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.tasks_refreshed, 1,
+            "only the clean board's task is stamped"
+        );
+        assert!(
+            tasks.get(clean).await.unwrap().synced_at.is_some(),
+            "the clean board's task is stamped"
+        );
+        assert!(
+            tasks.get(trunc).await.unwrap().synced_at.is_none(),
+            "the truncated board's task is NOT stamped"
+        );
+        assert_eq!(tasks.synced_stamps(), vec![(clean, SyncedSource::Polled)]);
     }
 
     /// A polled item whose `item_node_id` matches a local task's
