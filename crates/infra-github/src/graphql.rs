@@ -133,7 +133,7 @@ mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   updateProjectV2ItemFieldValue(input: $input) {
     projectV2Item {
       id
-      fieldValues(first: 20) {
+      fieldValues(first: 100) {
         nodes {
           __typename
           ... on ProjectV2ItemFieldSingleSelectValue {
