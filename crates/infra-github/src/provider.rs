@@ -248,7 +248,7 @@ impl RemoteProjectProvider for GithubAdapter {
         item_node_id: &str,
         status_field_id: &str,
         option_id: &str,
-    ) -> PortResult<()> {
+    ) -> PortResult<String> {
         self.graphql
             .set_status(project_node_id, item_node_id, status_field_id, option_id)
             .await

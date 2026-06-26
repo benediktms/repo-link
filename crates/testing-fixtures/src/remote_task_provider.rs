@@ -45,6 +45,11 @@ pub struct InMemoryRemoteTaskProvider {
     updates: Mutex<Vec<RecordedUpdate>>,
     relation_calls: Mutex<Vec<RecordedRelationCall>>,
     fail_next: Mutex<u32>,
+    /// Assignees the `update_remote` response snapshot reports back. `None`
+    /// (default) echoes whatever the PATCH sent (the confirming case GitHub
+    /// returns); set it to a DIFFERENT list to drive the drainer's
+    /// assignee-conflict tripwire (a remote that didn't apply the assignees).
+    update_assignees_returns: Mutex<Option<Vec<String>>>,
 }
 
 impl InMemoryRemoteTaskProvider {
@@ -54,6 +59,14 @@ impl InMemoryRemoteTaskProvider {
 
     pub fn fail_next(&self, n: u32) {
         *self.fail_next.lock().unwrap() = n;
+    }
+
+    /// Override the assignees the `update_remote` response reports, simulating a
+    /// remote that did NOT apply the PATCH's assignees (e.g. returns `[]` for a
+    /// non-empty set). Drives the drainer's `UpdateRemote` → `Conflict`
+    /// tripwire.
+    pub fn set_update_assignees_returns(&self, assignees: Vec<String>) {
+        *self.update_assignees_returns.lock().unwrap() = Some(assignees);
     }
 
     pub fn updates(&self) -> Vec<RecordedUpdate> {
@@ -125,6 +138,15 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
             state_reason: cmd.state_reason,
             assignees: cmd.assignees.map(|s| s.to_vec()),
         });
+        // Echo the sent assignees by default (the remote applied them), so a
+        // normal push confirms. An override forces a divergent return for the
+        // conflict tripwire. `None` sent (field omitted) → empty response.
+        let assignees = self
+            .update_assignees_returns
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| cmd.assignees.map(|s| s.to_vec()).unwrap_or_default());
         Ok(RemoteTaskSnapshot {
             remote_id: cmd.remote_id.into(),
             node_id: None,
@@ -132,7 +154,7 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
             body: cmd.body.unwrap_or("").into(),
             closed: cmd.closed.unwrap_or(false),
             updated_at: Timestamp::now(),
-            assignees: vec![],
+            assignees,
             labels: vec![],
         })
     }

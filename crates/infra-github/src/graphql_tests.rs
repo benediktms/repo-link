@@ -365,15 +365,27 @@ async fn set_status_sends_single_select_option_id() {
             } }
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": { "updateProjectV2ItemFieldValue": { "projectV2Item": { "id": "PVTI_y" } } }
+            "data": { "updateProjectV2ItemFieldValue": { "projectV2Item": {
+                "id": "PVTI_y",
+                "fieldValues": { "nodes": [
+                    { "__typename": "ProjectV2ItemFieldTextValue" },
+                    { "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                      "optionId": "47fc9ee4",
+                      "field": { "id": "PVTSSF_z" } }
+                ] }
+            } } }
         })))
         .mount(&server)
         .await;
 
-    provider(&server)
+    // The drainer relies on the returned option id to detect status conflicts:
+    // the adapter must read back the applied single-select value (matched by
+    // field id), not echo the sent option.
+    let applied = provider(&server)
         .set_status("PVT_x", "PVTI_y", "PVTSSF_z", "47fc9ee4")
         .await
         .unwrap();
+    assert_eq!(applied, "47fc9ee4");
 }
 
 /// One project item with a single-select value on the status field.

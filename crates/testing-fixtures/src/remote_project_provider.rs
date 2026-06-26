@@ -59,6 +59,10 @@ pub struct InMemoryRemoteProjectProvider {
     create_draft_returns: Mutex<Option<String>>,
     /// Issue node id + REST `number` `convert_draft_to_issue` returns.
     convert_returns: Mutex<Option<(String, u64)>>,
+    /// Applied `option_id` `set_status` reads back. `None` (default) echoes the
+    /// sent option id (the success case GitHub returns); set it to a DIFFERENT
+    /// id to drive the drainer's status-conflict tripwire.
+    set_status_returns: Mutex<Option<String>>,
     /// Fail the next N mutation calls with a transient backend error before
     /// any succeed. Each failing call decrements the counter. Lets a test
     /// drive "Err under cap → reschedule" and "Err at cap → dead-letter".
@@ -97,6 +101,13 @@ impl InMemoryRemoteProjectProvider {
     /// `convert_draft_to_issue` returns.
     pub fn set_convert_returns_with_number(&self, id: &str, number: u64) {
         *self.convert_returns.lock().unwrap() = Some((id.to_string(), number));
+    }
+
+    /// Override the `option_id` `set_status` reads back, simulating a remote
+    /// that applied a DIFFERENT option than requested. Drives the drainer's
+    /// `SetProjectStatus` → `Conflict` tripwire.
+    pub fn set_set_status_returns(&self, option_id: &str) {
+        *self.set_status_returns.lock().unwrap() = Some(option_id.to_string());
     }
 
     /// Make the next `n` mutation calls fail with a transient error.
@@ -235,7 +246,7 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
         item_node_id: &str,
         status_field_id: &str,
         option_id: &str,
-    ) -> PortResult<()> {
+    ) -> PortResult<String> {
         if self.should_fail() {
             return Err(PortError::Backend("stub: set_status transient".into()));
         }
@@ -245,7 +256,14 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
             status_field_id: status_field_id.to_string(),
             option_id: option_id.to_string(),
         });
-        Ok(())
+        // Default: echo the requested option (the remote applied it). A test
+        // can override via `set_set_status_returns` to force a mismatch.
+        Ok(self
+            .set_status_returns
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| option_id.to_string()))
     }
 
     async fn poll_project_items(

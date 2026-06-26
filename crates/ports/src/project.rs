@@ -109,14 +109,19 @@ pub trait RemoteProjectProvider: Send + Sync {
     ) -> PortResult<(String, u64)>;
 
     /// Set an item's single-select Status field. Works on both draft items
-    /// and issue-backed items.
+    /// and issue-backed items. Returns the **applied** `option_id` read back
+    /// from the mutation response — the drainer compares it against the sent
+    /// `option_id` to detect a project-status conflict (RFC 0004 D5). An
+    /// otherwise-successful mutation whose response omits the single-select
+    /// value is an error (the caller treats it as transient/retry), not a
+    /// silent confirmation.
     async fn set_status(
         &self,
         project_node_id: &str,
         item_node_id: &str,
         status_field_id: &str,
         option_id: &str,
-    ) -> PortResult<()>;
+    ) -> PortResult<String>;
 
     /// Poll a project for items changed since `since` matching `query` (an
     /// empty `query` means the delta `updated:>{since}` filter alone — what the

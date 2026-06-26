@@ -1697,8 +1697,14 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
-            Ok(())
+        async fn set_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            option_id: &str,
+        ) -> PortResult<String> {
+            Ok(option_id.to_string())
         }
         async fn poll_project_items(
             &self,
@@ -1742,8 +1748,14 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
-            Ok(())
+        async fn set_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            option_id: &str,
+        ) -> PortResult<String> {
+            Ok(option_id.to_string())
         }
         async fn poll_project_items(
             &self,
@@ -1785,8 +1797,14 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(&self, _: &str, _: &str, _: &str, _: &str) -> PortResult<()> {
-            Ok(())
+        async fn set_status(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            option_id: &str,
+        ) -> PortResult<String> {
+            Ok(option_id.to_string())
         }
         async fn poll_project_items(
             &self,
