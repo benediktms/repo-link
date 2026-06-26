@@ -217,9 +217,10 @@ impl TaskRepository for InMemoryTaskRepository {
                 Some(ts) => t.synced_at.is_none_or(|s| s < ts),
                 None => true,
             })
-            // NOTE: `active_workspaces_only` is a no-op here — the in-memory
-            // task repo has no workspace-status data, so test tasks are treated
-            // as active. The active-gate clause is verified at the SQL layer.
+            // NOTE: `pollable_workspaces_only` is a no-op here — the in-memory
+            // task repo has no workspace status/project data, so test tasks are
+            // treated as pollable. The gate clause (active + project-attached)
+            // is verified at the SQL layer.
             .map(|t| {
                 let mut task = t.clone();
                 task.synced_baseline = snaps

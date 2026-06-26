@@ -503,20 +503,54 @@ async fn list_filters_compose() {
 }
 
 /// The poller's per-tick stale-scan (RFC 0004 D3): `has_project_item_id` +
-/// `active_workspaces_only` + `synced_at_lt` + `limit`, ordered
-/// oldest-`synced_at`-first (NULLs first). Also the active-gate tripwire — a
-/// non-active workspace's tasks are excluded; a future `Deleted`/`Paused`/etc.
-/// variant stays excluded by the `status = 'active'` clause.
+/// `pollable_workspaces_only` + `synced_at_lt` + `limit`, ordered
+/// oldest-`synced_at`-first (NULLs first). Also the pollable-gate tripwire — the
+/// gate is `status = 'active' AND project_id IS NOT NULL`, so a non-active
+/// workspace's tasks AND a projectless workspace's tasks are both excluded (a
+/// future `Deleted`/`Paused` variant stays excluded by the explicit equality).
 #[tokio::test]
 async fn list_poll_scan_gates_and_orders() {
-    use domain_core::Timestamp;
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::Project;
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
 
-    let (_dir, ws, _rb, ts) = setup().await;
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db.clone());
 
+    // Two real projects so the `workspaces.project_id` FK is satisfied.
+    let mk_project = |node: &str| {
+        Project::new(
+            ProjectId::parse(node).unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            "PVTSSF_f".into(),
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+    };
+    let pa = mk_project("PVT_kwHO_active");
+    let pc = mk_project("PVT_kwHO_created");
+    projects.save(&pa).await.unwrap();
+    projects.save(&pc).await.unwrap();
+
+    // Active + project-attached → pollable.
     let mut active = Workspace::new(WorkspaceName::new("active").unwrap(), None, true);
     active.activate().unwrap();
-    let created = Workspace::new(WorkspaceName::new("created").unwrap(), None, true);
+    active.project_id = Some(pa.id.clone());
+    // Active but projectless → NOT pollable (a stale project_item_id here could
+    // otherwise loop forever).
+    let mut projectless = Workspace::new(WorkspaceName::new("projectless").unwrap(), None, true);
+    projectless.activate().unwrap();
+    // Not active → NOT pollable (even though project-attached).
+    let mut created = Workspace::new(WorkspaceName::new("created").unwrap(), None, true);
+    created.project_id = Some(pc.id.clone());
     ws.save(&active).await.unwrap();
+    ws.save(&projectless).await.unwrap();
     ws.save(&created).await.unwrap();
 
     // Helper: a project-backed task with an explicit synced_at, saved once
@@ -534,32 +568,35 @@ async fn list_poll_scan_gates_and_orders() {
     let stale = mk(active.id, "stale", Some("PVTI_stale"), Some(old));
     let no_item = mk(active.id, "no-item", None, None);
     let inactive = mk(created.id, "inactive-ws", Some("PVTI_inact"), None);
-    for t in [&never, &stale, &no_item, &inactive] {
+    let orphan = mk(projectless.id, "projectless-ws", Some("PVTI_orph"), None);
+    for t in [&never, &stale, &no_item, &inactive, &orphan] {
         ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
     }
 
     let scan = ts
         .list(TaskFilter {
             has_project_item_id: true,
-            active_workspaces_only: true,
+            pollable_workspaces_only: true,
             synced_at_lt: Some(now),
             limit: Some(10),
             ..Default::default()
         })
         .await
         .unwrap();
-    // Only the two active + project-backed + stale tasks; ordered NULLs first.
+    // Only the two pollable (active + project-attached) + project-backed + stale
+    // tasks; ordered NULLs first. `no-item` (no item), `inactive-ws` (not
+    // active), and `projectless-ws` (no project) are all excluded.
     assert_eq!(
         scan.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
         vec!["never-observed", "stale"],
-        "active+project-backed+stale only, oldest-synced first"
+        "pollable+project-backed+stale only, oldest-synced first"
     );
 
     // The LIMIT caps the scan, keeping the stalest (NULL synced_at) first.
     let capped = ts
         .list(TaskFilter {
             has_project_item_id: true,
-            active_workspaces_only: true,
+            pollable_workspaces_only: true,
             synced_at_lt: Some(now),
             limit: Some(1),
             ..Default::default()

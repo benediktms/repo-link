@@ -150,16 +150,20 @@ impl TaskRepository for SqliteTaskRepository {
             .collect::<Vec<_>>()
             .join(", ");
         let mut from = format!("SELECT {cols} FROM tasks");
-        if filter.active_workspaces_only {
+        if filter.pollable_workspaces_only {
             from.push_str(" JOIN workspaces ON workspaces.id = tasks.workspace_id");
         }
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(from);
         qb.push(" WHERE 1=1");
-        if filter.active_workspaces_only {
-            // Poller gate (RFC 0004 D3): only `active` workspaces are polled.
-            // A future `Deleted`/`Paused`/etc. variant stays excluded by this
-            // explicit equality — the tripwire test pins the clause.
-            qb.push(" AND workspaces.status = 'active'");
+        if filter.pollable_workspaces_only {
+            // Poller gate (RFC 0004 D3): only `active`, project-attached
+            // workspaces are polled. The `status = 'active'` half excludes
+            // paused/archived/created/deleted (a future variant stays excluded
+            // by the explicit equality); `project_id IS NOT NULL` excludes a
+            // projectless workspace whose tasks could otherwise sit in the
+            // stale-scan forever (never reconcilable/stampable). The tripwire
+            // test pins both halves.
+            qb.push(" AND workspaces.status = 'active' AND workspaces.project_id IS NOT NULL");
         }
         if let Some(w) = filter.workspace_id {
             qb.push(" AND tasks.workspace_id = ")

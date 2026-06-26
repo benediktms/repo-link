@@ -226,6 +226,7 @@ resumes from each task's last stamp rather than re-fetching everything.
 SELECT tasks.* FROM tasks
 JOIN workspaces ON workspaces.id = tasks.workspace_id
 WHERE workspaces.status = 'active'
+  AND workspaces.project_id IS NOT NULL
   AND tasks.project_item_id IS NOT NULL
   AND (tasks.synced_at IS NULL OR tasks.synced_at < ?)
 ORDER BY tasks.synced_at ASC NULLS FIRST
@@ -248,16 +249,15 @@ closes the poller's existing TODO, and reuses the new SQL filter
 for both the poller and any future per-task query that needs the
 same shape.
 
-**Per-workspace gate.** The poller skips tasks whose workspace is
-not `WorkspaceStatus::Active`. A workspace in `Created` (initial
-state, never reached in practice for project-attached workspaces),
-`Paused` (user paused), or `Archived` (terminal) is not polled.
-`WorkspaceStatus` is a 4-variant state machine today
-(`Created | Active | Paused | Archived`); the poller gate is
-`status = 'active'` only. A future `Deleted` variant (e.g. for
-detached workspaces) must extend the gate explicitly — the tripwire
-test asserts the JOIN clause filters on the active status, so a
-silent regression where `Deleted` is omitted will fail the test.
+**Per-workspace gate.** A workspace is *pollable* iff it is
+`WorkspaceStatus::Active` **and** project-attached (`project_id IS NOT
+NULL`). A `Created` / `Paused` / `Archived` / `Deleted` workspace is not
+polled (the gate is `status = 'active'` only, so any non-active variant
+stays excluded); a projectless workspace is also skipped — a task there
+with a stale `project_item_id` can never be reconciled or stamped, so
+including it would park it at the front of the stale-scan forever. The
+tripwire test asserts both halves of the JOIN clause, so a silent
+regression dropping either fails the test.
 
 **Thresholds and rate-limit math.** Two budgets, named:
 
@@ -672,12 +672,13 @@ an answer. (Risks and non-goals cover the rest.)
 
 ### Phase 4 — Poller
 
-- Extend `ports::TaskFilter` with `synced_at_lt: Option<Timestamp>`
-  and `has_project_item_id: bool`. The poller's per-tick query
-  becomes a SQL-level filter (replacing the in-memory
-  `index_tasks_by_item_id` filter and its `TODO(scale)`); the
-  `WHERE` clause is JOIN on `workspaces` + `status = 'active'` +
-  `has_project_item_id` + `synced_at_lt`. Add a composite index
+- Extend `ports::TaskFilter` with `synced_at_lt: Option<Timestamp>`,
+  `has_project_item_id: bool`, `pollable_workspaces_only: bool`, and
+  `limit`. The poller's per-tick query becomes a SQL-level filter
+  (replacing the in-memory `index_tasks_by_item_id` filter and its
+  `TODO(scale)`); the `WHERE` clause is JOIN on `workspaces` +
+  `status = 'active' AND project_id IS NOT NULL` + `has_project_item_id`
+  + `synced_at_lt`. Add a composite index
   `CREATE INDEX idx_tasks_poll ON tasks(workspace_id,
   project_item_id, synced_at) WHERE project_item_id IS NOT NULL`
   so the per-tick cost is O(log N + stale_count), not O(N).
@@ -745,8 +746,9 @@ an answer. (Risks and non-goals cover the rest.)
      `cache_synced_at(.., source)`; a recording-repo test asserts the
      source per call site (poller = `Polled`, `--refresh` = `Refresh`,
      future drainer/pull = `Push`/`Pull`).
-  3. Poller gate — the SQL `JOIN workspaces … WHERE status = 'active'`
-     clause is present and correct.
+  3. Poller gate — the SQL `JOIN workspaces … WHERE status = 'active'
+     AND project_id IS NOT NULL` clause is present and correct (both
+     halves: active and project-attached).
   4. Drainer response inspection — for each of the 10
      `OutboxMutation` arms, a per-arm tripwire (the D5 table) that
      injects a port returning the wrong response and asserts the

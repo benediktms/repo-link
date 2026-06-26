@@ -380,7 +380,7 @@ impl ProjectPoller {
     /// debug so it's diagnosable.
     ///
     /// The bound is enforced in SQL (RFC 0004 D3): `has_project_item_id` +
-    /// `active_workspaces_only` + `synced_at_lt` + `limit`, ordered
+    /// `pollable_workspaces_only` + `synced_at_lt` + `limit`, ordered
     /// oldest-`synced_at`-first so the cap rotates fairly across ticks when a
     /// workspace has more than `POLL_LIMIT` project-backed tasks (the previous
     /// implementation listed ALL tasks and filtered in memory). Lifecycle is
@@ -392,7 +392,7 @@ impl ProjectPoller {
             .tasks
             .list(TaskFilter {
                 has_project_item_id: true,
-                active_workspaces_only: true,
+                pollable_workspaces_only: true,
                 synced_at_lt: Some(Timestamp::now()),
                 limit: Some(POLL_LIMIT),
                 ..TaskFilter::default()
