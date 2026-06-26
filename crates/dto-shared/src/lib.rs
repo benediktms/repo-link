@@ -23,4 +23,4 @@ pub use task::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto,
     RemoveTaskRelationCmd, TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,
 };
-pub use workspace::{CreateWorkspaceCmd, ListWorkspacesQuery, WorkspaceDto};
+pub use workspace::{CreateWorkspaceCmd, ListWorkspacesQuery, UpdateWorkspaceCmd, WorkspaceDto};

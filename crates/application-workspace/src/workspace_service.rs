@@ -7,7 +7,7 @@ use domain_core::{ProjectId, WorkspaceId};
 use domain_sync::OutboxMutation;
 use domain_task::SnapshotSource;
 use domain_workspace::{Workspace, WorkspaceName};
-use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery, WorkspaceDto};
+use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery, UpdateWorkspaceCmd, WorkspaceDto};
 use ports::{
     OutboxRepository, PortError, ProjectRepository, TaskFilter, TaskRepository, WorkspaceRepository,
 };
@@ -77,6 +77,40 @@ impl WorkspaceService {
             w.project_id = Some(self.resolve_project(spec).await?);
         }
         self.repo.save(&w).await?;
+        Ok(workspace_to_dto(&w))
+    }
+
+    pub async fn edit(&self, cmd: UpdateWorkspaceCmd) -> Result<WorkspaceDto> {
+        if cmd.name.is_none() && cmd.description.is_none() {
+            return Err(ServiceError::EmptyWorkspaceEdit);
+        }
+
+        let mut w = self.resolve_workspace(&cmd.workspace_id).await?;
+        let name = match cmd.name {
+            Some(raw) => {
+                let name = WorkspaceName::new(raw)?;
+                if name.as_str() != w.name.as_str()
+                    && let Some(existing) = self.repo.find_by_name(name.as_str()).await?
+                    && existing.id != w.id
+                {
+                    return Err(ServiceError::DuplicateName(name.as_str().to_string()));
+                }
+                Some(name)
+            }
+            None => None,
+        };
+
+        let duplicate_name = name.as_ref().map(|n| n.as_str().to_string());
+        w.edit(name, cmd.description);
+        match self.repo.save(&w).await {
+            Ok(()) => {}
+            Err(e) if e.conflict_target() == Some("workspaces.name") => {
+                return Err(ServiceError::DuplicateName(
+                    duplicate_name.unwrap_or_else(|| w.name.as_str().to_string()),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(workspace_to_dto(&w))
     }
 
@@ -358,6 +392,20 @@ impl WorkspaceService {
         op(&mut w)?;
         self.repo.save(&w).await?;
         Ok(workspace_to_dto(&w))
+    }
+
+    async fn resolve_workspace(&self, id_or_name: &str) -> Result<Workspace> {
+        if let Ok(id) = id_or_name.parse::<WorkspaceId>() {
+            match self.repo.get(id).await {
+                Ok(w) => return Ok(w),
+                Err(PortError::NotFound(_)) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.repo
+            .find_by_name(id_or_name)
+            .await?
+            .ok_or_else(|| ServiceError::WorkspaceNotFound(id_or_name.to_string()))
     }
 }
 

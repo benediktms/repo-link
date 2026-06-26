@@ -114,6 +114,16 @@ pub(crate) enum WorkspaceCmd {
     Show {
         id: String,
     },
+    /// Edit a workspace's mutable display fields.
+    ///
+    /// At least one of `--name` or `--description` must be supplied.
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
+    },
     Activate {
         id: String,
     },

@@ -13,6 +13,10 @@ pub enum ServiceError {
     Domain(#[from] domain_core::DomainError),
     #[error("workspace name already in use: {0}")]
     DuplicateName(String),
+    #[error("workspace not found: no match for '{0}'")]
+    WorkspaceNotFound(String),
+    #[error("workspace edit requires at least one of name or description")]
+    EmptyWorkspaceEdit,
     #[error("invalid id: {0}")]
     BadId(String),
     #[error("project not found: no match for '{0}'")]
