@@ -806,6 +806,35 @@ an answer. (Risks and non-goals cover the rest.)
 - `rpl-2l6` (the original `task show` display spike) is closed,
   pointing at this RFC.
 
+**As-built (Phase 6).** The tripwire list above was written before Phases 4–5
+locked their as-built shape; the implemented guards reconcile to it as follows:
+
+- Tripwire 2 (stamp-source discipline) reads `cache_synced_at(.., source)`, not
+  the dropped `mark_synced` funnel (§D3 Phase-4 note). The three **live** sources
+  each have a recording-repo assertion:
+  `poll_once_stamps_synced_at_for_candidates` (`Polled`),
+  `drain_success_stamps_synced_at_with_push_source` (`Push`),
+  `refresh_stamps_synced_at_on_success` (`Refresh`). `SyncedSource::Pull` is
+  **defined but unused** — `sync pull` reconciles via the snapshot baseline and
+  does not stamp `synced_at` today; wiring pull to populate `last_refreshed_at`
+  is a deferred follow-up, not part of this RFC.
+- Tripwires 3, 4, 5, 7 are covered, respectively, by
+  `list_poll_scan_gates_and_orders` (both gate halves),
+  the ten per-arm drainer disposition tests (Phase 5),
+  the `last_refreshed_at` field + serde guard on `DriftRow`, and
+  `update_remote_does_not_rebaseline_assignees_from_response`.
+- Tripwire 6 is moot — `synced_instant` was removed in Phase 4.
+- Tripwire 8: there is no `derive_display_status` function in the as-built code;
+  display composition is `application-task`'s `task_to_dto` / `TaskDto::from_task`.
+  The load-bearing half — the freshness line is gated on `is_mirror()` — is locked
+  by `last_refreshed_at_is_mirror_only`; relation-derived state is locked by
+  `is_blocked_is_derived_from_relations`.
+- D1 invariants: `closed_lifecycle_always_has_a_state_reason`,
+  `open_lifecycle_is_never_not_planned` (`domain-task` `enums`),
+  `local_only_has_no_remote_and_cannot_promote_directly` (`domain-task` `task`),
+  and `blocked_by_to_nonexistent_task_is_rejected_by_fk` (`infra-sqlite`
+  integration — the FK is the primary enforcement, the aggregate the safety net).
+
 ## Appendix A — current field matrix (post-RFC)
 
 | Field | On `Task` | On `TaskSnapshot` | In detection | In `RemoteTaskUpdate` | Drained from | Polled | DTO source |

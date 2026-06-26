@@ -2013,6 +2013,14 @@ mod tests {
         // Observed → freshness stamped; content untouched.
         let after = tasks.get(task.id).await.unwrap();
         assert!(after.synced_at.is_some(), "refresh stamps synced_at");
+        // Stamp-source discipline (RFC 0004 §6 tripwire 2): the refresh path
+        // must stamp with `SyncedSource::Refresh`, distinct from the poller's
+        // `Polled` and the drainer's `Push`.
+        assert_eq!(
+            tasks.synced_stamps(),
+            vec![(task.id, SyncedSource::Refresh)],
+            "refresh must stamp with the Refresh source"
+        );
         assert_eq!(
             after.title, before.title,
             "refresh must NOT reconcile content"
