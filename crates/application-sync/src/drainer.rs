@@ -84,15 +84,49 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use domain_core::Timestamp;
-use domain_sync::{OutboxEntry, OutboxMutation};
+use domain_sync::{ConflictKind, OutboxEntry, OutboxMutation};
 use domain_task::{RemoteRef, SnapshotSource, SyncState};
 use ports::{
-    OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider, TaskRepository,
-    WorkspaceRepository,
+    OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider, SyncedSource,
+    TaskRepository, WorkspaceRepository,
 };
 use tracing::{debug, info, warn};
 
-use crate::error::Result;
+use crate::error::{Result, SyncError};
+
+/// Outcome of applying one outbox entry against the remote (RFC 0004 D5). The
+/// drainer's `apply` computes this 3-state disposition from the remote
+/// response instead of a fire-and-forget `Result<()>`:
+///
+/// - [`Stamped`](Self::Stamped) — the response confirms the sent payload (or is
+///   an HTTP success for arms with no inspectable body). `drain_once` stamps
+///   `synced_at` via `cache_synced_at(.., SyncedSource::Push)` and marks the
+///   outbox row succeeded.
+/// - [`Retry`](Self::Retry) — a transient failure (5xx / 429 / network). The
+///   existing backoff / dead-letter-at-cap path runs; no stamp. (Genuine
+///   internal errors — e.g. a DB write inside an arm — propagate as `Err` and
+///   are handled identically.)
+/// - [`Conflict`](Self::Conflict) — the response succeeded but disagrees with
+///   what was sent. The task is flipped to `SyncState::Conflict` (surfaced by
+///   `rl query drift`) and the outbox row is dead-lettered (no retry — the
+///   conflict is real). The carried [`ConflictKind`] is for tripwires / logs;
+///   it is not persisted (see the `ConflictKind` doc-comment).
+enum ApplyDisposition {
+    Stamped,
+    Retry(SyncError),
+    Conflict(ConflictKind),
+}
+
+/// Map a no-response-body port result onto a disposition: HTTP success ⇒
+/// [`ApplyDisposition::Stamped`], a transient error ⇒
+/// [`ApplyDisposition::Retry`]. Used by the relation-sync arms, which have no
+/// response content to inspect for a conflict.
+fn stamped_or_retry(result: ports::PortResult<()>) -> Result<ApplyDisposition> {
+    match result {
+        Ok(()) => Ok(ApplyDisposition::Stamped),
+        Err(e) => Ok(ApplyDisposition::Retry(e.into())),
+    }
+}
 
 /// Exponential backoff schedule + attempt cap for the drainer's retry policy
 /// (RFC 0001 §10.2). `delays[i]` is the wait before attempt `i + 2` (the
@@ -198,47 +232,86 @@ impl OutboxDrainer {
             let Some(entry) = self.outbox.claim_next_eligible(now).await? else {
                 break;
             };
-            match self.apply(&entry).await {
-                Ok(()) => {
+            // Map both the transient-`Retry` disposition and a genuine `Err`
+            // (e.g. a DB write inside an arm) onto the same backoff path.
+            let retry_err = match self.apply(&entry).await {
+                Ok(ApplyDisposition::Stamped) => {
+                    // Confirmed remote state — stamp freshness, then succeed.
+                    self.tasks
+                        .cache_synced_at(entry.task_id, Timestamp::now(), SyncedSource::Push)
+                        .await?;
                     self.outbox.mark_succeeded(entry.id).await?;
                     succeeded += 1;
                     info!(entry_id = %entry.id, task_id = %entry.task_id, kind = entry.mutation.kind(), "outbox entry drained");
+                    continue;
                 }
-                Err(e) => {
-                    let msg = e.to_string();
-                    // `attempts` is the count *before* this failure; the repo
-                    // bumps it. After bumping it becomes `attempts + 1`, so the
-                    // cap test is "would the bumped count reach max_attempts?".
-                    let attempts_after = entry.attempts + 1;
-                    if attempts_after < self.backoff.max_attempts {
-                        let delay = self.backoff.delay_for(attempts_after);
-                        // Compute the backoff window from a FRESH timestamp at
-                        // FAILURE time, not the claim-time `now` (#54). The
-                        // remote call / error path can take longer than the
-                        // backoff delay; reusing claim-time `now` would schedule
-                        // `next_attempt_at` in the past, making the entry
-                        // immediately re-claimable and defeating the backoff.
-                        let failed_at = Timestamp::now();
-                        let next_attempt_at = Timestamp::from_utc(
-                            failed_at.into_inner()
-                                + chrono::Duration::from_std(delay).unwrap_or_default(),
-                        );
-                        self.outbox
-                            .record_retry(entry.id, &msg, next_attempt_at)
-                            .await?;
-                        warn!(entry_id = %entry.id, task_id = %entry.task_id, attempts = attempts_after, error = %msg, "outbox entry rescheduled");
-                    } else {
-                        self.outbox.mark_failed(entry.id, &msg).await?;
-                        warn!(entry_id = %entry.id, task_id = %entry.task_id, attempts = attempts_after, error = %msg, "outbox entry dead-lettered");
+                Ok(ApplyDisposition::Conflict(kind)) => {
+                    // The remote confirmed a state that disagrees with what we
+                    // sent. Flip the task to Conflict so `rl query drift`
+                    // surfaces it, then dead-letter the entry (no retry).
+                    // Best-effort: `mark_conflicted` rejects a task that isn't
+                    // in {DirtyLocal, DirtyRemote, Synced} (e.g. a Staged
+                    // first-push whose SetProjectStatus follow-up conflicts) —
+                    // log and dead-letter anyway rather than crash or retry.
+                    match self.tasks.get(entry.task_id).await {
+                        Ok(mut task) => match task.mark_conflicted() {
+                            Ok(()) => self.tasks.save(&task, SnapshotSource::LocalEdit).await?,
+                            Err(e) => {
+                                warn!(entry_id = %entry.id, task_id = %entry.task_id, error = %e, "could not flip task to conflict from its sync state")
+                            }
+                        },
+                        Err(e) => {
+                            warn!(entry_id = %entry.id, task_id = %entry.task_id, error = %e, "could not load task to flip to conflict")
+                        }
                     }
+                    self.outbox
+                        .mark_failed(entry.id, &format!("conflict: {kind:?}"))
+                        .await?;
+                    warn!(entry_id = %entry.id, task_id = %entry.task_id, kind = ?kind, "outbox entry dead-lettered: remote response conflict");
+                    continue;
+                }
+                Ok(ApplyDisposition::Retry(e)) => e,
+                Err(e) => e,
+            };
+            {
+                let e = retry_err;
+                let msg = e.to_string();
+                // `attempts` is the count *before* this failure; the repo
+                // bumps it. After bumping it becomes `attempts + 1`, so the
+                // cap test is "would the bumped count reach max_attempts?".
+                let attempts_after = entry.attempts + 1;
+                if attempts_after < self.backoff.max_attempts {
+                    let delay = self.backoff.delay_for(attempts_after);
+                    // Compute the backoff window from a FRESH timestamp at
+                    // FAILURE time, not the claim-time `now` (#54). The
+                    // remote call / error path can take longer than the
+                    // backoff delay; reusing claim-time `now` would schedule
+                    // `next_attempt_at` in the past, making the entry
+                    // immediately re-claimable and defeating the backoff.
+                    let failed_at = Timestamp::now();
+                    let next_attempt_at = Timestamp::from_utc(
+                        failed_at.into_inner()
+                            + chrono::Duration::from_std(delay).unwrap_or_default(),
+                    );
+                    self.outbox
+                        .record_retry(entry.id, &msg, next_attempt_at)
+                        .await?;
+                    warn!(entry_id = %entry.id, task_id = %entry.task_id, attempts = attempts_after, error = %msg, "outbox entry rescheduled");
+                } else {
+                    self.outbox.mark_failed(entry.id, &msg).await?;
+                    warn!(entry_id = %entry.id, task_id = %entry.task_id, attempts = attempts_after, error = %msg, "outbox entry dead-lettered");
                 }
             }
         }
         Ok(succeeded)
     }
 
-    /// Route one entry to the right provider and apply its write-backs.
-    async fn apply(&self, entry: &OutboxEntry) -> Result<()> {
+    /// Route one entry to the right provider, apply its write-backs, and
+    /// compute the entry's [`ApplyDisposition`] from the remote response (RFC
+    /// 0004 D5). A transient provider error maps to
+    /// [`ApplyDisposition::Retry`]; a genuine internal error (DB write inside an
+    /// arm) propagates as `Err` and `drain_once` treats it the same way.
+    async fn apply(&self, entry: &OutboxEntry) -> Result<ApplyDisposition> {
         match &entry.mutation {
             OutboxMutation::UpdateRemote {
                 canonical_repo,
@@ -288,7 +361,30 @@ impl OutboxDrainer {
                     if let Some(update) =
                         crate::build_update_from_patch(&task, &patch, canonical_repo, remote_id)
                     {
-                        self.remote_tasks.update_remote(update).await?;
+                        // Capture the assignees we're sending before `update`
+                        // moves into the port — we compare them against the
+                        // response to detect silent assignee drift (D5).
+                        let sent_assignees: Option<Vec<String>> =
+                            update.assignees.map(<[String]>::to_vec);
+                        let snap = match self.remote_tasks.update_remote(update).await {
+                            Ok(s) => s,
+                            Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                        };
+                        // Assignee carve-out (D5): the empty-empty case ("we
+                        // didn't set assignees, the API confirms []") is the one
+                        // legitimate `[]`; a `[]` response when a NON-empty set
+                        // was sent is the silent-drift bug → Conflict. `None`
+                        // sent ⇒ the field was omitted from the PATCH, nothing
+                        // to confirm.
+                        if let Some(sent) = sent_assignees.as_deref() {
+                            let confirmed = snap.assignees == sent
+                                || (sent.is_empty() && snap.assignees.is_empty());
+                            if !confirmed {
+                                return Ok(ApplyDisposition::Conflict(
+                                    ConflictKind::AssigneeMismatch,
+                                ));
+                            }
+                        }
                     }
                     // Never re-baseline from the PATCH response:
                     // octocrab's `update_issue` returns assignees=[]
@@ -300,15 +396,27 @@ impl OutboxDrainer {
                     task.confirm_synced_fields(SnapshotSource::Push, &patch)?;
                     self.tasks.save(&task, SnapshotSource::Push).await?;
                 }
+                Ok(ApplyDisposition::Stamped)
             }
             OutboxMutation::AddItem {
                 project_node_id,
                 issue_node_id,
             } => {
-                let item_id = self
+                let item_id = match self
                     .remote_projects
                     .add_item(project_node_id, issue_node_id)
-                    .await?;
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                };
+                // An empty item id means the attach didn't yield a handle —
+                // the remote "succeeded" without giving us something to anchor
+                // to. Treat as a conflict (defensive: the live adapter returns
+                // `Err`, not an empty id, on failure).
+                if item_id.is_empty() {
+                    return Ok(ApplyDisposition::Conflict(ConflictKind::TargetRemapped));
+                }
                 // Detach-idempotent write-back (#54): an `AddItem` already
                 // `inflight` can finish AFTER its workspace detached from (or
                 // moved off) `project_node_id`. Persisting `project_item_id`
@@ -334,6 +442,7 @@ impl OutboxDrainer {
                         "add-item write-back skipped: workspace no longer targets this project (detached/moved)"
                     );
                 }
+                Ok(ApplyDisposition::Stamped)
             }
             OutboxMutation::CreateDraftIssue {
                 project_node_id,
@@ -359,16 +468,24 @@ impl OutboxDrainer {
                         existing
                     }
                     None => {
-                        let minted = self
+                        let minted = match self
                             .remote_projects
                             .create_draft_issue(project_node_id, title, body)
-                            .await?;
+                            .await
+                        {
+                            Ok(id) => id,
+                            Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                        };
+                        if minted.is_empty() {
+                            return Ok(ApplyDisposition::Conflict(ConflictKind::TargetRemapped));
+                        }
                         self.write_back_project_item(entry.task_id, &minted).await?;
                         minted
                     }
                 };
                 self.enqueue_status_follow_up(entry.task_id, project_node_id, &item_id)
                     .await?;
+                Ok(ApplyDisposition::Stamped)
             }
             OutboxMutation::UpdateDraftIssue {
                 item_node_id,
@@ -385,9 +502,15 @@ impl OutboxDrainer {
                 // content can't race a coalesced sibling. The payload's
                 // captured title/body are intentionally ignored.
                 let task = self.tasks.get(entry.task_id).await?;
-                self.remote_projects
+                match self
+                    .remote_projects
                     .update_draft_issue(item_node_id, Some(&task.title), Some(&task.body))
-                    .await?;
+                    .await
+                {
+                    // No response body to disagree on — HTTP success ⇒ Stamped.
+                    Ok(()) => Ok(ApplyDisposition::Stamped),
+                    Err(e) => Ok(ApplyDisposition::Retry(e.into())),
+                }
             }
             OutboxMutation::ConvertDraftToIssue {
                 item_node_id,
@@ -410,14 +533,25 @@ impl OutboxDrainer {
                         task_id = %entry.task_id,
                         "convert-draft replay: task already has an issue node id; skipping convert"
                     );
-                } else {
-                    let (issue_node_id, issue_number) = self
-                        .remote_projects
-                        .convert_draft_to_issue(item_node_id, repo_node_id)
-                        .await?;
-                    self.write_back_converted_issue(entry.task_id, &issue_node_id, issue_number)
-                        .await?;
+                    return Ok(ApplyDisposition::Stamped);
                 }
+                let (issue_node_id, issue_number) = match self
+                    .remote_projects
+                    .convert_draft_to_issue(item_node_id, repo_node_id)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                };
+                // The convert must yield a real issue handle: an `I_*` node id
+                // AND a positive REST number. Junk back (empty id / number 0)
+                // is a conflict, not a success.
+                if !issue_node_id.starts_with("I_") || issue_number == 0 {
+                    return Ok(ApplyDisposition::Conflict(ConflictKind::TargetRemapped));
+                }
+                self.write_back_converted_issue(entry.task_id, &issue_node_id, issue_number)
+                    .await?;
+                Ok(ApplyDisposition::Stamped)
             }
             OutboxMutation::SetProjectStatus {
                 project_node_id,
@@ -425,9 +559,24 @@ impl OutboxDrainer {
                 status_field_id,
                 option_id,
             } => {
-                self.remote_projects
+                let applied = match self
+                    .remote_projects
                     .set_status(project_node_id, item_node_id, status_field_id, option_id)
-                    .await?;
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                };
+                // Read-back disposition (D5): the remote echoes the applied
+                // single-select option. A different option_id than we sent is a
+                // real project-status conflict.
+                if applied == *option_id {
+                    Ok(ApplyDisposition::Stamped)
+                } else {
+                    Ok(ApplyDisposition::Conflict(
+                        ConflictKind::ProjectStatusMismatch,
+                    ))
+                }
             }
             // Relation-sync arms (#95/#96). These address the GitHub-native
             // primitives directly via REST; the adapter resolves the *related*
@@ -436,12 +585,15 @@ impl OutboxDrainer {
             // (already-linked / already-gone collapse to success), so an
             // at-least-once redelivery after a crash is safe with no extra
             // guard.
+            // Relation-sync arms return `()` (REST 204) — no response body to
+            // disagree on, so HTTP success ⇒ Stamped and a transient error ⇒
+            // Retry. Their tripwire is "Err → Retry", not "wrong → Conflict".
             OutboxMutation::AddSubIssue {
                 parent_canonical,
                 parent_remote_id,
                 child_canonical,
                 child_remote_id,
-            } => {
+            } => stamped_or_retry(
                 self.remote_tasks
                     .add_sub_issue(
                         parent_canonical,
@@ -449,14 +601,14 @@ impl OutboxDrainer {
                         child_canonical,
                         child_remote_id,
                     )
-                    .await?;
-            }
+                    .await,
+            ),
             OutboxMutation::RemoveSubIssue {
                 parent_canonical,
                 parent_remote_id,
                 child_canonical,
                 child_remote_id,
-            } => {
+            } => stamped_or_retry(
                 self.remote_tasks
                     .remove_sub_issue(
                         parent_canonical,
@@ -464,14 +616,14 @@ impl OutboxDrainer {
                         child_canonical,
                         child_remote_id,
                     )
-                    .await?;
-            }
+                    .await,
+            ),
             OutboxMutation::AddBlockedBy {
                 blocked_canonical,
                 blocked_remote_id,
                 blocker_canonical,
                 blocker_remote_id,
-            } => {
+            } => stamped_or_retry(
                 self.remote_tasks
                     .add_blocked_by(
                         blocked_canonical,
@@ -479,14 +631,14 @@ impl OutboxDrainer {
                         blocker_canonical,
                         blocker_remote_id,
                     )
-                    .await?;
-            }
+                    .await,
+            ),
             OutboxMutation::RemoveBlockedBy {
                 blocked_canonical,
                 blocked_remote_id,
                 blocker_canonical,
                 blocker_remote_id,
-            } => {
+            } => stamped_or_retry(
                 self.remote_tasks
                     .remove_blocked_by(
                         blocked_canonical,
@@ -494,10 +646,9 @@ impl OutboxDrainer {
                         blocker_canonical,
                         blocker_remote_id,
                     )
-                    .await?;
-            }
+                    .await,
+            ),
         }
-        Ok(())
     }
 
     /// Persist `item_id` onto `task.project_item_id`. The save uses a
@@ -2081,5 +2232,344 @@ mod tests {
         let remote = reloaded.remote.as_ref().expect("remote populated");
         assert_eq!(remote.node_id.as_deref(), Some("I_converted_cross"));
         assert_eq!(remote.remote_id, "99");
+    }
+
+    // ---- RFC 0004 Phase 5: ApplyDisposition tripwires (D5 table) -----------
+    //
+    // A `Conflict` disposition flips the task to `SyncState::Conflict` (surfaced
+    // by `rl query drift`) and dead-letters the outbox row (status `Failed`,
+    // no retry). A `Retry` disposition reschedules the row (status `Pending`,
+    // attempts bumped) under the cap. The tests below inject a wrong/failing
+    // response per arm and assert the observable outcome.
+
+    /// UpdateRemote: a response that drops the assignees we sent is the
+    /// silent-drift bug class → Conflict (D5 assignee carve-out).
+    #[tokio::test]
+    async fn update_remote_conflicts_when_response_drops_assignees() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+
+        // Promote (baseline: no assignees), then add one locally so the patch
+        // carries assignees=[alice].
+        let mut t = Task::new_draft(ws, None, "task 1".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "1")).unwrap();
+        h.tasks.save(&t, SnapshotSource::Promote).await.unwrap();
+        t.set_assignees(vec!["alice".into()]);
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+        assert_eq!(t.sync, SyncState::DirtyLocal);
+
+        // The remote "succeeds" but reports no assignees applied.
+        h.remote_tasks.set_update_assignees_returns(vec![]);
+
+        let entry = OutboxEntry::new(
+            t.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        let n = h.drainer.drain_once().await.unwrap();
+        assert_eq!(n, 0, "a conflict is not a success");
+
+        assert_eq!(h.tasks.get(t.id).await.unwrap().sync, SyncState::Conflict);
+        let row = &h.outbox.all()[0];
+        assert_eq!(
+            row.status,
+            OutboxStatus::Failed,
+            "dead-lettered, not retried"
+        );
+        assert!(row.last_error.as_deref().unwrap_or("").contains("conflict"));
+        assert!(
+            h.tasks.synced_stamps().is_empty(),
+            "a conflict must not stamp synced_at"
+        );
+    }
+
+    /// AddItem: an empty returned item id means the attach gave us no handle →
+    /// Conflict.
+    #[tokio::test]
+    async fn add_item_conflicts_when_response_item_id_empty() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await; // DirtyLocal, flippable
+
+        h.remote_projects.set_add_item_returns("");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddItem {
+                project_node_id: "PVT_x".into(),
+                issue_node_id: "I_9".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Failed);
+    }
+
+    /// CreateDraftIssue: an empty returned item id → Conflict.
+    #[tokio::test]
+    async fn create_draft_conflicts_when_response_item_id_empty() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        h.remote_projects.set_create_draft_returns("");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::CreateDraftIssue {
+                project_node_id: "PVT_x".into(),
+                title: "t".into(),
+                body: "b".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Failed);
+    }
+
+    /// ConvertDraftToIssue: a non-`I_*` node id (or number 0) is junk → Conflict.
+    #[tokio::test]
+    async fn convert_draft_conflicts_when_response_is_junk() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        // Junk node id (does not start with `I_`); the task has no issue node
+        // id yet so the replay guard does not short-circuit.
+        h.remote_projects.set_convert_returns("garbage");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::ConvertDraftToIssue {
+                item_node_id: "PVTI_x".into(),
+                repo_node_id: "R_x".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Failed);
+    }
+
+    /// SetProjectStatus: the remote applies a DIFFERENT option than we sent →
+    /// Conflict (the `ProjectStatusMismatch` arm; needs the full read-back).
+    #[tokio::test]
+    async fn set_project_status_conflicts_on_option_mismatch() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        h.remote_projects.set_set_status_returns("o_wrong");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectStatus {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                status_field_id: "PVTSSF_z".into(),
+                option_id: "o_backlog".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Failed);
+    }
+
+    /// SetProjectStatus: the remote confirms the option we sent → Stamped (the
+    /// read-back must not false-positive on a matching response).
+    #[tokio::test]
+    async fn set_project_status_stamps_when_option_confirmed() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        // Default fixture echoes the sent option id, so no override needed.
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectStatus {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                status_field_id: "PVTSSF_z".into(),
+                option_id: "o_backlog".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+        assert_ne!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict
+        );
+    }
+
+    /// The relation-sync arms have no response body — a transient error is the
+    /// only non-success outcome and must Retry (reschedule), not dead-letter.
+    #[tokio::test]
+    async fn relation_sync_arms_reschedule_on_transient_error() {
+        let cases = [
+            OutboxMutation::AddSubIssue {
+                parent_canonical: "github.com/o/r".into(),
+                parent_remote_id: "1".into(),
+                child_canonical: "github.com/o/r".into(),
+                child_remote_id: "2".into(),
+            },
+            OutboxMutation::RemoveSubIssue {
+                parent_canonical: "github.com/o/r".into(),
+                parent_remote_id: "1".into(),
+                child_canonical: "github.com/o/r".into(),
+                child_remote_id: "2".into(),
+            },
+            OutboxMutation::AddBlockedBy {
+                blocked_canonical: "github.com/o/r".into(),
+                blocked_remote_id: "1".into(),
+                blocker_canonical: "github.com/o/r".into(),
+                blocker_remote_id: "2".into(),
+            },
+            OutboxMutation::RemoveBlockedBy {
+                blocked_canonical: "github.com/o/r".into(),
+                blocked_remote_id: "1".into(),
+                blocker_canonical: "github.com/o/r".into(),
+                blocker_remote_id: "2".into(),
+            },
+        ];
+        for mutation in cases {
+            let kind = mutation.kind();
+            let h = harness(test_backoff(5)).await;
+            let ws = WorkspaceId::new();
+            let task = seed_issue_task(&h, ws, "1").await;
+            h.remote_tasks.fail_next(1);
+            let entry = OutboxEntry::new(task.id, mutation);
+            h.outbox.enqueue(&entry).await.unwrap();
+
+            assert_eq!(h.drainer.drain_once().await.unwrap(), 0, "{kind}");
+            let row = &h.outbox.all()[0];
+            assert_eq!(row.status, OutboxStatus::Pending, "{kind} rescheduled");
+            assert_eq!(row.attempts, 1, "{kind} attempts bumped");
+            assert_ne!(
+                h.tasks.get(task.id).await.unwrap().sync,
+                SyncState::Conflict,
+                "{kind} is not a conflict"
+            );
+        }
+    }
+
+    /// UpdateDraftIssue has no response body — a transient error must Retry.
+    #[tokio::test]
+    async fn update_draft_issue_reschedules_on_transient_error() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        h.remote_projects.fail_next(1);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateDraftIssue {
+                item_node_id: "PVTI_draft".into(),
+                title: Some("t".into()),
+                body: Some("b".into()),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        let row = &h.outbox.all()[0];
+        assert_eq!(row.status, OutboxStatus::Pending);
+        assert_eq!(row.attempts, 1);
+    }
+
+    /// Stamp-source discipline: a successful drain stamps `synced_at` via
+    /// `cache_synced_at(.., SyncedSource::Push)`.
+    #[tokio::test]
+    async fn drain_success_stamps_synced_at_with_push_source() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+
+        assert_eq!(
+            h.tasks.synced_stamps(),
+            vec![(task.id, SyncedSource::Push)],
+            "a confirmed push stamps freshness with the Push source"
+        );
+    }
+
+    /// No re-baseline from the response (RFC 0003 D5): a response carrying
+    /// assignees the patch did not send must NOT fold them into the baseline.
+    #[tokio::test]
+    async fn update_remote_does_not_rebaseline_assignees_from_response() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        // Title diff only; baseline carries no assignees.
+        let task = seed_issue_task(&h, ws, "1").await;
+        let pre = h.tasks.get(task.id).await.unwrap();
+        assert!(pre.synced_baseline.unwrap().assignees.is_empty());
+
+        // The remote response reports assignees we never sent.
+        h.remote_tasks
+            .set_update_assignees_returns(vec!["ghost".into()]);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        assert_eq!(
+            h.drainer.drain_once().await.unwrap(),
+            1,
+            "title patch succeeds"
+        );
+
+        let post = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(post.sync, SyncState::Synced, "rebaselined to Synced");
+        assert!(
+            post.synced_baseline.unwrap().assignees.is_empty(),
+            "the response's phantom assignees must not enter the baseline"
+        );
     }
 }

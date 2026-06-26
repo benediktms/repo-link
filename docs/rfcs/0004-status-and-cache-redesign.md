@@ -403,6 +403,36 @@ variants. `ConflictKind::StatusMismatch` is deleted — see the
 the doc-comment that must be added to `ConflictKind` itself to
 explain the gap.
 
+**As-built (Phase 5).** Three implementation specifics:
+
+1. `SetProjectStatus` full read-back was adopted: the
+   `set_status` port now returns `PortResult<String>` (the applied
+   `option_id`), and the GraphQL `updateProjectV2ItemFieldValue`
+   mutation reads back the item's single-select value for the chosen
+   Status field (matched by field id, mirroring `map_poll_item`). A
+   successful mutation whose response omits the value is surfaced as a
+   backend error → `Retry`, never a false `Conflict`. This is what
+   makes the `SetProjectStatus` → `ProjectStatusMismatch` arm a genuine
+   read-back check rather than a defensive-only one.
+2. Only **`ProjectStatusMismatch`** was added (not a separate
+   `ProjectItemMismatch`). The `AddItem` / `CreateDraftIssue` /
+   `ConvertDraftToIssue` conflict arms reuse the existing
+   `TargetRemapped` variant — the remote "succeeded" but returned no
+   usable handle. `UpdateRemote` reuses `AssigneeMismatch`.
+3. The `ConflictKind` carried by `ApplyDisposition::Conflict` is **not
+   persisted** on the `Task`. A conflict is recorded only as
+   `SyncState::Conflict` (via `Task::mark_conflicted()`, which takes no
+   kind) and surfaced by `rl query drift`'s `sync == Conflict` axis;
+   the kind is used for the per-arm tripwires and log lines. The flip
+   is best-effort: `mark_conflicted` rejects a task not in
+   `{DirtyLocal, DirtyRemote, Synced}` (e.g. a `Staged` first-push
+   whose `SetProjectStatus` follow-up conflicts), in which case the
+   drainer logs and dead-letters the row anyway rather than crash or
+   retry. `ApplyDisposition::Retry` carries the crate's `SyncError`
+   (not `anyhow`); a transient port error in any arm maps to it, and a
+   genuine internal error (a DB write inside an arm) propagates as
+   `Err` and is handled identically.
+
 ## 3. Non-goals
 
 - **D8 (labels)** — same status as before. Deferred to a followup

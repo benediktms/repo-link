@@ -130,7 +130,20 @@ mutation($input: ConvertProjectV2DraftIssueItemToIssueInput!) {
 
 const SET_STATUS: &str = r#"
 mutation($input: UpdateProjectV2ItemFieldValueInput!) {
-  updateProjectV2ItemFieldValue(input: $input) { projectV2Item { id } }
+  updateProjectV2ItemFieldValue(input: $input) {
+    projectV2Item {
+      id
+      fieldValues(first: 100) {
+        nodes {
+          __typename
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            optionId
+            field { ... on ProjectV2FieldCommon { id } }
+          }
+        }
+      }
+    }
+  }
 }"#;
 
 const POLL_ITEMS: &str = r#"
@@ -332,8 +345,8 @@ impl GraphqlClient {
         item_node_id: &str,
         status_field_id: &str,
         option_id: &str,
-    ) -> PortResult<()> {
-        let _: SetStatusData = self
+    ) -> PortResult<String> {
+        let data: SetStatusData = self
             .run(
                 SET_STATUS,
                 json!({ "input": {
@@ -344,7 +357,24 @@ impl GraphqlClient {
                 } }),
             )
             .await?;
-        Ok(())
+        // Read back the applied option from the project's chosen Status field
+        // (matched by id, mirroring `map_poll_item`). The caller (drainer)
+        // compares it against the sent `option_id` to detect a conflict. A
+        // mutation that succeeds but returns no single-select value for the
+        // field is ambiguous — surface it as a backend error so the drainer
+        // retries rather than dead-lettering on a false conflict.
+        data.update_project_v2_item_field_value
+            .project_v2_item
+            .field_values
+            .nodes
+            .into_iter()
+            .find(|v| v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(status_field_id))
+            .and_then(|v| v.option_id)
+            .ok_or_else(|| {
+                PortError::Backend(format!(
+                    "set_status on item {item_node_id} returned no single-select value for field {status_field_id}"
+                ))
+            })
     }
 
     pub(crate) async fn poll_project_items(
@@ -618,14 +648,20 @@ struct ConvertIssueContent {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetStatusData {
-    #[allow(dead_code)]
     update_project_v2_item_field_value: ProjectV2ItemWrap,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectV2ItemWrap {
+    project_v2_item: SetStatusItem,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetStatusItem {
     #[allow(dead_code)]
-    project_v2_item: IdNode,
+    id: String,
+    #[serde(default)]
+    field_values: FieldValuesConn,
 }
 
 #[derive(Deserialize)]

@@ -24,6 +24,20 @@ pub enum SyncDecision {
     RequireManualMerge,
 }
 
+/// Why a task is in conflict. **These variants are not yet persisted on the
+/// `Task` aggregate** — a conflict is recorded only as `SyncState::Conflict`
+/// (which is what `rl query drift` surfaces). The drainer's `ApplyDisposition`
+/// carries a kind so per-arm tripwires and log lines can name the disagreement,
+/// but the kind is dropped at the `mark_conflicted()` transition; wiring a
+/// conflict-reason column is a future RFC.
+///
+/// There is deliberately **no** "local lifecycle vs. remote open/closed"
+/// variant. RFC 0004 D1 collapsed the 5-state `TaskStatus` so `is_open` is the
+/// 1:1 inverse of the REST `closed` bit, and pull now folds the open/closed bit
+/// into the inbound mirror set (a local-vs-remote flip is handled by the generic
+/// `decide()` → `RequireManualMerge` path). The old `StatusMismatch` variant
+/// that modelled that case was removed; see RFC 0004 D1 + RFC 0003 §6 OQ5 for
+/// the reasoning so it is not re-derived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictKind {
@@ -31,7 +45,10 @@ pub enum ConflictKind {
     RemoteDeletedLocalEdited,
     LocalDeletedRemoteEdited,
     AssigneeMismatch,
-    StatusMismatch,
+    /// A `SetProjectStatus` push whose response confirms a different
+    /// `option_id` than was sent (the drainer reads back the applied
+    /// single-select value, per RFC 0004 D5).
+    ProjectStatusMismatch,
     RelationMismatch,
     TargetRemapped,
 }
