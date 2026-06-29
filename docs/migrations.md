@@ -240,7 +240,7 @@ BEGIN;
 ALTER TABLE repo_instances ADD COLUMN remote_url TEXT NOT NULL DEFAULT '';
 ALTER TABLE repo_instances ADD COLUMN name       TEXT NOT NULL DEFAULT '';
 ALTER TABLE repo_instances ADD COLUMN aliases    TEXT NOT NULL DEFAULT '[]'
-                                                  CHECK (json_valid(aliases));
+                                                  CHECK (json_valid(aliases) AND json_type(aliases) = 'array');
 ALTER TABLE repo_instances ADD COLUMN prefix     TEXT NOT NULL DEFAULT '';
 UPDATE repo_instances SET
     remote_url = (SELECT o.remote_url FROM repo_origins o WHERE o.id = repo_instances.origin_id),

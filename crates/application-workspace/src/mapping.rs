@@ -42,6 +42,13 @@ pub fn workspace_to_dto(w: &Workspace) -> WorkspaceDto {
 }
 
 pub fn binding_to_dto(instance: &RepoInstance, origin: &RepoOrigin) -> RepoBindingDto {
+    // The two halves always come from one `RepoBindingView`; assert the pairing
+    // so a future caller can't emit a DTO mixing an instance with an unrelated
+    // origin (inconsistent origin_id / canonical_url / prefix / aliases).
+    debug_assert_eq!(
+        instance.origin_id, origin.id,
+        "binding_to_dto: instance.origin_id must match origin.id"
+    );
     RepoBindingDto {
         id: instance.id.to_string(),
         workspace_id: instance.workspace_id.to_string(),
