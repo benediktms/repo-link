@@ -829,7 +829,7 @@ mod tests {
     use super::*;
     use crate::report::LastTick;
     use async_trait::async_trait;
-    use domain_repo::RepoBinding;
+    use domain_repo::{RepoInstance, RepoOrigin};
     use domain_task::{SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
@@ -925,21 +925,20 @@ mod tests {
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
         ws_repo.save(&ws).await.unwrap();
 
-        let mut binding = RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
-        binding.link_worktree(std::path::PathBuf::from("/tmp/gone"), None);
-        bind_repo.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let mut instance =
+            RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None).unwrap();
+        instance.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        instance.link_worktree(std::path::PathBuf::from("/tmp/gone"), None);
+        bind_repo.save_origin(&origin).await.unwrap();
+        bind_repo.save_instance(&instance).await.unwrap();
 
         // Probe sees only /tmp/exists.
         let probe = Arc::new(StubFilesystemProbe::new().with_path("/tmp/exists"));
 
         // A task that was synced + then locally edited (DirtyLocal mirror).
-        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        let mut task = Task::new_draft(ws.id, Some(instance.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
@@ -1034,17 +1033,16 @@ mod tests {
 
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
         ws_repo.save(&ws).await.unwrap();
-        let mut binding = RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
-        bind_repo.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let mut instance =
+            RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None).unwrap();
+        instance.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save_origin(&origin).await.unwrap();
+        bind_repo.save_instance(&instance).await.unwrap();
 
         // A DirtyLocal issue-backed mirror.
-        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        let mut task = Task::new_draft(ws.id, Some(instance.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
@@ -1121,17 +1119,16 @@ mod tests {
 
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
         ws_repo.save(&ws).await.unwrap();
-        let mut binding = RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
-        bind_repo.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let mut instance =
+            RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None).unwrap();
+        instance.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save_origin(&origin).await.unwrap();
+        bind_repo.save_instance(&instance).await.unwrap();
 
         // A DirtyLocal issue-backed mirror.
-        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        let mut task = Task::new_draft(ws.id, Some(instance.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
@@ -1206,18 +1203,17 @@ mod tests {
 
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
         ws_repo.save(&ws).await.unwrap();
-        let mut binding = RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        binding.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
-        bind_repo.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let mut instance =
+            RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None).unwrap();
+        instance.link_worktree(std::path::PathBuf::from("/tmp/exists"), None);
+        bind_repo.save_origin(&origin).await.unwrap();
+        bind_repo.save_instance(&instance).await.unwrap();
 
         // A DirtyLocal issue-backed mirror with an already-pending outbox entry
         // (the forward path enqueued it on the local edit).
-        let mut task = Task::new_draft(ws.id, Some(binding.id), "edit me".into()).unwrap();
+        let mut task = Task::new_draft(ws.id, Some(instance.id), "edit me".into()).unwrap();
         task.stage_for_sync().unwrap();
         task.promote_to_remote(domain_task::RemoteRef::new("github", "777"))
             .unwrap();
@@ -1335,17 +1331,16 @@ mod tests {
         let ws = Workspace::new(WorkspaceName::new("scratch").unwrap(), None, true);
         ws_repo.save(&ws).await.unwrap();
 
-        let mut binding = RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let mut instance =
+            RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None).unwrap();
         for p in link_paths {
-            binding.link_worktree(PathBuf::from(p), None);
+            instance.link_worktree(PathBuf::from(p), None);
         }
-        let binding_id = binding.id;
-        bind_repo.save(&binding).await.unwrap();
+        let binding_id = instance.id;
+        bind_repo.save_origin(&origin).await.unwrap();
+        bind_repo.save_instance(&instance).await.unwrap();
 
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
@@ -1386,7 +1381,7 @@ mod tests {
 
         // Verify the worktree is actually gone from the binding.
         let after = bind_repo.get(bid).await.unwrap();
-        assert_eq!(after.worktrees.len(), 0);
+        assert_eq!(after.instance.worktrees.len(), 0);
     }
 
     #[tokio::test]
@@ -1467,23 +1462,21 @@ mod tests {
         ws_repo.save(&ws_a).await.unwrap();
         ws_repo.save(&ws_b).await.unwrap();
 
-        let mut binding_a = RepoBinding::new(
-            ws_a.id,
-            "git@github.com:o/r-a.git".into(),
-            "github.com/o/r-a".into(),
-        )
-        .unwrap();
-        binding_a.link_worktree(PathBuf::from("/tmp/gone-a"), None);
-        bind_repo.save(&binding_a).await.unwrap();
+        let origin_a =
+            RepoOrigin::new("git@github.com:o/r-a.git".into(), "github.com/o/r-a".into()).unwrap();
+        let mut instance_a =
+            RepoInstance::new(ws_a.id, origin_a.id, "github.com/o/r-a".into(), None).unwrap();
+        instance_a.link_worktree(PathBuf::from("/tmp/gone-a"), None);
+        bind_repo.save_origin(&origin_a).await.unwrap();
+        bind_repo.save_instance(&instance_a).await.unwrap();
 
-        let mut binding_b = RepoBinding::new(
-            ws_b.id,
-            "git@github.com:o/r-b.git".into(),
-            "github.com/o/r-b".into(),
-        )
-        .unwrap();
-        binding_b.link_worktree(PathBuf::from("/tmp/gone-b"), None);
-        bind_repo.save(&binding_b).await.unwrap();
+        let origin_b =
+            RepoOrigin::new("git@github.com:o/r-b.git".into(), "github.com/o/r-b".into()).unwrap();
+        let mut instance_b =
+            RepoInstance::new(ws_b.id, origin_b.id, "github.com/o/r-b".into(), None).unwrap();
+        instance_b.link_worktree(PathBuf::from("/tmp/gone-b"), None);
+        bind_repo.save_origin(&origin_b).await.unwrap();
+        bind_repo.save_instance(&instance_b).await.unwrap();
 
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo, bind_repo.clone());
@@ -1535,14 +1528,12 @@ mod tests {
         // T0: only WS1 exists, with a missing worktree.
         let ws1 = Workspace::new(WorkspaceName::new("alpha").unwrap(), None, true);
         ws_repo.save(&ws1).await.unwrap();
-        let mut b1 = RepoBinding::new(
-            ws1.id,
-            "git@github.com:o/r1.git".into(),
-            "github.com/o/r1".into(),
-        )
-        .unwrap();
+        let origin1 =
+            RepoOrigin::new("git@github.com:o/r1.git".into(), "github.com/o/r1".into()).unwrap();
+        let mut b1 = RepoInstance::new(ws1.id, origin1.id, "github.com/o/r1".into(), None).unwrap();
         b1.link_worktree(PathBuf::from("/tmp/gone-1"), None);
-        bind_repo.save(&b1).await.unwrap();
+        bind_repo.save_origin(&origin1).await.unwrap();
+        bind_repo.save_instance(&b1).await.unwrap();
 
         let workspaces = WorkspaceService::new(ws_repo.clone());
         let bindings = RepoBindingService::new(ws_repo.clone(), bind_repo.clone());
@@ -1562,14 +1553,16 @@ mod tests {
         // Between ticks: add WS2 with its own missing worktree.
         let ws2 = Workspace::new(WorkspaceName::new("beta").unwrap(), None, true);
         ws_repo.save(&ws2).await.unwrap();
-        let mut b2 = RepoBinding::new(
-            ws2.id,
-            "git@github.com:o/r2.git".into(),
-            "github.com/o/r2".into(),
-        )
-        .unwrap();
+        let mut origin2 =
+            RepoOrigin::new("git@github.com:o/r2.git".into(), "github.com/o/r2".into()).unwrap();
+        // `r1` and `r2` both derive prefix `rxx`; seeding raw via `save_origin`
+        // bypasses the service's collision-breaking, so set the distinct prefix
+        // the service would have assigned (`rxx` → `rxx1`-style) by hand.
+        origin2.set_prefix("rxy".into()).unwrap();
+        let mut b2 = RepoInstance::new(ws2.id, origin2.id, "github.com/o/r2".into(), None).unwrap();
         b2.link_worktree(PathBuf::from("/tmp/gone-2"), None);
-        bind_repo.save(&b2).await.unwrap();
+        bind_repo.save_origin(&origin2).await.unwrap();
+        bind_repo.save_instance(&b2).await.unwrap();
 
         // Tick 2: WS1 → 2 (continues), WS2 → 1 (fresh start, doesn't inherit).
         daemon.tick_once().await.unwrap();

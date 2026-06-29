@@ -205,7 +205,8 @@ async fn sync_import(
                  attach it first with `rl repo attach`"
             )
         })?;
-    let repo_id = root_binding.id; // RepoId — all imported tasks land under it
+    let repo_id = root_binding.instance.id; // RepoInstanceId — used for task creation
+    let filing_origin_id = root_binding.instance.origin_id; // RepoOriginId — used for dedup lookup
     let repo_id_str = repo_id.to_string();
 
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -229,7 +230,7 @@ async fn sync_import(
         // import will write.
         let node_task_id = if let Some(existing) = svc
             .tasks_repo
-            .find_by_remote(repo_id, PROVIDER, &number)
+            .find_by_remote(filing_origin_id, PROVIDER, &number)
             .await
             .map_err(|e| anyhow!("{e}"))?
         {
@@ -269,7 +270,7 @@ async fn sync_import(
                 })) => {
                     match svc
                         .tasks_repo
-                        .find_by_remote(repo_id, PROVIDER, &number)
+                        .find_by_remote(filing_origin_id, PROVIDER, &number)
                         .await
                         .map_err(|e| anyhow!("{e}"))?
                     {

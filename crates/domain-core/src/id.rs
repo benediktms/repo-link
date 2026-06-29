@@ -66,8 +66,16 @@ macro_rules! define_id {
 
 define_id!(WorkspaceId, "workspace");
 define_id!(RepoId, "repo");
+define_id!(RepoOriginId, "repo-origin");
 define_id!(TaskId, "task");
 define_id!(OutboxEntryId, "outbox-entry");
+
+/// The per-workspace repo membership id (RFC 0005). Kept as an alias of the
+/// pre-0005 [`RepoId`] so `tasks.repo_instance_id` / `worktree_links.repo_id`
+/// FK round-trips and already-serialized ids are unchanged. The shared repo
+/// identity uses the distinct [`RepoOriginId`] newtype — they must NOT be
+/// conflated (RFC 0005 §D4: filing/remote keys live in origin id space).
+pub type RepoInstanceId = RepoId;
 
 #[derive(Debug, Error)]
 pub enum ProjectIdParseError {

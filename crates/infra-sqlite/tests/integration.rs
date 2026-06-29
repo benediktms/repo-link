@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use domain_repo::RepoBinding;
+use domain_core::{RepoId, RepoOriginId};
+use domain_repo::{RepoInstance, RepoOrigin};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
@@ -24,6 +25,30 @@ async fn setup() -> (
 ) {
     let (dir, _db, ws, rb, ts) = setup_with_db().await;
     (dir, ws, rb, ts)
+}
+
+/// RFC 0005 test helper: persist a shared `RepoOrigin` + a per-workspace
+/// `RepoInstance` for it, returning the instance (whose `id` is what a task's
+/// logical `repo_id` points at). An optional `prefix` overrides the
+/// auto-derived one so callers can dodge the `repo_origins.prefix` UNIQUE index
+/// when seeding several look-alike canonicals. The instance carries
+/// `instance.origin_id`, which is the ORIGIN id space `filing_repo_id` /
+/// `find_by_remote` / `find_by_remote_mapping` operate in.
+async fn seed_binding(
+    rb: &SqliteRepoBindingRepository,
+    workspace_id: domain_core::WorkspaceId,
+    remote_url: &str,
+    canonical_url: &str,
+    prefix: Option<&str>,
+) -> RepoInstance {
+    let mut origin = RepoOrigin::new(remote_url.into(), canonical_url.into()).unwrap();
+    if let Some(p) = prefix {
+        origin.set_prefix(p.into()).unwrap();
+    }
+    rb.save_origin(&origin).await.unwrap();
+    let instance = RepoInstance::new(workspace_id, origin.id, canonical_url.into(), None).unwrap();
+    rb.save_instance(&instance).await.unwrap();
+    instance
 }
 
 async fn setup_with_db() -> (
@@ -246,25 +271,32 @@ async fn remote_mapping_is_repo_scoped() {
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
     ws.save(&w).await.unwrap();
 
-    // Two bindings in the same workspace.
-    let repo_a = RepoBinding::new(
+    // Two bindings in the same workspace, each with its own shared origin.
+    let repo_a = seed_binding(
+        &rb,
         w.id,
-        "git@github.com:o/a.git".into(),
-        "github.com/o/a".into(),
+        "git@github.com:o/a.git",
+        "github.com/o/a",
+        Some("aaa"),
     )
-    .unwrap();
-    let repo_b = RepoBinding::new(
+    .await;
+    let repo_b = seed_binding(
+        &rb,
         w.id,
-        "git@github.com:o/b.git".into(),
-        "github.com/o/b".into(),
+        "git@github.com:o/b.git",
+        "github.com/o/b",
+        Some("bbb"),
     )
-    .unwrap();
-    rb.save(&repo_a).await.unwrap();
-    rb.save(&repo_b).await.unwrap();
+    .await;
 
-    // A task in `repo` mirroring github issue `num`.
-    let mk = |repo_id, num: &str| {
-        let mut t = Task::new_draft(w.id, Some(repo_id), format!("issue {num}")).unwrap();
+    // A task in `repo` mirroring github issue `num`. RFC 0005: the remote
+    // axis is keyed on the FILING repo in ORIGIN id space, so record the
+    // logical repo's origin as the filing repo (mirrors the migration's 7a
+    // straggler backfill) before promoting.
+    let mk = |instance: &RepoInstance, num: &str| {
+        let mut t = Task::new_draft(w.id, Some(instance.id), format!("issue {num}")).unwrap();
+        t.set_filing_repo_id(Some(RepoId::from_uuid(instance.origin_id.as_uuid())))
+            .unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
         t
@@ -272,16 +304,16 @@ async fn remote_mapping_is_repo_scoped() {
 
     // Same issue number (#1) in two different repos must both persist —
     // remote identity is repo-scoped, so they don't collide.
-    ts.save(&mk(repo_a.id, "1"), SnapshotSource::Promote)
+    ts.save(&mk(&repo_a, "1"), SnapshotSource::Promote)
         .await
         .unwrap();
-    ts.save(&mk(repo_b.id, "1"), SnapshotSource::Promote)
+    ts.save(&mk(&repo_b, "1"), SnapshotSource::Promote)
         .await
         .expect("repoB#1 must not collide with repoA#1");
 
     // But the same (repo, provider, remote_id) still conflicts.
     let err = ts
-        .save(&mk(repo_a.id, "1"), SnapshotSource::Promote)
+        .save(&mk(&repo_a, "1"), SnapshotSource::Promote)
         .await
         .expect_err("duplicate remote in the same repo should conflict");
     let msg = format!("{err:?}").to_lowercase();
@@ -302,25 +334,31 @@ async fn remote_dedup_keyed_on_filing_repo_when_it_diverges() {
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
     ws.save(&w).await.unwrap();
 
-    let logical = RepoBinding::new(
+    let logical = seed_binding(
+        &rb,
         w.id,
-        "git@github.com:o/logical.git".into(),
-        "github.com/o/logical".into(),
+        "git@github.com:o/logical.git",
+        "github.com/o/logical",
+        None,
     )
-    .unwrap();
-    let filing = RepoBinding::new(
+    .await;
+    let filing = seed_binding(
+        &rb,
         w.id,
-        "git@github.com:o/filing.git".into(),
-        "github.com/o/filing".into(),
+        "git@github.com:o/filing.git",
+        "github.com/o/filing",
+        None,
     )
-    .unwrap();
-    rb.save(&logical).await.unwrap();
-    rb.save(&filing).await.unwrap();
+    .await;
+    // RFC 0005: the filing axis is in ORIGIN id space.
+    let filing_origin = RepoOriginId::from_uuid(filing.origin_id.as_uuid());
+    let logical_origin = RepoOriginId::from_uuid(logical.origin_id.as_uuid());
 
     // Logical repo = `logical`, but the issue is FILED in `filing`.
     let mk = |num: &str| {
         let mut t = Task::new_draft(w.id, Some(logical.id), format!("issue {num}")).unwrap();
-        t.set_filing_repo_id(Some(filing.id)).unwrap();
+        t.set_filing_repo_id(Some(RepoId::from_uuid(filing.origin_id.as_uuid())))
+            .unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
         t
@@ -330,14 +368,14 @@ async fn remote_dedup_keyed_on_filing_repo_when_it_diverges() {
 
     // Read side: found by the FILING repo, not the logical repo.
     assert!(
-        ts.find_by_remote(filing.id, "github", "1")
+        ts.find_by_remote(filing_origin, "github", "1")
             .await
             .unwrap()
             .is_some(),
         "dedup must match on the filing repo"
     );
     assert!(
-        ts.find_by_remote(logical.id, "github", "1")
+        ts.find_by_remote(logical_origin, "github", "1")
             .await
             .unwrap()
             .is_none(),
@@ -357,34 +395,42 @@ async fn remote_dedup_keyed_on_filing_repo_when_it_diverges() {
     );
 }
 
-/// Pre-resolution / migrated rows (filing_repo_id NULL) still dedup by their
-/// logical repo via the COALESCE fallback, so D6 doesn't break tasks promoted
-/// before the filing repo was resolved.
+/// RFC 0005 §D4: the COALESCE-to-logical fallback is GONE — `find_by_remote`
+/// keys on `filing_repo_id` alone (ORIGIN id space). A task whose logical repo
+/// is its filing repo records the logical repo's *origin* as the filing repo
+/// (the runtime equivalent of the migration's 7a straggler backfill), and is
+/// then found by that ORIGIN id — not by the logical *instance* id.
 #[tokio::test]
-async fn remote_dedup_falls_back_to_logical_when_filing_unresolved() {
+async fn remote_dedup_keys_on_filing_origin_not_logical_instance() {
     let (_dir, ws, rb, ts) = setup().await;
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
     ws.save(&w).await.unwrap();
-    let repo = RepoBinding::new(
-        w.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
-    )
-    .unwrap();
-    rb.save(&repo).await.unwrap();
+    let repo = seed_binding(&rb, w.id, "git@github.com:o/r.git", "github.com/o/r", None).await;
+    let repo_origin = RepoOriginId::from_uuid(repo.origin_id.as_uuid());
 
-    // filing_repo_id left None (pre-resolution); logical repo is `repo`.
+    // Logical repo IS the filing repo: record its origin as the filing repo.
     let mut t = Task::new_draft(w.id, Some(repo.id), "issue 7".into()).unwrap();
+    t.set_filing_repo_id(Some(RepoId::from_uuid(repo.origin_id.as_uuid())))
+        .unwrap();
     t.stage_for_sync().unwrap();
     t.promote_to_remote(RemoteRef::new("github", "7")).unwrap();
     ts.save(&t, SnapshotSource::Promote).await.unwrap();
 
+    // Found by the filing repo's ORIGIN id.
     assert!(
-        ts.find_by_remote(repo.id, "github", "7")
+        ts.find_by_remote(repo_origin, "github", "7")
             .await
             .unwrap()
             .is_some(),
-        "a task with NULL filing repo must still be found by its logical repo (COALESCE fallback)"
+        "remote-backed task is found by its recorded filing-repo origin id"
+    );
+    // NOT found by the logical *instance* id (a different id space).
+    assert!(
+        ts.find_by_remote(RepoOriginId::from_uuid(repo.id.as_uuid()), "github", "7")
+            .await
+            .unwrap()
+            .is_none(),
+        "find_by_remote keys on filing_repo_id alone — the logical instance id no longer matches"
     );
 }
 
@@ -393,20 +439,17 @@ async fn repo_with_worktrees_roundtrip() {
     let (_dir, ws, rb, _ts) = setup().await;
     let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
     ws.save(&w).await.unwrap();
-    let mut binding = RepoBinding::new(
-        w.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
-    )
-    .unwrap();
+    let origin = RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+    rb.save_origin(&origin).await.unwrap();
+    let mut binding = RepoInstance::new(w.id, origin.id, "github.com/o/r".into(), None).unwrap();
     binding.link_worktree(PathBuf::from("/tmp/a"), Some("main".into()));
     binding.link_worktree(PathBuf::from("/tmp/b"), None);
     binding
         .mark_path_missing(std::path::Path::new("/tmp/b"))
         .unwrap();
-    rb.save(&binding).await.unwrap();
+    rb.save_instance(&binding).await.unwrap();
 
-    let back = rb.get(binding.id).await.unwrap();
+    let back = rb.get(binding.id).await.unwrap().instance;
     assert_eq!(back.worktrees.len(), 2);
     let by_path: std::collections::HashMap<_, _> = back
         .worktrees
@@ -422,8 +465,8 @@ async fn repo_with_worktrees_roundtrip() {
     // Replace child collection: prune missing and resave.
     let mut updated = back;
     updated.prune_missing();
-    rb.save(&updated).await.unwrap();
-    let after = rb.get(binding.id).await.unwrap();
+    rb.save_instance(&updated).await.unwrap();
+    let after = rb.get(binding.id).await.unwrap().instance;
     assert_eq!(after.worktrees.len(), 1);
 }
 
@@ -926,22 +969,18 @@ async fn concurrent_reads_during_active_write() {
 
 #[tokio::test]
 async fn backfill_derives_name_for_empty_rows() {
-    let (_dir, db, ws, _rb, _ts) = setup_with_db().await;
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
 
-    // Seed a workspace so the FK constraint on repos is satisfied.
-    let w = Workspace::new(WorkspaceName::new("bf-ws").unwrap(), None, true);
-    ws.save(&w).await.unwrap();
-
-    // Insert a repos row with name = '' directly, bypassing the repository
-    // layer to simulate a row that predates the name column.
+    // RFC 0005: name/aliases now live on `repo_origins`. Insert an origin row
+    // with name = '' directly, bypassing the repository layer to simulate a
+    // row that predates the name column.
     sqlx::query(
-        "INSERT INTO repos (id, workspace_id, remote_url, canonical_url, name, aliases, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, '', '[]', datetime('now'), datetime('now'))",
+        "INSERT INTO repo_origins (id, canonical_url, remote_url, prefix, name, aliases, created_at, updated_at) \
+         VALUES (?, ?, ?, '', '', '[]', datetime('now'), datetime('now'))",
     )
     .bind("aaaaaaaa-0000-0000-0000-000000000001")
-    .bind(w.id.to_string())
-    .bind("git@github.com:org/myrepo.git")
     .bind("github.com/org/myrepo")
+    .bind("git@github.com:org/myrepo.git")
     .execute(&db.writes)
     .await
     .unwrap();
@@ -949,7 +988,7 @@ async fn backfill_derives_name_for_empty_rows() {
     // Run the backfill — should derive "myrepo" from the canonical URL.
     backfill_empty_repo_names(&db.writes).await.unwrap();
 
-    let (name,): (String,) = sqlx::query_as("SELECT name FROM repos WHERE id = ?")
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM repo_origins WHERE id = ?")
         .bind("aaaaaaaa-0000-0000-0000-000000000001")
         .fetch_one(&db.reads)
         .await
@@ -964,19 +1003,20 @@ async fn backfill_is_idempotent_on_populated_rows() {
     let w = Workspace::new(WorkspaceName::new("bf-ws2").unwrap(), None, true);
     ws.save(&w).await.unwrap();
 
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         w.id,
-        "git@github.com:org/proj.git".into(),
-        "github.com/org/proj".into(),
+        "git@github.com:org/proj.git",
+        "github.com/org/proj",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
 
     // Running backfill again should be a no-op and not error.
     backfill_empty_repo_names(&db.writes).await.unwrap();
 
-    let (name,): (String,) = sqlx::query_as("SELECT name FROM repos WHERE id = ?")
-        .bind(binding.id.to_string())
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM repo_origins WHERE id = ?")
+        .bind(binding.origin_id.to_string())
         .fetch_one(&db.reads)
         .await
         .unwrap();
@@ -1014,28 +1054,26 @@ async fn concurrent_writes_serialize_without_busy_error() {
     assert_eq!(listed.len(), 2);
 }
 
-/// The CHECK constraint on `repos.aliases` must reject valid JSON that
+/// The CHECK constraint on `repo_origins.aliases` must reject valid JSON that
 /// isn't a JSON array. Without `json_type(...) = 'array'`, an object or
 /// scalar would slip through and break Vec<String> hydration on load.
+/// (RFC 0005: name/aliases moved from `repos` to the shared `repo_origins`.)
 #[tokio::test]
 async fn aliases_check_rejects_non_array_json() {
-    let (_dir, db, ws, _rb, _ts) = setup_with_db().await;
-    let w = Workspace::new(WorkspaceName::new("ws-check").unwrap(), None, true);
-    ws.save(&w).await.unwrap();
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
 
-    // Try to insert a repo row whose aliases is a valid JSON *object*
+    // Try to insert an origin row whose aliases is a valid JSON *object*
     // (not an array). The CHECK constraint must reject this.
     let result = sqlx::query(
         r#"
-        INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch,
-                           name, aliases, created_at, updated_at)
-        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+        INSERT INTO repo_origins (id, canonical_url, remote_url, prefix,
+                                  name, aliases, created_at, updated_at)
+        VALUES (?, ?, ?, '', ?, ?, ?, ?)
         "#,
     )
     .bind("c08c09c5-4ac2-4a43-96ea-d574a580fde5")
-    .bind(w.id.to_string())
-    .bind("git@example.com:o/r.git")
     .bind("example.com/o/r")
+    .bind("git@example.com:o/r.git")
     .bind("r")
     .bind(r#"{"not": "an array"}"#)
     .bind(chrono::Utc::now())
@@ -1376,13 +1414,16 @@ async fn workspace_filing_repo_id_roundtrips() {
 
     let mut workspace = Workspace::new(WorkspaceName::new("filing-ws").unwrap(), None, true);
     ws.save(&workspace).await.unwrap();
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         workspace.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
+    // RFC 0005: the workspace default filing repo is in ORIGIN id space.
+    let filing_default = RepoId::from_uuid(binding.origin_id.as_uuid());
 
     // Insert path: no default filing repo yet.
     assert_eq!(
@@ -1392,11 +1433,11 @@ async fn workspace_filing_repo_id_roundtrips() {
     );
 
     // Upsert path: set the default and re-save; the DO UPDATE must persist it.
-    workspace.filing_repo_id = Some(binding.id);
+    workspace.filing_repo_id = Some(filing_default);
     ws.save(&workspace).await.unwrap();
     assert_eq!(
         ws.get(workspace.id).await.unwrap().filing_repo_id,
-        Some(binding.id),
+        Some(filing_default),
         "workspace default filing repo round-trips through the upsert"
     );
 }
@@ -1407,13 +1448,14 @@ async fn task_remote_node_id_and_project_item_id_roundtrip() {
 
     let workspace = Workspace::new(WorkspaceName::new("nodes").unwrap(), None, true);
     ws.save(&workspace).await.unwrap();
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         workspace.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
 
     let mut task = Task::new_draft(workspace.id, Some(binding.id), "with node ids".into()).unwrap();
     task.stage_for_sync().unwrap();
@@ -1494,13 +1536,16 @@ async fn task_filing_repo_id_roundtrips_through_upsert() {
 
     let workspace = Workspace::new(WorkspaceName::new("filing-task").unwrap(), None, true);
     ws.save(&workspace).await.unwrap();
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         workspace.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
+    // RFC 0005: filing_repo_id is in ORIGIN id space.
+    let filing = RepoId::from_uuid(binding.origin_id.as_uuid());
 
     // Insert: a fresh task has no resolved filing repo.
     let mut task = Task::new_draft(workspace.id, Some(binding.id), "filing".into()).unwrap();
@@ -1516,11 +1561,11 @@ async fn task_filing_repo_id_roundtrips_through_upsert() {
 
     // Record the filing repo (the promote-time write: None → Some is allowed
     // even once remote-backed) and upsert; the DO UPDATE must persist it.
-    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    task.set_filing_repo_id(Some(filing)).unwrap();
     ts.save(&task, SnapshotSource::LocalEdit).await.unwrap();
     assert_eq!(
         ts.get(task.id).await.unwrap().filing_repo_id,
-        Some(binding.id),
+        Some(filing),
         "DO UPDATE must persist the recorded filing repo on upsert"
     );
 }
@@ -1535,13 +1580,16 @@ async fn snapshot_filing_repo_id_roundtrips() {
     let (_dir, db, ws, rb, ts) = setup_with_db().await;
     let workspace = Workspace::new(WorkspaceName::new("snap-filing").unwrap(), None, true);
     ws.save(&workspace).await.unwrap();
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         workspace.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
+    // RFC 0005: filing_repo_id is in ORIGIN id space.
+    let filing = RepoId::from_uuid(binding.origin_id.as_uuid());
 
     // Promote then record the filing repo, then write a Promote snapshot
     // carrying it.
@@ -1549,7 +1597,7 @@ async fn snapshot_filing_repo_id_roundtrips() {
     task.stage_for_sync().unwrap();
     task.promote_to_remote(RemoteRef::new("github", "7"))
         .unwrap();
-    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    task.set_filing_repo_id(Some(filing)).unwrap();
     ts.save(&task, SnapshotSource::Promote).await.unwrap();
 
     let snaps = SqliteTaskSnapshotRepository::new(db);
@@ -1557,13 +1605,13 @@ async fn snapshot_filing_repo_id_roundtrips() {
     assert_eq!(listed.len(), 1);
     assert_eq!(
         listed[0].filing_repo_id,
-        Some(binding.id),
+        Some(filing),
         "list must read back the captured filing repo"
     );
     let got = snaps.get(task.id, listed[0].version).await.unwrap();
     assert_eq!(
         got.filing_repo_id,
-        Some(binding.id),
+        Some(filing),
         "get must read back the captured filing repo"
     );
 }
@@ -1576,26 +1624,29 @@ async fn load_latest_baseline_carries_filing_repo_id() {
     let (_dir, ws, rb, ts) = setup().await;
     let workspace = Workspace::new(WorkspaceName::new("snap-baseline").unwrap(), None, true);
     ws.save(&workspace).await.unwrap();
-    let binding = RepoBinding::new(
+    let binding = seed_binding(
+        &rb,
         workspace.id,
-        "git@github.com:o/r.git".into(),
-        "github.com/o/r".into(),
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
     )
-    .unwrap();
-    rb.save(&binding).await.unwrap();
+    .await;
+    // RFC 0005: filing_repo_id is in ORIGIN id space.
+    let filing = RepoId::from_uuid(binding.origin_id.as_uuid());
 
     let mut task = Task::new_draft(workspace.id, Some(binding.id), "baseline".into()).unwrap();
     task.stage_for_sync().unwrap();
     task.promote_to_remote(RemoteRef::new("github", "8"))
         .unwrap();
-    task.set_filing_repo_id(Some(binding.id)).unwrap();
+    task.set_filing_repo_id(Some(filing)).unwrap();
     // Promote IS baseline-eligible, so this snapshot becomes the baseline.
     ts.save(&task, SnapshotSource::Promote).await.unwrap();
 
     let reloaded = ts.get(task.id).await.unwrap();
     assert_eq!(
         reloaded.synced_baseline.unwrap().filing_repo_id,
-        Some(binding.id),
+        Some(filing),
         "the hydrated baseline must carry the filing repo"
     );
 }
@@ -2394,6 +2445,200 @@ async fn rfc0002_migration_sequence_data_integrity() {
     drop(dir);
 }
 
+/// RFC 0005 §D6 tripwires for the shared-repo-identity migration
+/// (`20260629000001`). Seeds the PRE-migration duplicate-repo shape — the exact
+/// bug #202 fixes: the same `canonical_url` attached to two workspaces with
+/// divergent prefix/name/aliases, plus two tasks mirroring the same remote issue
+/// into it — then runs the migration and asserts the transformation. Mirrors
+/// `rfc0002_migration_sequence_data_integrity`. These pin SQLite behaviours the
+/// migration relies on (rename carries child FKs; RENAME COLUMN rewrites the
+/// expression index) and the data rules (survivor, alias-fold, collision dedup).
+#[tokio::test]
+async fn rfc0005_migration_splits_identity_keeps_instances_and_dedups_remote() {
+    const D5_VERSION: i64 = 20260629000001;
+    const TS1: &str = "2026-01-01T00:00:00Z"; // earlier — the survivor
+    const TS2: &str = "2026-02-01T00:00:00Z"; // later
+
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("rfc0005-audit.db").display());
+    let pool = infra_sqlite::open_write_pool(&url)
+        .await
+        .expect("open write pool (no migrations yet)");
+    let migrator = sqlx::migrate!("./migrations");
+
+    // (1) Apply every migration BEFORE the RFC 0005 split → the pre-split schema.
+    for m in migrator.iter() {
+        if m.version < D5_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0005 migration {} failed: {e}", m.version));
+        }
+    }
+    let pre = column_names(&pool, "repos").await;
+    assert!(
+        pre.contains(&"prefix".to_string()),
+        "pre-0005 repos must still carry the per-workspace prefix; got {pre:?}"
+    );
+
+    // (2) Seed the duplicate-repo bug: one canonical, two workspaces, divergent
+    // prefix (shr/shr1) + name + aliases; two tasks mirroring the SAME remote
+    // issue (github/500) into it — a cross-workspace remote_mappings collision.
+    sqlx::raw_sql(&format!(
+        "INSERT INTO workspaces (id, name, status, local_only, created_at, updated_at)
+           VALUES ('ws-1','a','created',1,'{TS1}','{TS1}'), ('ws-2','b','created',1,'{TS2}','{TS2}');
+         INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, name, aliases, prefix, created_at, updated_at)
+           VALUES ('inst-1','ws-1','git@github.com:o/shared.git','github.com/o/shared',NULL,'shared','[\"legacy\"]','shr','{TS1}','{TS1}'),
+                  ('inst-2','ws-2','git@github.com:o/shared.git','github.com/o/shared',NULL,'shared-renamed','[]','shr1','{TS2}','{TS2}');
+         INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, remote_provider, remote_id, filing_repo_id, created_at, updated_at)
+           VALUES ('task-1','ws-1','inst-1','t1','','done','synced','p2','github','500','inst-1','{TS1}','{TS1}'),
+                  ('task-2','ws-2','inst-2','t2','','done','synced','p2','github','500','inst-2','{TS2}','{TS2}');
+         INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id, last_synced_at)
+           VALUES ('task-1','inst-1','github','500','{TS1}'),
+                  ('task-2','inst-2','github','500','{TS2}');"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed pre-0005 duplicate-repo state");
+
+    // (3) Apply the RFC 0005 migration (and anything after it).
+    for m in migrator.iter() {
+        if m.version >= D5_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("0005+ migration {} failed: {e}", m.version));
+        }
+    }
+
+    // --- (a) The duplicated canonical collapses to ONE shared origin; the
+    // earliest-created instance's prefix wins, and the non-surviving instance's
+    // name + aliases are folded in (survivor rule, §D6 step 3).
+    let (origin_id, prefix, aliases): (String, String, String) = sqlx::query_as(
+        "SELECT id, prefix, aliases FROM repo_origins WHERE canonical_url = 'github.com/o/shared'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("exactly one origin for the shared canonical");
+    assert_eq!(
+        prefix, "shr",
+        "earliest-created instance's prefix wins (not shr1)"
+    );
+    assert!(
+        aliases.contains("legacy"),
+        "unioned alias preserved; got {aliases}"
+    );
+    assert!(
+        aliases.contains("shared-renamed"),
+        "non-surviving instance name folded into origin aliases; got {aliases}"
+    );
+
+    // --- (b) BOTH per-workspace instances are kept, sharing the one origin.
+    let (inst_count, distinct_origins): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT origin_id) FROM repo_instances WHERE canonical_url = 'github.com/o/shared'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inst_count, 2, "every instance is kept (none merged away)");
+    assert_eq!(
+        distinct_origins, 1,
+        "both instances share one origin_id => consistent prefix across workspaces"
+    );
+
+    // --- (c) tasks.repo_id renamed to repo_instance_id.
+    let tcols = column_names(&pool, "tasks").await;
+    assert!(
+        tcols.contains(&"repo_instance_id".to_string()) && !tcols.contains(&"repo_id".to_string()),
+        "tasks.repo_id must be renamed to repo_instance_id; got {tcols:?}"
+    );
+
+    // --- (d) child FKs followed the table rename to repo_instances.
+    for child in ["tasks", "worktree_links"] {
+        let parents: Vec<String> = sqlx::query(&format!(
+            "SELECT \"table\" AS p FROM pragma_foreign_key_list('{child}')"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "p"))
+        .collect();
+        assert!(
+            parents.iter().any(|p| p == "repo_instances"),
+            "{child} FK must target repo_instances after the rename; got {parents:?}"
+        );
+    }
+
+    // --- (e) remote-identity index keyed on filing_repo_id ALONE — the
+    // COALESCE(filing_repo_id, repo_id) fallback is gone (origin id space, §D4).
+    let (idx_sql,): (String,) =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_remote_lookup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        idx_sql.contains("filing_repo_id"),
+        "remote-lookup index must key on filing_repo_id; got {idx_sql}"
+    );
+    assert!(
+        !idx_sql.to_uppercase().contains("COALESCE"),
+        "COALESCE fallback must be dropped (origin id space only); got {idx_sql}"
+    );
+
+    // --- (f) the two cross-workspace mappings for the same remote issue collapse
+    // to ONE (collision dedup, §D6 step 7d) re-keyed to the shared origin id.
+    let (mapping_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM remote_mappings WHERE provider = 'github' AND remote_id = '500'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mapping_count, 1,
+        "colliding cross-workspace mappings must dedup to one before the origin rewrite"
+    );
+    let (survivor_filing,): (String,) = sqlx::query_as(
+        "SELECT filing_repo_id FROM remote_mappings WHERE provider = 'github' AND remote_id = '500'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        survivor_filing, origin_id,
+        "surviving mapping must be re-keyed to the shared origin id"
+    );
+    // tasks.filing_repo_id is rewritten to the shared origin too (§D6 step 7b),
+    // not left as the per-workspace instance id.
+    let task_filings: Vec<String> =
+        sqlx::query("SELECT filing_repo_id FROM tasks WHERE id IN ('task-1', 'task-2')")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| sqlx::Row::get::<String, _>(&r, "filing_repo_id"))
+            .collect();
+    assert!(
+        task_filings.len() == 2 && task_filings.iter().all(|f| *f == origin_id),
+        "both tasks' filing_repo_id must be re-keyed to the shared origin; got {task_filings:?}"
+    );
+
+    // --- (g) no FK orphans after the full sequence.
+    let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "table"))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "PRAGMA foreign_key_check must find no orphans after the RFC 0005 sequence; got {orphans:?}"
+    );
+
+    drop(dir);
+}
+
 /// rpl-sv2 follow-up: `find_by_remote_mapping` must be
 /// workspace-scoped and ambiguous (≥2 matches in the same workspace)
 /// must surface as `None` (so the doctor surfaces the situation as
@@ -2411,35 +2656,42 @@ async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none()
     ws.save(&w1).await.unwrap();
     ws.save(&w2).await.unwrap();
 
-    let repo_w1 = RepoBinding::new(
+    // Each origin must have a unique prefix — same-shaped canonicals
+    // would otherwise collide on the `repo_origins.prefix` UNIQUE index.
+    let repo_w1 = seed_binding(
+        &rb,
         w1.id,
-        "git@github.com:o/cross-w1.git".into(),
-        "github.com/o/cross-w1".into(),
+        "git@github.com:o/cross-w1.git",
+        "github.com/o/cross-w1",
+        Some("cw1"),
     )
-    .unwrap();
-    let repo_w2 = RepoBinding::new(
+    .await;
+    let repo_w2 = seed_binding(
+        &rb,
         w2.id,
-        "git@github.com:o/cross-w2.git".into(),
-        "github.com/o/cross-w2".into(),
+        "git@github.com:o/cross-w2.git",
+        "github.com/o/cross-w2",
+        Some("cw2"),
     )
-    .unwrap();
-    // Each binding must have a unique prefix — the second
-    // `RepoBinding::new` with a same-shaped canonical would
-    // otherwise collide on the `repos.prefix` UNIQUE index.
-    // (The first auto-derives a prefix from its canonical; the
-    // second needs an explicit override.)
-    let repo_w1_id = repo_w1.id;
-    let repo_w2_id = repo_w2.id;
-    rb.save(&repo_w1).await.unwrap();
-    let mut repo_w2 = repo_w2;
-    repo_w2.set_prefix("cw2".into()).unwrap();
-    rb.save(&repo_w2).await.unwrap();
+    .await;
+    // RFC 0005: find_by_remote_mapping resolves to ORIGIN ids.
+    let repo_w1_origin = RepoOriginId::from_uuid(repo_w1.origin_id.as_uuid());
+    let repo_w2_origin = RepoOriginId::from_uuid(repo_w2.origin_id.as_uuid());
 
     // One task per workspace, both mirroring the same github issue
     // (legitimate cross-workspace import — different workspaces
-    // importing the same upstream issue for local tracking).
-    for (ws_id, repo_id) in [(w1.id, repo_w1_id), (w2.id, repo_w2_id)] {
-        let mut t = Task::new_draft(ws_id, Some(repo_id), "shared issue".into()).unwrap();
+    // importing the same upstream issue for local tracking). Each
+    // records its own logical repo's origin as the filing repo so the
+    // `remote_mappings` row is keyed in ORIGIN id space (#D4).
+    for instance in [&repo_w1, &repo_w2] {
+        let mut t = Task::new_draft(
+            instance.workspace_id,
+            Some(instance.id),
+            "shared issue".into(),
+        )
+        .unwrap();
+        t.set_filing_repo_id(Some(RepoId::from_uuid(instance.origin_id.as_uuid())))
+            .unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", "shared-1"))
             .unwrap();
@@ -2457,32 +2709,33 @@ async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none()
         .unwrap();
     assert_eq!(
         w1_hit,
-        Some(repo_w1.id),
-        "w1 lookup must return the w1 binding, not a cross-workspace pick"
+        Some(repo_w1_origin),
+        "w1 lookup must return the w1 origin, not a cross-workspace pick"
     );
     let w2_hit = rb
         .find_by_remote_mapping(w2.id, "github", "shared-1")
         .await
         .unwrap();
-    assert_eq!(w2_hit, Some(repo_w2.id));
+    assert_eq!(w2_hit, Some(repo_w2_origin));
 
-    // Ambiguity-in-workspace case: two bindings in w1 with the
+    // Ambiguity-in-workspace case: two origins in w1 with the
     // same `(provider, remote_id)` row. (Reach it by saving a
-    // second task in w1 pointing at a *different* binding under
+    // second task in w1 pointing at a *different* origin under
     // the same remote_id — `remote_mappings` carries a UNIQUE on
     // `(filing_repo_id, provider, remote_id)`, so two distinct
-    // bindings in the same workspace CAN both hold the same
+    // origins in the same workspace CAN both hold the same
     // `(provider, remote_id)` row.)
-    let mut repo_w1_2 = RepoBinding::new(
+    let repo_w1_2 = seed_binding(
+        &rb,
         w1.id,
-        "git@github.com:o/cross-w1-mirror.git".into(),
-        "github.com/o/cross-w1-mirror".into(),
+        "git@github.com:o/cross-w1-mirror.git",
+        "github.com/o/cross-w1-mirror",
+        Some("cw1m"),
     )
-    .unwrap();
-    let repo_w1_2_id = repo_w1_2.id;
-    repo_w1_2.set_prefix("cw1m".into()).unwrap();
-    rb.save(&repo_w1_2).await.unwrap();
-    let mut t2 = Task::new_draft(w1.id, Some(repo_w1_2_id), "ambiguous".into()).unwrap();
+    .await;
+    let mut t2 = Task::new_draft(w1.id, Some(repo_w1_2.id), "ambiguous".into()).unwrap();
+    t2.set_filing_repo_id(Some(RepoId::from_uuid(repo_w1_2.origin_id.as_uuid())))
+        .unwrap();
     t2.stage_for_sync().unwrap();
     t2.promote_to_remote(RemoteRef::new("github", "shared-1"))
         .unwrap();
@@ -2498,13 +2751,13 @@ async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none()
         ambiguous, None,
         "ambiguous workspace lookup must return None (not arbitrarily pick)"
     );
-    // w2's lookup is unaffected (only one binding holds the
+    // w2's lookup is unaffected (only one origin holds the
     // mapping there).
     let w2_unchanged = rb
         .find_by_remote_mapping(w2.id, "github", "shared-1")
         .await
         .unwrap();
-    assert_eq!(w2_unchanged, Some(repo_w2.id));
+    assert_eq!(w2_unchanged, Some(repo_w2_origin));
 }
 
 /// RFC 0004 D1 invariant — *blocked_by referential integrity*. The storage

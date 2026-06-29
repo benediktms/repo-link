@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use application_sync::enqueue;
-use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, OutboxMutation, resolve_filing_repo};
 use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
@@ -91,7 +91,7 @@ impl TaskService {
         let Some(repo_id) = t.repo_id else {
             return Ok(None);
         };
-        Ok(Some(self.bindings.get(repo_id).await?.prefix))
+        Ok(Some(self.bindings.get(repo_id).await?.origin.prefix))
     }
 
     /// Convert a single task to its DTO, looking up the composite-ID
@@ -200,7 +200,7 @@ impl TaskService {
             // The bare hash is the source of truth — we found the task.
             // The prefix half is a sanity check.
             let actual_prefix = match task.repo_id {
-                Some(repo_id) => self.bindings.get(repo_id).await?.prefix,
+                Some(repo_id) => self.bindings.get(repo_id).await?.origin.prefix,
                 // Task without a repo binding can't have a prefix; any
                 // input prefix is necessarily a mismatch.
                 None => String::new(),
@@ -266,6 +266,16 @@ impl TaskService {
             cmd.assignees,
             cmd.closed,
         )?;
+        // RFC 0005 §D4: `filing_repo_id` is origin-space. `Task::import_mirror`
+        // seeds it from the logical *instance* id (the domain can't resolve
+        // origins); convert it to that instance's origin so the stored
+        // remote-identity key matches `find_by_remote` (which keys on the
+        // origin) — otherwise re-importing the same issue misses dedup and
+        // creates a duplicate task.
+        if let Some(rid) = repo_id {
+            let origin_id = self.bindings.get(rid).await?.instance.origin_id;
+            t.force_set_filing_repo_id(Some(RepoId::from_uuid(origin_id.as_uuid())));
+        }
         self.save_with_minted_hash(&mut t, SnapshotSource::Pull)
             .await?;
         self.task_dto(&t).await
@@ -374,7 +384,19 @@ impl TaskService {
         // or enqueue a duplicate `ConvertDraftToIssue` (Greptile #137).
         let resolved_filing = if was_orphan_draft && t.filing_repo_id.is_none() {
             let workspace = self.workspaces.get(t.workspace_id).await?;
-            resolve_filing_repo(None, workspace.filing_repo_id, t.repo_id)
+            // RFC 0005: resolve_filing_repo operates in origin id space.
+            // workspace.filing_repo_id and t.repo_id carry RepoId bytes but
+            // hold origin UUIDs (workspace default) or instance UUIDs (repo_id).
+            let ws_default = workspace
+                .filing_repo_id
+                .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+            let logical_origin = if let Some(rid) = t.repo_id {
+                Some(self.bindings.get(rid).await?.instance.origin_id)
+            } else {
+                None
+            };
+            resolve_filing_repo(None, ws_default, logical_origin)
+                .map(|o| RepoId::from_uuid(o.as_uuid()))
         } else {
             None
         };
@@ -498,17 +520,20 @@ impl TaskService {
         task_id: &str,
         target: Option<RepoId>,
     ) -> Result<TaskDto> {
-        // Validate the target binding exists before mutating the
-        // task. `force_set_filing_repo_id` is a deliberate-override
-        // domain method that accepts any RepoId without checking —
-        // its only safety net is this service-layer check. Without
-        // it, the doctor's `--target` flag could persist ANOTHER
-        // dangling pointer (the bug we're fixing, just on a
-        // different column). `None` (clear) is a separate case the
-        // user explicitly opts into and doesn't need validation.
-        if let Some(target_id) = target {
-            self.bindings.get(target_id).await?;
-        }
+        // Validate the target binding exists before mutating the task, and
+        // resolve it to its ORIGIN. `force_set_filing_repo_id` accepts any
+        // RepoId without checking; its only safety net is this service-layer
+        // step. The `--target` is an instance handle, but `filing_repo_id` is
+        // origin-space (RFC 0005 §D4) — storing the raw instance id would
+        // re-plant a dangling filing pointer (the very bug the doctor heals,
+        // moved to a different column). `None` (clear) is a separate case the
+        // user explicitly opts into and needs no validation.
+        let target = if let Some(target_id) = target {
+            let view = self.bindings.get(target_id).await?;
+            Some(RepoId::from_uuid(view.instance.origin_id.as_uuid()))
+        } else {
+            None
+        };
         let id_str = self.resolve_id(task_id).await?;
         let id: TaskId = id_str.parse()?;
         let mut t = self.repo.get(id).await?;
@@ -992,7 +1017,17 @@ impl TaskService {
         // transition. `set_filing_repo_id(None)` is a no-op, so a draft with no
         // default simply stays a board draft.
         if project.is_some() && task.project_item_id.is_none() && task.filing_repo_id.is_none() {
-            let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
+            // RFC 0005: convert to origin id space for the chain, then back for storage.
+            let ws_default = workspace
+                .filing_repo_id
+                .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+            let logical_origin = if let Some(rid) = task.repo_id {
+                Some(self.bindings.get(rid).await?.instance.origin_id)
+            } else {
+                None
+            };
+            let filing = resolve_filing_repo(None, ws_default, logical_origin)
+                .map(|o| RepoId::from_uuid(o.as_uuid()));
             task.set_filing_repo_id(filing)?;
         }
 
@@ -1048,17 +1083,32 @@ impl TaskService {
         // (recorded `filing_repo_id`) or step 3 (logical `repo_id`) win.
         // Only when the chain itself returns `None` — meaning all three
         // inputs are absent — do we return `Ok(None)`. (CodeRabbit #191.)
+        // RFC 0005: convert to origin id space for the chain.
         let workspace_default = match self.workspaces.get(task.workspace_id).await {
-            Ok(ws) => ws.filing_repo_id,
+            Ok(ws) => ws
+                .filing_repo_id
+                .map(|r| RepoOriginId::from_uuid(r.as_uuid())),
             Err(ports::PortError::NotFound(_)) => None,
             Err(e) => return Err(e.into()),
         };
-        let Some(repo_id) =
-            resolve_filing_repo(task.filing_repo_id, workspace_default, task.repo_id)
-        else {
+        let step1 = task
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let step3 = if let Some(rid) = task.repo_id {
+            match self.bindings.get(rid).await {
+                Ok(v) => Some(v.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+        let Some(origin_id) = resolve_filing_repo(step1, workspace_default, step3) else {
             return Ok(None);
         };
-        Ok(Some(self.bindings.get(repo_id).await?.canonical_url))
+        Ok(Some(
+            self.bindings.get_origin(origin_id).await?.canonical_url,
+        ))
     }
 
     /// Issue coordinates `(filing_canonical, remote_id)` for a task, or `None`
@@ -1109,12 +1159,26 @@ impl TaskService {
         let Some(remote) = &task.remote else {
             return Ok(None);
         };
-        let Some(repo_id) =
-            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
-        else {
+        // RFC 0005: convert to origin id space for the chain.
+        let step1 = task
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let ws_default = workspace
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let step3 = if let Some(rid) = task.repo_id {
+            match self.bindings.get(rid).await {
+                Ok(v) => Some(v.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            None
+        };
+        let Some(origin_id) = resolve_filing_repo(step1, ws_default, step3) else {
             return Ok(None);
         };
-        let canonical = self.bindings.get(repo_id).await?.canonical_url;
+        let canonical = self.bindings.get_origin(origin_id).await?.canonical_url;
         Ok(Some((canonical, remote.remote_id.clone())))
     }
 
@@ -1841,7 +1905,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_task_round_trips_composite_for_bound_task() {
-        use domain_repo::RepoBinding;
+        use domain_repo::{RepoInstance, RepoOrigin};
         use ports::RepoBindingRepository;
 
         let repo = Arc::new(InMemoryTaskRepository::new());
@@ -1852,15 +1916,17 @@ mod tests {
         // Seed a binding with a known prefix so the created task's id is a
         // real `prefix-hash` composite (not the bare-hash fallback).
         let ws = WorkspaceId::new();
-        let mut binding = RepoBinding::new(
-            ws,
+        let mut origin = RepoOrigin::new(
             "git@github.com:o/widget.git".into(),
             "github.com/o/widget".into(),
         )
         .unwrap();
-        binding.set_prefix("wid".into()).unwrap();
-        let repo_id = binding.id;
-        bindings.save(&binding).await.unwrap();
+        origin.set_prefix("wid".into()).unwrap();
+        let instance =
+            RepoInstance::new(ws, origin.id, "github.com/o/widget".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
         let svc = TaskService::new(
             repo,
@@ -1938,14 +2004,19 @@ mod tests {
         // Stand up a real binding for A so the post-rollback `task_dto`
         // prefix lookup succeeds. We don't need one for B — the test never
         // renders a DTO while pointed at B.
-        let binding_a = domain_repo::RepoBinding::new(
+        let origin_a =
+            domain_repo::RepoOrigin::new("git@github.com:o/a.git".into(), "github.com/o/a".into())
+                .unwrap();
+        let instance_a = domain_repo::RepoInstance::new(
             workspace_id,
-            "git@github.com:o/a.git".into(),
+            origin_a.id,
             "github.com/o/a".into(),
+            None,
         )
         .unwrap();
-        let repo_a = binding_a.id;
-        bindings_repo.save(&binding_a).await.unwrap();
+        let repo_a = instance_a.id;
+        bindings_repo.save_origin(&origin_a).await.unwrap();
+        bindings_repo.save_instance(&instance_a).await.unwrap();
         let repo_b = domain_core::RepoId::new();
 
         // v1: task bound to repo A.
@@ -2027,14 +2098,19 @@ mod tests {
         let workspace_id = WorkspaceId::new();
         // Stand up a real binding so the post-rollback `task_dto` prefix lookup
         // succeeds (the task stays bound to this repo throughout).
-        let binding = domain_repo::RepoBinding::new(
+        let origin_a =
+            domain_repo::RepoOrigin::new("git@github.com:o/a.git".into(), "github.com/o/a".into())
+                .unwrap();
+        let instance_a = domain_repo::RepoInstance::new(
             workspace_id,
-            "git@github.com:o/a.git".into(),
+            origin_a.id,
             "github.com/o/a".into(),
+            None,
         )
         .unwrap();
-        let logical_repo = binding.id;
-        bindings_repo.save(&binding).await.unwrap();
+        let logical_repo = instance_a.id;
+        bindings_repo.save_origin(&origin_a).await.unwrap();
+        bindings_repo.save_instance(&instance_a).await.unwrap();
         let filing_repo = domain_core::RepoId::new();
 
         // v1: fresh draft, filing repo NOT yet resolved (None).
@@ -2308,15 +2384,16 @@ mod tests {
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // `start()` is a no-op on an open task (RFC 0004 D1); use `complete()`
@@ -2348,15 +2425,16 @@ mod tests {
         } = rich_svc();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         svc.update(UpdateTaskCmd {
@@ -2489,15 +2567,16 @@ mod tests {
         } = rich_svc();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         assert!(outbox.all().is_empty(), "no entries before the transition");
@@ -2526,15 +2605,16 @@ mod tests {
         // canonical_repo resolves.
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         svc.reopen(&t.id.to_string()).await.unwrap();
@@ -2572,15 +2652,16 @@ mod tests {
         // board item (project_item_id set), so a SetProjectStatus is formed
         // too. This is the shape that exercises "an open-keeping transition
         // moves the card but does NOT close the issue".
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), Some("PVTI_7")).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // `reopen()` is an open-keeping transition that genuinely changes the
@@ -2642,15 +2723,16 @@ mod tests {
         } = rich_svc();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
         let mut t = save_issue_mirror(&repo, ws.id, None, None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         svc.update(UpdateTaskCmd {
@@ -2675,17 +2757,18 @@ mod tests {
     async fn ws_with_binding(
         workspaces: &Arc<InMemoryWorkspaceRepository>,
         bindings: &Arc<InMemoryRepoBindingRepository>,
-    ) -> (Workspace, domain_repo::RepoBinding) {
+    ) -> (Workspace, domain_repo::RepoInstance) {
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
-        (ws, binding)
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+        (ws, instance)
     }
 
     #[tokio::test]
@@ -3012,13 +3095,14 @@ mod tests {
         } = rich_svc();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
         // Orphan-draft mirror: a project draft with no remote + no repo.
         let mut t = Task::import_mirror(
@@ -3041,7 +3125,7 @@ mod tests {
             body: None,
             priority: None,
             assignees: None,
-            repo_id: Some(binding.id.to_string()),
+            repo_id: Some(instance.id.to_string()),
         })
         .await
         .unwrap();
@@ -3072,13 +3156,14 @@ mod tests {
         } = rich_svc();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
         let mut t = Task::import_mirror(
             ws.id,
@@ -3100,7 +3185,7 @@ mod tests {
             body: None,
             priority: None,
             assignees: None,
-            repo_id: Some(binding.id.to_string()),
+            repo_id: Some(instance.id.to_string()),
         })
         .await
         .unwrap();
@@ -3138,16 +3223,23 @@ mod tests {
         } = rich_svc();
 
         // Set up a workspace default filing repo binding.
-        let default_binding = domain_repo::RepoBinding::new(
-            WorkspaceId::new(), // bindings.get(id) looks up by binding id, not workspace scope; any value is fine
+        let default_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
+        let default_instance = domain_repo::RepoInstance::new(
+            WorkspaceId::new(),
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_origin(&default_origin).await.unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
 
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
-        ws.filing_repo_id = Some(default_binding.id);
+        ws.filing_repo_id = Some(RepoId::from_uuid(default_origin.id.as_uuid()));
         workspaces.save(&ws).await.unwrap();
 
         // Orphan-draft mirror: a project draft with no remote + no repo.
@@ -3186,7 +3278,7 @@ mod tests {
         // filing_repo_id is recorded as the workspace default.
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(default_binding.id),
+            Some(RepoId::from_uuid(default_origin.id.as_uuid())),
             "filing_repo_id must be the workspace default"
         );
         // Exactly [convert_draft_to_issue] is enqueued.
@@ -3226,23 +3318,37 @@ mod tests {
             ..
         } = rich_svc();
 
-        let first_binding = domain_repo::RepoBinding::new(
-            WorkspaceId::new(),
+        let first_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/first.git".into(),
             "github.com/o/first".into(),
         )
         .unwrap();
-        let second_binding = domain_repo::RepoBinding::new(
+        let first_instance = domain_repo::RepoInstance::new(
             WorkspaceId::new(),
+            first_origin.id,
+            "github.com/o/first".into(),
+            None,
+        )
+        .unwrap();
+        let second_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/second.git".into(),
             "github.com/o/second".into(),
         )
         .unwrap();
-        bindings.save(&first_binding).await.unwrap();
-        bindings.save(&second_binding).await.unwrap();
+        let second_instance = domain_repo::RepoInstance::new(
+            WorkspaceId::new(),
+            second_origin.id,
+            "github.com/o/second".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_origin(&first_origin).await.unwrap();
+        bindings.save_instance(&first_instance).await.unwrap();
+        bindings.save_origin(&second_origin).await.unwrap();
+        bindings.save_instance(&second_instance).await.unwrap();
 
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
-        ws.filing_repo_id = Some(first_binding.id);
+        ws.filing_repo_id = Some(RepoId::from_uuid(first_origin.id.as_uuid()));
         workspaces.save(&ws).await.unwrap();
 
         let mut t = Task::import_mirror(
@@ -3272,11 +3378,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             repo.get(t.id).await.unwrap().filing_repo_id,
-            Some(first_binding.id)
+            Some(RepoId::from_uuid(first_origin.id.as_uuid()))
         );
 
         // The workspace default changes AFTER the draft recorded its filing repo.
-        ws.filing_repo_id = Some(second_binding.id);
+        ws.filing_repo_id = Some(RepoId::from_uuid(second_origin.id.as_uuid()));
         workspaces.save(&ws).await.unwrap();
 
         // A second edit must NOT error and must NOT re-resolve/re-record.
@@ -3294,7 +3400,7 @@ mod tests {
         let reloaded = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(first_binding.id),
+            Some(RepoId::from_uuid(first_origin.id.as_uuid())),
             "recorded filing repo is authoritative — not retargeted to the new default"
         );
         let converts = outbox
@@ -3326,13 +3432,16 @@ mod tests {
         // Workspace with NO filing default — chain collapses to logical.
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
+        let origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/logical.git".into(),
             "github.com/o/logical".into(),
         )
         .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/logical".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
         let mut t = Task::import_mirror(
             ws.id,
@@ -3354,16 +3463,16 @@ mod tests {
             body: None,
             priority: None,
             assignees: None,
-            repo_id: Some(binding.id.to_string()),
+            repo_id: Some(instance.id.to_string()),
         })
         .await
         .unwrap();
 
         let reloaded = repo.get(t.id).await.unwrap();
-        // filing_repo_id == logical repo (D2 step-3 collapse).
+        // filing_repo_id == logical repo origin id (D2 step-3 collapse, RFC 0005).
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(binding.id),
+            Some(RepoId::from_uuid(origin.id.as_uuid())),
             "filing_repo_id must equal the attached logical repo when there is no workspace default"
         );
         let entries = outbox.all();
@@ -3399,15 +3508,22 @@ mod tests {
             bindings,
             ..
         } = rich_svc();
-        let default_binding = domain_repo::RepoBinding::new(
-            WorkspaceId::new(),
+        let default_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
+        let default_instance = domain_repo::RepoInstance::new(
+            WorkspaceId::new(),
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_origin(&default_origin).await.unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
-        ws.filing_repo_id = Some(default_binding.id);
+        ws.filing_repo_id = Some(RepoId::from_uuid(default_origin.id.as_uuid()));
         workspaces.save(&ws).await.unwrap();
 
         let mut t = Task::import_mirror(
@@ -3438,7 +3554,7 @@ mod tests {
         let reloaded = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(default_binding.id),
+            Some(RepoId::from_uuid(default_origin.id.as_uuid())),
             "filing_repo_id recorded even with combined title + convert"
         );
         let entries = outbox.all();
@@ -3469,15 +3585,22 @@ mod tests {
             bindings,
             ..
         } = rich_svc();
-        let default_binding = domain_repo::RepoBinding::new(
-            WorkspaceId::new(),
+        let default_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
+        let default_instance = domain_repo::RepoInstance::new(
+            WorkspaceId::new(),
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_origin(&default_origin).await.unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
-        ws.filing_repo_id = Some(default_binding.id);
+        ws.filing_repo_id = Some(RepoId::from_uuid(default_origin.id.as_uuid()));
         workspaces.save(&ws).await.unwrap();
 
         // Issue-backed mirror (NOT a draft) — the convert gate must not fire.
@@ -3522,17 +3645,18 @@ mod tests {
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let b_origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let b_instance =
+            domain_repo::RepoInstance::new(ws.id, b_origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        bindings.save_origin(&b_origin).await.unwrap();
+        bindings.save_instance(&b_instance).await.unwrap();
 
         // Issue-backed mirror with a node id but NOT yet a project item.
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_7"), None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(b_instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         svc.reopen(&t.id.to_string()).await.unwrap();
@@ -3564,18 +3688,20 @@ mod tests {
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let b_origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let b_instance =
+            domain_repo::RepoInstance::new(ws.id, b_origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        let b_origin_as_repo_id = RepoId::from_uuid(b_origin.id.as_uuid());
+        bindings.save_origin(&b_origin).await.unwrap();
+        bindings.save_instance(&b_instance).await.unwrap();
 
         // Issue-backed mirror with a node id, NOT yet a board item, no filing
         // repo recorded yet (filing_repo_id == None before the transition).
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_r1"), None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(b_instance.id);
         // Confirm: filing_repo_id not recorded yet (pre-condition).
         assert_eq!(t.filing_repo_id, None);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
@@ -3587,8 +3713,8 @@ mod tests {
         let reloaded = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(binding.id),
-            "filing_repo_id must equal the logical repo (step 3) after first board filing"
+            Some(b_origin_as_repo_id),
+            "filing_repo_id must equal the logical repo origin (step 3) after first board filing"
         );
         // AddItem was enqueued (lazy net for issue-backed mirror).
         let kinds: Vec<&str> = outbox.all().iter().map(|e| e.mutation.kind()).collect();
@@ -3622,26 +3748,41 @@ mod tests {
 
         // Two distinct bindings: the logical repo (where code lives) and the
         // filing repo (where the issue was filed).
-        let logical = domain_repo::RepoBinding::new(
-            ws.id,
+        let logical_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/logical.git".into(),
             "github.com/o/logical".into(),
         )
         .unwrap();
-        let filing = domain_repo::RepoBinding::new(
+        let logical_instance = domain_repo::RepoInstance::new(
             ws.id,
+            logical_origin.id,
+            "github.com/o/logical".into(),
+            None,
+        )
+        .unwrap();
+        let filing_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&logical).await.unwrap();
-        bindings.save(&filing).await.unwrap();
+        let filing_instance = domain_repo::RepoInstance::new(
+            ws.id,
+            filing_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_origin(&logical_origin).await.unwrap();
+        bindings.save_instance(&logical_instance).await.unwrap();
+        bindings.save_origin(&filing_origin).await.unwrap();
+        bindings.save_instance(&filing_instance).await.unwrap();
 
         // Issue-backed mirror filed in `filing` while its logical repo is
         // `logical` — the cross-filed shape.
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_node"), None).await;
-        t.repo_id = Some(logical.id);
-        t.set_filing_repo_id(Some(filing.id)).unwrap();
+        t.repo_id = Some(logical_instance.id);
+        t.set_filing_repo_id(Some(RepoId::from_uuid(filing_origin.id.as_uuid())))
+            .unwrap();
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // Lifecycle transition → plan_mirror_mutations → UpdateRemote.
@@ -3729,17 +3870,25 @@ mod tests {
 
         // Bind a "filing default" repo to the workspace.
         let ws_placeholder_id = domain_core::WorkspaceId::new();
-        let default_binding = domain_repo::RepoBinding::new(
-            ws_placeholder_id,
+        let default_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
+        let default_instance = domain_repo::RepoInstance::new(
+            ws_placeholder_id,
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        let default_origin_as_repo_id = RepoId::from_uuid(default_origin.id.as_uuid());
+        bindings.save_origin(&default_origin).await.unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
 
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
-        ws.filing_repo_id = Some(default_binding.id); // workspace default
+        ws.filing_repo_id = Some(default_origin_as_repo_id); // workspace default (origin id stored as RepoId)
         workspaces.save(&ws).await.unwrap();
 
         // Orphan draft: no repo_id, pure draft (remote = None, project_item_id = None).
@@ -3762,7 +3911,7 @@ mod tests {
         let reloaded = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(default_binding.id),
+            Some(default_origin_as_repo_id),
             "orphan + workspace default must resolve to the workspace default repo (step 2)"
         );
         // CreateDraftIssue is enqueued (the issue conversion to a real issue
@@ -3778,7 +3927,7 @@ mod tests {
         let reloaded2 = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded2.filing_repo_id,
-            Some(default_binding.id),
+            Some(default_origin_as_repo_id),
             "filing_repo_id must not change on repeat transition (idempotent same-value set)"
         );
     }
@@ -3801,18 +3950,20 @@ mod tests {
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let b_origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let b_instance =
+            domain_repo::RepoInstance::new(ws.id, b_origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        let b_origin_as_repo_id = RepoId::from_uuid(b_origin.id.as_uuid());
+        bindings.save_origin(&b_origin).await.unwrap();
+        bindings.save_instance(&b_instance).await.unwrap();
 
         // Already attached: project_item_id is set; filing_repo_id already recorded.
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_a1"), Some("PVTI_a1")).await;
-        t.repo_id = Some(binding.id);
-        t.set_filing_repo_id(Some(binding.id)).unwrap();
+        t.repo_id = Some(b_instance.id);
+        t.set_filing_repo_id(Some(b_origin_as_repo_id)).unwrap();
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
         let filing_before = t.filing_repo_id;
 
@@ -3858,30 +4009,47 @@ mod tests {
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
 
-        let logical = domain_repo::RepoBinding::new(
-            ws.id,
+        let logical_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/logical.git".into(),
             "github.com/o/logical".into(),
         )
         .unwrap();
-        let other = domain_repo::RepoBinding::new(
+        let logical_instance = domain_repo::RepoInstance::new(
             ws.id,
+            logical_origin.id,
+            "github.com/o/logical".into(),
+            None,
+        )
+        .unwrap();
+        let logical_origin_as_repo_id = RepoId::from_uuid(logical_origin.id.as_uuid());
+        let other_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/other.git".into(),
             "github.com/o/other".into(),
         )
         .unwrap();
-        bindings.save(&logical).await.unwrap();
-        bindings.save(&other).await.unwrap();
+        let other_instance = domain_repo::RepoInstance::new(
+            ws.id,
+            other_origin.id,
+            "github.com/o/other".into(),
+            None,
+        )
+        .unwrap();
+        let other_origin_as_repo_id = RepoId::from_uuid(other_origin.id.as_uuid());
+        bindings.save_origin(&logical_origin).await.unwrap();
+        bindings.save_instance(&logical_instance).await.unwrap();
+        bindings.save_origin(&other_origin).await.unwrap();
+        bindings.save_instance(&other_instance).await.unwrap();
 
         // Issue-backed, NOT yet a board item (project_item_id None); filing
         // recorded at promote = the logical repo (#117, no default then).
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_x"), None).await;
-        t.repo_id = Some(logical.id);
-        t.set_filing_repo_id(Some(logical.id)).unwrap();
+        t.repo_id = Some(logical_instance.id);
+        t.set_filing_repo_id(Some(logical_origin_as_repo_id))
+            .unwrap();
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
         // The workspace default is set to a DIFFERENT repo AFTER promote.
-        ws.filing_repo_id = Some(other.id);
+        ws.filing_repo_id = Some(other_origin_as_repo_id);
         workspaces.save(&ws).await.unwrap();
 
         // A lifecycle transition must NOT error and must NOT retarget filing.
@@ -3891,7 +4059,7 @@ mod tests {
         let reloaded = repo.get(t.id).await.unwrap();
         assert_eq!(
             reloaded.filing_repo_id,
-            Some(logical.id),
+            Some(logical_origin_as_repo_id),
             "recorded filing repo is authoritative — not retargeted to the changed workspace default"
         );
     }
@@ -3914,23 +4082,25 @@ mod tests {
         let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
         ws.project_id = Some(project.id.clone());
         workspaces.save(&ws).await.unwrap();
-        let binding = domain_repo::RepoBinding::new(
-            ws.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let b_origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let b_instance =
+            domain_repo::RepoInstance::new(ws.id, b_origin.id, "github.com/o/r".into(), None)
+                .unwrap();
+        let b_origin_as_repo_id = RepoId::from_uuid(b_origin.id.as_uuid());
+        bindings.save_origin(&b_origin).await.unwrap();
+        bindings.save_instance(&b_instance).await.unwrap();
 
         // Not yet attached.
         let mut t = save_issue_mirror(&repo, ws.id, Some("I_rep"), None).await;
-        t.repo_id = Some(binding.id);
+        t.repo_id = Some(b_instance.id);
         repo.save(&t, SnapshotSource::Promote).await.unwrap();
 
-        // First transition: records filing_repo_id.
+        // First transition: records filing_repo_id (= origin id stored as RepoId).
         svc.reopen(&t.id.to_string()).await.unwrap();
         let after_first = repo.get(t.id).await.unwrap();
-        assert_eq!(after_first.filing_repo_id, Some(binding.id));
+        assert_eq!(after_first.filing_repo_id, Some(b_origin_as_repo_id));
 
         // Clear outbox for a clean second-pass observation.
         let _ = outbox.all();
@@ -3946,7 +4116,7 @@ mod tests {
         let after_second = repo.get(t.id).await.unwrap();
         assert_eq!(
             after_second.filing_repo_id,
-            Some(binding.id),
+            Some(b_origin_as_repo_id),
             "repeat transition must not change or error on the already-recorded filing_repo_id"
         );
     }
@@ -3994,14 +4164,21 @@ mod tests {
         // the test plants the filing pointer via `force_set_filing_repo_id`
         // after import.
         let ws = ws_id();
-        let new_binding = domain_repo::RepoBinding::new(
-            domain_core::WorkspaceId::new(),
+        let new_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/target.git".into(),
             "github.com/o/target".into(),
         )
         .unwrap();
-        let new_binding_id = new_binding.id;
-        bindings.save(&new_binding).await.unwrap();
+        let new_instance = domain_repo::RepoInstance::new(
+            domain_core::WorkspaceId::new(),
+            new_origin.id,
+            "github.com/o/target".into(),
+            None,
+        )
+        .unwrap();
+        let new_instance_id = new_instance.id;
+        bindings.save_origin(&new_origin).await.unwrap();
+        bindings.save_instance(&new_instance).await.unwrap();
 
         let original = svc
             .import_mirror(ImportMirrorCmd {
@@ -4018,12 +4195,17 @@ mod tests {
             .unwrap();
 
         let resolved = svc
-            .repoint_filing_repo(&original.id, Some(new_binding_id))
+            .repoint_filing_repo(&original.id, Some(new_instance_id))
             .await
             .unwrap();
-        // The recorded value is now the new binding.
+        // §D4: the recorded filing repo is the target's ORIGIN, not the raw
+        // instance id (which would be a dangling filing pointer).
         let domain = svc.resolve_task(&original.id).await.unwrap();
-        assert_eq!(domain.filing_repo_id, Some(new_binding_id));
+        assert_eq!(
+            domain.filing_repo_id,
+            Some(domain_core::RepoId::from_uuid(new_origin.id.as_uuid()))
+        );
+        let _ = new_instance_id;
         // D5 contract (the dto never carries filing_repo_id) is covered
         // by the CLI test `task_show_surfaces_filing_repo_without_leaking_filing_repo_id`,
         // not duplicated here.
@@ -4038,14 +4220,21 @@ mod tests {
     async fn repoint_filing_repo_idempotent_on_same_target() {
         let (svc, bindings) = svc_with_bindings();
         // Plant a real binding for the pre-validation check.
-        let new_binding = domain_repo::RepoBinding::new(
-            domain_core::WorkspaceId::new(),
+        let new_origin = domain_repo::RepoOrigin::new(
             "git@github.com:o/idem-target.git".into(),
             "github.com/o/idem-target".into(),
         )
         .unwrap();
-        let target = new_binding.id;
-        bindings.save(&new_binding).await.unwrap();
+        let new_instance = domain_repo::RepoInstance::new(
+            domain_core::WorkspaceId::new(),
+            new_origin.id,
+            "github.com/o/idem-target".into(),
+            None,
+        )
+        .unwrap();
+        let target = new_instance.id;
+        bindings.save_origin(&new_origin).await.unwrap();
+        bindings.save_instance(&new_instance).await.unwrap();
 
         let original = svc
             .import_mirror(ImportMirrorCmd {

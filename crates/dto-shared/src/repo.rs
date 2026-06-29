@@ -17,6 +17,9 @@ pub struct WorktreeLinkDto {
 pub struct RepoBindingDto {
     pub id: String,
     pub workspace_id: String,
+    /// The shared-identity origin id (RFC 0005). The `id` field is the
+    /// per-workspace instance id; `origin_id` is the cross-workspace identity key.
+    pub origin_id: String,
     pub remote_url: String,
     pub canonical_url: String,
     pub tracked_branch: Option<String>,

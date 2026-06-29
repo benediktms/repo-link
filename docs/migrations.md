@@ -196,3 +196,88 @@ schema cannot represent.
   set at connection-open time and cannot be toggled inside a transaction. Run it
   via the `sqlite3` CLI (outside the app process) where you can control the
   session flags.
+
+## RFC 0005 — shared repo identity: reversibility story
+
+**Migration file:** `20260629000001_shared_repo_identity.sql`
+**Tracking:** #202 (see `docs/rfcs/0005-shared-repo-identity.md`)
+
+### What the migration does
+
+Splits the per-workspace `repos` row into a shared `repo_origins` (identity:
+`prefix`/`name`/`aliases`/`remote_url`, one per `canonical_url`) plus
+`repo_instances` (membership). It is **additive** — `ALTER TABLE repos RENAME TO
+repo_instances` (child FKs `tasks.repo_id`/`worktree_links.repo_id` follow),
+`CREATE TABLE repo_origins`, `ADD COLUMN`/`DROP COLUMN`, `RENAME COLUMN
+tasks.repo_id → repo_instance_id`, and value rewrites of the filing/remote axis
+into origin id space — so there is **no parent-table rebuild** and it runs
+inside sqlx's forced FK-on transaction. Verified on the real DB and pinned by
+`rfc0005_migration_splits_identity_keeps_instances_and_dedups_remote` in
+`crates/infra-sqlite/tests/integration.rs`.
+
+### Reversibility — partial, and lossy for multi-workspace repos
+
+**This migration is not losslessly reversible, by design.** Collapsing the
+collision-broken per-workspace prefixes (`rpl` / `rpl1`) onto one shared origin
+is the whole point of #202; the inverse cannot re-derive which workspace owned
+which prefix, and the filing/remote axis is re-keyed from instance ids to
+**origin** ids (and colliding cross-workspace mappings are deduped — those rows
+are gone). For a repo that lived in **one** workspace the reverse is clean
+(`origin.id == survivor instance.id`); for a repo spanning **several** the
+downgrade loses the divergence the migration removed.
+
+Because the local DB is a re-syncable cache of GitHub, **the practical recovery
+is to recreate it** (`rm` the DB + re-sync); the manual reverse below exists for
+completeness. Run it via the `sqlite3` CLI (outside the app, so `foreign_keys =
+OFF` actually takes effect):
+
+```sh
+sqlite3 <path-to-db> <<'SQL'
+DELETE FROM _sqlx_migrations WHERE version = 20260629000001;
+PRAGMA foreign_keys = OFF;
+BEGIN;
+-- Fold the shared identity back onto each instance.
+ALTER TABLE repo_instances ADD COLUMN remote_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE repo_instances ADD COLUMN name       TEXT NOT NULL DEFAULT '';
+ALTER TABLE repo_instances ADD COLUMN aliases    TEXT NOT NULL DEFAULT '[]'
+                                                  CHECK (json_valid(aliases) AND json_type(aliases) = 'array');
+ALTER TABLE repo_instances ADD COLUMN prefix     TEXT NOT NULL DEFAULT '';
+UPDATE repo_instances SET
+    remote_url = (SELECT o.remote_url FROM repo_origins o WHERE o.id = repo_instances.origin_id),
+    name       = (SELECT o.name       FROM repo_origins o WHERE o.id = repo_instances.origin_id),
+    aliases    = (SELECT o.aliases    FROM repo_origins o WHERE o.id = repo_instances.origin_id),
+    prefix     = (SELECT o.prefix     FROM repo_origins o WHERE o.id = repo_instances.origin_id);
+-- Every instance of a shared origin now re-derives the SAME prefix; for a repo
+-- that spanned workspaces, hand-pick distinct prefixes BEFORE recreating the
+-- UNIQUE index or it will fail.
+ALTER TABLE repo_instances DROP COLUMN origin_id;
+ALTER TABLE repo_instances RENAME TO repos;
+CREATE UNIQUE INDEX idx_repos_prefix ON repos(prefix) WHERE prefix != '';
+DROP TABLE repo_origins;
+-- Restore tasks' column name + the pre-0005 COALESCE remote-lookup index.
+ALTER TABLE tasks RENAME COLUMN repo_instance_id TO repo_id;
+DROP INDEX idx_tasks_remote_lookup;
+CREATE INDEX idx_tasks_remote_lookup
+    ON tasks (COALESCE(filing_repo_id, repo_id), remote_provider, remote_id)
+    WHERE remote_provider IS NOT NULL;
+PRAGMA foreign_key_check;   -- must return no rows
+COMMIT;
+PRAGMA foreign_keys = ON;
+SQL
+```
+
+`tasks.filing_repo_id` / `workspaces.filing_repo_id` / `remote_mappings.filing_repo_id`
+still hold **origin** ids after this reverse. For single-workspace repos they
+remain valid instance ids (same bytes); for multi-workspace repos they may not
+map to the workspace's instance — accept the loss or re-sync.
+
+### What NOT to do
+
+- Do not edit `20260629000001_shared_repo_identity.sql` after it ships — sqlx
+  checksums break for everyone who already applied it.
+- Do not run the forward migration against the **shared** dev DB from a
+  feature-branch build before it merges — that is the binary/DB version-skew trap
+  (see the version-skew section / `just dev`'s isolated `REPO_LINK_DB`).
+- Do not expect the reverse to restore deduped cross-workspace `remote_mappings`
+  rows or the original per-workspace prefixes — that information is intentionally
+  collapsed by the forward migration.

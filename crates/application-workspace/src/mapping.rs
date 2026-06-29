@@ -1,19 +1,19 @@
 //! Mapping (domain → DTO) plus the prefix-conflict translation helper.
 
-use domain_repo::RepoBinding;
+use domain_repo::{RepoInstance, RepoOrigin};
 use domain_workspace::Workspace;
 use dto_shared::{RepoBindingDto, WorkspaceDto, WorktreeLinkDto};
 use ports::PortError;
 
 use crate::error::ServiceError;
 
-/// Translate a `repos.prefix` UNIQUE violation into the friendly
+/// Translate a `repo_origins.prefix` UNIQUE violation into the friendly
 /// [`ServiceError::PrefixTaken`]; pass every other error through
 /// unchanged. Used on the explicit-prefix paths (`attach --prefix`
 /// and `set_prefix`) where we want the user to pick a different value
 /// rather than see a raw SQL message or get silent suffix-bumping.
 pub(crate) fn map_prefix_conflict(e: PortError, prefix: &str) -> ServiceError {
-    if e.conflict_target() == Some("repos.prefix") {
+    if e.conflict_target() == Some("repo_origins.prefix") {
         ServiceError::PrefixTaken(prefix.to_string())
     } else {
         ServiceError::Port(e)
@@ -41,17 +41,25 @@ pub fn workspace_to_dto(w: &Workspace) -> WorkspaceDto {
     }
 }
 
-pub fn binding_to_dto(b: &RepoBinding) -> RepoBindingDto {
+pub fn binding_to_dto(instance: &RepoInstance, origin: &RepoOrigin) -> RepoBindingDto {
+    // The two halves always come from one `RepoBindingView`; assert the pairing
+    // so a future caller can't emit a DTO mixing an instance with an unrelated
+    // origin (inconsistent origin_id / canonical_url / prefix / aliases).
+    debug_assert_eq!(
+        instance.origin_id, origin.id,
+        "binding_to_dto: instance.origin_id must match origin.id"
+    );
     RepoBindingDto {
-        id: b.id.to_string(),
-        workspace_id: b.workspace_id.to_string(),
-        remote_url: b.remote_url.clone(),
-        canonical_url: b.canonical_url.clone(),
-        tracked_branch: b.tracked_branch.clone(),
-        name: b.name.clone(),
-        aliases: b.aliases.clone(),
-        prefix: b.prefix.clone(),
-        worktrees: b
+        id: instance.id.to_string(),
+        workspace_id: instance.workspace_id.to_string(),
+        origin_id: origin.id.to_string(),
+        remote_url: origin.remote_url.clone(),
+        canonical_url: instance.canonical_url.clone(),
+        tracked_branch: instance.tracked_branch.clone(),
+        name: origin.name.clone(),
+        aliases: origin.aliases.clone(),
+        prefix: origin.prefix.clone(),
+        worktrees: instance
             .worktrees
             .iter()
             .map(|w| WorktreeLinkDto {
@@ -61,7 +69,9 @@ pub fn binding_to_dto(b: &RepoBinding) -> RepoBindingDto {
                 last_seen_at: w.last_seen_at.into(),
             })
             .collect(),
-        created_at: b.created_at.into(),
-        updated_at: b.updated_at.into(),
+        created_at: instance.created_at.into(),
+        // A change to the shared origin (rename / alias / prefix) should surface
+        // as an update too, so reflect whichever side changed most recently.
+        updated_at: instance.updated_at.max(origin.updated_at).into(),
     }
 }
