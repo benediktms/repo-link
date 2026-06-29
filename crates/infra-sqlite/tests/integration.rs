@@ -2445,6 +2445,186 @@ async fn rfc0002_migration_sequence_data_integrity() {
     drop(dir);
 }
 
+/// RFC 0005 §D6 tripwires for the shared-repo-identity migration
+/// (`20260629000001`). Seeds the PRE-migration duplicate-repo shape — the exact
+/// bug #202 fixes: the same `canonical_url` attached to two workspaces with
+/// divergent prefix/name/aliases, plus two tasks mirroring the same remote issue
+/// into it — then runs the migration and asserts the transformation. Mirrors
+/// `rfc0002_migration_sequence_data_integrity`. These pin SQLite behaviours the
+/// migration relies on (rename carries child FKs; RENAME COLUMN rewrites the
+/// expression index) and the data rules (survivor, alias-fold, collision dedup).
+#[tokio::test]
+async fn rfc0005_migration_splits_identity_keeps_instances_and_dedups_remote() {
+    const D5_VERSION: i64 = 20260629000001;
+    const TS1: &str = "2026-01-01T00:00:00Z"; // earlier — the survivor
+    const TS2: &str = "2026-02-01T00:00:00Z"; // later
+
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("rfc0005-audit.db").display());
+    let pool = infra_sqlite::open_write_pool(&url)
+        .await
+        .expect("open write pool (no migrations yet)");
+    let migrator = sqlx::migrate!("./migrations");
+
+    // (1) Apply every migration BEFORE the RFC 0005 split → the pre-split schema.
+    for m in migrator.iter() {
+        if m.version < D5_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0005 migration {} failed: {e}", m.version));
+        }
+    }
+    let pre = column_names(&pool, "repos").await;
+    assert!(
+        pre.contains(&"prefix".to_string()),
+        "pre-0005 repos must still carry the per-workspace prefix; got {pre:?}"
+    );
+
+    // (2) Seed the duplicate-repo bug: one canonical, two workspaces, divergent
+    // prefix (shr/shr1) + name + aliases; two tasks mirroring the SAME remote
+    // issue (github/500) into it — a cross-workspace remote_mappings collision.
+    sqlx::raw_sql(&format!(
+        "INSERT INTO workspaces (id, name, status, local_only, created_at, updated_at)
+           VALUES ('ws-1','a','created',1,'{TS1}','{TS1}'), ('ws-2','b','created',1,'{TS2}','{TS2}');
+         INSERT INTO repos (id, workspace_id, remote_url, canonical_url, tracked_branch, name, aliases, prefix, created_at, updated_at)
+           VALUES ('inst-1','ws-1','git@github.com:o/shared.git','github.com/o/shared',NULL,'shared','[\"legacy\"]','shr','{TS1}','{TS1}'),
+                  ('inst-2','ws-2','git@github.com:o/shared.git','github.com/o/shared',NULL,'shared-renamed','[]','shr1','{TS2}','{TS2}');
+         INSERT INTO tasks (id, workspace_id, repo_id, title, body, status, sync_state, priority, remote_provider, remote_id, filing_repo_id, created_at, updated_at)
+           VALUES ('task-1','ws-1','inst-1','t1','','done','synced','p2','github','500','inst-1','{TS1}','{TS1}'),
+                  ('task-2','ws-2','inst-2','t2','','done','synced','p2','github','500','inst-2','{TS2}','{TS2}');
+         INSERT INTO remote_mappings (task_id, filing_repo_id, provider, remote_id, last_synced_at)
+           VALUES ('task-1','inst-1','github','500','{TS1}'),
+                  ('task-2','inst-2','github','500','{TS2}');"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed pre-0005 duplicate-repo state");
+
+    // (3) Apply the RFC 0005 migration (and anything after it).
+    for m in migrator.iter() {
+        if m.version >= D5_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("0005+ migration {} failed: {e}", m.version));
+        }
+    }
+
+    // --- (a) The duplicated canonical collapses to ONE shared origin; the
+    // earliest-created instance's prefix wins, and the non-surviving instance's
+    // name + aliases are folded in (survivor rule, §D6 step 3).
+    let (origin_id, prefix, aliases): (String, String, String) = sqlx::query_as(
+        "SELECT id, prefix, aliases FROM repo_origins WHERE canonical_url = 'github.com/o/shared'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("exactly one origin for the shared canonical");
+    assert_eq!(
+        prefix, "shr",
+        "earliest-created instance's prefix wins (not shr1)"
+    );
+    assert!(
+        aliases.contains("legacy"),
+        "unioned alias preserved; got {aliases}"
+    );
+    assert!(
+        aliases.contains("shared-renamed"),
+        "non-surviving instance name folded into origin aliases; got {aliases}"
+    );
+
+    // --- (b) BOTH per-workspace instances are kept, sharing the one origin.
+    let (inst_count, distinct_origins): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT origin_id) FROM repo_instances WHERE canonical_url = 'github.com/o/shared'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inst_count, 2, "every instance is kept (none merged away)");
+    assert_eq!(
+        distinct_origins, 1,
+        "both instances share one origin_id => consistent prefix across workspaces"
+    );
+
+    // --- (c) tasks.repo_id renamed to repo_instance_id.
+    let tcols = column_names(&pool, "tasks").await;
+    assert!(
+        tcols.contains(&"repo_instance_id".to_string()) && !tcols.contains(&"repo_id".to_string()),
+        "tasks.repo_id must be renamed to repo_instance_id; got {tcols:?}"
+    );
+
+    // --- (d) child FKs followed the table rename to repo_instances.
+    for child in ["tasks", "worktree_links"] {
+        let parents: Vec<String> = sqlx::query(&format!(
+            "SELECT \"table\" AS p FROM pragma_foreign_key_list('{child}')"
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "p"))
+        .collect();
+        assert!(
+            parents.iter().any(|p| p == "repo_instances"),
+            "{child} FK must target repo_instances after the rename; got {parents:?}"
+        );
+    }
+
+    // --- (e) remote-identity index keyed on filing_repo_id ALONE — the
+    // COALESCE(filing_repo_id, repo_id) fallback is gone (origin id space, §D4).
+    let (idx_sql,): (String,) =
+        sqlx::query_as("SELECT sql FROM sqlite_master WHERE name = 'idx_tasks_remote_lookup'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        idx_sql.contains("filing_repo_id"),
+        "remote-lookup index must key on filing_repo_id; got {idx_sql}"
+    );
+    assert!(
+        !idx_sql.to_uppercase().contains("COALESCE"),
+        "COALESCE fallback must be dropped (origin id space only); got {idx_sql}"
+    );
+
+    // --- (f) the two cross-workspace mappings for the same remote issue collapse
+    // to ONE (collision dedup, §D6 step 7d) re-keyed to the shared origin id.
+    let (mapping_count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM remote_mappings WHERE provider = 'github' AND remote_id = '500'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        mapping_count, 1,
+        "colliding cross-workspace mappings must dedup to one before the origin rewrite"
+    );
+    let (survivor_filing,): (String,) = sqlx::query_as(
+        "SELECT filing_repo_id FROM remote_mappings WHERE provider = 'github' AND remote_id = '500'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        survivor_filing, origin_id,
+        "surviving mapping must be re-keyed to the shared origin id"
+    );
+
+    // --- (g) no FK orphans after the full sequence.
+    let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| sqlx::Row::get::<String, _>(&r, "table"))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "PRAGMA foreign_key_check must find no orphans after the RFC 0005 sequence; got {orphans:?}"
+    );
+
+    drop(dir);
+}
+
 /// rpl-sv2 follow-up: `find_by_remote_mapping` must be
 /// workspace-scoped and ambiguous (≥2 matches in the same workspace)
 /// must surface as `None` (so the doctor surfaces the situation as
