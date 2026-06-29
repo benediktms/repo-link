@@ -252,8 +252,16 @@ CREATE UNIQUE INDEX idx_origins_prefix ON repo_origins(prefix);
 --    UNION across all instances of the group. Any DISTINCT non-surviving name is
 --    NOT discarded — it is folded into the origin's `aliases` so a user-chosen
 --    rename stays resolvable, and the migration logs the folded names.
+-- The shipped migration picks the survivor with a correlated subquery rather
+-- than GROUP BY, so the non-grouped columns are deterministic (a bare GROUP BY
+-- canonical_url would leave prefix/name/created_at indeterminate):
 INSERT INTO repo_origins (id, canonical_url, remote_url, prefix, name, aliases, created_at, updated_at)
-SELECT … FROM repo_instances GROUP BY canonical_url;   -- earliest-created survivor per group
+SELECT s.id, s.canonical_url, s.remote_url, s.prefix, s.name, s.aliases, s.created_at, s.updated_at
+FROM repo_instances s
+WHERE s.id = (SELECT s2.id FROM repo_instances s2
+              WHERE s2.canonical_url = s.canonical_url
+              ORDER BY s2.created_at ASC, s2.id ASC LIMIT 1);
+-- aliases are then unioned across the group + non-surviving names folded in.
 
 -- 4. Link instance → origin. ADD COLUMN with a FK is legal because the default is
 --    NULL; backfill by canonical_url. The column stays NOMINALLY NULLABLE at the
