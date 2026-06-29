@@ -101,15 +101,7 @@ impl SyncService {
         let ws_default_origin = workspace
             .filing_repo_id
             .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
-        let logical_origin = if let Some(repo_id) = task.repo_id {
-            match self.bindings.get(repo_id).await {
-                Ok(v) => Some(v.instance.origin_id),
-                Err(ports::PortError::NotFound(_)) => None,
-                Err(e) => return Err(SyncError::Port(e)),
-            }
-        } else {
-            None
-        };
+        let logical_origin = self.logical_origin_for(&task).await?;
         let filing_origin = resolve_filing_repo(None, ws_default_origin, logical_origin);
         // Convert back to RepoId for set_filing_repo_id (domain field is Option<RepoId>)
         let filing = filing_origin.map(|o| RepoId::from_uuid(o.as_uuid()));
@@ -597,6 +589,21 @@ impl SyncService {
         Ok(view.instance.canonical_url)
     }
 
+    /// Map a task's logical repo (an instance id) to its origin id for the
+    /// filing chain. `None` when the task has no logical repo or its instance
+    /// was detached (`NotFound`) — the caller falls through to the recorded
+    /// filing id / workspace default.
+    async fn logical_origin_for(&self, task: &Task) -> Result<Option<RepoOriginId>> {
+        let Some(repo_id) = task.repo_id else {
+            return Ok(None);
+        };
+        match self.bindings.get(repo_id).await {
+            Ok(v) => Ok(Some(v.instance.origin_id)),
+            Err(ports::PortError::NotFound(_)) => Ok(None),
+            Err(e) => Err(SyncError::Port(e)),
+        }
+    }
+
     /// Canonical URL of the repo the task's backing issue is *filed* in
     /// (RFC 0002). Walks the D2 chain — recorded `filing_repo_id` →
     /// workspace default → logical `repo_id` — via `resolve_filing_repo`.
@@ -631,15 +638,7 @@ impl SyncService {
             .filing_repo_id
             .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
         // Step 3: logical instance → origin
-        let step3 = if let Some(repo_id) = task.repo_id {
-            match self.bindings.get(repo_id).await {
-                Ok(v) => Some(v.instance.origin_id),
-                Err(ports::PortError::NotFound(_)) => None,
-                Err(e) => return Err(SyncError::Port(e)),
-            }
-        } else {
-            None
-        };
+        let step3 = self.logical_origin_for(task).await?;
         let origin_id =
             resolve_filing_repo(step1, workspace_default, step3).ok_or(SyncError::NoRepo)?;
         let origin = self.bindings.get_origin(origin_id).await?;
@@ -714,15 +713,7 @@ impl SyncService {
         let ws_default = workspace
             .filing_repo_id
             .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
-        let step3 = if let Some(repo_id) = task.repo_id {
-            match self.bindings.get(repo_id).await {
-                Ok(v) => Some(v.instance.origin_id),
-                Err(ports::PortError::NotFound(_)) => None,
-                Err(e) => return Err(SyncError::Port(e)),
-            }
-        } else {
-            None
-        };
+        let step3 = self.logical_origin_for(task).await?;
         let Some(origin_id) = resolve_filing_repo(step1, ws_default, step3) else {
             return Ok(None);
         };

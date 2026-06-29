@@ -66,16 +66,13 @@ impl RepoBindingService {
         let _ = self.workspaces.get(workspace_id).await?;
 
         // Step 1: find or create the shared origin
-        let (mut origin, _origin_existed) = match self
+        let mut origin = match self
             .bindings
             .find_origin_by_canonical_url(&cmd.canonical_url)
             .await?
         {
-            Some(o) => (o, true),
-            None => {
-                let o = RepoOrigin::new(cmd.remote_url.clone(), cmd.canonical_url.clone())?;
-                (o, false)
-            }
+            Some(o) => o,
+            None => RepoOrigin::new(cmd.remote_url.clone(), cmd.canonical_url.clone())?,
         };
 
         // Explicit prefix always wins
