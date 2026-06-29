@@ -206,11 +206,26 @@ impl TaskService {
                 None => String::new(),
             };
             if actual_prefix != input_prefix {
-                return Err(ServiceError::PrefixMismatch {
-                    input_prefix: input_prefix.to_string(),
-                    actual_prefix,
-                    hash: hash.to_string(),
-                });
+                if domain_repo::is_superseded_prefix(input_prefix, &actual_prefix) {
+                    // RFC 0005 §D3: the repo's per-workspace prefix was collapsed
+                    // onto a shared origin, so a friendly ID typed against the old
+                    // collision-suffixed prefix (e.g. `rpl1` for origin `rpl`)
+                    // still names this task. Accept it during the transition with
+                    // a deprecation warning rather than a hard PrefixMismatch.
+                    tracing::warn!(
+                        input_prefix,
+                        origin_prefix = %actual_prefix,
+                        hash,
+                        "resolved a superseded repo prefix; use `{actual_prefix}-{hash}` — \
+                         the old prefix will stop resolving in a future release"
+                    );
+                } else {
+                    return Err(ServiceError::PrefixMismatch {
+                        input_prefix: input_prefix.to_string(),
+                        actual_prefix,
+                        hash: hash.to_string(),
+                    });
+                }
             }
         }
         Ok(task)
@@ -1966,6 +1981,63 @@ mod tests {
 
         // A composite naming the wrong prefix is a hard error.
         let err = svc.resolve_task(&format!("nope-{hash}")).await.unwrap_err();
+        assert!(matches!(err, ServiceError::PrefixMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolve_task_tolerates_superseded_prefix() {
+        // RFC 0005 §D3: a friendly ID typed against a per-workspace prefix that
+        // was collapsed onto a shared origin (`wid1-` when the origin prefix is
+        // now `wid`) still resolves — with a deprecation warning, not an error.
+        use domain_repo::{RepoInstance, RepoOrigin};
+        use ports::RepoBindingRepository;
+
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+
+        let ws = WorkspaceId::new();
+        let mut origin = RepoOrigin::new(
+            "git@github.com:o/widget.git".into(),
+            "github.com/o/widget".into(),
+        )
+        .unwrap();
+        origin.set_prefix("wid".into()).unwrap();
+        let instance =
+            RepoInstance::new(ws, origin.id, "github.com/o/widget".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+
+        let svc = TaskService::new(
+            repo,
+            snaps,
+            bindings,
+            Arc::new(InMemoryWorkspaceRepository::new()),
+            Arc::new(InMemoryProjectRepository::new()),
+        );
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws.to_string(),
+                repo_id: Some(repo_id.to_string()),
+                title: "bound task".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: None,
+            })
+            .await
+            .unwrap();
+        let hash = dto.id.split_once('-').unwrap().1.to_string();
+
+        // The superseded `wid1-` form resolves to the same task as `wid-`.
+        let by_superseded = svc.resolve_task(&format!("wid1-{hash}")).await.unwrap();
+        assert_eq!(by_superseded.hash, hash);
+        let by_current = svc.resolve_task(&format!("wid-{hash}")).await.unwrap();
+        assert_eq!(by_superseded.id, by_current.id);
+
+        // A non-suffix mismatch is still a hard error.
+        let err = svc.resolve_task(&format!("zzz-{hash}")).await.unwrap_err();
         assert!(matches!(err, ServiceError::PrefixMismatch { .. }));
     }
 

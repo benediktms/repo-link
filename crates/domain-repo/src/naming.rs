@@ -147,6 +147,23 @@ pub fn is_valid_prefix(p: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
+/// True when `input` is a collision-suffixed variant of `base` — `base`
+/// followed by one or more decimal digits, the scheme the persistence layer
+/// uses to break prefix collisions (`rpl` → `rpl1` → `rpl2`). Used by
+/// `resolve_task` to tolerate a friendly ID typed against a per-workspace
+/// prefix that was since collapsed onto a shared origin (RFC 0005 §D3).
+///
+/// `base` must be non-empty and `input` must carry at least one suffix digit,
+/// so an exact match (`input == base`) is NOT "superseded".
+pub fn is_superseded_prefix(input: &str, base: &str) -> bool {
+    !base.is_empty()
+        && input.len() > base.len()
+        && input.starts_with(base)
+        && input.as_bytes()[base.len()..]
+            .iter()
+            .all(u8::is_ascii_digit)
+}
+
 fn prefix_from_multi_words(segments: &[&str]) -> String {
     let mut result = Vec::new();
     let mut seen = Vec::new();
@@ -243,6 +260,22 @@ mod tests {
         assert!(is_valid_prefix("abcdefghijklmnopqrst")); // exactly 20
         // Digits allowed after the first char.
         assert!(is_valid_prefix("rl1"));
+    }
+
+    #[test]
+    fn is_superseded_prefix_recognizes_numeric_suffix() {
+        // The collision-break scheme: base + one-or-more digits.
+        assert!(is_superseded_prefix("rpl1", "rpl"));
+        assert!(is_superseded_prefix("rpl12", "rpl"));
+        // An exact match is not "superseded" (it resolves on the normal path).
+        assert!(!is_superseded_prefix("rpl", "rpl"));
+        // A genuinely different prefix.
+        assert!(!is_superseded_prefix("xyz", "rpl"));
+        // Shares the stem but the suffix isn't numeric → a distinct prefix.
+        assert!(!is_superseded_prefix("rpla", "rpl"));
+        // Degenerate inputs.
+        assert!(!is_superseded_prefix("rpl1", ""));
+        assert!(!is_superseded_prefix("rp", "rpl"));
     }
 
     #[test]
