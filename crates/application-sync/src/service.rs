@@ -2437,7 +2437,11 @@ mod tests {
         let second_id = second_instance.id;
         bindings.save_instance(&second_instance).await.unwrap();
         t.repo_id = Some(second_id);
-        t.force_set_filing_repo_id(Some(second_id));
+        // filing_repo_id is origin-space (§D4); point it at an origin that never
+        // resolves so the filing axis is genuinely dangling — deleting the
+        // instance below would NOT dangle a live origin (origins survive
+        // detach, §D5), so a real origin id here would resolve and miss the bug.
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(RepoOriginId::new().as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
         // Delete the (now) only binding.

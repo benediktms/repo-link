@@ -63,6 +63,8 @@ pub fn binding_to_dto(instance: &RepoInstance, origin: &RepoOrigin) -> RepoBindi
             })
             .collect(),
         created_at: instance.created_at.into(),
-        updated_at: instance.updated_at.into(),
+        // A change to the shared origin (rename / alias / prefix) should surface
+        // as an update too, so reflect whichever side changed most recently.
+        updated_at: instance.updated_at.max(origin.updated_at).into(),
     }
 }

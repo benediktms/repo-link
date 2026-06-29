@@ -266,6 +266,16 @@ impl TaskService {
             cmd.assignees,
             cmd.closed,
         )?;
+        // RFC 0005 §D4: `filing_repo_id` is origin-space. `Task::import_mirror`
+        // seeds it from the logical *instance* id (the domain can't resolve
+        // origins); convert it to that instance's origin so the stored
+        // remote-identity key matches `find_by_remote` (which keys on the
+        // origin) — otherwise re-importing the same issue misses dedup and
+        // creates a duplicate task.
+        if let Some(rid) = repo_id {
+            let origin_id = self.bindings.get(rid).await?.instance.origin_id;
+            t.force_set_filing_repo_id(Some(RepoId::from_uuid(origin_id.as_uuid())));
+        }
         self.save_with_minted_hash(&mut t, SnapshotSource::Pull)
             .await?;
         self.task_dto(&t).await
@@ -510,17 +520,20 @@ impl TaskService {
         task_id: &str,
         target: Option<RepoId>,
     ) -> Result<TaskDto> {
-        // Validate the target binding exists before mutating the
-        // task. `force_set_filing_repo_id` is a deliberate-override
-        // domain method that accepts any RepoId without checking —
-        // its only safety net is this service-layer check. Without
-        // it, the doctor's `--target` flag could persist ANOTHER
-        // dangling pointer (the bug we're fixing, just on a
-        // different column). `None` (clear) is a separate case the
-        // user explicitly opts into and doesn't need validation.
-        if let Some(target_id) = target {
-            self.bindings.get(target_id).await?;
-        }
+        // Validate the target binding exists before mutating the task, and
+        // resolve it to its ORIGIN. `force_set_filing_repo_id` accepts any
+        // RepoId without checking; its only safety net is this service-layer
+        // step. The `--target` is an instance handle, but `filing_repo_id` is
+        // origin-space (RFC 0005 §D4) — storing the raw instance id would
+        // re-plant a dangling filing pointer (the very bug the doctor heals,
+        // moved to a different column). `None` (clear) is a separate case the
+        // user explicitly opts into and needs no validation.
+        let target = if let Some(target_id) = target {
+            let view = self.bindings.get(target_id).await?;
+            Some(RepoId::from_uuid(view.instance.origin_id.as_uuid()))
+        } else {
+            None
+        };
         let id_str = self.resolve_id(task_id).await?;
         let id: TaskId = id_str.parse()?;
         let mut t = self.repo.get(id).await?;
@@ -4185,9 +4198,14 @@ mod tests {
             .repoint_filing_repo(&original.id, Some(new_instance_id))
             .await
             .unwrap();
-        // The recorded value is now the new binding (stored as-is — instance id).
+        // §D4: the recorded filing repo is the target's ORIGIN, not the raw
+        // instance id (which would be a dangling filing pointer).
         let domain = svc.resolve_task(&original.id).await.unwrap();
-        assert_eq!(domain.filing_repo_id, Some(new_instance_id));
+        assert_eq!(
+            domain.filing_repo_id,
+            Some(domain_core::RepoId::from_uuid(new_origin.id.as_uuid()))
+        );
+        let _ = new_instance_id;
         // D5 contract (the dto never carries filing_repo_id) is covered
         // by the CLI test `task_show_surfaces_filing_repo_without_leaking_filing_repo_id`,
         // not duplicated here.

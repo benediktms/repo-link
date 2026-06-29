@@ -2608,6 +2608,20 @@ async fn rfc0005_migration_splits_identity_keeps_instances_and_dedups_remote() {
         survivor_filing, origin_id,
         "surviving mapping must be re-keyed to the shared origin id"
     );
+    // tasks.filing_repo_id is rewritten to the shared origin too (§D6 step 7b),
+    // not left as the per-workspace instance id.
+    let task_filings: Vec<String> =
+        sqlx::query("SELECT filing_repo_id FROM tasks WHERE id IN ('task-1', 'task-2')")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| sqlx::Row::get::<String, _>(&r, "filing_repo_id"))
+            .collect();
+    assert!(
+        task_filings.len() == 2 && task_filings.iter().all(|f| *f == origin_id),
+        "both tasks' filing_repo_id must be re-keyed to the shared origin; got {task_filings:?}"
+    );
 
     // --- (g) no FK orphans after the full sequence.
     let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
