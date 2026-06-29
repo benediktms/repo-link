@@ -172,13 +172,14 @@ Decision: the entire remote-identity key operates in **origin id space**:
   `UNIQUE(filing_repo_id, provider, remote_id)` becomes a cross-workspace
   uniqueness guard (one remote issue = one mapping, correct for a shared filing
   origin).
-- The `find_by_remote` predicate and `idx_tasks_remote_lookup` must coalesce to
-  **origin ids on both sides** — the logical fallback resolves to the logical
-  instance's `origin_id`, not the instance id. An expression index can only
-  reference the row's own columns, so the fast path needs **either** a
-  denormalized logical-origin value on `tasks` **or** to lean on the
-  (origin-keyed) `remote_mappings` UNIQUE index for lookups. Pick at
-  implementation, but the key must be one id space.
+- **As built:** `find_by_remote` and `idx_tasks_remote_lookup` key on
+  `filing_repo_id` **alone** (an origin id) — the old
+  `COALESCE(filing_repo_id, repo_id)` fallback is dropped. RFC 0002 D6 already
+  backfilled `filing_repo_id` for every remote-backed task, and this migration's
+  straggler backfill (§D6 step 7a) covers any gap, so the logical fallback was
+  dead for indexed rows and the predicate stays in one (origin) id space with no
+  denormalized column. This resolves Open-Q1 — neither a denormalized
+  `tasks` column nor a `remote_mappings`-UNIQUE read path was needed.
 - `find_by_remote_mapping` / `resolve_doctor_target` must JOIN
   `remote_mappings.filing_repo_id` to **`repo_origins(id)`** (or through
   `repo_instances.origin_id`). "Dangling filing" now means *no surviving origin*,
@@ -369,9 +370,9 @@ implementation tickets):
 
 ## 3. Open questions
 
-1. **Remote-identity fast path (D4).** Denormalize a logical-origin column on
-   `tasks` for the expression index, or rely on the `remote_mappings` origin-keyed
-   UNIQUE for lookups? Decide with a benchmark on the read path.
+1. ~~**Remote-identity fast path (D4).**~~ **Resolved** — neither option was
+   needed: `filing_repo_id` is backfilled for every remote-backed task, so the
+   index keys on it alone (origin id space), no denormalized column. See §D4.
 2. **`tracked_branch` placement.** Kept per-instance. If it always agrees across a
    repo's instances, it could move to the origin — defer until there's evidence.
 3. **`#112` terminology prerequisite (RFC 0002).** This RFC introduces
