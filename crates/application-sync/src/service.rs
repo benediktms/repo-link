@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::{TaskId, Timestamp, WorkspaceId};
+use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
 use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
@@ -95,7 +95,24 @@ impl SyncService {
         // no-op when nothing resolved (orphan with no default), preserving the
         // existing "promote needs a repo" error via `filing_canonical_for`.
         let workspace = self.workspaces.get(task.workspace_id).await?;
-        let filing = resolve_filing_repo(None, workspace.filing_repo_id, task.repo_id);
+        // Convert RepoId (instance id space) to RepoOriginId for the chain.
+        // workspace.filing_repo_id already holds an origin id after the RFC 0005
+        // migration; task.repo_id is an instance id → map to origin via the binding.
+        let ws_default_origin = workspace
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let logical_origin = if let Some(repo_id) = task.repo_id {
+            match self.bindings.get(repo_id).await {
+                Ok(v) => Some(v.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(e) => return Err(SyncError::Port(e)),
+            }
+        } else {
+            None
+        };
+        let filing_origin = resolve_filing_repo(None, ws_default_origin, logical_origin);
+        // Convert back to RepoId for set_filing_repo_id (domain field is Option<RepoId>)
+        let filing = filing_origin.map(|o| RepoId::from_uuid(o.as_uuid()));
         task.set_filing_repo_id(filing)?;
         let filing_canonical = self.filing_canonical_for(&task).await?;
 
@@ -515,7 +532,7 @@ impl SyncService {
             // node id onto the relinked ref — a relinked task should be just as
             // board-eligible as a freshly promoted one (RFC 0001 §9 / §D1).
             new_remote.node_id = snap.node_id;
-            task.link_to_remote(binding.id, new_remote.clone(), false)?;
+            task.link_to_remote(binding.instance.id, new_remote.clone(), false)?;
             let new_comments = self
                 .provider
                 .fetch_comments(new_canonical, new_remote_id)
@@ -554,7 +571,7 @@ impl SyncService {
                 }
                 Err(e) => return Err(SyncError::Port(e)),
             }
-            task.link_to_remote(binding.id, new_remote.clone(), true)?;
+            task.link_to_remote(binding.instance.id, new_remote.clone(), true)?;
             // Same ordering as the relink branch: commit the link first; then
             // clear synced comments (pending preserved by contract). If the
             // comment write fails, the task is still on the new remote and a
@@ -576,8 +593,8 @@ impl SyncService {
     /// task, since there is no repo to address.
     async fn logical_canonical_for(&self, task: &Task) -> Result<String> {
         let repo_id = task.repo_id.ok_or(SyncError::NoRepo)?;
-        let binding = self.bindings.get(repo_id).await?;
-        Ok(binding.canonical_url)
+        let view = self.bindings.get(repo_id).await?;
+        Ok(view.instance.canonical_url)
     }
 
     /// Canonical URL of the repo the task's backing issue is *filed* in
@@ -592,6 +609,10 @@ impl SyncService {
     /// mutation. Pin step 1 (`filing_repo_id`) on the task — promote
     /// records it automatically — to make the resolution permanent.
     async fn filing_canonical_for(&self, task: &Task) -> Result<String> {
+        // RFC 0005 §D4: filing_repo_id holds ORIGIN id bytes. Steps 1+2 are
+        // already in origin id space; step 3 (logical repo_id) is an instance
+        // id that must be mapped to its origin first.
+        //
         // A deleted workspace row is not a hard error here: it just means
         // step 2 of the D2 chain (workspace default) is unavailable, so
         // resolve with `workspace_default = None` and let step 1
@@ -599,14 +620,30 @@ impl SyncService {
         // Only when the chain itself returns `None` — meaning all three
         // inputs are absent — do we surface `NoRepo`. (CodeRabbit #191.)
         let workspace_default = match self.workspaces.get(task.workspace_id).await {
-            Ok(ws) => ws.filing_repo_id,
+            Ok(ws) => ws
+                .filing_repo_id
+                .map(|r| RepoOriginId::from_uuid(r.as_uuid())),
             Err(ports::PortError::NotFound(_)) => None,
             Err(e) => return Err(SyncError::Port(e)),
         };
-        let repo_id = resolve_filing_repo(task.filing_repo_id, workspace_default, task.repo_id)
-            .ok_or(SyncError::NoRepo)?;
-        let binding = self.bindings.get(repo_id).await?;
-        Ok(binding.canonical_url)
+        // Step 1: recorded filing_repo_id (already in origin id space)
+        let step1 = task
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        // Step 3: logical instance → origin
+        let step3 = if let Some(repo_id) = task.repo_id {
+            match self.bindings.get(repo_id).await {
+                Ok(v) => Some(v.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(e) => return Err(SyncError::Port(e)),
+            }
+        } else {
+            None
+        };
+        let origin_id =
+            resolve_filing_repo(step1, workspace_default, step3).ok_or(SyncError::NoRepo)?;
+        let origin = self.bindings.get_origin(origin_id).await?;
+        Ok(origin.canonical_url)
     }
 
     /// Plan the outbox entries a just-promoted task owes for its existing
@@ -670,12 +707,26 @@ impl SyncService {
         let Some(remote) = task.remote.as_ref() else {
             return Ok(None);
         };
-        let Some(repo_id) =
-            resolve_filing_repo(task.filing_repo_id, workspace.filing_repo_id, task.repo_id)
-        else {
+        // RFC 0005: convert to origin id space for the chain
+        let step1 = task
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let ws_default = workspace
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+        let step3 = if let Some(repo_id) = task.repo_id {
+            match self.bindings.get(repo_id).await {
+                Ok(v) => Some(v.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(e) => return Err(SyncError::Port(e)),
+            }
+        } else {
+            None
+        };
+        let Some(origin_id) = resolve_filing_repo(step1, ws_default, step3) else {
             return Ok(None);
         };
-        let canonical = self.bindings.get(repo_id).await?.canonical_url;
+        let canonical = self.bindings.get_origin(origin_id).await?.canonical_url;
         Ok(Some((canonical, remote.remote_id.clone())))
     }
 
@@ -757,7 +808,11 @@ impl SyncService {
             };
             if let Some(t) = self
                 .tasks
-                .find_by_remote(binding.id, "github", &item.snapshot.remote_id)
+                .find_by_remote(
+                    binding.instance.origin_id,
+                    "github",
+                    &item.snapshot.remote_id,
+                )
                 .await?
             {
                 ids.push(t.id);
@@ -843,7 +898,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use domain_core::{RepoId, Timestamp, WorkspaceId};
-    use domain_repo::RepoBinding;
+    use domain_repo::{RepoInstance, RepoOrigin};
     use domain_sync::OutboxMutation;
     use domain_task::Task;
     use domain_workspace::{Workspace, WorkspaceName};
@@ -1073,14 +1128,13 @@ mod tests {
         let workspace_id = workspace.id;
         workspaces.save(&workspace).await.unwrap();
 
-        let binding = RepoBinding::new(
-            workspace_id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        let repo_id = binding.id;
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
 
         let task = Task::new_draft(workspace_id, Some(repo_id), "ship it".into()).unwrap();
         tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
@@ -1115,12 +1169,16 @@ mod tests {
     /// A `SyncService` whose task repo shares `outbox`, plus a helper to seed an
     /// already-promoted (issue-backed) task. Used by the relation-sync tests
     /// that need to inspect enqueued mutations and resolve neighbor coords.
+    /// Returns `(svc, tasks, bindings, outbox, workspace_id, repo_id, filing_origin_as_repo_id, provider)`.
+    /// `repo_id` is the instance id; `filing_origin_as_repo_id` is the origin id
+    /// wrapped as `RepoId` for use in `seed_promoted`'s `filing_repo_id`.
     async fn setup_with_outbox() -> (
         SyncService,
         Arc<InMemoryTaskRepository>,
         Arc<InMemoryRepoBindingRepository>,
         Arc<InMemoryOutboxRepository>,
         WorkspaceId,
+        domain_core::RepoId,
         domain_core::RepoId,
         Arc<FakeProvider>,
     ) {
@@ -1133,14 +1191,14 @@ mod tests {
         let workspace = Workspace::new(WorkspaceName::new("sync-ws").unwrap(), None, true);
         let workspace_id = workspace.id;
         workspaces.save(&workspace).await.unwrap();
-        let binding = RepoBinding::new(
-            workspace_id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        let repo_id = binding.id;
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let filing_origin_as_repo_id = domain_core::RepoId::from_uuid(origin.id.as_uuid());
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
 
         let svc = SyncService::new(
             tasks.clone(),
@@ -1155,21 +1213,28 @@ mod tests {
             outbox,
             workspace_id,
             repo_id,
+            filing_origin_as_repo_id,
             provider,
         )
     }
 
     /// Persist an already-promoted, issue-backed task bound to `repo_id`.
+    /// `filing_repo_id` must be the origin id (as `RepoId`) for `find_by_remote`
+    /// to resolve this task during relation reconciliation.
     async fn seed_promoted(
         tasks: &Arc<InMemoryTaskRepository>,
         ws: WorkspaceId,
         repo_id: domain_core::RepoId,
+        filing_repo_id: domain_core::RepoId,
         remote_id: &str,
     ) -> Task {
         let mut t = Task::new_draft(ws, Some(repo_id), format!("issue {remote_id}")).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", remote_id))
             .unwrap();
+        // RFC 0005 §D4: filing_repo_id is in origin id space. Set it manually
+        // here because seed_promoted bypasses the service promote path.
+        t.set_filing_repo_id(Some(filing_repo_id)).unwrap();
         tasks.save(&t, SnapshotSource::Promote).await.unwrap();
         t
     }
@@ -1179,8 +1244,8 @@ mod tests {
         // A child task related to an already-promoted parent BEFORE the child
         // had an issue: relate-time skipped it (child was local-only). Promoting
         // the child must now backfill the AddSubIssue mutation.
-        let (svc, tasks, _b, outbox, ws, repo_id, _p) = setup_with_outbox().await;
-        let parent = seed_promoted(&tasks, ws, repo_id, "200").await;
+        let (svc, tasks, _b, outbox, ws, repo_id, filing_id, _p) = setup_with_outbox().await;
+        let parent = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
 
         // Local draft child, related child_of the promoted parent.
         let mut child_task = Task::new_draft(ws, Some(repo_id), "child".into()).unwrap();
@@ -1217,7 +1282,7 @@ mod tests {
     async fn promote_skips_relation_to_local_only_neighbor() {
         // The neighbor has no issue yet → not projectable → no enqueue. (It will
         // backfill when the NEIGHBOR promotes, since the edge is reciprocal.)
-        let (svc, tasks, _b, outbox, ws, repo_id, _p) = setup_with_outbox().await;
+        let (svc, tasks, _b, outbox, ws, repo_id, _filing_id, _p) = setup_with_outbox().await;
         let mut neighbor = Task::new_draft(ws, Some(repo_id), "neighbor".into()).unwrap();
         tasks
             .save(&neighbor, SnapshotSource::LocalEdit)
@@ -1241,13 +1306,13 @@ mod tests {
         // Remote says #100 has a sub-issue #200 and is blocked_by #300; both map
         // to local tasks. Pull must add child_of #200... actually parent_of, and
         // blocked_by, locally — without enqueuing any outbound mutation.
-        let (svc, tasks, _b, outbox, ws, repo_id, provider) = setup_with_outbox().await;
-        let mut subject = seed_promoted(&tasks, ws, repo_id, "100").await;
+        let (svc, tasks, _b, outbox, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
         // Give it a baseline so pull's drift compare is a clean Noop.
         subject.confirm_synced(SnapshotSource::Pull).ok();
         tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
-        let child = seed_promoted(&tasks, ws, repo_id, "200").await;
-        let blocker = seed_promoted(&tasks, ws, repo_id, "300").await;
+        let child = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
+        let blocker = seed_promoted(&tasks, ws, repo_id, filing_id, "300").await;
 
         provider.set_fetch(RemoteTaskSnapshot {
             remote_id: "100".into(),
@@ -1295,9 +1360,9 @@ mod tests {
     async fn pull_drops_local_edge_the_remote_removed() {
         // Local has parent_of #200, but the remote sub-issue list is now empty →
         // the edge must be dropped locally (both ends issue-backed).
-        let (svc, tasks, _b, _o, ws, repo_id, provider) = setup_with_outbox().await;
-        let mut subject = seed_promoted(&tasks, ws, repo_id, "100").await;
-        let child = seed_promoted(&tasks, ws, repo_id, "200").await;
+        let (svc, tasks, _b, _o, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
+        let child = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
         subject.add_relation(RelationKind::ParentOf, child.id);
         tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
         let mut child = tasks.get(child.id).await.unwrap();
@@ -1355,11 +1420,25 @@ mod tests {
         // RFC 0002 D2: no per-task override, no workspace default ⇒ the chain
         // collapses to the logical repo, so promote records filing == logical
         // and files at the same canonical as today.
-        let (svc, tasks, task, provider) = setup().await;
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
         svc.promote(&task.id.to_string()).await.unwrap();
         let saved = tasks.get(task.id).await.unwrap();
-        assert!(saved.repo_id.is_some());
-        assert_eq!(saved.filing_repo_id, saved.repo_id);
+        // The chain collapsed to the logical repo, so filing_repo_id must hold that
+        // logical instance's ORIGIN id (RFC 0005 §D4 — filing is origin-space), not
+        // the instance id and not an arbitrary value.
+        let logical_instance = saved.repo_id.expect("promoted task has a logical repo");
+        let logical_origin = bindings
+            .get(logical_instance)
+            .await
+            .unwrap()
+            .instance
+            .origin_id;
+        assert_eq!(
+            saved.filing_repo_id,
+            Some(domain_core::RepoId::from_uuid(logical_origin.as_uuid())),
+            "no override/default ⇒ filing resolves to the logical repo's origin"
+        );
+        // ...and the issue is actually filed at that origin's canonical.
         assert_eq!(
             provider.last_create_canonical.lock().unwrap().as_deref(),
             Some("github.com/o/r")
@@ -1378,14 +1457,22 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
 
         let mut workspace = Workspace::new(WorkspaceName::new("orphan-ws").unwrap(), None, true);
-        let default_binding = RepoBinding::new(
-            workspace.id,
+        let default_origin = RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
-        workspace.filing_repo_id = Some(default_binding.id);
+        bindings.save_origin(&default_origin).await.unwrap();
+        let default_instance = RepoInstance::new(
+            workspace.id,
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
+        workspace.filing_repo_id =
+            Some(domain_core::RepoId::from_uuid(default_origin.id.as_uuid()));
         workspaces.save(&workspace).await.unwrap();
 
         // Orphan: no logical repo at all.
@@ -1403,8 +1490,8 @@ mod tests {
         let saved = tasks.get(task.id).await.unwrap();
         assert_eq!(saved.repo_id, None, "still an orphan on the logical axis");
         assert_eq!(
-            saved.filing_repo_id,
-            Some(default_binding.id),
+            saved.filing_repo_id.map(|r| r.as_uuid()),
+            Some(default_origin.id.as_uuid()),
             "filing resolved to the workspace default and was recorded"
         );
         assert_eq!(
@@ -1434,21 +1521,36 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
 
         let mut workspace = Workspace::new(WorkspaceName::new("saga-ws").unwrap(), None, true);
-        let default_binding = RepoBinding::new(
-            workspace.id,
+        let default_origin = RepoOrigin::new(
             "git@github.com:o/filing.git".into(),
             "github.com/o/filing".into(),
         )
         .unwrap();
-        let code_binding = RepoBinding::new(
+        bindings.save_origin(&default_origin).await.unwrap();
+        let default_instance = RepoInstance::new(
             workspace.id,
+            default_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_instance(&default_instance).await.unwrap();
+        let code_origin = RepoOrigin::new(
             "git@github.com:o/code.git".into(),
             "github.com/o/code".into(),
         )
         .unwrap();
-        bindings.save(&default_binding).await.unwrap();
-        bindings.save(&code_binding).await.unwrap();
-        workspace.filing_repo_id = Some(default_binding.id);
+        bindings.save_origin(&code_origin).await.unwrap();
+        let code_instance = RepoInstance::new(
+            workspace.id,
+            code_origin.id,
+            "github.com/o/code".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_instance(&code_instance).await.unwrap();
+        workspace.filing_repo_id =
+            Some(domain_core::RepoId::from_uuid(default_origin.id.as_uuid()));
         workspaces.save(&workspace).await.unwrap();
 
         // Saga task: `repo_id` is the code repo, `filing_repo_id` is
@@ -1457,7 +1559,7 @@ mod tests {
         // through promote.
         let mut task = Task::new_draft(
             workspace.id,
-            Some(code_binding.id),
+            Some(code_instance.id),
             "saga: add a thing".into(),
         )
         .unwrap();
@@ -1475,7 +1577,7 @@ mod tests {
             tasks,
             provider,
             task,
-            default_binding_id: default_binding.id,
+            default_binding_id: domain_core::RepoId::from_uuid(default_origin.id.as_uuid()),
         }
     }
 
@@ -2246,18 +2348,17 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
 
         // Build a workspace + binding, then promote a task on it. The
-        // promote records `filing_repo_id == repo_id == binding.id`
+        // promote records `filing_repo_id` (origin id) and `repo_id` (instance id)
         // on the task. Then delete the *workspace* row (not the
         // binding) and pull must still succeed.
         let workspace = Workspace::new(WorkspaceName::new("del-ws").unwrap(), None, true);
-        let binding = RepoBinding::new(
-            workspace.id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        let binding_id = binding.id;
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace.id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let binding_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
         workspaces.save(&workspace).await.unwrap();
         let task = Task::new_draft(workspace.id, Some(binding_id), "t".into()).unwrap();
         tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
@@ -2329,14 +2430,21 @@ mod tests {
         // this divergence the second binding doesn't exist and we can't
         // exercise the both-gone branch.
         let mut t = tasks.get(task.id).await.unwrap();
-        let second_binding = RepoBinding::new(
-            t.workspace_id,
+        let second_origin = RepoOrigin::new(
             "git@github.com:o/other.git".into(),
             "github.com/o/other".into(),
         )
         .unwrap();
-        let second_id = second_binding.id;
-        bindings.save(&second_binding).await.unwrap();
+        bindings.save_origin(&second_origin).await.unwrap();
+        let second_instance = RepoInstance::new(
+            t.workspace_id,
+            second_origin.id,
+            "github.com/o/other".into(),
+            None,
+        )
+        .unwrap();
+        let second_id = second_instance.id;
+        bindings.save_instance(&second_instance).await.unwrap();
         t.repo_id = Some(second_id);
         t.force_set_filing_repo_id(Some(second_id));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
@@ -2545,8 +2653,7 @@ mod tests {
         workspace_id: WorkspaceId,
         canonical: &str,
     ) {
-        let b = RepoBinding::new(
-            workspace_id,
+        let mut origin = RepoOrigin::new(
             format!(
                 "git@github.com:{}",
                 canonical.trim_start_matches("github.com/")
@@ -2554,7 +2661,22 @@ mod tests {
             canonical.to_string(),
         )
         .unwrap();
-        bindings.save(&b).await.unwrap();
+        // In tests the InMemoryRepoBindingRepository enforces prefix uniqueness
+        // but does not auto-break ties the way SQLite does. Derive a unique
+        // prefix from the full canonical URL's alphabetic chars so collisions
+        // with the primary binding ("rpe" from "github.com/o/r") cannot occur.
+        let alpha: Vec<char> = canonical
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        let mut prefix_chars: Vec<char> = alpha.iter().rev().take(3).cloned().collect();
+        prefix_chars.resize(3, 'x');
+        let prefix: String = prefix_chars.iter().collect::<String>().to_ascii_lowercase();
+        origin.set_prefix(prefix).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, canonical.to_string(), None).unwrap();
+        bindings.save_instance(&instance).await.unwrap();
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
 //! Task-side repository contracts.
 
 use async_trait::async_trait;
-use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
-use domain_repo::RepoBinding;
+use domain_core::{RepoId, RepoInstanceId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
+use domain_repo::{RepoBindingView, RepoInstance, RepoOrigin};
 use domain_sync::OutboxEntry;
 use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot};
 use domain_workspace::Workspace;
@@ -25,52 +25,31 @@ pub trait WorkspaceRepository: Send + Sync {
 
 #[async_trait]
 pub trait RepoBindingRepository: Send + Sync {
-    async fn save(&self, binding: &RepoBinding) -> PortResult<()>;
-    async fn get(&self, id: RepoId) -> PortResult<RepoBinding>;
-    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> PortResult<Vec<RepoBinding>>;
+    async fn save_origin(&self, origin: &RepoOrigin) -> PortResult<()>;
+    async fn save_instance(&self, instance: &RepoInstance) -> PortResult<()>;
+    async fn get(&self, id: RepoInstanceId) -> PortResult<RepoBindingView>;
+    async fn get_origin(&self, id: RepoOriginId) -> PortResult<RepoOrigin>;
+    async fn list_by_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<Vec<RepoBindingView>>;
     async fn find_by_canonical_url(
         &self,
         workspace_id: WorkspaceId,
         canonical_url: &str,
-    ) -> PortResult<Option<RepoBinding>>;
-    /// Look up a binding by its globally-unique `prefix`. Used by the
-    /// repo locator path so callers can pass `--repo rpl` (or use
-    /// `rpl-ak7` for tasks and reuse the prefix half here) instead of a
-    /// UUID.
-    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>>;
-    /// Look up the live binding that holds a particular remote issue
-    /// identity `(provider, remote_id)` within `workspace_id` via the
-    /// `remote_mappings` table (D6 rekey — `remote_mappings` is
-    /// keyed on `(filing_repo_id, provider, remote_id)` so the
-    /// lookup is effectively a join). Used by the
-    /// `rl repo doctor --repair` auto-target resolution chain
-    /// (rpl-sv2) when the task's logical `repo_id` is itself stale
-    /// and the doctor has to fall back to the remote-issue identity
-    /// as the load-bearing signal.
-    ///
-    /// Scoped to `workspace_id` so a cross-workspace import
-    /// (the same `(provider, remote_id)` happens to live in two
-    /// workspaces) doesn't silently pick an arbitrary binding. The
-    /// join against `repos` also filters out rows whose
-    /// `filing_repo_id` references a deleted binding (silent-
-    /// divergence protection — the doctor must never re-point a
-    /// task to a *second* deleted binding).
-    ///
-    /// Returns `None` when no match OR when the match is
-    /// ambiguous (multiple bindings in the same workspace hold
-    /// the same `(provider, remote_id)` — `remote_mappings` has
-    /// a `UNIQUE(provider, remote_id)` only across the cross-repo
-    /// key, not on `(provider, remote_id)` alone). The doctor
-    /// surfaces this as `unresolved` so the user can resolve
-    /// it with `--target` rather than the service arbitrarily
-    /// picking.
+    ) -> PortResult<Option<RepoBindingView>>;
+    async fn find_origin_by_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> PortResult<Option<RepoOrigin>>;
+    async fn find_origin_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoOrigin>>;
     async fn find_by_remote_mapping(
         &self,
         workspace_id: WorkspaceId,
         provider: &str,
         remote_id: &str,
-    ) -> PortResult<Option<RepoId>>;
-    async fn delete(&self, id: RepoId) -> PortResult<()>;
+    ) -> PortResult<Option<RepoOriginId>>;
+    async fn delete(&self, id: RepoInstanceId) -> PortResult<()>;
 }
 
 // ---------- Task repository -----------------------------------------------
@@ -204,13 +183,13 @@ pub trait TaskRepository: Send + Sync {
     /// (`filing_repo_id` + `provider` + `remote_id`). Scoped by the **filing**
     /// repo (RFC 0002 D6) — where the issue actually lives — because remote
     /// issue numbers are only unique per repo (GitHub `repoA#123` ≠
-    /// `repoB#123`). Implementations COALESCE to the logical `repo_id` for rows
-    /// whose filing repo is unresolved, so callers may pass the logical repo
-    /// when filing == logical (e.g. `sync import`, which records both equal).
+    /// `repoB#123`). Implementations look up by `filing_repo_id` alone per RFC
+    /// 0005 §D4 — the migration guarantees every remote-backed task has a
+    /// populated `filing_repo_id` in origin id space.
     /// Used by `sync import` to skip already-tracked issues.
     async fn find_by_remote(
         &self,
-        filing_repo_id: RepoId,
+        filing_repo_id: RepoOriginId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>>;

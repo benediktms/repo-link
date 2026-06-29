@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use domain_core::{RepoId, WorkspaceId};
-use domain_repo::RepoBinding;
+use domain_core::{RepoId, RepoInstanceId, RepoOriginId, WorkspaceId};
+use domain_repo::{RepoBindingView, RepoInstance, RepoOrigin};
 use domain_workspace::WorkspaceStatus;
 use dto_shared::{
     AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, RepoAttachOutcomeDto,
@@ -63,55 +63,67 @@ impl RepoBindingService {
     /// without git running).
     pub async fn attach(&self, cmd: AttachRepoCmd) -> Result<RepoAttachOutcomeDto> {
         let workspace_id: WorkspaceId = cmd.workspace_id.parse()?;
-        // Confirm the workspace exists; bubbles up as PortError::NotFound otherwise.
         let _ = self.workspaces.get(workspace_id).await?;
 
-        let (mut binding, merged) = match self
+        // Step 1: find or create the shared origin
+        let (mut origin, _origin_existed) = match self
+            .bindings
+            .find_origin_by_canonical_url(&cmd.canonical_url)
+            .await?
+        {
+            Some(o) => (o, true),
+            None => {
+                let o = RepoOrigin::new(cmd.remote_url.clone(), cmd.canonical_url.clone())?;
+                (o, false)
+            }
+        };
+
+        // Explicit prefix always wins
+        let explicit_prefix = cmd.prefix.is_some();
+        if let Some(requested) = cmd.prefix {
+            origin.set_prefix(requested)?;
+        }
+
+        // Step 2: find or create the per-workspace instance
+        let (mut instance, merged) = match self
             .bindings
             .find_by_canonical_url(workspace_id, &cmd.canonical_url)
             .await?
         {
-            Some(existing) => (existing, true),
+            Some(existing) => (existing.instance, true),
             None => {
-                let mut b = RepoBinding::new(workspace_id, cmd.remote_url, cmd.canonical_url)?;
-                b.tracked_branch = cmd.tracked_branch;
-                (b, false)
+                let inst = RepoInstance::new(
+                    workspace_id,
+                    origin.id,
+                    cmd.canonical_url.clone(),
+                    cmd.tracked_branch.clone(),
+                )?;
+                (inst, false)
             }
         };
 
-        // Explicit `--prefix` always wins over the derived value, even
-        // on merge — interpreted as "set this binding's prefix to X if
-        // it wasn't already". `set_prefix` validates the shape and
-        // bumps `updated_at` only when the value actually changes.
-        let explicit_prefix = cmd.prefix.is_some();
-        if let Some(requested) = cmd.prefix {
-            binding.set_prefix(requested)?;
-        }
-
         let worktree_added = cmd.link_path.inspect(|path| {
-            binding.link_worktree(PathBuf::from(path), cmd.link_branch);
+            instance.link_worktree(PathBuf::from(path), cmd.link_branch.clone());
         });
 
         if explicit_prefix {
-            // Explicit prefix → surface conflicts as a human-readable
-            // "pick a different one" rather than silent suffix-bumping
-            // (`myprefix` → `myprefix1`) or a raw SQL error.
             self.bindings
-                .save(&binding)
+                .save_origin(&origin)
                 .await
-                .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
+                .map_err(|e| map_prefix_conflict(e, &origin.prefix))?;
         } else {
-            // Derived prefix → break collisions automatically.
-            self.save_with_unique_prefix(&mut binding).await?;
+            self.save_with_unique_prefix(&mut origin).await?;
         }
+        self.bindings.save_instance(&instance).await?;
+
         Ok(RepoAttachOutcomeDto {
-            binding: binding_to_dto(&binding),
+            binding: binding_to_dto(&instance, &origin),
             merged,
             worktree_added,
         })
     }
 
-    /// Save a binding, retrying with a numeric suffix on `repos.prefix`
+    /// Save an origin, retrying with a numeric suffix on `repo_origins.prefix`
     /// UNIQUE violations. Two distinct repos with the same `name` would
     /// otherwise both derive the same prefix and collide globally; the
     /// suffix breaks the tie deterministically (`rpe` → `rpe1` → `rpe2`).
@@ -119,19 +131,19 @@ impl RepoBindingService {
     /// The retry runs against the database, not a pre-flight cache —
     /// the spec is explicit that uniqueness is the index's job and a
     /// pre-check would race.
-    async fn save_with_unique_prefix(&self, binding: &mut RepoBinding) -> Result<()> {
+    async fn save_with_unique_prefix(&self, origin: &mut RepoOrigin) -> Result<()> {
         // No low ceiling: automatic collision-breaking must scale to any
         // number of same-named repos (`rpe100` is just as valid as
         // `rpe1`). The suffix is bounded by the 20-char prefix cap, and
         // SAFETY_CAP only guards against a logic-bug infinite loop, not
         // legitimate data.
         const SAFETY_CAP: u32 = 1_000_000;
-        let base = binding.prefix.clone();
+        let base = origin.prefix.clone();
         let mut suffix: u32 = 0;
         loop {
-            match self.bindings.save(binding).await {
+            match self.bindings.save_origin(origin).await {
                 Ok(()) => return Ok(()),
-                Err(e) if e.conflict_target() == Some("repos.prefix") => {
+                Err(e) if e.conflict_target() == Some("repo_origins.prefix") => {
                     suffix += 1;
                     if suffix > SAFETY_CAP {
                         return Err(ServiceError::Port(PortError::Backend(format!(
@@ -142,7 +154,7 @@ impl RepoBindingService {
                     let max_base_chars = 20usize.saturating_sub(suffix_str.len());
                     let trimmed: String = base.chars().take(max_base_chars).collect();
                     let candidate = format!("{trimmed}{suffix_str}");
-                    binding.set_prefix(candidate)?;
+                    origin.set_prefix(candidate)?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -150,29 +162,29 @@ impl RepoBindingService {
     }
 
     pub async fn detach(&self, id: &str) -> Result<()> {
-        let id: RepoId = id.parse()?;
+        let id: RepoInstanceId = id.parse()?;
         self.bindings.delete(id).await?;
         Ok(())
     }
 
     pub async fn show(&self, query: &str) -> Result<RepoBindingDto> {
-        if let Ok(id) = query.parse::<RepoId>() {
-            let b = self.bindings.get(id).await?;
-            return Ok(binding_to_dto(&b));
+        if let Ok(id) = query.parse::<RepoInstanceId>() {
+            let view = self.bindings.get(id).await?;
+            return Ok(binding_to_dto(&view.instance, &view.origin));
         }
-        let binding = self.resolve_by_handle(query).await?;
-        Ok(binding_to_dto(&binding))
+        let view = self.resolve_by_handle(query).await?;
+        Ok(binding_to_dto(&view.instance, &view.origin))
     }
 
-    /// Resolve a UUID, exact name, or exact alias to a `RepoBinding`.
-    async fn resolve(&self, query: &str) -> Result<RepoBinding> {
-        if let Ok(id) = query.parse::<RepoId>() {
+    /// Resolve a UUID, exact name, or exact alias to a `RepoBindingView`.
+    async fn resolve(&self, query: &str) -> Result<RepoBindingView> {
+        if let Ok(id) = query.parse::<RepoInstanceId>() {
             return Ok(self.bindings.get(id).await?);
         }
         self.resolve_by_handle(query).await
     }
 
-    /// Resolve `query` to a binding by trying, in order: exact
+    /// Resolve `query` to a binding view by trying, in order: exact
     /// `prefix` match (globally-unique, single index lookup); then
     /// exact `name` or `alias` match. The prefix takes priority because it
     /// carries an explicit uniqueness guarantee — names and aliases can clash
@@ -190,13 +202,23 @@ impl RepoBindingService {
     /// that resolved cleanly before still resolves cleanly even when an
     /// archived workspace happens to hold a same-named binding. Ambiguity is
     /// still surfaced WITHIN whichever set ultimately resolves the handle.
-    async fn resolve_by_handle(&self, query: &str) -> Result<RepoBinding> {
-        if let Some(binding) = self.bindings.find_by_prefix(query).await? {
-            return Ok(binding);
+    async fn resolve_by_handle(&self, query: &str) -> Result<RepoBindingView> {
+        if let Some(origin) = self.bindings.find_origin_by_prefix(query).await? {
+            // Find any instance that has this origin
+            let workspaces = self.workspaces.list(true).await?;
+            for ws in &workspaces {
+                if ws.status == WorkspaceStatus::Deleted {
+                    continue;
+                }
+                let views = self.bindings.list_by_workspace(ws.id).await?;
+                if let Some(view) = views.into_iter().find(|v| v.origin.id == origin.id) {
+                    return Ok(view);
+                }
+            }
         }
         let workspaces = self.workspaces.list(true).await?;
-        let mut active: Vec<RepoBinding> = Vec::new();
-        let mut archived: Vec<RepoBinding> = Vec::new();
+        let mut active: Vec<RepoBindingView> = Vec::new();
+        let mut archived: Vec<RepoBindingView> = Vec::new();
         for ws in &workspaces {
             // `list(true)` returns ALL statuses, Deleted included — a deleted
             // workspace's bindings must never resolve a handle, so drop them
@@ -205,13 +227,13 @@ impl RepoBindingService {
             if ws.status == WorkspaceStatus::Deleted {
                 continue;
             }
-            let bindings = self.bindings.list_by_workspace(ws.id).await?;
-            for b in bindings {
-                if b.name == query || b.aliases.iter().any(|a| a == query) {
+            let views = self.bindings.list_by_workspace(ws.id).await?;
+            for v in views {
+                if v.origin.name == query || v.origin.aliases.iter().any(|a| a == query) {
                     if ws.status == WorkspaceStatus::Archived {
-                        archived.push(b);
+                        archived.push(v);
                     } else {
-                        active.push(b);
+                        active.push(v);
                     }
                 }
             }
@@ -226,11 +248,11 @@ impl RepoBindingService {
                 query: query.to_string(),
                 candidates: matches
                     .into_iter()
-                    .map(|b| AmbiguousCandidate {
-                        id: b.id.to_string(),
-                        workspace_id: b.workspace_id.to_string(),
-                        canonical_url: b.canonical_url.clone(),
-                        name: b.name.clone(),
+                    .map(|v| AmbiguousCandidate {
+                        id: v.instance.id.to_string(),
+                        workspace_id: v.instance.workspace_id.to_string(),
+                        canonical_url: v.instance.canonical_url.clone(),
+                        name: v.origin.name.clone(),
                     })
                     .collect(),
             }),
@@ -238,10 +260,11 @@ impl RepoBindingService {
     }
 
     pub async fn rename(&self, query: &str, new_name: String) -> Result<RepoBindingDto> {
-        let mut binding = self.resolve(query).await?;
-        binding.set_name(new_name)?;
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        let view = self.resolve(query).await?;
+        let mut origin = view.origin;
+        origin.set_name(new_name)?;
+        self.bindings.save_origin(&origin).await?;
+        Ok(binding_to_dto(&view.instance, &origin))
     }
 
     /// Replace the binding's prefix with an explicit value. Validates
@@ -252,56 +275,59 @@ impl RepoBindingService {
     /// goes stale — the bare hash still resolves, but `oldprefix-ak7`
     /// will now error with PrefixMismatch. Document this in CLI help.
     pub async fn set_prefix(&self, query: &str, new_prefix: String) -> Result<RepoBindingDto> {
-        let mut binding = self.resolve(query).await?;
-        binding.set_prefix(new_prefix)?;
+        let view = self.resolve(query).await?;
+        let mut origin = view.origin;
+        origin.set_prefix(new_prefix)?;
         self.bindings
-            .save(&binding)
+            .save_origin(&origin)
             .await
-            .map_err(|e| map_prefix_conflict(e, &binding.prefix))?;
-        Ok(binding_to_dto(&binding))
+            .map_err(|e| map_prefix_conflict(e, &origin.prefix))?;
+        Ok(binding_to_dto(&view.instance, &origin))
     }
 
     pub async fn add_alias(&self, query: &str, alias: String) -> Result<RepoBindingDto> {
-        let mut binding = self.resolve(query).await?;
-        binding.add_alias(alias)?;
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        let view = self.resolve(query).await?;
+        let mut origin = view.origin;
+        origin.add_alias(alias)?;
+        self.bindings.save_origin(&origin).await?;
+        Ok(binding_to_dto(&view.instance, &origin))
     }
 
     pub async fn remove_alias(&self, query: &str, alias: &str) -> Result<RepoBindingDto> {
-        let mut binding = self.resolve(query).await?;
-        if !binding.remove_alias(alias) {
+        let view = self.resolve(query).await?;
+        let mut origin = view.origin;
+        if !origin.remove_alias(alias) {
             return Err(ServiceError::Domain(domain_core::DomainError::validation(
                 format!("alias '{alias}' not found"),
             )));
         }
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        self.bindings.save_origin(&origin).await?;
+        Ok(binding_to_dto(&view.instance, &origin))
     }
 
     pub async fn find(&self, query: &str) -> Result<FindRepoResponseDto> {
         let workspaces = self.workspaces.list(false).await?;
-        let mut hits: Vec<(u8, RepoBinding, String)> = Vec::new();
+        let mut hits: Vec<(u8, RepoBindingView, String)> = Vec::new();
         for ws in &workspaces {
-            let bindings = self.bindings.list_by_workspace(ws.id).await?;
-            for b in bindings {
-                if b.name == query {
-                    hits.push((0, b, "name".to_string()));
-                } else if b.aliases.iter().any(|a| a == query) {
-                    hits.push((1, b, "alias".to_string()));
-                } else if b.canonical_url.contains(query) {
-                    hits.push((2, b, "canonical_url".to_string()));
-                } else if b.name.contains(query) {
-                    hits.push((3, b, "name_substring".to_string()));
+            let views = self.bindings.list_by_workspace(ws.id).await?;
+            for v in views {
+                if v.origin.name == query {
+                    hits.push((0, v, "name".to_string()));
+                } else if v.origin.aliases.iter().any(|a| a == query) {
+                    hits.push((1, v, "alias".to_string()));
+                } else if v.instance.canonical_url.contains(query) {
+                    hits.push((2, v, "canonical_url".to_string()));
+                } else if v.origin.name.contains(query) {
+                    hits.push((3, v, "name_substring".to_string()));
                 }
             }
         }
-        hits.sort_by_key(|(rank, b, _)| (*rank, b.created_at));
+        hits.sort_by_key(|(rank, v, _)| (*rank, v.instance.created_at));
         let matches: Vec<FindRepoMatchDto> = hits
             .into_iter()
-            .map(|(_, b, matched_by)| FindRepoMatchDto {
-                workspace_id: b.workspace_id.to_string(),
-                binding: binding_to_dto(&b),
+            .map(|(_, v, matched_by)| FindRepoMatchDto {
+                workspace_id: v.instance.workspace_id.to_string(),
+                binding: binding_to_dto(&v.instance, &v.origin),
                 matched_by,
             })
             .collect();
@@ -316,7 +342,10 @@ impl RepoBindingService {
     pub async fn list(&self, workspace_id: &str) -> Result<Vec<RepoBindingDto>> {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
         let rows = self.bindings.list_by_workspace(workspace_id).await?;
-        Ok(rows.iter().map(binding_to_dto).collect())
+        Ok(rows
+            .iter()
+            .map(|v| binding_to_dto(&v.instance, &v.origin))
+            .collect())
     }
 
     /// Return every (workspace, binding) pair whose binding's
@@ -341,14 +370,14 @@ impl RepoBindingService {
             if ws.status == WorkspaceStatus::Deleted {
                 continue;
             }
-            if let Some(binding) = self
+            if let Some(view) = self
                 .bindings
                 .find_by_canonical_url(ws.id, canonical_url)
                 .await?
             {
                 out.push(RepoMembershipDto {
                     workspace: workspace_to_dto(ws),
-                    binding: binding_to_dto(&binding),
+                    binding: binding_to_dto(&view.instance, &view.origin),
                 });
             }
         }
@@ -356,27 +385,30 @@ impl RepoBindingService {
     }
 
     pub async fn link_worktree(&self, cmd: LinkWorktreeCmd) -> Result<RepoBindingDto> {
-        let id: RepoId = cmd.repo_id.parse()?;
-        let mut binding = self.bindings.get(id).await?;
-        binding.link_worktree(PathBuf::from(cmd.path), cmd.branch);
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        let id: RepoInstanceId = cmd.repo_id.parse()?;
+        let view = self.bindings.get(id).await?;
+        let mut instance = view.instance;
+        instance.link_worktree(PathBuf::from(cmd.path), cmd.branch);
+        self.bindings.save_instance(&instance).await?;
+        Ok(binding_to_dto(&instance, &view.origin))
     }
 
     pub async fn unlink_worktree(&self, cmd: UnlinkWorktreeCmd) -> Result<RepoBindingDto> {
-        let id: RepoId = cmd.repo_id.parse()?;
-        let mut binding = self.bindings.get(id).await?;
-        binding.unlink_worktree(std::path::Path::new(&cmd.path))?;
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        let id: RepoInstanceId = cmd.repo_id.parse()?;
+        let view = self.bindings.get(id).await?;
+        let mut instance = view.instance;
+        instance.unlink_worktree(std::path::Path::new(&cmd.path))?;
+        self.bindings.save_instance(&instance).await?;
+        Ok(binding_to_dto(&instance, &view.origin))
     }
 
     pub async fn prune_missing(&self, id: &str) -> Result<RepoBindingDto> {
-        let id: RepoId = id.parse()?;
-        let mut binding = self.bindings.get(id).await?;
-        binding.prune_missing();
-        self.bindings.save(&binding).await?;
-        Ok(binding_to_dto(&binding))
+        let id: RepoInstanceId = id.parse()?;
+        let view = self.bindings.get(id).await?;
+        let mut instance = view.instance;
+        instance.prune_missing();
+        self.bindings.save_instance(&instance).await?;
+        Ok(binding_to_dto(&instance, &view.origin))
     }
 
     /// Walk every binding in the workspace, ask the probe whether each
@@ -393,13 +425,14 @@ impl RepoBindingService {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
         // Confirm the workspace exists; bubbles up as PortError::NotFound otherwise.
         let _ = self.workspaces.get(workspace_id).await?;
-        let bindings = self.bindings.list_by_workspace(workspace_id).await?;
+        let views = self.bindings.list_by_workspace(workspace_id).await?;
 
         let mut summary = ReconcileSummary::default();
-        for mut binding in bindings {
+        for view in views {
+            let mut instance = view.instance;
             summary.repos_checked += 1;
             let mut missing_paths = Vec::new();
-            for link in &binding.worktrees {
+            for link in &instance.worktrees {
                 summary.worktrees_checked += 1;
                 let exists = probe.path_exists(&link.path).await?;
                 let already_missing = matches!(
@@ -413,19 +446,19 @@ impl RepoBindingService {
 
             let mut changed = false;
             for path in &missing_paths {
-                binding.mark_path_missing(path)?;
+                instance.mark_path_missing(path)?;
                 summary.marked_missing += 1;
                 changed = true;
             }
             if prune {
-                let pruned = binding.prune_missing();
+                let pruned = instance.prune_missing();
                 if pruned > 0 {
                     summary.pruned += pruned;
                     changed = true;
                 }
             }
             if changed {
-                self.bindings.save(&binding).await?;
+                self.bindings.save_instance(&instance).await?;
             }
         }
         Ok(summary)
@@ -486,7 +519,8 @@ impl RepoBindingService {
         // this via `resolve_repo_handle_required`; this is the
         // service-layer net for direct API callers.
         if let Some(forced) = target_override {
-            self.bindings.get(forced).await?;
+            let origin_id = RepoOriginId::from_uuid(forced.as_uuid());
+            self.bindings.get_origin(origin_id).await?;
         }
 
         let ws_tasks = tasks
@@ -507,10 +541,14 @@ impl RepoBindingService {
                 continue; // no recorded filing repo — nothing to doctor
             };
 
-            // Probe the binding. `Port(NotFound)` is the silent-divergence
+            // Convert the stored RepoId (filing_repo_id) to a RepoOriginId
+            // since filing_repo_id holds origin id bytes (RFC 0005 §D4).
+            let origin_id = RepoOriginId::from_uuid(filing_id.as_uuid());
+
+            // Probe the origin. `Port(NotFound)` is the silent-divergence
             // case the doctor is here to heal. Other errors propagate.
-            let dangling = match self.bindings.get(filing_id).await {
-                Ok(_) => continue, // filing binding is alive — task is fine
+            let dangling = match self.bindings.get_origin(origin_id).await {
+                Ok(_) => continue, // filing origin is alive — task is fine
                 Err(PortError::NotFound(_)) => true,
                 Err(e) => return Err(e.into()),
             };
@@ -519,8 +557,8 @@ impl RepoBindingService {
             }
 
             // Resolve a target. Override wins; otherwise run the chain.
-            let target = if let Some(forced) = target_override {
-                Some(forced)
+            let target: Option<RepoOriginId> = if let Some(forced) = target_override {
+                Some(RepoOriginId::from_uuid(forced.as_uuid()))
             } else {
                 Self::resolve_doctor_target(&self.bindings, t).await?
             };
@@ -528,7 +566,7 @@ impl RepoBindingService {
             let mut row = DoctorRow {
                 task_id: t.id.to_string(),
                 title: t.title.clone(),
-                current_filing_repo_id: filing_id.to_string(),
+                current_filing_repo_id: origin_id.to_string(),
                 target_repo_id: target.map(|r| r.to_string()),
                 repaired: false,
             };
@@ -536,7 +574,8 @@ impl RepoBindingService {
             if repair {
                 if let Some(target_id) = target {
                     let mut updated = tasks.get(t.id).await?;
-                    updated.force_set_filing_repo_id(Some(target_id));
+                    let filing_as_repo_id = RepoId::from_uuid(target_id.as_uuid());
+                    updated.force_set_filing_repo_id(Some(filing_as_repo_id));
                     tasks
                         .save(&updated, domain_task::SnapshotSource::FilingRepoRepair)
                         .await?;
@@ -574,7 +613,7 @@ impl RepoBindingService {
     async fn resolve_doctor_target(
         bindings: &Arc<dyn RepoBindingRepository>,
         t: &domain_task::Task,
-    ) -> Result<Option<domain_core::RepoId>> {
+    ) -> Result<Option<RepoOriginId>> {
         // Step 1: the task's *logical* `repo_id`, if it still resolves
         // to a live binding. Org-moves update `repo_id` correctly
         // (this is the divergence rpl-sv2 describes), so the live
@@ -587,7 +626,7 @@ impl RepoBindingService {
         // task to a different binding instead of aborting.
         if let Some(logical) = t.repo_id {
             match bindings.get(logical).await {
-                Ok(_) => return Ok(Some(logical)),
+                Ok(view) => return Ok(Some(view.instance.origin_id)),
                 Err(PortError::NotFound(_)) => {}
                 Err(e) => return Err(e.into()),
             }
@@ -852,6 +891,71 @@ mod tests {
         let second = bsvc.attach(cmd).await.unwrap();
         assert!(second.merged);
         assert_eq!(second.binding.id, first.binding.id);
+    }
+
+    #[tokio::test]
+    async fn attach_same_repo_in_two_workspaces_shares_origin_and_prefix() {
+        // RFC 0005's core fix: the SAME on-disk repo (same canonical_url) attached
+        // to two DIFFERENT workspaces reuses ONE shared origin — so the friendly-ID
+        // prefix is identical across workspaces instead of being collision-broken.
+        // (Pre-0005 this produced `rpl` in one workspace and `rpl1` in another, the
+        // very divergence #202 exists to kill.)
+        let (ws_svc, bsvc) = setup();
+        let ws1 = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: "alpha".into(),
+                description: None,
+                local_only: true,
+                project_spec: None,
+            })
+            .await
+            .unwrap();
+        let ws2 = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: "beta".into(),
+                description: None,
+                local_only: true,
+                project_spec: None,
+            })
+            .await
+            .unwrap();
+        let cmd = |ws_id: String| AttachRepoCmd {
+            workspace_id: ws_id,
+            remote_url: "git@github.com:o/r.git".into(),
+            canonical_url: "github.com/o/r".into(),
+            tracked_branch: None,
+            link_path: None,
+            link_branch: None,
+            prefix: None,
+        };
+
+        let a = bsvc.attach(cmd(ws1.id.clone())).await.unwrap();
+        let b = bsvc.attach(cmd(ws2.id.clone())).await.unwrap();
+
+        // Each workspace gets its OWN instance — a second *workspace* is a new
+        // membership, not a within-workspace merge.
+        assert!(!a.merged);
+        assert!(
+            !b.merged,
+            "a second workspace attaching the same repo is a new instance, not a merge"
+        );
+        assert_ne!(
+            a.binding.id, b.binding.id,
+            "distinct per-workspace instance ids"
+        );
+        assert_eq!(a.binding.workspace_id, ws1.id);
+        assert_eq!(b.binding.workspace_id, ws2.id);
+
+        // ...but they share ONE origin and therefore ONE prefix — the fix.
+        assert_eq!(
+            a.binding.origin_id, b.binding.origin_id,
+            "same canonical_url => one shared origin across workspaces"
+        );
+        assert_eq!(
+            a.binding.prefix, b.binding.prefix,
+            "shared origin => identical task-ID prefix (no rpl/rpl1 divergence)"
+        );
+        assert!(!a.binding.prefix.is_empty());
     }
 
     #[tokio::test]
@@ -1267,33 +1371,29 @@ mod tests {
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        // Create two bindings: one for the (now-deleted) filing repo,
-        // one for the live logical repo the org-move re-pointed at.
-        let old_binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r-oldorg.git".into(),
-            "github.com/o/r-oldorg".into(),
-        )
-        .unwrap();
-        let new_binding = RepoBinding::new(
-            ws_id,
+        // Build an "old" origin id that is never persisted — simulates a
+        // filing_repo_id that references an origin which has since been
+        // removed (the silent-divergence case doctor is here to heal).
+        let dangling_origin_id = RepoOriginId::new();
+
+        let new_origin = RepoOrigin::new(
             "git@github.com:o/r-neworg.git".into(),
             "github.com/o/r-neworg".into(),
         )
         .unwrap();
-        bindings.save(&old_binding).await.unwrap();
-        bindings.save(&new_binding).await.unwrap();
+        let new_instance =
+            RepoInstance::new(ws_id, new_origin.id, "github.com/o/r-neworg".into(), None).unwrap();
+        bindings.save_origin(&new_origin).await.unwrap();
+        bindings.save_instance(&new_instance).await.unwrap();
 
-        // Create a task, set both axes (filing = old, logical = new),
-        // then delete the old binding to simulate the silent-divergence
-        // shape.
-        let mut t = Task::new_draft(ws_id, Some(new_binding.id), "t".into()).unwrap();
-        t.force_set_filing_repo_id(Some(old_binding.id));
+        // Create a task: filing points at a phantom origin (dangling),
+        // logical points at the live new instance.
+        let mut t = Task::new_draft(ws_id, Some(new_instance.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(dangling_origin_id.as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
-        bindings.delete(old_binding.id).await.unwrap();
 
         // List-only mode: no state changes, but the row is reported
-        // with the auto-target = the live logical binding.
+        // with the auto-target = the live logical binding's origin.
         let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
         assert_eq!(summary.affected, 1, "exactly one task should be affected");
         assert_eq!(summary.repaired, 0);
@@ -1301,11 +1401,11 @@ mod tests {
         assert_eq!(summary.rows.len(), 1);
         let row = &summary.rows[0];
         assert_eq!(row.task_id, t.id.to_string());
-        assert_eq!(row.current_filing_repo_id, old_binding.id.to_string());
+        assert_eq!(row.current_filing_repo_id, dangling_origin_id.to_string());
         assert_eq!(
             row.target_repo_id.as_deref(),
-            Some(new_binding.id.to_string()).as_deref(),
-            "auto-target must be the live logical binding"
+            Some(new_origin.id.to_string()).as_deref(),
+            "auto-target must be the live logical binding's origin"
         );
         assert!(!row.repaired);
     }
@@ -1320,25 +1420,22 @@ mod tests {
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        let old_binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r-oldorg.git".into(),
-            "github.com/o/r-oldorg".into(),
-        )
-        .unwrap();
-        let new_binding = RepoBinding::new(
-            ws_id,
+        // Phantom old origin — never persisted, simulates a dangling filing pointer.
+        let dangling_origin_id = RepoOriginId::new();
+
+        let new_origin = RepoOrigin::new(
             "git@github.com:o/r-neworg.git".into(),
             "github.com/o/r-neworg".into(),
         )
         .unwrap();
-        bindings.save(&old_binding).await.unwrap();
-        bindings.save(&new_binding).await.unwrap();
+        let new_instance =
+            RepoInstance::new(ws_id, new_origin.id, "github.com/o/r-neworg".into(), None).unwrap();
+        bindings.save_origin(&new_origin).await.unwrap();
+        bindings.save_instance(&new_instance).await.unwrap();
 
-        let mut t = Task::new_draft(ws_id, Some(new_binding.id), "t".into()).unwrap();
-        t.force_set_filing_repo_id(Some(old_binding.id));
+        let mut t = Task::new_draft(ws_id, Some(new_instance.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(dangling_origin_id.as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
-        bindings.delete(old_binding.id).await.unwrap();
 
         let summary = bsvc.doctor(&ws_id.to_string(), true, None).await.unwrap();
         assert_eq!(summary.affected, 1);
@@ -1347,8 +1444,12 @@ mod tests {
 
         // The task is now re-pointed; load and confirm.
         let after = tasks.get(t.id).await.unwrap();
-        assert_eq!(after.filing_repo_id, Some(new_binding.id));
-        assert_eq!(after.repo_id, Some(new_binding.id), "logical stays put");
+        assert_eq!(
+            after.filing_repo_id.map(|r| r.as_uuid()),
+            Some(new_origin.id.as_uuid()),
+            "filing_repo_id must now point to the new origin"
+        );
+        assert_eq!(after.repo_id, Some(new_instance.id), "logical stays put");
     }
 
     /// `target_override` forces every affected task to that binding,
@@ -1364,20 +1465,10 @@ mod tests {
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        // No `new_binding` saved here. Logical = old_binding (will be
-        // deleted); the override is a brand-new binding that's never
-        // been saved. The doctor uses it anyway — the user is
-        // responsible for the override's liveness.
-        let old_binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r-oldorg.git".into(),
-            "github.com/o/r-oldorg".into(),
-        )
-        .unwrap();
-        bindings.save(&old_binding).await.unwrap();
+        // Phantom old origin — never persisted, simulates a dangling filing pointer.
+        let dangling_origin_id = RepoOriginId::new();
 
-        let override_binding = RepoBinding::new(
-            ws_id,
+        let override_origin = RepoOrigin::new(
             "git@github.com:o/r-replacement.git".into(),
             "github.com/o/r-replacement".into(),
         )
@@ -1385,25 +1476,26 @@ mod tests {
         // The override MUST exist — the doctor now pre-validates
         // the override target before mutating any task, exactly the
         // same defensive guard `TaskService::repoint_filing_repo`
-        // has. The test that previously saved nothing here asserted
-        // the unsound behavior; now we plant the override properly
-        // and the test verifies the override path still works.
-        bindings.save(&override_binding).await.unwrap();
+        // has.
+        bindings.save_origin(&override_origin).await.unwrap();
 
-        let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
-        t.force_set_filing_repo_id(Some(old_binding.id));
+        let mut t = Task::new_draft(ws_id, None, "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(dangling_origin_id.as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
-        bindings.delete(old_binding.id).await.unwrap();
 
         let summary = bsvc
-            .doctor(&ws_id.to_string(), true, Some(override_binding.id))
+            .doctor(
+                &ws_id.to_string(),
+                true,
+                Some(domain_core::RepoId::from_uuid(override_origin.id.as_uuid())),
+            )
             .await
             .unwrap();
         assert_eq!(summary.affected, 1);
         assert_eq!(summary.repaired, 1);
         assert_eq!(
             summary.rows[0].target_repo_id.as_deref(),
-            Some(override_binding.id.to_string()).as_deref(),
+            Some(override_origin.id.to_string()).as_deref(),
             "override must win over the auto-target chain"
         );
     }
@@ -1417,23 +1509,16 @@ mod tests {
     /// bug class rpl-sv2 exists to heal.
     #[tokio::test]
     async fn doctor_repair_rejects_unknown_target_override() {
-        let (bsvc, tasks, bindings, workspaces) = setup_with_tasks();
+        let (bsvc, tasks, _bindings, workspaces) = setup_with_tasks();
         let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        // Real task with a dangling filing pointer.
-        let old_binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r-oldorg.git".into(),
-            "github.com/o/r-oldorg".into(),
-        )
-        .unwrap();
-        bindings.save(&old_binding).await.unwrap();
-        let mut t = Task::new_draft(ws_id, Some(old_binding.id), "t".into()).unwrap();
-        t.force_set_filing_repo_id(Some(old_binding.id));
+        // Real task with a dangling filing pointer — phantom origin, never persisted.
+        let dangling_origin_id = RepoOriginId::new();
+        let mut t = Task::new_draft(ws_id, None, "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(dangling_origin_id.as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
-        bindings.delete(old_binding.id).await.unwrap();
 
         // Phantom override — never saved.
         let phantom = RepoId::new();
@@ -1467,16 +1552,14 @@ mod tests {
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        let binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let instance = RepoInstance::new(ws_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
         // Unpromoted task: no `filing_repo_id` recorded.
-        let t = Task::new_draft(ws_id, Some(binding.id), "draft".into()).unwrap();
+        let t = Task::new_draft(ws_id, Some(instance.id), "draft".into()).unwrap();
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
         let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();
@@ -1494,16 +1577,14 @@ mod tests {
         let ws_id = ws.id;
         workspaces.save(&ws).await.unwrap();
 
-        let binding = RepoBinding::new(
-            ws_id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        bindings.save(&binding).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        let instance = RepoInstance::new(ws_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
 
-        let mut t = Task::new_draft(ws_id, Some(binding.id), "t".into()).unwrap();
-        t.force_set_filing_repo_id(Some(binding.id));
+        let mut t = Task::new_draft(ws_id, Some(instance.id), "t".into()).unwrap();
+        t.force_set_filing_repo_id(Some(RepoId::from_uuid(origin.id.as_uuid())));
         tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
         let summary = bsvc.doctor(&ws_id.to_string(), false, None).await.unwrap();

@@ -2,77 +2,145 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use domain_core::{RepoId, WorkspaceId};
-use domain_repo::RepoBinding;
+use domain_core::{RepoInstanceId, RepoOriginId, WorkspaceId};
+use domain_repo::{RepoBindingView, RepoInstance, RepoOrigin};
 use ports::{PortError, PortResult, RepoBindingRepository};
 
-// ---------- Repo binding repository ---------------------------------------
+// ---------- Repo binding repository (RFC 0005: origins + instances) -------
 
 #[derive(Default)]
 pub struct InMemoryRepoBindingRepository {
-    inner: Mutex<HashMap<RepoId, RepoBinding>>,
+    origins: Mutex<HashMap<RepoOriginId, RepoOrigin>>,
+    instances: Mutex<HashMap<RepoInstanceId, RepoInstance>>,
 }
 
 impl InMemoryRepoBindingRepository {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn view(&self, instance: RepoInstance) -> PortResult<RepoBindingView> {
+        let origins = self.origins.lock().unwrap();
+        let origin = origins
+            .get(&instance.origin_id)
+            .cloned()
+            .ok_or_else(|| PortError::NotFound(format!("origin {}", instance.origin_id)))?;
+        Ok(RepoBindingView { origin, instance })
+    }
 }
 
 #[async_trait]
 impl RepoBindingRepository for InMemoryRepoBindingRepository {
-    async fn save(&self, binding: &RepoBinding) -> PortResult<()> {
-        self.inner
+    async fn save_origin(&self, origin: &RepoOrigin) -> PortResult<()> {
+        // Check prefix uniqueness (if non-empty) before inserting
+        if !origin.prefix.is_empty() {
+            let g = self.origins.lock().unwrap();
+            for (id, existing) in g.iter() {
+                if existing.prefix == origin.prefix && *id != origin.id {
+                    return Err(PortError::Conflict {
+                        target: Some("repo_origins.prefix".to_string()),
+                        message: format!(
+                            "prefix '{}' already taken by origin {}",
+                            origin.prefix, id
+                        ),
+                    });
+                }
+            }
+        }
+        self.origins
             .lock()
             .unwrap()
-            .insert(binding.id, binding.clone());
+            .insert(origin.id, origin.clone());
         Ok(())
     }
 
-    async fn get(&self, id: RepoId) -> PortResult<RepoBinding> {
-        self.inner
+    async fn save_instance(&self, instance: &RepoInstance) -> PortResult<()> {
+        self.instances
+            .lock()
+            .unwrap()
+            .insert(instance.id, instance.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: RepoInstanceId) -> PortResult<RepoBindingView> {
+        let instance = self
+            .instances
             .lock()
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or_else(|| PortError::NotFound(format!("repo {id}")))
+            .ok_or_else(|| PortError::NotFound(format!("repo instance {id}")))?;
+        self.view(instance)
     }
 
-    async fn list_by_workspace(&self, workspace_id: WorkspaceId) -> PortResult<Vec<RepoBinding>> {
-        let g = self.inner.lock().unwrap();
-        let mut rows: Vec<_> = g
+    async fn get_origin(&self, id: RepoOriginId) -> PortResult<RepoOrigin> {
+        self.origins
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| PortError::NotFound(format!("repo origin {id}")))
+    }
+
+    async fn list_by_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> PortResult<Vec<RepoBindingView>> {
+        let instances = self.instances.lock().unwrap();
+        let mut rows: Vec<RepoInstance> = instances
             .values()
-            .filter(|b| b.workspace_id == workspace_id)
+            .filter(|i| i.workspace_id == workspace_id)
             .cloned()
             .collect();
-        rows.sort_by_key(|b| b.created_at);
-        Ok(rows)
+        rows.sort_by_key(|i| i.created_at);
+        drop(instances);
+        let mut out = Vec::with_capacity(rows.len());
+        for instance in rows {
+            out.push(self.view(instance)?);
+        }
+        Ok(out)
     }
 
     async fn find_by_canonical_url(
         &self,
         workspace_id: WorkspaceId,
         canonical_url: &str,
-    ) -> PortResult<Option<RepoBinding>> {
+    ) -> PortResult<Option<RepoBindingView>> {
+        let instances = self.instances.lock().unwrap();
+        let instance = instances
+            .values()
+            .find(|i| i.workspace_id == workspace_id && i.canonical_url == canonical_url)
+            .cloned();
+        drop(instances);
+        match instance {
+            Some(i) => Ok(Some(self.view(i)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_origin_by_canonical_url(
+        &self,
+        canonical_url: &str,
+    ) -> PortResult<Option<RepoOrigin>> {
         Ok(self
-            .inner
+            .origins
             .lock()
             .unwrap()
             .values()
-            .find(|b| b.workspace_id == workspace_id && b.canonical_url == canonical_url)
+            .find(|o| o.canonical_url == canonical_url)
             .cloned())
     }
 
-    async fn find_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoBinding>> {
+    async fn find_origin_by_prefix(&self, prefix: &str) -> PortResult<Option<RepoOrigin>> {
         if prefix.is_empty() {
             return Ok(None);
         }
         Ok(self
-            .inner
+            .origins
             .lock()
             .unwrap()
             .values()
-            .find(|b| b.prefix == prefix)
+            .find(|o| o.prefix == prefix)
             .cloned())
     }
 
@@ -81,7 +149,7 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
         _workspace_id: WorkspaceId,
         _provider: &str,
         _remote_id: &str,
-    ) -> PortResult<Option<RepoId>> {
+    ) -> PortResult<Option<RepoOriginId>> {
         // The in-memory binding repo doesn't model `remote_mappings`
         // (that table is SQLite-specific). Tests that exercise the
         // auto-target's step 2 (`remote_mappings` lookup) need to
@@ -92,8 +160,8 @@ impl RepoBindingRepository for InMemoryRepoBindingRepository {
         Ok(None)
     }
 
-    async fn delete(&self, id: RepoId) -> PortResult<()> {
-        self.inner.lock().unwrap().remove(&id);
+    async fn delete(&self, id: RepoInstanceId) -> PortResult<()> {
+        self.instances.lock().unwrap().remove(&id);
         Ok(())
     }
 }

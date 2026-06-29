@@ -26,7 +26,8 @@ CREATE TABLE repo_origins (
     remote_url    TEXT NOT NULL,
     prefix        TEXT NOT NULL DEFAULT '',
     name          TEXT NOT NULL DEFAULT '',
-    aliases       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(aliases)),
+    aliases       TEXT NOT NULL DEFAULT '[]'
+                  CHECK (json_valid(aliases) AND json_type(aliases) = 'array'),
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );

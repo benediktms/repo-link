@@ -61,7 +61,11 @@ mod schema_const_consistency {
             .expect("open db");
 
         let cases: &[(&str, &str)] = &[
-            ("repos", crate::repo_binding_repo::REPO_COLS),
+            (
+                "repo_instances",
+                crate::repo_binding_repo::REPO_INSTANCE_COLS,
+            ),
+            ("repo_origins", crate::repo_binding_repo::REPO_ORIGIN_COLS),
             (
                 "worktree_links",
                 crate::repo_binding_repo::WORKTREE_LINK_COLS,

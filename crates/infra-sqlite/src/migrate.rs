@@ -17,14 +17,14 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::migrate::MigrateErro
 /// Phase D world where the daemon and CLI may share a DB it becomes
 /// real — and the guard is free.
 pub async fn backfill_empty_repo_names(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query("SELECT id, canonical_url FROM repos WHERE name = ''")
+    let rows = sqlx::query("SELECT id, canonical_url FROM repo_origins WHERE name = ''")
         .fetch_all(pool)
         .await?;
     for row in rows {
         let id: String = row.try_get("id")?;
         let canonical_url: String = row.try_get("canonical_url")?;
         let name = domain_repo::derive_name(&canonical_url);
-        sqlx::query("UPDATE repos SET name = ? WHERE id = ? AND name = ''")
+        sqlx::query("UPDATE repo_origins SET name = ? WHERE id = ? AND name = ''")
             .bind(name)
             .bind(id)
             .execute(pool)
@@ -43,7 +43,7 @@ pub async fn backfill_empty_repo_names(pool: &SqlitePool) -> Result<(), sqlx::Er
 /// nothing once rows are populated. The per-row UPDATE also re-asserts
 /// `prefix = ''` so two concurrent backfills can't both stomp a row.
 pub async fn backfill_empty_repo_prefixes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query("SELECT id, name FROM repos WHERE prefix = ''")
+    let rows = sqlx::query("SELECT id, name FROM repo_origins WHERE prefix = ''")
         .fetch_all(pool)
         .await?;
     for row in rows {
@@ -60,11 +60,12 @@ pub async fn backfill_empty_repo_prefixes(pool: &SqlitePool) -> Result<(), sqlx:
                 let trimmed: String = base.chars().take(n).collect();
                 format!("{trimmed}{s}")
             };
-            let res = sqlx::query("UPDATE repos SET prefix = ? WHERE id = ? AND prefix = ''")
-                .bind(&candidate)
-                .bind(&id)
-                .execute(pool)
-                .await;
+            let res =
+                sqlx::query("UPDATE repo_origins SET prefix = ? WHERE id = ? AND prefix = ''")
+                    .bind(&candidate)
+                    .bind(&id)
+                    .execute(pool)
+                    .await;
             match res {
                 Ok(r) if r.rows_affected() > 0 => break,
                 // Race: another writer set the prefix between our SELECT

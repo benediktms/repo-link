@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{
     Lifecycle, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment,
@@ -32,7 +32,7 @@ impl SqliteTaskRepository {
 // per the #110 every-live-column contract) but `row_to_task` no longer reads it —
 // the lifecycle axis is read from `lifecycle` (RFC 0004 D1). `synced_at` is the
 // RFC 0004 D3 write-through cache column.
-pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at";
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
@@ -170,7 +170,8 @@ impl TaskRepository for SqliteTaskRepository {
                 .push_bind(w.to_string());
         }
         if let Some(r) = filter.repo_id {
-            qb.push(" AND tasks.repo_id = ").push_bind(r.to_string());
+            qb.push(" AND tasks.repo_instance_id = ")
+                .push_bind(r.to_string());
         }
         if let Some(open) = filter.is_open {
             // Filter on the open/closed bit (RFC 0004 D1). open ⇒
@@ -245,20 +246,15 @@ impl TaskRepository for SqliteTaskRepository {
 
     async fn find_by_remote(
         &self,
-        filing_repo_id: RepoId,
+        filing_repo_id: RepoOriginId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>> {
-        // RFC 0002 D6: dedup on the FILING repo (where the issue lives),
-        // COALESCE-ing to the logical repo_id for pre-resolution / migrated rows
-        // whose filing_repo_id is still NULL — so the read-side dedup agrees
-        // with the (filing_repo_id, provider, remote_id) UNIQUE key on
-        // remote_mappings. No empty-string sentinel here: this binds a real
-        // repo id, so it never matches a NULL COALESCE result (the sentinel
-        // only exists in the UNIQUE-key storage, where NULLs must not be
-        // treated as distinct).
+        // RFC 0005 §D4: filing_repo_id is now in ORIGIN id space; the migration
+        // (step 7a) backfilled every remote-backed row, so the COALESCE fallback
+        // to logical repo_id is no longer needed. Look up by filing_repo_id alone.
         let row = sqlx::query(&format!(
-            "SELECT {TASK_COLS} FROM tasks WHERE COALESCE(filing_repo_id, repo_id) = ? AND remote_provider = ? AND remote_id = ?"
+            "SELECT {TASK_COLS} FROM tasks WHERE filing_repo_id = ? AND remote_provider = ? AND remote_id = ?"
         ))
         .bind(filing_repo_id.to_string())
         .bind(provider)
@@ -503,11 +499,11 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at)
+        INSERT INTO tasks (id, workspace_id, repo_instance_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
-            repo_id = excluded.repo_id,
+            repo_instance_id = excluded.repo_instance_id,
             filing_repo_id = excluded.filing_repo_id,
             title = excluded.title,
             body = excluded.body,
@@ -628,12 +624,12 @@ async fn write_task_in_tx(
             "#,
         )
         .bind(t.id.to_string())
-        // Key on the FILING repo (D6), falling back to the logical repo when
-        // filing is unresolved (pre-resolution / migrated rows) so this agrees
-        // with find_by_remote's COALESCE predicate. Empty-string sentinel for a
-        // repo-less remote task keeps the UNIQUE key well-defined (NULLs would
-        // dedupe as distinct).
-        .bind(t.filing_repo_id.or(t.repo_id).map(|r| r.to_string()).unwrap_or_default())
+        // RFC 0005 §D4: filing_repo_id is now in ORIGIN id space; the fallback
+        // to logical repo_id is removed — step 7a of the migration guarantees
+        // every remote-backed task has a populated filing_repo_id. Empty-string
+        // sentinel for a repo-less remote task keeps the UNIQUE key well-defined
+        // (NULLs would dedupe as distinct).
+        .bind(t.filing_repo_id.map(|r| r.to_string()).unwrap_or_default())
         .bind(&remote.provider)
         .bind(&remote.remote_id)
         .bind(t.updated_at.into_inner())
@@ -666,7 +662,7 @@ fn legacy_status_str(lifecycle: Lifecycle) -> &'static str {
 fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let id_str: String = row.try_get("id").map_err(map_sqlx_err)?;
     let workspace_id_str: String = row.try_get("workspace_id").map_err(map_sqlx_err)?;
-    let repo_id_str: Option<String> = row.try_get("repo_id").map_err(map_sqlx_err)?;
+    let repo_id_str: Option<String> = row.try_get("repo_instance_id").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
     let body: String = row.try_get("body").map_err(map_sqlx_err)?;
     // RFC 0004 D1: read the canonical `lifecycle`; legacy `status` is no longer read.

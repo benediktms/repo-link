@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use domain_core::{RepoId, TaskId, Timestamp, WorkspaceId};
+use domain_core::{RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
 use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
@@ -268,18 +268,21 @@ impl TaskRepository for InMemoryTaskRepository {
 
     async fn find_by_remote(
         &self,
-        filing_repo_id: RepoId,
+        filing_repo_id: RepoOriginId,
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>> {
         let g = self.inner.lock().unwrap();
+        // RFC 0005 §D4: filing_repo_id is in origin id space. Since RepoOriginId
+        // and RepoId share the same UUID bytes (RepoInstanceId = RepoId alias), we
+        // compare by UUID. Match on filing_repo_id only (no COALESCE fallback to
+        // logical repo_id — the migration backfills all remote-backed rows).
         let Some(task) = g
             .values()
             .find(|t| {
-                // D6: match on the filing repo, COALESCE-ing to the logical
-                // repo for rows whose filing repo is unresolved — mirrors the
-                // SQLite `COALESCE(filing_repo_id, repo_id)` predicate.
-                t.filing_repo_id.or(t.repo_id) == Some(filing_repo_id)
+                t.filing_repo_id
+                    .as_ref()
+                    .is_some_and(|fid| fid.as_uuid() == filing_repo_id.as_uuid())
                     && t.remote
                         .as_ref()
                         .is_some_and(|r| r.provider == provider && r.remote_id == remote_id)

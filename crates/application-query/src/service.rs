@@ -55,10 +55,10 @@ impl QueryService {
             })
             .await?;
 
-        let worktree_count: usize = bindings.iter().map(|b| b.worktrees.len()).sum();
+        let worktree_count: usize = bindings.iter().map(|b| b.instance.worktrees.len()).sum();
         let stale_worktree_count: usize = bindings
             .iter()
-            .flat_map(|b| b.worktrees.iter())
+            .flat_map(|b| b.instance.worktrees.iter())
             .filter(|w| matches!(w.status, LinkStatus::Stale | LinkStatus::MissingPath))
             .count();
 
@@ -206,11 +206,11 @@ impl QueryService {
         let bindings = self.bindings.list_by_workspace(id).await?;
         let mut out = Vec::new();
         for b in bindings {
-            for w in &b.worktrees {
+            for w in &b.instance.worktrees {
                 if matches!(w.status, LinkStatus::Stale | LinkStatus::MissingPath) {
                     out.push(StaleWorktreeRow {
-                        repo_id: b.id.to_string(),
-                        canonical_url: b.canonical_url.clone(),
+                        repo_id: b.instance.id.to_string(),
+                        canonical_url: b.instance.canonical_url.clone(),
                         path: w.path.display().to_string(),
                         status: enum_str(&w.status),
                     });
@@ -447,19 +447,23 @@ impl QueryService {
             // path, batch this via a `bindings.list_by_ids(&[uuid; n])`
             // port method — out of scope for the first cut.
             let filing_drift = match t.filing_repo_id {
-                Some(filing_id) => match self.bindings.get(filing_id).await {
-                    Ok(_) => false,
-                    // The silent-divergence case: a deleted binding
-                    // is what the doctor / drift axis exists to
-                    // surface.
-                    Err(ports::PortError::NotFound(_)) => true,
-                    // Any other failure (backend I/O, decode, etc.)
-                    // is a real problem — don't silently call the
-                    // task drift-free, propagate so the operator
-                    // sees a partial-failure error rather than a
-                    // mis-leading "this workspace is clean" report.
-                    Err(e) => return Err(e.into()),
-                },
+                Some(filing_id) => {
+                    // filing_repo_id holds ORIGIN id bytes (RFC 0005 §D4)
+                    let origin_id = domain_core::RepoOriginId::from_uuid(filing_id.as_uuid());
+                    match self.bindings.get_origin(origin_id).await {
+                        Ok(_) => false,
+                        // The silent-divergence case: a deleted origin
+                        // is what the doctor / drift axis exists to
+                        // surface.
+                        Err(ports::PortError::NotFound(_)) => true,
+                        // Any other failure (backend I/O, decode, etc.)
+                        // is a real problem — don't silently call the
+                        // task drift-free, propagate so the operator
+                        // sees a partial-failure error rather than a
+                        // mis-leading "this workspace is clean" report.
+                        Err(e) => return Err(e.into()),
+                    }
+                }
                 None => false,
             };
 
@@ -621,7 +625,7 @@ fn is_transitively_blocked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_repo::RepoBinding;
+    use domain_repo::{RepoInstance, RepoOrigin};
     use domain_task::{RemoteRef, SnapshotSource, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use std::path::PathBuf;
@@ -664,16 +668,17 @@ mod tests {
         let workspace_id = workspace.id;
         ws.save(&workspace).await.unwrap();
 
-        let mut b = RepoBinding::new(
-            workspace_id,
-            "git@github.com:o/r.git".into(),
-            "github.com/o/r".into(),
-        )
-        .unwrap();
-        b.link_worktree(PathBuf::from("/tmp/a"), None);
-        b.link_worktree(PathBuf::from("/tmp/b"), None);
-        b.mark_path_missing(std::path::Path::new("/tmp/b")).unwrap();
-        bs.save(&b).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bs.save_origin(&origin).await.unwrap();
+        let mut instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        instance.link_worktree(std::path::PathBuf::from("/tmp/a"), None);
+        instance.link_worktree(std::path::PathBuf::from("/tmp/b"), None);
+        instance
+            .mark_path_missing(std::path::Path::new("/tmp/b"))
+            .unwrap();
+        bs.save_instance(&instance).await.unwrap();
 
         let local_only = Task::new_draft(workspace_id, None, "still local".into()).unwrap();
         let mut staged = Task::new_draft(workspace_id, None, "staged thing".into()).unwrap();
@@ -1427,11 +1432,14 @@ mod tests {
         let wid = workspace.id;
         ws.save(&workspace).await.unwrap();
 
-        let mut b = RepoBinding::new(wid, "x".into(), "github.com/o/r".into()).unwrap();
-        b.link_worktree(PathBuf::from("/tmp/x"), None);
-        b.link_worktree(PathBuf::from("/tmp/y"), None);
-        b.mark_path_missing(std::path::Path::new("/tmp/x")).unwrap();
-        bs.save(&b).await.unwrap();
+        let origin = RepoOrigin::new("x".into(), "github.com/o/r".into()).unwrap();
+        bs.save_origin(&origin).await.unwrap();
+        let mut inst = RepoInstance::new(wid, origin.id, "github.com/o/r".into(), None).unwrap();
+        inst.link_worktree(PathBuf::from("/tmp/x"), None);
+        inst.link_worktree(PathBuf::from("/tmp/y"), None);
+        inst.mark_path_missing(std::path::Path::new("/tmp/x"))
+            .unwrap();
+        bs.save_instance(&inst).await.unwrap();
 
         let rows = svc.stale_worktrees(&wid.to_string()).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1449,34 +1457,29 @@ mod tests {
     /// tripwire that closes the silent-divergence gap.
     #[tokio::test]
     async fn drift_surfaces_dangling_filing_repo_id_even_when_synced() {
-        let (svc, ws, bs, ts, _ps) = svc_with_projects();
+        let (svc, ws, _bs, ts, _ps) = svc_with_projects();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
         ws.save(&workspace).await.unwrap();
 
-        // The recorded filing binding. Will be deleted below to
-        // simulate the silent-divergence shape.
-        let old = RepoBinding::new(
-            wid,
-            "git@github.com:o/r-oldorg.git".into(),
-            "github.com/o/r-oldorg".into(),
-        )
-        .unwrap();
-        let old_id = old.id;
-        bs.save(&old).await.unwrap();
+        // Under RFC 0005 §D4 `filing_repo_id` holds an ORIGIN id, and §D5 keeps an
+        // origin alive even when every workspace instance is detached (the issue
+        // still lives in that canonical repo). So the silent-divergence shape is no
+        // longer "the instance was deleted" — it is a recorded filing origin that no
+        // longer resolves at all (corruption, or an origin removed out-of-band).
+        // Point filing at an origin id that was never persisted.
+        let missing_origin_id = domain_core::RepoOriginId::new();
 
-        // A `Synced` task (via promote) with `filing_repo_id`
-        // pointing at the (about-to-be-deleted) old binding. Logical
-        // is *not* set (matches the rpl-sv2 repro where the live
-        // bindings in the workspace's `repos` table no longer include
-        // `old_id`).
+        // A `Synced` task (via promote) whose recorded `filing_repo_id` references a
+        // non-existent origin. Logical is *not* set, so the dangling filing axis is
+        // the only thing that can surface it.
         let mut t = Task::new_draft(wid, None, "dangling".into()).unwrap();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(RemoteRef::new("github", "1")).unwrap();
-        t.force_set_filing_repo_id(Some(old_id));
+        t.force_set_filing_repo_id(Some(domain_core::RepoId::from_uuid(
+            missing_origin_id.as_uuid(),
+        )));
         ts.save(&t, SnapshotSource::Push).await.unwrap();
-        // Delete the binding — the silent divergence is now real.
-        bs.delete(old_id).await.unwrap();
 
         let rows = svc.drift(&wid.to_string()).await.unwrap();
         assert_eq!(rows.len(), 1, "exactly the dangling task must surface");

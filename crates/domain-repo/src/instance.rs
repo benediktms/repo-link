@@ -140,8 +140,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_canonical() {
-        let err =
-            RepoInstance::new(WorkspaceId::new(), RepoOriginId::new(), "  ".into(), None).unwrap_err();
+        let err = RepoInstance::new(WorkspaceId::new(), RepoOriginId::new(), "  ".into(), None)
+            .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 
