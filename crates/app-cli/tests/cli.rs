@@ -3666,9 +3666,17 @@ fn repo_doctor_target_resolves_origin_not_instance() {
 #[test]
 fn workspace_arg_derives_from_cwd_when_single_workspace() {
     let dir = TempDir::new().unwrap();
+    // A decoy workspace created FIRST and unrelated to the checkout. If
+    // resolution wrongly fell back to "the only / first workspace in the DB" it
+    // would pick this one — the assertion below pins that it resolves from the
+    // checkout's repo binding instead.
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "decoy", "--local-only"],
+    );
     let workspace = run_json(
         &mut bin("repo-link", &dir),
-        &["workspace", "create", "w", "--local-only"],
+        &["workspace", "create", "target", "--local-only"],
     )["id"]
         .as_str()
         .unwrap()
@@ -3677,6 +3685,7 @@ fn workspace_arg_derives_from_cwd_when_single_workspace() {
     let checkout = TempDir::new().unwrap();
     init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
     let checkout_path = checkout.path().display().to_string();
+    // Attach the checkout's repo to the TARGET workspace only.
     run_json(
         &mut bin("repo-link", &dir),
         &[
@@ -3693,13 +3702,17 @@ fn workspace_arg_derives_from_cwd_when_single_workspace() {
         ],
     );
 
-    // Run `query overview` from inside the checkout with NO --workspace. The
-    // command succeeds (run_json asserts exit 0) only because the workspace was
-    // derived from cwd; a failed derivation would error "pass --workspace".
+    // `query overview` from inside the checkout with NO --workspace must resolve
+    // to the TARGET workspace (bound to this checkout), not the decoy.
     let mut cmd = bin("repo-link", &dir);
     cmd.current_dir(checkout.path());
     let out = run_json(&mut cmd, &["query", "overview"]);
-    assert!(out.is_object(), "overview resolved from cwd: {out}");
+    assert_eq!(
+        out["workspace_id"].as_str(),
+        Some(workspace.as_str()),
+        "cwd derivation must select the checkout's workspace, not a fallback: {out}"
+    );
+    assert_eq!(out["workspace_name"], "target");
 }
 
 /// When the cwd repo is attached to more than one workspace, derivation is
