@@ -14,7 +14,7 @@
 //! response is still statically typed — each operation deserializes into a
 //! purpose-built struct below.
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use ports::{
     PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectSnapshot,
@@ -25,10 +25,11 @@ use serde_json::json;
 
 use crate::rest::DEFAULT_BASE_URL;
 
-/// Hard cap on `poll_project_items` pagination. A single tick should never
-/// see more than a handful of pages (the `query:` delta filter keeps the
-/// payload proportional to the change rate, RFC §D4), so this is a runaway
-/// guard, not an expected limit.
+/// Hard cap on `poll_project_items` pagination. There is no server-side delta
+/// filter (#208), so a tick enumerates the whole board: this caps the page walk
+/// at MAX_POLL_PAGES * POLL_PAGE_SIZE items (2000) — comfortably above real
+/// boards, and a runaway guard rather than an expected limit. A board larger
+/// than that reports `truncated` and the poller refetches next cycle.
 const MAX_POLL_PAGES: u32 = 20;
 const POLL_PAGE_SIZE: u32 = 100;
 
@@ -147,7 +148,7 @@ mutation($input: UpdateProjectV2ItemFieldValueInput!) {
 }"#;
 
 const POLL_ITEMS: &str = r#"
-query($projectId: ID!, $query: String!, $first: Int!, $after: String) {
+query($projectId: ID!, $query: String, $first: Int!, $after: String) {
   node(id: $projectId) {
     ... on ProjectV2 {
       items(first: $first, after: $after, query: $query) {
@@ -381,16 +382,18 @@ impl GraphqlClient {
         &self,
         project_node_id: &str,
         status_field_id: &str,
-        since: domain_core::Timestamp,
         query: &str,
     ) -> PortResult<PollPage> {
-        // GitHub issue-search syntax: `updated:>` is the delta lever (RFC
-        // §D4). Combine it with any caller-supplied filter (e.g. "is:open").
-        let since_str = since.as_inner().to_rfc3339_opts(SecondsFormat::Secs, true);
-        let search = if query.trim().is_empty() {
-            format!("updated:>{since_str}")
+        // `ProjectV2.items(query:)` uses Projects-v2 filter syntax (#208), NOT
+        // issue-search: it has no `updated:` qualifier, so there is no
+        // server-side time delta. We pass only a caller-supplied filter (e.g.
+        // `is:open`, which Projects-v2 filter syntax does honour); an empty
+        // filter becomes `null` (no filter → the full board). The per-project
+        // watermark and the delta itself are client-side, in the poller.
+        let query_arg = if query.trim().is_empty() {
+            serde_json::Value::Null
         } else {
-            format!("{} updated:>{since_str}", query.trim())
+            json!(query.trim())
         };
 
         let mut out = Vec::new();
@@ -402,7 +405,7 @@ impl GraphqlClient {
                     POLL_ITEMS,
                     json!({
                         "projectId": project_node_id,
-                        "query": search,
+                        "query": query_arg,
                         "first": POLL_PAGE_SIZE,
                         "after": after,
                     }),
@@ -431,11 +434,11 @@ impl GraphqlClient {
             }
         }
         if truncated {
-            // Exhausted the page cap with more pages still available. The
-            // `updated:>` delta filter keeps a steady-state tick well under the
-            // cap, so this signals an unusually large change set; the caller
-            // treats the result as partial (via `PollPage.truncated`) and
-            // refetches the same window next cycle.
+            // Exhausted the page cap with more pages still available. A tick
+            // enumerates the full board (no server-side delta, #208), so this
+            // means the board exceeds MAX_POLL_PAGES * POLL_PAGE_SIZE items; the
+            // caller treats the result as partial (via `PollPage.truncated`) and
+            // refetches next cycle.
             tracing::warn!(
                 project = project_node_id,
                 max_pages = MAX_POLL_PAGES,

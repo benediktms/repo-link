@@ -123,10 +123,11 @@ pub trait RemoteProjectProvider: Send + Sync {
         option_id: &str,
     ) -> PortResult<String>;
 
-    /// Poll a project for items changed since `since` matching `query` (an
-    /// empty `query` means the delta `updated:>{since}` filter alone — what the
-    /// status-reconciliation poller passes, so drafts and closed/Done items are
-    /// not filtered out). Returns both issue-backed items and drafts;
+    /// Poll a project for items matching `query`, a Projects-v2 filter (#208).
+    /// `ProjectV2.items(query:)` has no `updated:` qualifier, so there is no
+    /// server-side time delta: an empty `query` enumerates the whole board (the
+    /// status-reconciliation poller passes empty and applies its watermark
+    /// client-side). Returns both issue-backed items and drafts;
     /// `RemoteProjectItem.issue_node_id` is `None` for drafts.
     ///
     /// `status_field_id` is the project's chosen Status field (`PVTSSF_…`, as
@@ -143,7 +144,6 @@ pub trait RemoteProjectProvider: Send + Sync {
         &self,
         project_node_id: &str,
         status_field_id: &str,
-        since: Timestamp,
         query: &str,
     ) -> PortResult<PollPage>;
 }

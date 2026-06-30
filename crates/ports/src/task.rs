@@ -253,6 +253,19 @@ pub trait TaskRepository: Send + Sync {
         task_id: TaskId,
         option_id: Option<String>,
     ) -> PortResult<()>;
+    /// Flip ONLY a clean (`Synced`) task to `DirtyRemote` — a targeted
+    /// single-column `sync_state` write the poller uses when it observes remote
+    /// content (title / body / open-closed) diverging from the task's baseline
+    /// (#208). It surfaces in `rl query drift` and the next `sync pull` applies
+    /// the remote (the poller never re-baselines or overwrites).
+    ///
+    /// Conditional on `sync_state = Synced`: a `DirtyLocal` / `Staged` /
+    /// `Conflict` task is left untouched — the pull path's `decide()` resolves
+    /// the genuine both-sides-diverged case, and a concurrent CLI edit that
+    /// already moved the row off `Synced` is never clobbered. No snapshot, no
+    /// version bump, no other column touched. A zero-row match (task absent or
+    /// not `Synced`) is benign — return `Ok`.
+    async fn mark_remote_dirty(&self, task_id: TaskId) -> PortResult<()>;
     /// Backfill ONLY the `remote_node_id` column for one task — a targeted
     /// single-column write that must NOT touch any other column, append a
     /// snapshot, bump the `version`, or change `sync_state`. Used by `sync

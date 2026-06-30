@@ -5,7 +5,6 @@
 //! method to whichever protocol GitHub exposes the capability on.
 
 use async_trait::async_trait;
-use domain_core::Timestamp;
 use ports::{
     PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteProjectProvider,
     RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
@@ -258,11 +257,10 @@ impl RemoteProjectProvider for GithubAdapter {
         &self,
         project_node_id: &str,
         status_field_id: &str,
-        since: Timestamp,
         query: &str,
     ) -> PortResult<PollPage> {
         self.graphql
-            .poll_project_items(project_node_id, status_field_id, since, query)
+            .poll_project_items(project_node_id, status_field_id, query)
             .await
     }
 }

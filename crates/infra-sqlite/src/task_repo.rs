@@ -424,6 +424,23 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn mark_remote_dirty(&self, task_id: TaskId) -> PortResult<()> {
+        // Targeted, CONDITIONAL single-column write (#208): flip Synced →
+        // DirtyRemote only. The `WHERE sync_state = synced` guard means a
+        // concurrent CLI edit that already moved the row to DirtyLocal/Conflict/
+        // Staged is never clobbered, and no other column, version, or snapshot
+        // is touched. A zero-row match (task absent or not Synced) is a benign
+        // no-op. enum_to_str keeps the stored strings rename-safe.
+        sqlx::query("UPDATE tasks SET sync_state = ? WHERE id = ? AND sync_state = ?")
+            .bind(enum_to_str(&SyncState::DirtyRemote)?)
+            .bind(task_id.to_string())
+            .bind(enum_to_str(&SyncState::Synced)?)
+            .execute(&self.db.writes)
+            .await
+            .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()> {
         // Targeted single-column write — same rationale as `cache_project_status`
         // above: `sync pull`'s Noop branch makes no aggregate write, so routing

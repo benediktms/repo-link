@@ -1703,7 +1703,6 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: domain_core::Timestamp,
             _: &str,
         ) -> PortResult<ports::PollPage> {
             self.polls.fetch_add(1, Ordering::SeqCst);
@@ -1754,7 +1753,6 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: domain_core::Timestamp,
             _: &str,
         ) -> PortResult<ports::PollPage> {
             panic!("boom: poller task panic injection");
@@ -1803,7 +1801,6 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: domain_core::Timestamp,
             _: &str,
         ) -> PortResult<ports::PollPage> {
             // Park forever — ignores cancellation, just like a stalled I/O call.

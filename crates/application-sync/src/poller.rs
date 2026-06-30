@@ -6,11 +6,13 @@
 //! Where the [`OutboxDrainer`](crate::OutboxDrainer) pushes *local* edits to
 //! GitHub, the poller pulls *remote* project state back. Once per cadence it
 //! enumerates every locally-known project and asks the
-//! [`RemoteProjectProvider`] for the items that changed since the last poll
-//! (per §D4 the delta lever is `updated:>{since}` alone — see [`POLL_QUERY`];
-//! the older `is:open` filter wrongly dropped drafts and closed/Done items).
-//! Each returned item is correlated with its local task by
-//! `project_item_id`; what is reconcilable *now* is reconciled.
+//! [`RemoteProjectProvider`] for its items. `ProjectV2.items(query:)` has no
+//! server-side `updated:` filter (#208), so the poller fetches the whole board
+//! and applies the per-project `since` watermark **client-side** — see
+//! [`POLL_QUERY`] (sent empty) and the `updated_at > since` skip in
+//! [`Self::poll_once`]. Each item changed since the watermark is correlated
+//! with its local task by `project_item_id`; what is reconcilable *now* is
+//! reconciled.
 //!
 //! # Project-status cache (Stage 8, closes #39)
 //!
@@ -32,6 +34,20 @@
 //! idempotent: the cache is only persisted when the polled value actually
 //! differs from what's indexed, so a steady-state re-poll does no writes.
 //!
+//! # Content drift (#208)
+//!
+//! The poll payload also carries the item's `title` / `body` / open-closed
+//! state. When those diverge from a *clean* (`Synced`) task's last-synced
+//! baseline, the poller flips it to [`SyncState::DirtyRemote`] via the targeted,
+//! conditional [`TaskRepository::mark_remote_dirty`] — surfaced by
+//! `rl query drift` and applied by the next `sync pull`. This is detection
+//! only: the poller never re-baselines or overwrites local content (that is the
+//! pull path's job). Assignees aren't in the board payload, so assignee-only
+//! drift stays a pull-time concern. Unlike the status cache, this *is* a
+//! `SyncState` transition — but a conditional one (`WHERE sync_state = synced`)
+//! that leaves `DirtyLocal` / `Conflict` / `Staged` rows for the pull path's
+//! `decide()` to resolve, and never clobbers a concurrent CLI edit.
+//!
 //! # Truncation / partiality
 //!
 //! The provider paginates GitHub's `project.items(first: …)`. GitHub caps a
@@ -50,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
-use domain_task::Task;
+use domain_task::{SyncState, Task};
 #[cfg(doc)]
 use ports::PollPage;
 use ports::{
@@ -61,18 +77,16 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::error::Result;
 
-/// The GitHub `project.items(query:)` filter the poller sends every cycle
-/// (RFC §D4). Empty on purpose: the graphql layer composes it into just
-/// `updated:>{since}`, so the per-project `since` watermark is the *only*
-/// delta lever and the page already stays proportional to the change rate.
+/// The `ProjectV2.items(query:)` filter the poller sends every cycle. Empty on
+/// purpose: that connection uses Projects-v2 filter syntax, which has **no
+/// `updated:` qualifier** (#208) — there is no server-side time delta, so the
+/// poller sends no filter (the adapter maps empty → `query: null` = the whole
+/// board) and applies its `since` watermark client-side in [`ProjectPoller::poll_once`].
 ///
-/// It used to be `"is:open"`, but that was an over-restriction (issue
-/// r3325531902): GitHub Projects `is:open` matches open issues/PRs only, so it
-/// silently dropped **draft items** (draft-backed mirror tasks were never
-/// polled or reconciled) and **items that moved to a closed/Done state** — the
-/// exact status transitions a reconciliation poller must observe. Space-joining
-/// `is:open is:draft` would AND (match nothing), so the fix is to drop the
-/// `is:` filter entirely and lean on `updated:>{since}` alone.
+/// It must also stay free of `is:`-style filters: `is:open` (a since-abandoned
+/// attempt, issue r3325531902) silently dropped **draft items** and **items
+/// that moved to a closed/Done state** — the exact transitions a reconciliation
+/// poller must observe — and `ProjectV2.items` would honour it server-side.
 const POLL_QUERY: &str = "";
 
 /// Per-tick cap on the stale-task working set (RFC 0004 D3). Bounds the
@@ -102,6 +116,9 @@ pub struct PollReport {
     /// 0004 D3). Non-zero only on a fully-clean pass; zero when any board was
     /// truncated or errored (stamping is deferred to the next tick).
     pub tasks_refreshed: usize,
+    /// Clean tasks flipped to `DirtyRemote` this pass because the polled item's
+    /// content (title / body / open-closed) diverged from their baseline (#208).
+    pub content_drift_marked: usize,
 }
 
 /// Polls every known project for changed items and reconciles them against
@@ -168,12 +185,7 @@ impl ProjectPoller {
             // Per-project span so the reconcile events below nest under it.
             let res = async {
                 self.remote_projects
-                    .poll_project_items(
-                        project.id.as_str(),
-                        &project.status_field_id,
-                        since,
-                        POLL_QUERY,
-                    )
+                    .poll_project_items(project.id.as_str(), &project.status_field_id, POLL_QUERY)
                     .await
             }
             .instrument(info_span!(
@@ -208,6 +220,15 @@ impl ProjectPoller {
                 if item.updated_at.into_inner() > max_seen.into_inner() {
                     max_seen = item.updated_at;
                 }
+                // Client-side delta (#208): `ProjectV2.items` has no server-side
+                // `updated:` filter, so we enumerate the whole board but only
+                // reconcile items changed since this project's watermark. The
+                // first poll (watermark = epoch) reconciles every item; steady
+                // state touches only the changed tail, bounding the per-item
+                // baseline fetch in `reconcile_item`.
+                if item.updated_at.into_inner() <= since.into_inner() {
+                    continue;
+                }
                 self.reconcile_item(&mut by_item_id, item, &mut report)
                     .await;
             }
@@ -227,17 +248,16 @@ impl ProjectPoller {
                 completed_projects.insert(project_id.clone());
                 if max_seen > since {
                     // Advance only on a strictly-newer item. The 1s safety margin
-                    // (M-p1) pulls the watermark back one second before the next
-                    // strict `updated:>` query: GitHub's `updated:>` is
-                    // strict-greater, so advancing to exactly `max_seen` would
-                    // drop any sibling sharing the newest item's second.
-                    // Re-reading is idempotent, so over-fetching one second is
-                    // safer than under-fetching same-second deltas. `max(since,
-                    // …)` clamps the margin so a complete page whose newest item
-                    // is only one second past `since` keeps `since`, never
-                    // regresses. (Without the `max_seen > since` guard, an empty /
-                    // nothing-newer page would set the watermark to `since - 1s`
-                    // and drift it backward every poll.)
+                    // (M-p1) pulls the watermark back one second so the next
+                    // pass's strict-greater client-side filter (`updated_at >
+                    // since`) re-includes any sibling sharing the newest item's
+                    // second. Re-reading is idempotent, so over-fetching one
+                    // second is safer than under-fetching same-second deltas.
+                    // `max(since, …)` clamps the margin so a complete page whose
+                    // newest item is only one second past `since` keeps `since`,
+                    // never regresses. (Without the `max_seen > since` guard, an
+                    // empty / nothing-newer page would set the watermark to
+                    // `since - 1s` and drift it backward every poll.)
                     self.set_watermark(project_id, since.max(max_seen.minus_one_second()));
                 }
                 // else: complete page with nothing strictly newer than `since`
@@ -335,6 +355,62 @@ impl ProjectPoller {
             return;
         };
         report.items_matched += 1;
+
+        // Content drift (#208): the poll carries the item's title / body /
+        // open-closed state. The bulk poll index does NOT load `synced_baseline`
+        // (`row_to_task` leaves it None), so fetch the task to compare against
+        // its last-synced baseline. A clean (`Synced`) task whose content
+        // diverged flips to `DirtyRemote` — surfaced by `query drift`, applied
+        // by the next pull. Detection only; the poller never re-baselines or
+        // overwrites. Runs BEFORE the status no-op skip below so a content
+        // change with an unchanged board column is still caught. Items reaching
+        // here are already filtered to "changed since the watermark" by the
+        // caller, so this per-item fetch is bounded to the changed tail.
+        match self.tasks.get(task.id).await {
+            Ok(full) if full.sync == SyncState::Synced => {
+                if let Some(baseline) = &full.synced_baseline {
+                    // Assignees aren't in the board payload, so neutralize that
+                    // dimension with the baseline's own — this compares title /
+                    // body / open-closed only (the fields the poll carries).
+                    let mirrors = crate::inbound_mirrors_baseline(
+                        &item.title,
+                        &item.body,
+                        &baseline.assignees,
+                        item.closed,
+                        baseline,
+                    );
+                    if !mirrors {
+                        match self.tasks.mark_remote_dirty(task.id).await {
+                            Ok(()) => {
+                                report.content_drift_marked += 1;
+                                // Keep the in-memory index consistent for a
+                                // duplicate item id later in the same pass.
+                                task.sync = SyncState::DirtyRemote;
+                                debug!(
+                                    item = %item.item_node_id,
+                                    task = %task.id,
+                                    "polled item content diverged from baseline; marked DirtyRemote"
+                                );
+                            }
+                            Err(e) => warn!(
+                                item = %item.item_node_id,
+                                task = %task.id,
+                                error = %e,
+                                "failed to mark task DirtyRemote on content drift; will retry next cycle"
+                            ),
+                        }
+                    }
+                }
+            }
+            // Not Synced (DirtyLocal / Conflict / Staged / LocalOnly): leave it
+            // for the pull path's `decide()` to resolve the genuine conflict.
+            Ok(_) => {}
+            Err(e) => warn!(
+                item = %item.item_node_id,
+                error = %e,
+                "failed to load task for content-drift check; skipping this item this cycle"
+            ),
+        }
 
         // Cheap no-op skip: the polled value already matches what's cached on
         // the indexed task, so steady-state re-polls do no writes at all.
@@ -607,7 +683,13 @@ mod tests {
         task.project_item_id = Some("PVTI_42".into());
         tasks.save(&task, SnapshotSource::Promote).await.unwrap();
 
-        remote.set_poll_items("PVT_kwHO_match", vec![item("PVTI_42", Some("o_wip"))]);
+        // Match the baseline content (title "mirror", empty body) so this
+        // status-reconcile test isolates the status axis and doesn't also trip
+        // content drift (#208) — only the board status differs.
+        let mut polled = item("PVTI_42", Some("o_wip"));
+        polled.title = "mirror".into();
+        polled.body = String::new();
+        remote.set_poll_items("PVT_kwHO_match", vec![polled]);
 
         let poller = poller(projects, tasks, remote.clone()).await;
         let report = poller.poll_once().await.unwrap();
@@ -618,8 +700,9 @@ mod tests {
         assert_eq!(report.items_unmatched, 0);
         assert_eq!(report.partial_projects, 0);
 
-        // Polled with the right project + field + the §D4 delta-only query
-        // (empty, so the graphql layer sends just `updated:>{since}`).
+        // Polled with the right project + field + an EMPTY query (#208:
+        // `ProjectV2.items` has no server-side `updated:` filter, so the poller
+        // sends no filter and applies its watermark client-side).
         let calls = remote.calls();
         assert!(calls.iter().any(|c| matches!(
             c,
@@ -833,7 +916,13 @@ mod tests {
         let snaps = tasks.snapshots_handle();
         let versions_after_promote = snaps.lock().unwrap().get(&task_id).map_or(0, Vec::len);
 
-        remote.set_poll_items("PVT_kwHO_cache", vec![item("PVTI_42", Some("o_done"))]);
+        // Match the task's baseline content (title "mirror", empty body) so ONLY
+        // the board status differs — this test isolates the status-cache axis;
+        // content drift (#208) is exercised separately below.
+        let mut polled = item("PVTI_42", Some("o_done"));
+        polled.title = "mirror".into();
+        polled.body = String::new();
+        remote.set_poll_items("PVT_kwHO_cache", vec![polled]);
 
         let poller = poller(projects, tasks.clone(), remote.clone()).await;
         let report = poller.poll_once().await.unwrap();
@@ -864,6 +953,103 @@ mod tests {
         assert_eq!(
             versions_after_second, versions_after_first,
             "an unchanged re-poll must not re-persist the cache"
+        );
+    }
+
+    /// Build a Synced, board-mirrored task (title "mirror", empty body) with a
+    /// baseline, ready for the content-drift tests below.
+    async fn synced_mirror_task(tasks: &InMemoryTaskRepository, item_id: &str) -> TaskId {
+        let mut task = Task::new_draft(WorkspaceId::new(), None, "mirror".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        task.project_item_id = Some(item_id.into());
+        let id = task.id;
+        tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn poll_once_marks_dirty_remote_on_content_drift() {
+        // #208: the poll carries the item's title/body/open-closed. A clean
+        // (Synced) task whose remote content diverged from its baseline flips to
+        // DirtyRemote — surfaced by `query drift`, applied by the next pull.
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+        projects.save(&project("PVT_drift")).await.unwrap();
+        let task_id = synced_mirror_task(&tasks, "PVTI_42").await;
+
+        // Remote title diverges from the baseline ("mirror").
+        let mut polled = item("PVTI_42", Some("o_wip"));
+        polled.title = "edited on github".into();
+        remote.set_poll_items("PVT_drift", vec![polled]);
+
+        let poller = poller(projects, tasks.clone(), remote).await;
+        let report = poller.poll_once().await.unwrap();
+
+        assert_eq!(report.content_drift_marked, 1);
+        assert_eq!(
+            tasks.get(task_id).await.unwrap().sync,
+            SyncState::DirtyRemote,
+            "content drift on a clean task must flip it to DirtyRemote"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_leaves_synced_when_content_matches() {
+        // The common steady-state case: the board item mirrors the baseline, so
+        // nothing drifts and the task stays Synced.
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+        projects.save(&project("PVT_nomatch")).await.unwrap();
+        let task_id = synced_mirror_task(&tasks, "PVTI_42").await;
+
+        let mut polled = item("PVTI_42", Some("o_wip"));
+        polled.title = "mirror".into();
+        polled.body = String::new();
+        remote.set_poll_items("PVT_nomatch", vec![polled]);
+
+        let poller = poller(projects, tasks.clone(), remote).await;
+        let report = poller.poll_once().await.unwrap();
+
+        assert_eq!(report.content_drift_marked, 0);
+        assert_eq!(tasks.get(task_id).await.unwrap().sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn poll_once_leaves_dirty_local_untouched_on_content_drift() {
+        // A task with a pending LOCAL edit (DirtyLocal) must NOT be flipped by
+        // the poller even when the remote also diverged — the genuine both-sides
+        // conflict is the pull path's `decide()` to resolve, and the poller's
+        // conditional `mark_remote_dirty` (WHERE sync_state = synced) leaves it.
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+        projects.save(&project("PVT_dl")).await.unwrap();
+
+        let mut task = Task::new_draft(WorkspaceId::new(), None, "mirror".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef::new("github", "1"))
+            .unwrap();
+        task.project_item_id = Some("PVTI_42".into());
+        task.sync = SyncState::DirtyLocal; // a local edit is pending push
+        let task_id = task.id;
+        tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        let mut polled = item("PVTI_42", Some("o_wip"));
+        polled.title = "edited on github".into();
+        remote.set_poll_items("PVT_dl", vec![polled]);
+
+        let poller = poller(projects, tasks.clone(), remote).await;
+        let report = poller.poll_once().await.unwrap();
+
+        assert_eq!(report.content_drift_marked, 0);
+        assert_eq!(
+            tasks.get(task_id).await.unwrap().sync,
+            SyncState::DirtyLocal,
+            "the poller must not clobber a pending local edit"
         );
     }
 

@@ -6,7 +6,6 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use domain_core::Timestamp;
 use ports::{
     PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectProvider,
     RemoteProjectSnapshot,
@@ -270,7 +269,6 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
         &self,
         project_node_id: &str,
         status_field_id: &str,
-        _since: Timestamp,
         query: &str,
     ) -> PortResult<PollPage> {
         if self.should_fail() {
