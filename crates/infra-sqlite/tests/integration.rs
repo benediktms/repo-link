@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use domain_core::{RepoId, RepoOriginId};
 use domain_repo::{RepoInstance, RepoOrigin};
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, Task};
+use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
@@ -143,6 +143,41 @@ async fn task_comments_roundtrip_and_replace() {
     let loaded = ts.get(t.id).await.unwrap();
     assert_eq!(loaded.comments.len(), 3);
     assert_eq!(loaded.comments[2].remote_id.as_deref(), Some("3"));
+}
+
+#[tokio::test]
+async fn mark_remote_dirty_flips_only_synced_tasks() {
+    // #208: the poller's targeted, CONDITIONAL sync_state write. A clean
+    // (Synced) task flips to DirtyRemote; a task with a pending local edit
+    // (DirtyLocal) is left untouched so the WHERE guard never clobbers it.
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let mk_synced = |num: &str| {
+        let mut t = Task::new_draft(w.id, None, "t".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
+        t
+    };
+
+    // Synced → DirtyRemote.
+    let clean = mk_synced("1");
+    ts.save(&clean, SnapshotSource::Promote).await.unwrap();
+    assert_eq!(ts.get(clean.id).await.unwrap().sync, SyncState::Synced);
+    ts.mark_remote_dirty(clean.id).await.unwrap();
+    assert_eq!(ts.get(clean.id).await.unwrap().sync, SyncState::DirtyRemote);
+
+    // DirtyLocal stays put — the conditional WHERE must not touch it.
+    let mut dirty = mk_synced("2");
+    dirty.sync = SyncState::DirtyLocal;
+    ts.save(&dirty, SnapshotSource::Promote).await.unwrap();
+    ts.mark_remote_dirty(dirty.id).await.unwrap();
+    assert_eq!(
+        ts.get(dirty.id).await.unwrap().sync,
+        SyncState::DirtyLocal,
+        "mark_remote_dirty must only flip Synced rows"
+    );
 }
 
 #[tokio::test]

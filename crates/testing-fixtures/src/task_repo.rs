@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use domain_core::{RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
-use domain_task::{SnapshotSource, Task, TaskComment, TaskSnapshot};
+use domain_task::{SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot};
 use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 
 use crate::InMemoryOutboxRepository;
@@ -410,6 +410,18 @@ impl TaskRepository for InMemoryTaskRepository {
         // bump, no `sync` change. An absent id is a benign no-op.
         if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
             task.project_status_option_id = option_id;
+        }
+        Ok(())
+    }
+
+    async fn mark_remote_dirty(&self, task_id: TaskId) -> PortResult<()> {
+        // Conditional single-column flip (#208): Synced → DirtyRemote only,
+        // mirroring the SQLite `WHERE sync_state = synced` guard. Any other
+        // state (or an absent task) is left untouched — a benign no-op.
+        if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id)
+            && task.sync == SyncState::Synced
+        {
+            task.sync = SyncState::DirtyRemote;
         }
         Ok(())
     }

@@ -5,8 +5,6 @@
 //! Fixture values mirror this account's project #3 from RFC 0001 Appendix A.
 
 use crate::GithubAdapter;
-use chrono::Utc;
-use domain_core::Timestamp;
 use ports::{PortError, RemoteProjectProvider};
 use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -425,8 +423,10 @@ async fn poll_project_items_reads_option_from_matching_field_id() {
         .and(path("/graphql"))
         .and(body_string_contains("items(first:"))
         .and(body_string_contains("fieldValues"))
-        // The `updated:>` delta lever must be present in the search string.
-        .and(body_string_contains("updated:>"))
+        // #208: a caller-supplied Projects-v2 filter is passed through verbatim
+        // as the `query:` arg (no `updated:>` injection — that grammar has no
+        // such qualifier and matched nothing).
+        .and(body_string_contains("is:open"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": { "node": { "items": {
                 "pageInfo": { "hasNextPage": false, "endCursor": null },
@@ -456,9 +456,8 @@ async fn poll_project_items_reads_option_from_matching_field_id() {
         .mount(&server)
         .await;
 
-    let since = Timestamp::from_utc(Utc::now());
     let page = provider(&server)
-        .poll_project_items("PVT_x", "PVTSSF_status", since, "is:open")
+        .poll_project_items("PVT_x", "PVTSSF_status", "is:open")
         .await
         .unwrap();
     let items = &page.items;
@@ -513,12 +512,7 @@ async fn poll_project_items_yields_none_when_status_field_absent() {
     .await;
 
     let page = provider(&server)
-        .poll_project_items(
-            "PVT_x",
-            "PVTSSF_status",
-            Timestamp::from_utc(Utc::now()),
-            "",
-        )
+        .poll_project_items("PVT_x", "PVTSSF_status", "")
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
@@ -548,12 +542,7 @@ async fn poll_project_items_marks_closed_issue() {
     .await;
 
     let page = provider(&server)
-        .poll_project_items(
-            "PVT_x",
-            "PVTSSF_status",
-            Timestamp::from_utc(Utc::now()),
-            "",
-        )
+        .poll_project_items("PVT_x", "PVTSSF_status", "")
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
@@ -593,12 +582,7 @@ async fn poll_project_items_follows_pagination() {
         .await;
 
     let page = provider(&server)
-        .poll_project_items(
-            "PVT_x",
-            "PVTSSF_status",
-            Timestamp::from_utc(Utc::now()),
-            "is:open",
-        )
+        .poll_project_items("PVT_x", "PVTSSF_status", "is:open")
         .await
         .unwrap();
     // Last page reported `hasNextPage: false` → the read is complete.
@@ -626,12 +610,7 @@ async fn poll_project_items_stops_at_page_cap() {
         .await;
 
     let page = provider(&server)
-        .poll_project_items(
-            "PVT_x",
-            "PVTSSF_status",
-            Timestamp::from_utc(Utc::now()),
-            "",
-        )
+        .poll_project_items("PVT_x", "PVTSSF_status", "")
         .await
         .unwrap();
     assert_eq!(page.items.len(), 20, "must stop at MAX_POLL_PAGES");
@@ -658,12 +637,7 @@ async fn poll_project_items_stops_on_missing_cursor() {
     .await;
 
     let page = provider(&server)
-        .poll_project_items(
-            "PVT_x",
-            "PVTSSF_status",
-            Timestamp::from_utc(Utc::now()),
-            "",
-        )
+        .poll_project_items("PVT_x", "PVTSSF_status", "")
         .await
         .unwrap();
     assert_eq!(page.items.len(), 1);
