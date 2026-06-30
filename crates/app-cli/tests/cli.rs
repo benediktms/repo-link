@@ -4077,6 +4077,51 @@ fn task_create_repo_explicit_infers_workspace_from_the_repo() {
     assert_eq!(created["repo_id"].as_str(), Some(repo_id.as_str()));
 }
 
+/// Both `--workspace` and `--repo` given, but the repo is bound in a DIFFERENT
+/// workspace: reject it. Otherwise the task's workspace would be paired with a
+/// logical repo instance owned by another workspace (cross-workspace drift).
+#[test]
+fn task_create_rejects_repo_from_another_workspace() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A repo bound only in workspace B.
+    let repo_b = attach_no_link(&dir, &ws_b, "git@github.com:o/b.git", "github.com/o/b");
+
+    let output = bin("repo-link", &dir)
+        .args([
+            "task",
+            "create",
+            "--workspace",
+            &ws_a,
+            "--repo",
+            &repo_b,
+            "--title",
+            "x",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("belongs to workspace"),
+        "a repo from another workspace must be rejected, got: {stderr}"
+    );
+}
+
 /// Both `--workspace` and `--repo` omitted with an unbound cwd errors clearly
 /// (the require-one-of-the-two rule): there is nothing to derive either axis
 /// from, so the command must ask for a flag rather than silently orphaning.

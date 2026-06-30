@@ -530,7 +530,21 @@ async fn resolve_task_create_scope(
     repo: Option<String>,
 ) -> Result<(String, Option<String>)> {
     match (workspace, repo) {
-        (Some(ws), Some(r)) => Ok((ws, Some(resolve_repo_handle_required(svc, &r).await?))),
+        (Some(ws), Some(r)) => {
+            // Both explicit: the repo must be a binding IN that workspace —
+            // otherwise we'd pair the task's workspace with a logical repo
+            // instance owned by a different workspace (a cross-workspace
+            // inconsistency). Reject the mismatch.
+            let instance_id = resolve_repo_handle_required(svc, &r).await?;
+            let binding = svc.bindings.show(&instance_id).await?;
+            if binding.workspace_id != ws {
+                return Err(anyhow!(
+                    "--repo '{r}' belongs to workspace {}, not {ws}; pass a repo bound in {ws} (or omit --workspace to use the repo's own)",
+                    binding.workspace_id
+                ));
+            }
+            Ok((ws, Some(binding.id)))
+        }
         (None, Some(r)) => {
             let instance_id = resolve_repo_handle_required(svc, &r).await?;
             let binding = svc.bindings.show(&instance_id).await?;
