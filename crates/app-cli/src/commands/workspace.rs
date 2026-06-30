@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use dto_shared::{CreateWorkspaceCmd, ListWorkspacesQuery, UpdateWorkspaceCmd};
 
 use crate::cli::WorkspaceCmd;
-use crate::commands::repo::resolve_repo_handle_required;
+use crate::commands::repo::{resolve_repo_handle_required, resolve_workspace};
 use crate::render;
 use crate::services::Services;
 
@@ -38,6 +38,7 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                 ));
             }
             let spec = if none { None } else { project.as_deref() };
+            let workspace = resolve_workspace(svc, workspace).await?;
             let dto = svc.workspaces.set_project(&workspace, spec).await?;
             render::workspace(&dto);
         }
@@ -51,6 +52,7 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                     "rl workspace set-filing-repo requires either --repo <handle> or --none"
                 ));
             }
+            let workspace = resolve_workspace(svc, workspace).await?;
             let filing_origin: Option<String> = if none {
                 None
             } else {
