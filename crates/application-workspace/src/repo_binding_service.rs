@@ -8,8 +8,8 @@ use domain_core::{RepoId, RepoInstanceId, RepoOriginId, WorkspaceId};
 use domain_repo::{RepoBindingView, RepoInstance, RepoOrigin};
 use domain_workspace::WorkspaceStatus;
 use dto_shared::{
-    AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, RepoAttachOutcomeDto,
-    RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
+    AttachRepoCmd, FilingRepoRefDto, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd,
+    RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
 };
 use ports::{
     FilesystemProbe, PortError, RepoBindingRepository, TaskRepository, WorkspaceRepository,
@@ -171,6 +171,35 @@ impl RepoBindingService {
         }
         let view = self.resolve_by_handle(query).await?;
         Ok(binding_to_dto(&view.instance, &view.origin))
+    }
+
+    /// Resolve a task's filing repo to its display fields (RFC 0005 §D4).
+    ///
+    /// The filing axis is **origin-level**: `tasks.filing_repo_id` stores a repo
+    /// *origin* id, not an instance id. So this resolves through
+    /// [`RepoBindingRepository::get_origin`] directly — it must NOT route through
+    /// [`Self::show`], which parses its argument as a `RepoInstanceId` and would
+    /// only resolve by the coincidence that the migration seeds `origin.id` from
+    /// the survivor instance's id (and would wrongly return `None` once that
+    /// survivor instance is detached, even though the origin still exists).
+    ///
+    /// Returns `Ok(None)` for a dangling pointer — a recorded `filing_repo_id`
+    /// whose origin no longer exists ("dangling filing" = no surviving origin,
+    /// §D4). `task show` renders that as a `null` block rather than erroring, so
+    /// it stays usable; any other backend error propagates.
+    pub async fn resolve_filing_origin(
+        &self,
+        origin_id: RepoOriginId,
+    ) -> Result<Option<FilingRepoRefDto>> {
+        match self.bindings.get_origin(origin_id).await {
+            Ok(origin) => Ok(Some(FilingRepoRefDto {
+                id: origin.id.to_string(),
+                name: origin.name,
+                canonical_url: origin.canonical_url,
+            })),
+            Err(PortError::NotFound(_)) => Ok(None),
+            Err(e) => Err(ServiceError::Port(e)),
+        }
     }
 
     /// Resolve a UUID, exact name, or exact alias to a `RepoBindingView`.
@@ -953,6 +982,74 @@ mod tests {
             "shared origin => identical task-ID prefix (no rpl/rpl1 divergence)"
         );
         assert!(!a.binding.prefix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_filing_origin_resolves_by_origin_id_not_instance_id() {
+        // RFC 0005 §D4: the filing axis is origin-level. `resolve_filing_origin`
+        // must resolve the ORIGIN directly — NOT route through `show`, which
+        // would parse the value as an instance id. For a freshly-attached repo
+        // the instance id and origin id differ, so resolving the origin id as an
+        // instance id would miss (or, post-detach, wrongly return None).
+        let (ws_svc, bsvc) = setup();
+        let ws = ws_svc
+            .create(CreateWorkspaceCmd {
+                name: "w".into(),
+                description: None,
+                local_only: true,
+                project_spec: None,
+            })
+            .await
+            .unwrap();
+        let attached = bsvc
+            .attach(AttachRepoCmd {
+                workspace_id: ws.id.clone(),
+                remote_url: "git@github.com:o/r.git".into(),
+                canonical_url: "github.com/o/r".into(),
+                tracked_branch: None,
+                link_path: None,
+                link_branch: None,
+                prefix: None,
+            })
+            .await
+            .unwrap();
+        // Precondition for the bug this guards: a fresh attach has distinct
+        // instance and origin ids.
+        assert_ne!(attached.binding.id, attached.binding.origin_id);
+
+        let origin_id: RepoOriginId = attached.binding.origin_id.parse().unwrap();
+        let filing = bsvc
+            .resolve_filing_origin(origin_id)
+            .await
+            .unwrap()
+            .expect("a live origin id must resolve");
+        assert_eq!(
+            filing.id, attached.binding.origin_id,
+            "filing id IS the origin id"
+        );
+        assert_eq!(filing.canonical_url, "github.com/o/r");
+        assert_eq!(filing.name, attached.binding.name);
+
+        // The per-workspace instance id must NOT resolve as a filing origin —
+        // it lives in a different id space (this is the old `show`-based bug).
+        let instance_as_origin: RepoOriginId = attached.binding.id.parse().unwrap();
+        assert!(
+            bsvc.resolve_filing_origin(instance_as_origin)
+                .await
+                .unwrap()
+                .is_none(),
+            "an instance id is not an origin id — must not resolve a filing origin"
+        );
+
+        // A recorded-but-gone origin (dangling filing pointer) resolves to None,
+        // never an error — `task show` renders that as a null block.
+        assert!(
+            bsvc.resolve_filing_origin(RepoOriginId::new())
+                .await
+                .unwrap()
+                .is_none(),
+            "dangling filing pointer => None, not an error"
+        );
     }
 
     #[tokio::test]

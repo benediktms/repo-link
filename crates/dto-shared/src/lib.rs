@@ -15,8 +15,9 @@ pub use project::{
     StatusOptionDto,
 };
 pub use repo::{
-    AttachRepoCmd, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd, LocateResponseDto,
-    RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd, WorktreeLinkDto,
+    AttachRepoCmd, FilingRepoRefDto, FindRepoMatchDto, FindRepoResponseDto, LinkWorktreeCmd,
+    LocateResponseDto, RepoAttachOutcomeDto, RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd,
+    WorktreeLinkDto,
 };
 pub use sync::{PromoteTaskCmd, PullTaskCmd, PushTaskCmd, SyncSummaryDto};
 pub use task::{
