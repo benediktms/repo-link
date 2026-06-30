@@ -387,10 +387,12 @@ pub(crate) enum TaskCmd {
         /// Logical repo binding — where the code/worktrees live and the source
         /// of the task's ID prefix. Today the issue is also filed in this repo
         /// on promote (logical == filing repo until RFC 0002). By UUID / prefix
-        /// / name / alias (same forms as `rl repo show`). Optional: when omitted,
-        /// derived from the current directory's repo (cwd git origin → the bound
-        /// checkout). At least one of `--workspace` / `--repo` must be resolvable
-        /// — the other is derived from cwd.
+        /// / name / alias (same forms as `rl repo show`). Optional: at least one
+        /// of `--workspace` / `--repo` must resolve and the other is inferred —
+        /// the workspace from the repo's binding when `--repo` is given, or the
+        /// repo from the cwd checkout (scoped to the workspace) when `--repo` is
+        /// omitted. With neither, both come from cwd iff its repo is in exactly
+        /// one active workspace.
         #[arg(short = 'r', long)]
         repo: Option<String>,
         /// Per-task filing-repo override (RFC 0002 D2 step 1, #122). Accepts

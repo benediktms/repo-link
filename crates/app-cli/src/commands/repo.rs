@@ -461,14 +461,28 @@ pub(crate) async fn resolve_repo_handle_required(svc: &Services, handle: &str) -
 }
 
 /// Resolve a `--repo` argument to a binding (per-workspace instance) id:
+/// The current directory's git-origin canonical URL, or `None` when cwd isn't a
+/// git repo with an origin. The shared cwd half of the derivation resolvers
+/// (and `task create`'s scope inference) — callers layer their own
+/// membership/binding lookup + error policy on top.
+pub(crate) fn cwd_canonical() -> Result<Option<String>> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
+    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    match discover_canonical(&abs) {
+        Ok(canonical) => Ok(canonical),
+        Err(GitError::NotARepo(_)) => Ok(None),
+        Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
 /// pass an explicit handle through [`resolve_repo_handle_required`], or — when
 /// omitted — derive it from the current directory's repo (cwd git origin →
 /// canonical URL → the single binding that has it attached). Mirrors
 /// [`resolve_workspace`] but returns the binding id, not the workspace id, so
-/// repo-addressing commands (`repo rename`, `worktree link`, …) and
-/// `task create --repo` can default to the cwd checkout. Errors (asking for
-/// `--repo`) when cwd isn't a bound checkout or its repo spans more than one
-/// workspace.
+/// repo-addressing commands (`repo rename`, `worktree link`, …) can default to
+/// the cwd checkout. Errors (asking for `--repo`) when cwd isn't a bound
+/// checkout or its repo spans more than one workspace.
 pub(crate) async fn resolve_repo_or_cwd(svc: &Services, repo: Option<String>) -> Result<String> {
     if let Some(handle) = repo {
         return resolve_repo_handle_required(svc, &handle).await;

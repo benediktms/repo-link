@@ -12,9 +12,7 @@ use infra_config::RepoLinkConfig;
 use ports::PortError;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
-use crate::commands::repo::{
-    resolve_repo_handle, resolve_repo_handle_required, resolve_repo_or_cwd, resolve_workspace,
-};
+use crate::commands::repo::{cwd_canonical, resolve_repo_handle, resolve_repo_handle_required};
 use crate::commands::sync::parse_issue_url;
 use crate::render;
 use crate::services::{Services, build_sync_service};
@@ -240,25 +238,7 @@ pub(crate) async fn task_dispatch(
                     resolved
                 ));
             }
-            // Both addressing axes can default to the cwd checkout, but only
-            // the axis the user actually left unspecified is derived — never
-            // both unless both were omitted:
-            //   * `--workspace` given, `--repo` omitted -> keep repo `None`
-            //     (the deliberate repo-less local draft); the user already
-            //     pinned the workspace, so don't second-guess the repo.
-            //   * `--repo` given, `--workspace` omitted -> derive workspace
-            //     from cwd (existing `resolve_workspace` behaviour).
-            //   * both omitted -> derive both from the cwd checkout; an unbound
-            //     cwd errors clearly from whichever resolver runs first.
-            // Net rule: at least one of `--workspace` / `--repo` must be
-            // resolvable; the other is filled from cwd when wholly omitted.
-            let derive_repo_from_cwd = workspace.is_none() && repo.is_none();
-            let workspace = resolve_workspace(svc, workspace).await?;
-            let repo_id = if derive_repo_from_cwd {
-                Some(resolve_repo_or_cwd(svc, repo).await?)
-            } else {
-                resolve_repo_handle(svc, repo).await?
-            };
+            let (workspace, repo_id) = resolve_task_create_scope(svc, workspace, repo).await?;
             let dto = svc
                 .tasks
                 .create(CreateTaskCmd {
@@ -529,4 +509,89 @@ pub(crate) async fn task_dispatch(
         }
     }
     Ok(())
+}
+
+/// Resolve the `(workspace, logical repo)` scope for `task create` from the
+/// flags plus the current directory. Either axis can be inferred from the
+/// other or from the cwd checkout; at least one must be resolvable. Returns the
+/// workspace id and an optional repo-instance id (`None` = a deliberate
+/// repo-less draft). Matrix:
+/// - both given: used as-is.
+/// - `--repo` only: the workspace is the repo's binding workspace (a handle
+///   shared across active workspaces already errors `AmbiguousHandle` in
+///   `resolve_repo_handle_required`, so a clean resolve is unambiguous).
+/// - `--workspace` only: the repo is inferred from cwd, scoped to that
+///   workspace; cwd not a bound checkout there → repo-less (no error).
+/// - neither: infer both from cwd iff its repo is attached to exactly one
+///   active workspace; otherwise require a flag.
+async fn resolve_task_create_scope(
+    svc: &Services,
+    workspace: Option<String>,
+    repo: Option<String>,
+) -> Result<(String, Option<String>)> {
+    match (workspace, repo) {
+        (Some(ws), Some(r)) => {
+            // Both explicit: the repo must be a binding IN that workspace —
+            // otherwise we'd pair the task's workspace with a logical repo
+            // instance owned by a different workspace (a cross-workspace
+            // inconsistency). Reject the mismatch.
+            let instance_id = resolve_repo_handle_required(svc, &r).await?;
+            let binding = svc.bindings.show(&instance_id).await?;
+            if binding.workspace_id != ws {
+                return Err(anyhow!(
+                    "--repo '{r}' belongs to workspace {}, not {ws}; pass a repo bound in {ws} (or omit --workspace to use the repo's own)",
+                    binding.workspace_id
+                ));
+            }
+            Ok((ws, Some(binding.id)))
+        }
+        (None, Some(r)) => {
+            let instance_id = resolve_repo_handle_required(svc, &r).await?;
+            let binding = svc.bindings.show(&instance_id).await?;
+            Ok((binding.workspace_id, Some(binding.id)))
+        }
+        (Some(ws), None) => {
+            let repo_id = cwd_repo_in_workspace(svc, &ws).await?;
+            Ok((ws, repo_id))
+        }
+        (None, None) => {
+            let canonical = cwd_canonical()?.ok_or_else(|| {
+                anyhow!(
+                    "provide --workspace or --repo (the current directory is not a git repo with an origin)"
+                )
+            })?;
+            let memberships = svc
+                .bindings
+                .memberships_for_canonical_url(&canonical, false)
+                .await?;
+            match memberships.as_slice() {
+                [m] => Ok((m.workspace.id.clone(), Some(m.binding.id.clone()))),
+                [] => Err(anyhow!(
+                    "provide --workspace or --repo ('{canonical}' is attached to no active workspace)"
+                )),
+                many => Err(anyhow!(
+                    "provide --workspace or --repo ('{canonical}' is attached to {} workspaces; pick one)",
+                    many.len()
+                )),
+            }
+        }
+    }
+}
+
+/// The repo-instance bound to cwd's repo *within* `workspace_id`, or `None` when
+/// cwd isn't a bound checkout in that workspace (a repo-less draft is then the
+/// valid outcome). `UNIQUE(workspace_id, canonical_url)` makes the per-workspace
+/// match unique.
+async fn cwd_repo_in_workspace(svc: &Services, workspace_id: &str) -> Result<Option<String>> {
+    let Some(canonical) = cwd_canonical()? else {
+        return Ok(None);
+    };
+    let memberships = svc
+        .bindings
+        .memberships_for_canonical_url(&canonical, false)
+        .await?;
+    Ok(memberships
+        .into_iter()
+        .find(|m| m.workspace.id == workspace_id)
+        .map(|m| m.binding.id))
 }
