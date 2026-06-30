@@ -3659,3 +3659,102 @@ fn repo_doctor_target_resolves_origin_not_instance() {
     );
     assert_eq!(summary["affected"], 0);
 }
+
+/// `--workspace` is optional: when omitted, it's derived from the current
+/// directory's repo (cwd git origin → the workspace that has it attached).
+/// A repo in exactly one workspace resolves cleanly.
+#[test]
+fn workspace_arg_derives_from_cwd_when_single_workspace() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    );
+
+    // Run `query overview` from inside the checkout with NO --workspace. The
+    // command succeeds (run_json asserts exit 0) only because the workspace was
+    // derived from cwd; a failed derivation would error "pass --workspace".
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let out = run_json(&mut cmd, &["query", "overview"]);
+    assert!(out.is_object(), "overview resolved from cwd: {out}");
+}
+
+/// When the cwd repo is attached to more than one workspace, derivation is
+/// ambiguous and the command errors asking for `--workspace` rather than
+/// picking one.
+#[test]
+fn workspace_arg_errors_when_cwd_repo_spans_multiple_workspaces() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    for ws in [&ws_a, &ws_b] {
+        run_json(
+            &mut bin("repo-link", &dir),
+            &[
+                "repo",
+                "attach",
+                "--workspace",
+                ws,
+                "--url",
+                "git@github.com:o/r.git",
+                "--canonical",
+                "github.com/o/r",
+                "--path",
+                &checkout_path,
+            ],
+        );
+    }
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let output = cmd
+        .args(["query", "overview"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--workspace"),
+        "ambiguous cwd must ask for --workspace, got: {stderr}"
+    );
+}

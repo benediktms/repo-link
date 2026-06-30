@@ -30,9 +30,12 @@ pub(crate) struct Cli {
 
 #[derive(Args, Debug)]
 pub(crate) struct WorkspaceArg {
-    /// Workspace UUID.
+    /// Workspace UUID. Optional: when omitted, it is derived from the current
+    /// directory's repo (its git origin → the workspace that has that repo
+    /// attached). Ambiguous (repo in >1 workspace) or no-match cwd errors and
+    /// asks for `--workspace`.
     #[arg(short = 'w', long)]
-    pub(crate) workspace: String,
+    pub(crate) workspace: Option<String>,
 }
 
 #[derive(Args, Debug)]
