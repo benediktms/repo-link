@@ -4107,6 +4107,132 @@ fn task_create_errors_when_both_omitted_and_cwd_unbound() {
     );
 }
 
+/// Both omitted + cwd's repo attached to MORE THAN ONE active workspace: we
+/// can't pick a workspace, so the require-one-of rule kicks in (the "infer both
+/// only when exactly one active workspace" boundary). Must error, not guess.
+#[test]
+fn task_create_errors_when_both_omitted_and_cwd_repo_spans_multiple_workspaces() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    for ws in [&ws_a, &ws_b] {
+        run_json(
+            &mut bin("repo-link", &dir),
+            &[
+                "repo",
+                "attach",
+                "--workspace",
+                ws,
+                "--url",
+                "git@github.com:o/r.git",
+                "--canonical",
+                "github.com/o/r",
+                "--path",
+                &checkout_path,
+            ],
+        );
+    }
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let output = cmd
+        .args(["task", "create", "--title", "ambiguous"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--workspace") || stderr.contains("--repo"),
+        "multi-workspace cwd with both omitted must ask for a flag, got: {stderr}"
+    );
+}
+
+/// `--repo` given as a handle shared across multiple active workspaces (the
+/// origin prefix/name is origin-global): the workspace can't be inferred from
+/// the repo, so it must error/disambiguate rather than pick one — rule A's
+/// "only when the repo is in one active workspace" condition.
+#[test]
+fn task_create_repo_shared_handle_across_workspaces_is_ambiguous() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    let prefix = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &ws_a,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    )["binding"]["prefix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &ws_b,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    );
+
+    // `--repo <shared prefix>` resolves to instances in both workspaces ->
+    // AmbiguousHandle; the command must fail rather than silently pick one.
+    let neutral = TempDir::new().unwrap();
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(neutral.path());
+    cmd.args(["task", "create", "--repo", &prefix, "--title", "x"])
+        .assert()
+        .failure();
+}
+
 /// When the cwd repo is attached to more than one workspace, `--repo`
 /// derivation is ambiguous and the command errors asking for `--repo` rather
 /// than picking one.
