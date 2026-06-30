@@ -210,38 +210,56 @@ impl RepoBindingService {
         self.resolve_by_handle(query).await
     }
 
-    /// Resolve `query` to a binding view by trying, in order: exact
-    /// `prefix` match (globally-unique, single index lookup); then
-    /// exact `name` or `alias` match. The prefix takes priority because it
-    /// carries an explicit uniqueness guarantee — names and aliases can clash
-    /// across workspaces, so they still produce the ambiguity error.
+    /// Resolve `query` to a binding view by trying, in order: exact `prefix`
+    /// match (globally-unique to one origin); then exact `name` or `alias`
+    /// match. Prefix takes priority because it pins a single origin.
     ///
     /// This resolver backs write commands (`--repo` on `task create`,
     /// `set-filing-repo`, etc.), so a repo whose workspace is archived must
     /// still be addressable by handle: archiving hides a workspace from
-    /// listings but does NOT lock it.
+    /// listings but does NOT lock it. Archived bindings are therefore searched
+    /// only as a **fallback** — active matches win outright.
     ///
-    /// Archived workspaces are therefore searched, but only as a **fallback**:
-    /// name/alias matches in ACTIVE workspaces win outright, and archived
-    /// bindings are consulted solely when the active set yields nothing. This
-    /// keeps archiving from broadening the ambiguity surface — a live handle
-    /// that resolved cleanly before still resolves cleanly even when an
-    /// archived workspace happens to hold a same-named binding. Ambiguity is
-    /// still surfaced WITHIN whichever set ultimately resolves the handle.
+    /// Because every handle is ORIGIN-global post-RFC-0005, a repo attached to
+    /// more than one workspace is ambiguous for ALL handle forms (prefix
+    /// included): resolution returns `AmbiguousHandle` with one candidate per
+    /// workspace rather than silently picking one. Disambiguate with an
+    /// instance UUID. This applies uniformly, including to origin-mutating verbs
+    /// (`rename` / `set-prefix` / `alias`) — they take the same `query` path, so
+    /// a multi-workspace repo needs a UUID there too.
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBindingView> {
+        // Prefix is globally unique to ONE origin, so it takes priority: a
+        // prefix hit resolves among that origin's instances only (never blended
+        // with a same-named different repo). Names/aliases can clash across
+        // origins, so they are the fallback.
+        //
+        // RFC 0005 (rpl-fqj): prefix/name/alias are ORIGIN-global now, so a repo
+        // attached to N workspaces sits behind one handle with N instances. Both
+        // stages therefore funnel through the SAME bucketing + ambiguity check —
+        // a multi-workspace handle yields `AmbiguousHandle` (one candidate per
+        // workspace), never an arbitrary pick. (Pre-split, distinct per-workspace
+        // prefixes `rpl`/`rpl1` made this unambiguous; the shared prefix is what
+        // introduced the cross-workspace ambiguity.)
         if let Some(origin) = self.bindings.find_origin_by_prefix(query).await? {
-            // Find any instance that has this origin
-            let workspaces = self.workspaces.list(true).await?;
-            for ws in &workspaces {
-                if ws.status == WorkspaceStatus::Deleted {
-                    continue;
-                }
-                let views = self.bindings.list_by_workspace(ws.id).await?;
-                if let Some(view) = views.into_iter().find(|v| v.origin.id == origin.id) {
-                    return Ok(view);
-                }
-            }
+            return self
+                .resolve_matching(query, |v| v.origin.id == origin.id)
+                .await;
         }
+        self.resolve_matching(query, |v| {
+            v.origin.name == query || v.origin.aliases.iter().any(|a| a == query)
+        })
+        .await
+    }
+
+    /// Collect every non-deleted binding view matching `pred` and resolve to a
+    /// single one, or `AmbiguousHandle` listing the candidates. Active
+    /// workspaces win outright; archived bindings are the fallback consulted
+    /// only when no active binding matches (archiving hides a workspace but does
+    /// NOT lock its repos). One rule for both the prefix and name/alias stages.
+    async fn resolve_matching<F>(&self, query: &str, pred: F) -> Result<RepoBindingView>
+    where
+        F: Fn(&RepoBindingView) -> bool,
+    {
         let workspaces = self.workspaces.list(true).await?;
         let mut active: Vec<RepoBindingView> = Vec::new();
         let mut archived: Vec<RepoBindingView> = Vec::new();
@@ -253,9 +271,8 @@ impl RepoBindingService {
             if ws.status == WorkspaceStatus::Deleted {
                 continue;
             }
-            let views = self.bindings.list_by_workspace(ws.id).await?;
-            for v in views {
-                if v.origin.name == query || v.origin.aliases.iter().any(|a| a == query) {
+            for v in self.bindings.list_by_workspace(ws.id).await? {
+                if pred(&v) {
                     if ws.status == WorkspaceStatus::Archived {
                         archived.push(v);
                     } else {
@@ -264,8 +281,6 @@ impl RepoBindingService {
                 }
             }
         }
-        // Active wins; archived is the fallback consulted only when no active
-        // binding matches the handle.
         let mut matches = if active.is_empty() { archived } else { active };
         match matches.len() {
             0 => Err(ServiceError::BindingNotFound(query.to_string())),
@@ -1231,6 +1246,40 @@ mod tests {
             }
             other => panic!("expected AmbiguousHandle, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn prefix_handle_for_multi_workspace_repo_is_ambiguous() {
+        // RFC 0005 (rpl-fqj): a prefix is ORIGIN-global, so the SAME repo
+        // attached to two workspaces sits behind one prefix with two instances.
+        // Resolution must surface AmbiguousHandle (one candidate per workspace)
+        // rather than silently returning an arbitrary workspace's instance — the
+        // old prefix short-circuit picked the first non-deleted workspace.
+        let (ws_svc, bsvc) = setup();
+        let a = seeded(&ws_svc, &bsvc, "ws-a", "github.com/o/shared").await;
+        let b = seeded(&ws_svc, &bsvc, "ws-b", "github.com/o/shared").await;
+        // Same canonical => one shared origin => one prefix across both.
+        assert_eq!(a.origin_id, b.origin_id);
+        assert_eq!(a.prefix, b.prefix);
+
+        let err = bsvc.show(&a.prefix).await.unwrap_err();
+        match err {
+            ServiceError::AmbiguousHandle { query, candidates } => {
+                assert_eq!(query, a.prefix);
+                assert_eq!(candidates.len(), 2, "one candidate per workspace instance");
+            }
+            other => panic!("expected AmbiguousHandle, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_handle_for_single_workspace_repo_resolves() {
+        // The common case stays unambiguous: one workspace, one instance, one
+        // prefix → resolves cleanly (no regression from the ambiguity guard).
+        let (ws_svc, bsvc) = setup();
+        let a = seeded(&ws_svc, &bsvc, "ws", "github.com/o/solo").await;
+        let hit = bsvc.show(&a.prefix).await.unwrap();
+        assert_eq!(hit.id, a.id);
     }
 
     #[tokio::test]
