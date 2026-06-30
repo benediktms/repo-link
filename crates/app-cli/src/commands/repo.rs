@@ -5,9 +5,11 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
-use dto_shared::{AttachRepoCmd, LinkWorktreeCmd, LocateResponseDto, UnlinkWorktreeCmd};
+use dto_shared::{
+    AttachRepoCmd, LinkWorktreeCmd, LocateResponseDto, RepoMembershipDto, UnlinkWorktreeCmd,
+};
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
-use infra_git::discover_canonical;
+use infra_git::{GitError, discover_canonical};
 
 use crate::cli::{AliasArg, BranchArg, RepoAliasCmd, RepoCmd, WorkspaceArg, WorktreeCmd};
 use crate::commands::handle_ambiguous;
@@ -25,12 +27,18 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             no_link,
             prefix,
         } => {
+            // Attach opts out of cwd-derivation: the workspace is the *target*
+            // to bind into, and the cwd repo is the one being attached — cwd
+            // can't name the target. Require an explicit `--workspace`.
+            let workspace_id = workspace.ok_or_else(|| {
+                anyhow!("repo attach requires --workspace (the target workspace)")
+            })?;
             let link_path = resolve_attach_link_path(path.as_deref(), no_link, &canonical)?;
 
             let outcome = svc
                 .bindings
                 .attach(AttachRepoCmd {
-                    workspace_id: workspace,
+                    workspace_id,
                     remote_url: url,
                     canonical_url: canonical,
                     tracked_branch: branch.clone(),
@@ -48,7 +56,10 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
         }
         RepoCmd::List {
             ws: WorkspaceArg { workspace },
-        } => render::repos(&svc.bindings.list(&workspace).await?),
+        } => {
+            let workspace = resolve_workspace(svc, workspace).await?;
+            render::repos(&svc.bindings.list(&workspace).await?)
+        }
         RepoCmd::Show { id } => match svc.bindings.show(&id).await {
             Ok(dto) => render::repo(&dto),
             Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
@@ -119,6 +130,7 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                 }
                 None => None,
             };
+            let workspace = resolve_workspace(svc, workspace).await?;
             let summary = svc.bindings.doctor(&workspace, repair, target_uuid).await?;
             // Serialize failure on a known-good in-memory struct is
             // a programmer error (DoctorSummary's Serialize impl is
@@ -389,6 +401,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
             ws: WorkspaceArg { workspace },
             prune,
         } => {
+            let workspace = resolve_workspace(svc, workspace).await?;
             let probe = TokioFilesystemProbe::new();
             let summary = svc
                 .bindings
@@ -425,5 +438,57 @@ pub(crate) async fn resolve_repo_handle_required(svc: &Services, handle: &str) -
             handle_ambiguous(query, candidates)
         }
         Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Resolve a [`WorkspaceArg`]'s workspace: pass an explicit value through, or —
+/// when omitted — derive it from the current directory's repo (cwd git origin →
+/// canonical URL → the workspace that has it attached). Reuses the same
+/// discovery path as `rl repo locate`. Errors (asking for `--workspace`) when
+/// cwd isn't a bound checkout or its repo spans more than one workspace.
+pub(crate) async fn resolve_workspace(svc: &Services, workspace: Option<String>) -> Result<String> {
+    if let Some(w) = workspace {
+        return Ok(w);
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
+    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let canonical = match discover_canonical(&abs) {
+        Ok(Some(c)) => c,
+        Ok(None) | Err(GitError::NotARepo(_)) => {
+            return Err(anyhow!(
+                "no --workspace given and {} is not a git repo with an origin; pass --workspace",
+                abs.display()
+            ));
+        }
+        Err(e) => return Err(anyhow!("{e}")),
+    };
+    let memberships = svc
+        .bindings
+        .memberships_for_canonical_url(&canonical, false)
+        .await?;
+    pick_workspace(&canonical, memberships)
+}
+
+/// Pure resolution step for [`resolve_workspace`]: exactly one membership
+/// resolves; zero or many error with guidance to pass `--workspace`. Split out
+/// so the 0/1/many policy is unit-testable without a git checkout.
+fn pick_workspace(canonical: &str, memberships: Vec<RepoMembershipDto>) -> Result<String> {
+    match memberships.as_slice() {
+        [] => Err(anyhow!(
+            "no active workspace has '{canonical}' attached; pass --workspace (or attach it with `rl repo attach`)"
+        )),
+        [m] => Ok(m.workspace.id.clone()),
+        many => {
+            let names = many
+                .iter()
+                .map(|m| format!("{} ({})", m.workspace.name, m.workspace.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "'{canonical}' is attached to {} workspaces; pass --workspace to disambiguate: {names}",
+                many.len()
+            ))
+        }
     }
 }

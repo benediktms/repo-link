@@ -12,7 +12,7 @@ use infra_config::RepoLinkConfig;
 use ports::PortError;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
-use crate::commands::repo::{resolve_repo_handle, resolve_repo_handle_required};
+use crate::commands::repo::{resolve_repo_handle, resolve_repo_handle_required, resolve_workspace};
 use crate::commands::sync::parse_issue_url;
 use crate::render;
 use crate::services::{Services, build_sync_service};
@@ -238,6 +238,10 @@ pub(crate) async fn task_dispatch(
                     resolved
                 ));
             }
+            // Derive the workspace from cwd when `--workspace` is omitted.
+            // Deriving `--repo` from cwd and the require-one-of-the-two rule is
+            // a separate follow-up; for now `--repo` stays explicit/optional.
+            let workspace = resolve_workspace(svc, workspace).await?;
             let dto = svc
                 .tasks
                 .create(CreateTaskCmd {

@@ -57,6 +57,7 @@ pub(crate) async fn sync_dispatch(
         ws: WorkspaceArg { workspace },
     } = cmd
     {
+        let workspace = crate::commands::repo::resolve_workspace(svc, workspace).await?;
         return sync_import(provider.as_ref(), svc, &workspace, &url, cascade).await;
     }
 

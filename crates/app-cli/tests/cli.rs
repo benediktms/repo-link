@@ -3659,3 +3659,115 @@ fn repo_doctor_target_resolves_origin_not_instance() {
     );
     assert_eq!(summary["affected"], 0);
 }
+
+/// `--workspace` is optional: when omitted, it's derived from the current
+/// directory's repo (cwd git origin → the workspace that has it attached).
+/// A repo in exactly one workspace resolves cleanly.
+#[test]
+fn workspace_arg_derives_from_cwd_when_single_workspace() {
+    let dir = TempDir::new().unwrap();
+    // A decoy workspace created FIRST and unrelated to the checkout. If
+    // resolution wrongly fell back to "the only / first workspace in the DB" it
+    // would pick this one — the assertion below pins that it resolves from the
+    // checkout's repo binding instead.
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "decoy", "--local-only"],
+    );
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    // Attach the checkout's repo to the TARGET workspace only.
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    );
+
+    // `query overview` from inside the checkout with NO --workspace must resolve
+    // to the TARGET workspace (bound to this checkout), not the decoy.
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let out = run_json(&mut cmd, &["query", "overview"]);
+    assert_eq!(
+        out["workspace_id"].as_str(),
+        Some(workspace.as_str()),
+        "cwd derivation must select the checkout's workspace, not a fallback: {out}"
+    );
+    assert_eq!(out["workspace_name"], "target");
+}
+
+/// When the cwd repo is attached to more than one workspace, derivation is
+/// ambiguous and the command errors asking for `--workspace` rather than
+/// picking one.
+#[test]
+fn workspace_arg_errors_when_cwd_repo_spans_multiple_workspaces() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    for ws in [&ws_a, &ws_b] {
+        run_json(
+            &mut bin("repo-link", &dir),
+            &[
+                "repo",
+                "attach",
+                "--workspace",
+                ws,
+                "--url",
+                "git@github.com:o/r.git",
+                "--canonical",
+                "github.com/o/r",
+                "--path",
+                &checkout_path,
+            ],
+        );
+    }
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let output = cmd
+        .args(["query", "overview"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--workspace"),
+        "ambiguous cwd must ask for --workspace, got: {stderr}"
+    );
+}
