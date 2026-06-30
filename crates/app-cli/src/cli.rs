@@ -258,8 +258,11 @@ pub(crate) enum RepoCmd {
     /// Set a new short name on a binding. Identity stays at canonical_url —
     /// rename is purely a display affordance.
     Rename {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(short = 'n', long)]
         name: String,
     },
@@ -273,8 +276,11 @@ pub(crate) enum RepoCmd {
     /// errors with `PrefixMismatch`. Bare-hash references (`ak7`) keep
     /// working because the hash itself is globally unique.
     SetPrefix {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         /// New prefix value. Must match `^[a-z][a-z0-9]{1,19}$`.
         #[arg(short = 'p', long)]
         prefix: String,
@@ -315,14 +321,20 @@ pub(crate) enum RepoCmd {
 #[derive(Subcommand, Debug)]
 pub(crate) enum RepoAliasCmd {
     Add {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[command(flatten)]
         a: AliasArg,
     },
     Rm {
+        /// Repo binding, by UUID / prefix / name / alias (same forms as
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[command(flatten)]
         a: AliasArg,
     },
@@ -332,9 +344,10 @@ pub(crate) enum RepoAliasCmd {
 pub(crate) enum WorktreeCmd {
     Link {
         /// Repo binding, by UUID / prefix / name / alias (same forms as
-        /// `rl repo show`).
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(short = 'p', long)]
         path: String,
         #[command(flatten)]
@@ -342,17 +355,19 @@ pub(crate) enum WorktreeCmd {
     },
     Unlink {
         /// Repo binding, by UUID / prefix / name / alias (same forms as
-        /// `rl repo show`).
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(short = 'p', long)]
         path: String,
     },
     PruneMissing {
         /// Repo binding, by UUID / prefix / name / alias (same forms as
-        /// `rl repo show`).
+        /// `rl repo show`). Optional: when omitted, derived from the current
+        /// directory's repo (cwd git origin → the bound checkout).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
     },
     /// Scan every worktree in a workspace, mark missing paths, optionally
     /// drop them. Use this after switching machines or pruning checkouts.
@@ -372,7 +387,10 @@ pub(crate) enum TaskCmd {
         /// Logical repo binding — where the code/worktrees live and the source
         /// of the task's ID prefix. Today the issue is also filed in this repo
         /// on promote (logical == filing repo until RFC 0002). By UUID / prefix
-        /// / name / alias (same forms as `rl repo show`).
+        /// / name / alias (same forms as `rl repo show`). Optional: when omitted,
+        /// derived from the current directory's repo (cwd git origin → the bound
+        /// checkout). At least one of `--workspace` / `--repo` must be resolvable
+        /// — the other is derived from cwd.
         #[arg(short = 'r', long)]
         repo: Option<String>,
         /// Per-task filing-repo override (RFC 0002 D2 step 1, #122). Accepts

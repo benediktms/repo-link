@@ -12,7 +12,9 @@ use infra_config::RepoLinkConfig;
 use ports::PortError;
 
 use crate::cli::{TaskCmd, WorkspaceArg};
-use crate::commands::repo::{resolve_repo_handle, resolve_repo_handle_required, resolve_workspace};
+use crate::commands::repo::{
+    resolve_repo_handle, resolve_repo_handle_required, resolve_repo_or_cwd, resolve_workspace,
+};
 use crate::commands::sync::parse_issue_url;
 use crate::render;
 use crate::services::{Services, build_sync_service};
@@ -238,15 +240,30 @@ pub(crate) async fn task_dispatch(
                     resolved
                 ));
             }
-            // Derive the workspace from cwd when `--workspace` is omitted.
-            // Deriving `--repo` from cwd and the require-one-of-the-two rule is
-            // a separate follow-up; for now `--repo` stays explicit/optional.
+            // Both addressing axes can default to the cwd checkout, but only
+            // the axis the user actually left unspecified is derived — never
+            // both unless both were omitted:
+            //   * `--workspace` given, `--repo` omitted -> keep repo `None`
+            //     (the deliberate repo-less local draft); the user already
+            //     pinned the workspace, so don't second-guess the repo.
+            //   * `--repo` given, `--workspace` omitted -> derive workspace
+            //     from cwd (existing `resolve_workspace` behaviour).
+            //   * both omitted -> derive both from the cwd checkout; an unbound
+            //     cwd errors clearly from whichever resolver runs first.
+            // Net rule: at least one of `--workspace` / `--repo` must be
+            // resolvable; the other is filled from cwd when wholly omitted.
+            let derive_repo_from_cwd = workspace.is_none() && repo.is_none();
             let workspace = resolve_workspace(svc, workspace).await?;
+            let repo_id = if derive_repo_from_cwd {
+                Some(resolve_repo_or_cwd(svc, repo).await?)
+            } else {
+                resolve_repo_handle(svc, repo).await?
+            };
             let dto = svc
                 .tasks
                 .create(CreateTaskCmd {
                     workspace_id: workspace,
-                    repo_id: resolve_repo_handle(svc, repo).await?,
+                    repo_id,
                     title,
                     body,
                     priority,

@@ -3832,3 +3832,226 @@ fn workspace_arg_errors_when_cwd_repo_spans_multiple_workspaces() {
         "ambiguous cwd must ask for --workspace, got: {stderr}"
     );
 }
+
+/// `--repo` is optional on repo-handle commands: when omitted, it's derived
+/// from the current directory's repo (cwd git origin → the single bound
+/// checkout's binding instance). `repo rename` from inside the checkout, with
+/// no `--repo`, mutates the binding the cwd resolves to.
+#[test]
+fn repo_arg_derives_from_cwd_when_single_workspace() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // `repo rename` from inside the checkout with NO --repo must target the
+    // binding the cwd resolves to.
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let renamed = run_json(&mut cmd, &["repo", "rename", "--name", "cwdname"]);
+    assert_eq!(renamed["name"], "cwdname");
+    assert_eq!(
+        renamed["id"].as_str(),
+        Some(repo_id.as_str()),
+        "cwd --repo derivation must select the checkout's binding: {renamed}"
+    );
+}
+
+/// `task create` with NO `--repo` derives the logical repo from the cwd
+/// checkout (same origin → binding instance), while `--workspace` is also
+/// cwd-derived. The created task records the derived binding as its `repo_id`.
+#[test]
+fn task_create_derives_repo_from_cwd() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    let repo_id = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // No --workspace and no --repo: both derive from the cwd checkout.
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let created = run_json(&mut cmd, &["task", "create", "--title", "from cwd"]);
+    assert_eq!(
+        created["repo_id"].as_str(),
+        Some(repo_id.as_str()),
+        "task create must derive --repo from the cwd checkout's binding: {created}"
+    );
+}
+
+/// Explicit `--workspace` with no `--repo` keeps the deliberate repo-less
+/// draft (repo_id null) — cwd-derivation only fills `--repo` when the
+/// workspace was *also* left to cwd. Even run from inside an (unbound) git
+/// repo, an explicit workspace must NOT force a repo onto the task.
+#[test]
+fn task_create_keeps_orphan_when_workspace_explicit_and_repo_omitted() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A git checkout whose origin is NOT attached to any workspace.
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/unbound.git");
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let created = run_json(
+        &mut cmd,
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "orphan",
+        ],
+    );
+    assert_eq!(
+        created["repo_id"],
+        Value::Null,
+        "explicit --workspace + omitted --repo must stay a repo-less draft: {created}"
+    );
+}
+
+/// Both `--workspace` and `--repo` omitted with an unbound cwd errors clearly
+/// (the require-one-of-the-two rule): there is nothing to derive either axis
+/// from, so the command must ask for a flag rather than silently orphaning.
+#[test]
+fn task_create_errors_when_both_omitted_and_cwd_unbound() {
+    let dir = TempDir::new().unwrap();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+
+    // A git checkout whose origin is NOT attached to any workspace.
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/unbound.git");
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let output = cmd
+        .args(["task", "create", "--title", "nowhere"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--workspace") || stderr.contains("--repo"),
+        "both-omitted + unbound cwd must ask for a flag, got: {stderr}"
+    );
+}
+
+/// When the cwd repo is attached to more than one workspace, `--repo`
+/// derivation is ambiguous and the command errors asking for `--repo` rather
+/// than picking one.
+#[test]
+fn repo_arg_errors_when_cwd_repo_spans_multiple_workspaces() {
+    let dir = TempDir::new().unwrap();
+    let ws_a = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "a", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws_b = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "b", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    for ws in [&ws_a, &ws_b] {
+        run_json(
+            &mut bin("repo-link", &dir),
+            &[
+                "repo",
+                "attach",
+                "--workspace",
+                ws,
+                "--url",
+                "git@github.com:o/r.git",
+                "--canonical",
+                "github.com/o/r",
+                "--path",
+                &checkout_path,
+            ],
+        );
+    }
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let output = cmd
+        .args(["repo", "rename", "--name", "x"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--repo"),
+        "ambiguous cwd must ask for --repo, got: {stderr}"
+    );
+}
