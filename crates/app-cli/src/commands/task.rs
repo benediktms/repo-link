@@ -3,6 +3,7 @@
 
 use anyhow::{Result, anyhow};
 use application_sync::{RefreshOutcome, SyncService};
+use domain_core::RepoOriginId;
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ListTasksQuery, RemoveTaskRelationCmd, TaskDto,
     UpdateTaskCmd,
@@ -292,27 +293,23 @@ pub(crate) async fn task_dispatch(
             // shape (and all list/query shapes) remain byte-identical.
             let base = svc.tasks.show(&id).await?;
             let filing_repo_block = if let Some(filing_id) = domain_task.filing_repo_id {
-                match svc.bindings.show(&filing_id.to_string()).await {
-                    Ok(binding) => serde_json::json!({
-                        "id": binding.id,
-                        "name": binding.name,
-                        "canonical_url": binding.canonical_url,
-                    }),
-                    // A recorded filing repo whose binding is gone is a
-                    // legitimate dangling pointer (no FK on
-                    // `filing_repo_id`, rpl-sv2 — org-move replaces the
-                    // binding and leaves the old UUID recorded on tasks
-                    // whose `repo_id` was correctly re-pointed). The
-                    // `bindings.get(id)` port raises `Port(NotFound)`;
-                    // `ServiceError::BindingNotFound` is the *handle*
-                    // path and never fires here. Surface both as null
-                    // so `task show` stays usable; any other error
-                    // (I/O, etc.) must propagate.
-                    Err(
-                        application_workspace::ServiceError::Port(PortError::NotFound(_))
-                        | application_workspace::ServiceError::BindingNotFound(_),
-                    ) => serde_json::Value::Null,
-                    Err(e) => return Err(anyhow!("resolve filing repo binding: {e}")),
+                // RFC 0005 §D4: the filing axis is origin-level — `filing_repo_id`
+                // holds a repo *origin* id (wrapped in the soft `RepoId` TEXT
+                // type). Resolve the ORIGIN directly; do NOT route through
+                // `bindings.show`, which would treat the value as an instance id
+                // and only resolve by the migration's `origin.id == survivor
+                // instance id` coincidence. A recorded filing repo whose origin
+                // is gone is a legitimate dangling pointer ("dangling filing" =
+                // no surviving origin) — `resolve_filing_origin` maps that to
+                // `None`, surfaced as a null block so `task show` stays usable;
+                // any other backend error propagates.
+                let origin_id = RepoOriginId::from_uuid(filing_id.as_uuid());
+                match svc.bindings.resolve_filing_origin(origin_id).await {
+                    Ok(Some(filing)) => {
+                        serde_json::to_value(&filing).unwrap_or(serde_json::Value::Null)
+                    }
+                    Ok(None) => serde_json::Value::Null,
+                    Err(e) => return Err(anyhow!("resolve filing repo origin: {e}")),
                 }
             } else {
                 serde_json::Value::Null

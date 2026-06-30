@@ -96,18 +96,25 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             repair,
             target,
         } => {
-            // Resolve `--target` to a binding id via the same handle
-            // resolver the rest of `rl repo` uses. Ambiguous matches
-            // exit 2 with the candidate list. A `--target` that
-            // doesn't resolve to *any* binding is a hard error — the
-            // user has to know the new home for the re-point.
+            // Resolve `--target` via the same handle resolver the rest of `rl
+            // repo` uses (ambiguous matches exit 2 with the candidate list; an
+            // unresolvable handle is a hard error — the user must know the new
+            // home). RFC 0005 §D4: doctor re-points the filing axis, which lives
+            // in ORIGIN id space, so the target is the binding's origin id — NOT
+            // the per-workspace instance id the handle resolves to (passing the
+            // instance id fails doctor's get_origin validation for any repo
+            // where instance.id != origin.id).
             let target_uuid = match target {
                 Some(handle) => {
-                    let id_str = resolve_repo_handle_required(svc, &handle).await?;
+                    let instance_id = resolve_repo_handle_required(svc, &handle).await?;
+                    let binding = svc.bindings.show(&instance_id).await?;
                     Some(
-                        id_str
+                        binding
+                            .origin_id
                             .parse::<domain_core::RepoId>()
-                            .map_err(|e| anyhow!("invalid --target binding id {id_str:?}: {e}"))?,
+                            .map_err(|e| {
+                                anyhow!("invalid --target origin id {:?}: {e}", binding.origin_id)
+                            })?,
                     )
                 }
                 None => None,

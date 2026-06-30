@@ -92,6 +92,19 @@ pub struct RepoMembershipDto {
     pub binding: RepoBindingDto,
 }
 
+/// Display projection of a task's filing repo, surfaced as the additive
+/// `filing_repo` block by `rl task show` (RFC 0002 D5 / #122). Post-RFC 0005
+/// (§D4) the filing axis is **origin-level**, so `id` is the repo *origin* id —
+/// the cross-workspace identity that matches the value stored on
+/// `tasks.filing_repo_id`, not a per-workspace instance id. `name` /
+/// `canonical_url` are origin-intrinsic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilingRepoRefDto {
+    pub id: String,
+    pub name: String,
+    pub canonical_url: String,
+}
+
 /// Full result of a `repo locate` lookup. `canonical_url` is `None` when
 /// the queried path isn't a git repo with an origin remote; `matches` is
 /// empty when no binding references the discovered remote.

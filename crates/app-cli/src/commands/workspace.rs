@@ -51,30 +51,33 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                     "rl workspace set-filing-repo requires either --repo <handle> or --none"
                 ));
             }
-            let resolved: Option<String> = if none {
+            let filing_origin: Option<String> = if none {
                 None
             } else {
-                Some(resolve_repo_handle_required(svc, &repo.unwrap()).await?)
-            };
-            // The repo-handle resolver searches bindings across ALL workspaces,
-            // so scope the result to the target workspace: a workspace filing
-            // default must be one of THAT workspace's own bindings, otherwise we
-            // would silently record a foreign binding the workspace can't file
-            // into. (`set_filing_repo` takes the workspace UUID, so the binding's
-            // workspace_id is a direct string compare.)
-            if let Some(repo_id) = &resolved {
-                let binding = svc.bindings.show(repo_id).await?;
+                let instance_id = resolve_repo_handle_required(svc, &repo.unwrap()).await?;
+                // The repo-handle resolver searches bindings across ALL
+                // workspaces, so scope the result to the target workspace: a
+                // workspace filing default must be one of THAT workspace's own
+                // bindings, otherwise we would silently record a foreign binding
+                // the workspace can't file into.
+                let binding = svc.bindings.show(&instance_id).await?;
                 if binding.workspace_id != workspace {
                     return Err(anyhow!(
-                        "repo {repo_id} belongs to workspace {} — a workspace \
+                        "repo {instance_id} belongs to workspace {} — a workspace \
                          filing default must be one of this workspace's own bindings",
                         binding.workspace_id
                     ));
                 }
-            }
+                // RFC 0005 §D4: the filing axis lives in ORIGIN id space — the
+                // promote path reads `workspace.filing_repo_id` as an origin id,
+                // and the migration backfilled existing values to origin ids.
+                // Store the shared ORIGIN id, not the per-workspace instance id
+                // the handle resolved to (that one is the *work* axis).
+                Some(binding.origin_id)
+            };
             let dto = svc
                 .workspaces
-                .set_filing_repo(&workspace, resolved.as_deref())
+                .set_filing_repo(&workspace, filing_origin.as_deref())
                 .await?;
             render::workspace(&dto);
         }

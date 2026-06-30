@@ -197,7 +197,18 @@ fn set_filing_repo_rejects_a_binding_from_another_workspace() {
         &mut bin("repo-link", &dir),
         &["workspace", "set-filing-repo", &ws_a, "--repo", &repo_a],
     );
-    assert_eq!(dto["filing_repo_id"], repo_a);
+    // RFC 0005 §D4: the filing axis lives in ORIGIN id space — the workspace
+    // default is recorded as the shared origin id, NOT the per-workspace
+    // instance id the handle resolved to. (The promote path reads
+    // `workspace.filing_repo_id` as an origin id; storing the instance id here
+    // would resolve to a nonexistent origin for any freshly-attached repo,
+    // where instance.id != origin.id.)
+    let origin_a = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_a])["origin_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(origin_a, repo_a, "instance and origin ids differ for a fresh attach");
+    assert_eq!(dto["filing_repo_id"], origin_a);
 }
 
 #[test]
@@ -3591,4 +3602,37 @@ fn repo_doctor_emits_zero_envelope_on_healthy_workspace() {
     );
     assert_eq!(repair_noop["affected"], 0);
     assert_eq!(repair_noop["repaired"], 0);
+}
+
+/// RFC 0005 §D4: `repo doctor --target <handle>` re-points the filing axis
+/// (origin id space). The handle must resolve to the repo's ORIGIN id — the
+/// doctor pre-validates the override via `get_origin` before the task loop, so
+/// passing the per-workspace INSTANCE id (which differs from the origin id for
+/// a freshly-attached repo) would reject a perfectly valid target. No dangling
+/// task is needed to trip the bug: override validation runs even on a clean ws.
+#[test]
+fn repo_doctor_target_resolves_origin_not_instance() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    // Precondition for the bug: fresh attach => instance id != origin id.
+    let origin = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo])["origin_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(origin, repo);
+
+    // Before the fix this exits non-zero (get_origin(instance_id) => NotFound);
+    // run_json asserts success, so a green run proves the origin-id resolution.
+    let summary = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "doctor", "--workspace", &workspace, "--target", &repo],
+    );
+    assert_eq!(summary["affected"], 0);
 }
