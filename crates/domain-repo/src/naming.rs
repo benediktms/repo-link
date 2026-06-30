@@ -155,6 +155,15 @@ pub fn is_valid_prefix(p: &str) -> bool {
 ///
 /// `base` must be non-empty and `input` must carry at least one suffix digit,
 /// so an exact match (`input == base`) is NOT "superseded".
+///
+/// Recognises the **un-trimmed** form (`base` + digits). When `base` is long
+/// enough that collision-breaking had to trim it to fit the 20-char cap
+/// (`save_with_unique_prefix` builds `base[..20-len(suffix)] + suffix`), the
+/// legacy value no longer starts with the full `base` and is not recognised —
+/// those rare cases (a manual prefix near 20 chars that then collided across
+/// workspaces) still resolve via the task UUID or bare hash. A prefix longer
+/// than 20 chars never existed, so the caller's `is_valid_prefix` precheck
+/// correctly rejects 21-char input rather than treating it as a legacy form.
 pub fn is_superseded_prefix(input: &str, base: &str) -> bool {
     !base.is_empty()
         && input.len() > base.len()
