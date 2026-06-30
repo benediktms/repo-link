@@ -203,11 +203,11 @@ fn set_filing_repo_rejects_a_binding_from_another_workspace() {
     // `workspace.filing_repo_id` as an origin id; storing the instance id here
     // would resolve to a nonexistent origin for any freshly-attached repo,
     // where instance.id != origin.id.)
-    let origin_a = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo_a])["origin_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(origin_a, repo_a, "instance and origin ids differ for a fresh attach");
+    let origin_a = origin_id_of(&dir, &repo_a);
+    assert_ne!(
+        origin_a, repo_a,
+        "instance and origin ids differ for a fresh attach"
+    );
     assert_eq!(dto["filing_repo_id"], origin_a);
 }
 
@@ -1349,6 +1349,17 @@ fn attach_no_link(dir: &TempDir, workspace: &str, url: &str, canonical: &str) ->
             "--no-link",
         ],
     )["binding"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Resolve a repo handle (UUID / name / alias) to its shared ORIGIN id
+/// (RFC 0005). The filing axis stores origin ids, so filing-default
+/// assertions compare against this — not the per-workspace instance id
+/// `attach_no_link` returns.
+fn origin_id_of(dir: &TempDir, handle: &str) -> String {
+    run_json(&mut bin("repo-link", dir), &["repo", "show", handle])["origin_id"]
         .as_str()
         .unwrap()
         .to_string()
@@ -3448,10 +3459,18 @@ fn workspace_set_filing_repo_attaches_by_name() {
         &mut bin("repo-link", &dir),
         &["workspace", "set-filing-repo", &ws_id, "--repo", "r"],
     );
+    // RFC 0005 §D4: the filing axis is origin-level — the recorded value is the
+    // shared ORIGIN id, not the per-workspace instance id `attach_no_link`
+    // returns (the promote path reads it back as an origin id).
     assert_eq!(
         dto["filing_repo_id"].as_str().unwrap(),
+        origin_id_of(&dir, "r"),
+        "filing_repo_id must equal the repo's origin id"
+    );
+    assert_ne!(
+        dto["filing_repo_id"].as_str().unwrap(),
         binding_id,
-        "filing_repo_id on the dto must equal the binding UUID"
+        "filing_repo_id must NOT be the instance id"
     );
 }
 
@@ -3497,8 +3516,8 @@ fn workspace_set_filing_repo_reassignment_succeeds() {
         .unwrap()
         .to_string();
 
-    let id_a = attach_no_link(&dir, &ws_id, "git@github.com:o/a.git", "github.com/o/a");
-    let id_b = attach_no_link(&dir, &ws_id, "git@github.com:o/b.git", "github.com/o/b");
+    attach_no_link(&dir, &ws_id, "git@github.com:o/a.git", "github.com/o/a");
+    attach_no_link(&dir, &ws_id, "git@github.com:o/b.git", "github.com/o/b");
 
     run_json(
         &mut bin("repo-link", &dir),
@@ -3508,14 +3527,15 @@ fn workspace_set_filing_repo_reassignment_succeeds() {
         &mut bin("repo-link", &dir),
         &["workspace", "set-filing-repo", &ws_id, "--repo", "b"],
     );
+    // RFC 0005 §D4: filing is recorded as the origin id (see above).
     assert_eq!(
         dto["filing_repo_id"].as_str().unwrap(),
-        id_b,
-        "after reassignment, dto must reflect repo B's id"
+        origin_id_of(&dir, "b"),
+        "after reassignment, dto must reflect repo B's origin id"
     );
     assert_ne!(
         dto["filing_repo_id"].as_str().unwrap(),
-        id_a,
+        origin_id_of(&dir, "a"),
         "dto must no longer show repo A after reassignment"
     );
 }
@@ -3622,17 +3642,20 @@ fn repo_doctor_target_resolves_origin_not_instance() {
         .to_string();
     let repo = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
     // Precondition for the bug: fresh attach => instance id != origin id.
-    let origin = run_json(&mut bin("repo-link", &dir), &["repo", "show", &repo])["origin_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_ne!(origin, repo);
+    assert_ne!(origin_id_of(&dir, &repo), repo);
 
     // Before the fix this exits non-zero (get_origin(instance_id) => NotFound);
     // run_json asserts success, so a green run proves the origin-id resolution.
     let summary = run_json(
         &mut bin("repo-link", &dir),
-        &["repo", "doctor", "--workspace", &workspace, "--target", &repo],
+        &[
+            "repo",
+            "doctor",
+            "--workspace",
+            &workspace,
+            "--target",
+            &repo,
+        ],
     );
     assert_eq!(summary["affected"], 0);
 }

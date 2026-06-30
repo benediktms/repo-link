@@ -1023,7 +1023,10 @@ mod tests {
             .await
             .unwrap()
             .expect("a live origin id must resolve");
-        assert_eq!(filing.id, attached.binding.origin_id, "filing id IS the origin id");
+        assert_eq!(
+            filing.id, attached.binding.origin_id,
+            "filing id IS the origin id"
+        );
         assert_eq!(filing.canonical_url, "github.com/o/r");
         assert_eq!(filing.name, attached.binding.name);
 
