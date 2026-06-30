@@ -67,40 +67,55 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
             }
             Err(e) => return Err(anyhow!("{e}")),
         },
-        RepoCmd::Rename { repo, name } => match svc.bindings.rename(&repo, name).await {
-            Ok(dto) => render::repo(&dto),
-            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                handle_ambiguous(query, candidates);
+        RepoCmd::Rename { repo, name } => {
+            // Resolve `--repo` (or cwd) to a binding id first; cross-workspace
+            // handle ambiguity is surfaced there (exit 2 with candidates). The
+            // rename then targets the shared origin behind that binding.
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
+            match svc.bindings.rename(&resolved, name).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
             }
-            Err(e) => return Err(anyhow!("{e}")),
-        },
-        RepoCmd::SetPrefix { repo, prefix } => match svc.bindings.set_prefix(&repo, prefix).await {
-            Ok(dto) => render::repo(&dto),
-            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                handle_ambiguous(query, candidates);
+        }
+        RepoCmd::SetPrefix { repo, prefix } => {
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
+            match svc.bindings.set_prefix(&resolved, prefix).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
             }
-            Err(e) => return Err(anyhow!("{e}")),
-        },
+        }
         RepoCmd::Alias(RepoAliasCmd::Add {
             repo,
             a: AliasArg { alias },
-        }) => match svc.bindings.add_alias(&repo, alias).await {
-            Ok(dto) => render::repo(&dto),
-            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                handle_ambiguous(query, candidates);
+        }) => {
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
+            match svc.bindings.add_alias(&resolved, alias).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
             }
-            Err(e) => return Err(anyhow!("{e}")),
-        },
+        }
         RepoCmd::Alias(RepoAliasCmd::Rm {
             repo,
             a: AliasArg { alias },
-        }) => match svc.bindings.remove_alias(&repo, &alias).await {
-            Ok(dto) => render::repo(&dto),
-            Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
-                handle_ambiguous(query, candidates);
+        }) => {
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
+            match svc.bindings.remove_alias(&resolved, &alias).await {
+                Ok(dto) => render::repo(&dto),
+                Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
+                    handle_ambiguous(query, candidates);
+                }
+                Err(e) => return Err(anyhow!("{e}")),
             }
-            Err(e) => return Err(anyhow!("{e}")),
-        },
+        }
         RepoCmd::Find { query } => render::find(&svc.bindings.find(&query).await?),
         RepoCmd::Doctor {
             ws: WorkspaceArg { workspace },
@@ -316,11 +331,15 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
                 Ok(Some(c)) => c,
             };
 
-            // Route through the same resolver as `rl repo show`: a prefix /
-            // name / alias works wherever a UUID does. Ambiguous handles exit
-            // 2 with the candidate JSON rather than collapsing into a generic
-            // error from the `?`.
-            let binding = match svc.bindings.show(&repo).await {
+            // Route through the shared resolver: an explicit `--repo` (prefix /
+            // name / alias / UUID) resolves wherever `rl repo show` does, while
+            // an omitted `--repo` derives the bound checkout from cwd. Ambiguous
+            // handles exit 2 with the candidate JSON rather than collapsing into
+            // a generic error from the `?`. The error messages below keep using
+            // the user-facing `--repo` token, so capture whether one was given.
+            let repo_short = repo.clone().unwrap_or_else(|| "<cwd>".to_string());
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
+            let binding = match svc.bindings.show(&resolved).await {
                 Ok(b) => b,
                 Err(application_workspace::ServiceError::AmbiguousHandle { query, candidates }) => {
                     handle_ambiguous(query, candidates)
@@ -336,7 +355,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
                     .bindings
                     .memberships_for_canonical_url(&discovered, false)
                     .await?;
-                let repo_short = &repo;
+                let repo_short = &repo_short;
                 match memberships.as_slice() {
                     [] => anyhow::bail!(
                         "path origin '{discovered}' doesn't match repo {repo_short} \
@@ -377,7 +396,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
             render::repo(&dto);
         }
         WorktreeCmd::Unlink { repo, path } => {
-            let resolved = resolve_repo_handle_required(svc, &repo).await?;
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
             // Mirror link's canonicalisation so identical --path input
             // round-trips. When the leaf is gone we still try to resolve
             // any symlinked prefix so e.g. macOS `/var/...` matches the
@@ -393,7 +412,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
             render::repo(&dto);
         }
         WorktreeCmd::PruneMissing { repo } => {
-            let resolved = resolve_repo_handle_required(svc, &repo).await?;
+            let resolved = resolve_repo_or_cwd(svc, repo).await?;
             let dto = svc.bindings.prune_missing(&resolved).await?;
             render::repo(&dto);
         }
@@ -438,6 +457,63 @@ pub(crate) async fn resolve_repo_handle_required(svc: &Services, handle: &str) -
             handle_ambiguous(query, candidates)
         }
         Err(e) => Err(anyhow!("{e}")),
+    }
+}
+
+/// Resolve a `--repo` argument to a binding (per-workspace instance) id:
+/// pass an explicit handle through [`resolve_repo_handle_required`], or — when
+/// omitted — derive it from the current directory's repo (cwd git origin →
+/// canonical URL → the single binding that has it attached). Mirrors
+/// [`resolve_workspace`] but returns the binding id, not the workspace id, so
+/// repo-addressing commands (`repo rename`, `worktree link`, …) and
+/// `task create --repo` can default to the cwd checkout. Errors (asking for
+/// `--repo`) when cwd isn't a bound checkout or its repo spans more than one
+/// workspace.
+pub(crate) async fn resolve_repo_or_cwd(svc: &Services, repo: Option<String>) -> Result<String> {
+    if let Some(handle) = repo {
+        return resolve_repo_handle_required(svc, &handle).await;
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
+    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let canonical = match discover_canonical(&abs) {
+        Ok(Some(c)) => c,
+        Ok(None) | Err(GitError::NotARepo(_)) => {
+            return Err(anyhow!(
+                "no --repo given and {} is not a git repo with an origin; pass --repo",
+                abs.display()
+            ));
+        }
+        Err(e) => return Err(anyhow!("{e}")),
+    };
+    let memberships = svc
+        .bindings
+        .memberships_for_canonical_url(&canonical, false)
+        .await?;
+    pick_repo(&canonical, memberships)
+}
+
+/// Pure resolution step for [`resolve_repo_or_cwd`]: exactly one membership
+/// resolves to its binding id; zero or many error with guidance to pass
+/// `--repo`. Split out so the 0/1/many policy is unit-testable without a git
+/// checkout, mirroring [`pick_workspace`].
+fn pick_repo(canonical: &str, memberships: Vec<RepoMembershipDto>) -> Result<String> {
+    match memberships.as_slice() {
+        [] => Err(anyhow!(
+            "no repo bound for '{canonical}'; pass --repo (or attach it with `rl repo attach`)"
+        )),
+        [m] => Ok(m.binding.id.clone()),
+        many => {
+            let names = many
+                .iter()
+                .map(|m| format!("{} (workspace: {})", m.binding.id, m.workspace.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow!(
+                "repo '{canonical}' is in {} workspaces; pass --repo to disambiguate: {names}",
+                many.len()
+            ))
+        }
     }
 }
 
