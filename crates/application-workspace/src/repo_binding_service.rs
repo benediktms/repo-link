@@ -212,38 +212,35 @@ impl RepoBindingService {
 
     /// Resolve `query` to a binding view by trying, in order: exact `prefix`
     /// match (globally-unique to one origin); then exact `name` or `alias`
-    /// match. Prefix takes priority because it pins a single origin.
+    /// match. Prefix takes priority because it pins a single origin — but a
+    /// prefix whose origin has no live instance falls through to name/alias
+    /// (the prefix string may also be another repo's name/alias).
     ///
-    /// This resolver backs write commands (`--repo` on `task create`,
-    /// `set-filing-repo`, etc.), so a repo whose workspace is archived must
-    /// still be addressable by handle: archiving hides a workspace from
-    /// listings but does NOT lock it. Archived bindings are therefore searched
-    /// only as a **fallback** — active matches win outright.
+    /// Backs write commands (`--repo` on `task create`, `set-filing-repo`, …),
+    /// so a repo whose workspace is archived stays addressable: archiving hides
+    /// a workspace but does NOT lock it. Archived bindings are a **fallback** —
+    /// active matches win outright.
     ///
-    /// Because every handle is ORIGIN-global post-RFC-0005, a repo attached to
-    /// more than one workspace is ambiguous for ALL handle forms (prefix
-    /// included): resolution returns `AmbiguousHandle` with one candidate per
-    /// workspace rather than silently picking one. Disambiguate with an
-    /// instance UUID. This applies uniformly, including to origin-mutating verbs
-    /// (`rename` / `set-prefix` / `alias`) — they take the same `query` path, so
-    /// a multi-workspace repo needs a UUID there too.
+    /// Handles are ORIGIN-global post-RFC-0005, so a repo attached to several
+    /// ACTIVE workspaces is ambiguous for every handle form (prefix included):
+    /// resolution returns `AmbiguousHandle` (one candidate per workspace) rather
+    /// than picking one arbitrarily. Disambiguate with an instance UUID — this
+    /// includes the origin-mutating verbs (`rename` / `set-prefix` / `alias`),
+    /// which route through the same path. An active+archived split still
+    /// resolves to the lone active instance, per the archive-fallback rule.
+    /// (Pre-split, distinct per-workspace prefixes `rpl`/`rpl1` made this
+    /// unambiguous; the shared prefix is what introduced the ambiguity.)
     async fn resolve_by_handle(&self, query: &str) -> Result<RepoBindingView> {
-        // Prefix is globally unique to ONE origin, so it takes priority: a
-        // prefix hit resolves among that origin's instances only (never blended
-        // with a same-named different repo). Names/aliases can clash across
-        // origins, so they are the fallback.
-        //
-        // RFC 0005 (rpl-fqj): prefix/name/alias are ORIGIN-global now, so a repo
-        // attached to N workspaces sits behind one handle with N instances. Both
-        // stages therefore funnel through the SAME bucketing + ambiguity check —
-        // a multi-workspace handle yields `AmbiguousHandle` (one candidate per
-        // workspace), never an arbitrary pick. (Pre-split, distinct per-workspace
-        // prefixes `rpl`/`rpl1` made this unambiguous; the shared prefix is what
-        // introduced the cross-workspace ambiguity.)
         if let Some(origin) = self.bindings.find_origin_by_prefix(query).await? {
-            return self
+            match self
                 .resolve_matching(query, |v| v.origin.id == origin.id)
-                .await;
+                .await
+            {
+                // Prefix origin exists but has no live instance — fall through
+                // so a name/alias collision on the same string still resolves.
+                Err(ServiceError::BindingNotFound(_)) => {}
+                resolved => return resolved, // Ok or AmbiguousHandle
+            }
         }
         self.resolve_matching(query, |v| {
             v.origin.name == query || v.origin.aliases.iter().any(|a| a == query)
@@ -1250,8 +1247,8 @@ mod tests {
 
     #[tokio::test]
     async fn prefix_handle_for_multi_workspace_repo_is_ambiguous() {
-        // RFC 0005 (rpl-fqj): a prefix is ORIGIN-global, so the SAME repo
-        // attached to two workspaces sits behind one prefix with two instances.
+        // RFC 0005 (#202): a prefix is ORIGIN-global, so the SAME repo attached
+        // to two workspaces sits behind one prefix with two instances.
         // Resolution must surface AmbiguousHandle (one candidate per workspace)
         // rather than silently returning an arbitrary workspace's instance — the
         // old prefix short-circuit picked the first non-deleted workspace.
@@ -1280,6 +1277,25 @@ mod tests {
         let a = seeded(&ws_svc, &bsvc, "ws", "github.com/o/solo").await;
         let hit = bsvc.show(&a.prefix).await.unwrap();
         assert_eq!(hit.id, a.id);
+    }
+
+    #[tokio::test]
+    async fn set_prefix_on_multi_workspace_repo_is_ambiguous() {
+        // The rustdoc promises origin-mutating verbs require a UUID for a
+        // multi-workspace repo (they share resolve_by_handle). Lock it: a shared
+        // prefix passed to set_prefix must surface AmbiguousHandle, never mutate
+        // the shared origin via an arbitrarily-picked instance.
+        let (ws_svc, bsvc) = setup();
+        let a = seeded(&ws_svc, &bsvc, "ws-a", "github.com/o/shared").await;
+        seeded(&ws_svc, &bsvc, "ws-b", "github.com/o/shared").await;
+        let err = bsvc
+            .set_prefix(&a.prefix, "newpfx".into())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ServiceError::AmbiguousHandle { .. }),
+            "set_prefix by a shared prefix must be ambiguous, got {err:?}"
+        );
     }
 
     #[tokio::test]
