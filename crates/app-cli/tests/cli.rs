@@ -3715,6 +3715,67 @@ fn workspace_arg_derives_from_cwd_when_single_workspace() {
     assert_eq!(out["workspace_name"], "target");
 }
 
+/// `workspace set-filing-repo` takes its target workspace positionally, but it
+/// is optional: when omitted it derives from the cwd checkout's repo binding,
+/// same as `--workspace` elsewhere. Attach a checkout to the TARGET workspace,
+/// then set THAT repo as its own filing default from inside the checkout with
+/// no workspace given — and assert the TARGET (not the decoy) was affected.
+#[test]
+fn set_filing_repo_derives_workspace_from_cwd() {
+    let dir = TempDir::new().unwrap();
+    // Decoy first: if derivation wrongly fell back to "the only / first
+    // workspace" it would pick this one.
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "decoy", "--local-only"],
+    );
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "target", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:o/r.git");
+    let checkout_path = checkout.path().display().to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--path",
+            &checkout_path,
+        ],
+    );
+
+    // No positional workspace: derive it from the cwd checkout. Set the
+    // checkout's own repo ("r") as the workspace filing default.
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(checkout.path());
+    let dto = run_json(&mut cmd, &["workspace", "set-filing-repo", "--repo", "r"]);
+
+    assert_eq!(
+        dto["id"].as_str(),
+        Some(workspace.as_str()),
+        "cwd derivation must affect the checkout's workspace, not a fallback: {dto}"
+    );
+    assert_eq!(dto["name"], "target");
+    // RFC 0005 §D4: the recorded filing axis is the repo's ORIGIN id.
+    assert_eq!(
+        dto["filing_repo_id"].as_str().unwrap(),
+        origin_id_of(&dir, "r"),
+        "filing_repo_id must equal the repo's origin id"
+    );
+}
+
 /// When the cwd repo is attached to more than one workspace, derivation is
 /// ambiguous and the command errors asking for `--workspace` rather than
 /// picking one.

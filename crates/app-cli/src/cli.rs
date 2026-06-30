@@ -144,8 +144,12 @@ pub(crate) enum WorkspaceCmd {
     /// Attach a workspace to a project (or detach with `--none`). Resolves
     /// `<project>` as a node ID or `owner/number`, same as
     /// `rl project show`.
+    ///
+    /// `<workspace>` is optional: when omitted, it is derived from the current
+    /// directory's repo (its git origin → the workspace that has that repo
+    /// attached), same as `--workspace` elsewhere.
     SetProject {
-        workspace: String,
+        workspace: Option<String>,
         /// Project to attach the workspace to (`PVT_…` or `owner/number`).
         /// Mutually exclusive with `--none`.
         #[arg(long, conflicts_with = "none")]
@@ -165,8 +169,12 @@ pub(crate) enum WorkspaceCmd {
     /// name, or alias. Ambiguous matches exit 2 with a candidate list.
     /// Reassigning an already-set default is permitted (forward-looking;
     /// per-task `filing_repo_id` values are never retargeted).
+    ///
+    /// `<workspace>` is optional: when omitted, it is derived from the current
+    /// directory's repo (its git origin → the workspace that has that repo
+    /// attached), same as `--workspace` elsewhere.
     SetFilingRepo {
-        workspace: String,
+        workspace: Option<String>,
         /// Repo binding handle (UUID / prefix / name / alias).
         /// Mutually exclusive with `--none`.
         #[arg(long, conflicts_with = "none")]
