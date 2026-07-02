@@ -41,22 +41,6 @@ pub struct WriteOutcome {
     pub bytes_written: usize,
 }
 
-/// One row of "this checkout belongs to workspace X under binding Y".
-/// A repo can be bound to multiple workspaces; the renderer emits one
-/// entry per membership.
-#[derive(Debug, Clone, Serialize)]
-pub struct DocRepoMembership {
-    pub workspace_id: String,
-    pub workspace_name: String,
-    pub binding_name: String,
-    pub aliases: Vec<String>,
-    /// Globally-unique short prefix for this binding (`rpl`, `bgt`, …).
-    /// Visible so agents reading the footer can use the prefix as a
-    /// repo locator (`--repo rpl`) or as the prefix half of friendly
-    /// task IDs (`rpl-ev6`) without first running `repo show`.
-    pub prefix: String,
-}
-
 /// Assemble the inner body of the fenced block: the curated intro
 /// followed by the per-repo info section. Markers are added by
 /// [`write_agents_md`].
@@ -71,20 +55,28 @@ pub fn render_block(repo_info: &str) -> String {
     out
 }
 
-/// Render the "## This repo" section. When `memberships` is empty, emit
-/// an `unbound` notice that points the agent at `rl repo attach`.
-/// Otherwise emit a single fenced JSON array with one entry per
-/// membership.
-pub fn render_repo_info(memberships: &[DocRepoMembership], canonical_url: Option<&str>) -> String {
+/// Render the "## This repo" section. When `bound` is `false`, emit an
+/// `unbound` notice that points the agent at `rl repo attach`. Otherwise
+/// emit a static pointer at `rl here` — the workspace/binding/roster data
+/// itself is live-queried, not embedded here, so it can't go stale between
+/// `rl agents docs` runs.
+pub fn render_repo_info(bound: bool, canonical_url: Option<&str>) -> String {
     let mut out = String::from("## This repo\n\n");
-    if memberships.is_empty() {
+    if !bound {
         let canonical = canonical_url.unwrap_or("<not a git repo, or no `origin` remote>");
         out.push_str(&format!(
             "```\nstatus: unbound\ncanonical_url: {canonical}\nhint: run `rl repo attach --workspace <id> --url <git-remote> --canonical <canonical-url>` to bind this checkout to a workspace.\n```\n"
         ));
     } else {
-        let json = serde_json::to_string_pretty(memberships).unwrap_or_else(|_| "[]".to_string());
-        out.push_str(&format!("```json\n{json}\n```\n"));
+        out.push_str(
+            "This checkout is bound to an `rl` workspace. Don't look for workspace IDs or a \
+             repo roster in this file — run `rl here` at the start of every session, and any \
+             time you need to recover context mid-session.\n\n\
+             `rl here` returns this checkout's repo binding (instance id, origin id, name, \
+             prefix, aliases), every workspace it belongs to (use each workspace's `id` as \
+             `--workspace <id>`), each workspace's attached project and default filing repo, \
+             and the roster of sibling repos in that workspace (name, prefix, worktree paths).\n",
+        );
     }
     out
 }
@@ -205,7 +197,7 @@ mod tests {
 
     #[test]
     fn render_repo_info_unbound_with_canonical() {
-        let out = render_repo_info(&[], Some("github.com/foo/bar"));
+        let out = render_repo_info(false, Some("github.com/foo/bar"));
         assert!(out.starts_with("## This repo\n\n```\n"));
         assert!(out.contains("status: unbound"));
         assert!(out.contains("canonical_url: github.com/foo/bar"));
@@ -215,58 +207,24 @@ mod tests {
 
     #[test]
     fn render_repo_info_unbound_without_canonical() {
-        let out = render_repo_info(&[], None);
+        let out = render_repo_info(false, None);
         assert!(out.contains("status: unbound"));
         assert!(out.contains("not a git repo"));
     }
 
     #[test]
-    fn render_repo_info_single_membership() {
-        let memberships = vec![DocRepoMembership {
-            workspace_id: "ws-1".to_string(),
-            workspace_name: "repo-link-dev".to_string(),
-            binding_name: "repo-link".to_string(),
-            aliases: vec!["rl".to_string()],
-            prefix: "tst".to_string(),
-        }];
-        let out = render_repo_info(&memberships, Some("github.com/foo/bar"));
-        assert!(out.starts_with("## This repo\n\n```json\n"));
-        assert!(out.contains("\"workspace_id\": \"ws-1\""));
-        assert!(out.contains("\"workspace_name\": \"repo-link-dev\""));
-        assert!(out.contains("\"binding_name\": \"repo-link\""));
-        assert!(out.contains("\"rl\""));
+    fn render_repo_info_bound_points_at_rl_here() {
+        let out = render_repo_info(true, Some("github.com/foo/bar"));
+        assert!(out.starts_with("## This repo\n\n"));
+        assert!(out.contains("rl here"));
+        assert!(!out.contains("workspace_id"));
+        assert!(!out.contains("```json"));
         assert!(!out.contains("status: unbound"));
     }
 
     #[test]
-    fn render_repo_info_multiple_memberships() {
-        let memberships = vec![
-            DocRepoMembership {
-                workspace_id: "ws-1".to_string(),
-                workspace_name: "alpha".to_string(),
-                binding_name: "shared-repo".to_string(),
-                aliases: vec![],
-                prefix: "tst".to_string(),
-            },
-            DocRepoMembership {
-                workspace_id: "ws-2".to_string(),
-                workspace_name: "beta".to_string(),
-                binding_name: "shared-repo".to_string(),
-                aliases: vec!["sr".to_string()],
-                prefix: "tst".to_string(),
-            },
-        ];
-        let out = render_repo_info(&memberships, None);
-        assert!(out.contains("\"workspace_name\": \"alpha\""));
-        assert!(out.contains("\"workspace_name\": \"beta\""));
-        let alpha_idx = out.find("\"alpha\"").unwrap();
-        let beta_idx = out.find("\"beta\"").unwrap();
-        assert!(alpha_idx < beta_idx);
-    }
-
-    #[test]
     fn render_block_includes_intro_and_repo_section() {
-        let repo = render_repo_info(&[], None);
+        let repo = render_repo_info(false, None);
         let block = render_block(&repo);
         assert!(block.contains("`rl` (repo-link) is a local-first workspace"));
         assert!(block.contains("### Finding work"));

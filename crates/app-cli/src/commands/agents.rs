@@ -23,24 +23,16 @@ pub(crate) async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()
                 Ok(Some(c)) => Some(c),
             };
 
-            let memberships = match canonical_url.as_deref() {
-                Some(c) => svc
+            let bound = match canonical_url.as_deref() {
+                Some(c) => !svc
                     .bindings
                     .memberships_for_canonical_url(c, false)
                     .await?
-                    .into_iter()
-                    .map(|m| docs::DocRepoMembership {
-                        workspace_id: m.workspace.id,
-                        workspace_name: m.workspace.name,
-                        binding_name: m.binding.name,
-                        aliases: m.binding.aliases,
-                        prefix: m.binding.prefix,
-                    })
-                    .collect(),
-                None => Vec::new(),
+                    .is_empty(),
+                None => false,
             };
 
-            let repo_info = docs::render_repo_info(&memberships, canonical_url.as_deref());
+            let repo_info = docs::render_repo_info(bound, canonical_url.as_deref());
             let body = docs::render_block(&repo_info);
             let path = abs.join("AGENTS.md");
             let outcome = docs::write_agents_md(&path, &body)?;

@@ -9,6 +9,7 @@ use infra_config::RepoLinkConfig;
 use crate::cli::{Cli, Cmd};
 use crate::commands::agents::agents_dispatch;
 use crate::commands::gh::gh_dispatch;
+use crate::commands::here::here_dispatch;
 use crate::commands::project::project_dispatch;
 use crate::commands::query::query_dispatch;
 use crate::commands::repo::repo_dispatch;
@@ -46,5 +47,6 @@ pub(crate) async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> 
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
         Cmd::Project(c) => project_dispatch(c, svc, cfg).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
+        Cmd::Here => here_dispatch(svc).await,
     }
 }

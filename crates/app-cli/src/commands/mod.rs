@@ -4,6 +4,7 @@
 
 pub(crate) mod agents;
 pub(crate) mod gh;
+pub(crate) mod here;
 pub(crate) mod project;
 pub(crate) mod query;
 pub(crate) mod repo;

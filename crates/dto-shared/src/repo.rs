@@ -103,6 +103,9 @@ pub struct FilingRepoRefDto {
     pub id: String,
     pub name: String,
     pub canonical_url: String,
+    /// The origin's short handle. Origin-intrinsic, like `name` /
+    /// `canonical_url` above.
+    pub prefix: String,
 }
 
 /// Full result of a `repo locate` lookup. `canonical_url` is `None` when
@@ -113,6 +116,58 @@ pub struct LocateResponseDto {
     pub query_path: String,
     pub canonical_url: Option<String>,
     pub matches: Vec<RepoMembershipDto>,
+}
+
+/// Slim per-repo projection used by `rl here`'s `repo` and `roster` fields.
+/// Deliberately not the full [`RepoBindingDto`] — drops timestamps,
+/// `remote_url`, and per-worktree branch/status metadata; `worktrees` is
+/// just the recorded paths.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HereRepoSummaryDto {
+    pub id: String,
+    pub origin_id: String,
+    pub name: String,
+    pub prefix: String,
+    pub aliases: Vec<String>,
+    pub canonical_url: String,
+    pub worktrees: Vec<String>,
+}
+
+impl From<&RepoBindingDto> for HereRepoSummaryDto {
+    fn from(b: &RepoBindingDto) -> Self {
+        Self {
+            id: b.id.clone(),
+            origin_id: b.origin_id.clone(),
+            name: b.name.clone(),
+            prefix: b.prefix.clone(),
+            aliases: b.aliases.clone(),
+            canonical_url: b.canonical_url.clone(),
+            worktrees: b.worktrees.iter().map(|w| w.path.clone()).collect(),
+        }
+    }
+}
+
+/// One workspace's slice of `rl here`'s result: the binding for the queried
+/// canonical URL, the resolved filing repo (`None` when unset or dangling),
+/// and the sibling roster (every other binding in the same workspace).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HereMatchDto {
+    pub workspace: WorkspaceDto,
+    pub repo: HereRepoSummaryDto,
+    pub filing_repo: Option<FilingRepoRefDto>,
+    pub roster: Vec<HereRepoSummaryDto>,
+}
+
+/// Full result of `rl here`: the cwd's full working context in one shot.
+/// `canonical_url` is `None` when the cwd isn't a git repo with an origin
+/// remote; `matches` is empty when no binding references the discovered
+/// remote. Archived workspaces are always excluded (no opt-in, unlike
+/// `rl repo locate -a`) — this is a session-start command, not a search.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HereResponseDto {
+    pub query_path: String,
+    pub canonical_url: Option<String>,
+    pub matches: Vec<HereMatchDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

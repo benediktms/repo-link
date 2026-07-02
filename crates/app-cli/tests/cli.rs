@@ -1647,6 +1647,224 @@ fn repo_locate_returns_empty_matches_for_unbound_repo() {
     assert!(located["matches"].as_array().unwrap().is_empty());
 }
 
+// ---------- rl here --------------------------------------------------------
+
+#[test]
+fn here_outside_git_repo_returns_null_canonical_and_empty_matches() {
+    let dir = TempDir::new().unwrap();
+    let scratch = TempDir::new().unwrap();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(scratch.path());
+    let here = run_json(&mut cmd, &["here"]);
+
+    assert!(here["canonical_url"].is_null());
+    assert!(here["matches"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn here_unbound_git_repo_returns_canonical_and_empty_matches() {
+    let dir = TempDir::new().unwrap();
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/unbound-here.git");
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(repo_dir.path());
+    let here = run_json(&mut cmd, &["here"]);
+
+    assert_eq!(here["canonical_url"], "github.com/o/unbound-here");
+    assert!(here["matches"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn here_bound_repo_reports_binding_filing_repo_and_roster() {
+    let dir = TempDir::new().unwrap();
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-here", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/here-a.git");
+    // Canonicalize up front so the expected worktree path matches what the
+    // service stores (macOS reports tempdirs as `/var/...`, but attach
+    // canonicalizes to `/private/var/...` before saving).
+    let canonical_path =
+        std::fs::canonicalize(repo_dir.path()).unwrap_or_else(|_| repo_dir.path().to_path_buf());
+    let path = canonical_path.display().to_string();
+
+    let attach_a = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &ws_id,
+            "--url",
+            "git@github.com:o/here-a.git",
+            "--canonical",
+            "github.com/o/here-a",
+            "--path",
+            &path,
+        ],
+    );
+    let a_instance_id = attach_a["binding"]["id"].as_str().unwrap().to_string();
+    let a_origin_id = attach_a["binding"]["origin_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let b_instance_id = attach_no_link(
+        &dir,
+        &ws_id,
+        "git@github.com:o/here-b.git",
+        "github.com/o/here-b",
+    );
+    let b = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "show", &b_instance_id],
+    );
+    let b_origin_id = b["origin_id"].as_str().unwrap().to_string();
+    let b_prefix = b["prefix"].as_str().unwrap().to_string();
+
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "set-filing-repo",
+            &ws_id,
+            "--repo",
+            &b_instance_id,
+        ],
+    );
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(repo_dir.path());
+    let here = run_json(&mut cmd, &["here"]);
+
+    assert_eq!(here["canonical_url"], "github.com/o/here-a");
+    let matches = here["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    let m = &matches[0];
+    assert_eq!(m["workspace"]["id"], ws_id);
+    assert_eq!(m["repo"]["id"], a_instance_id);
+    assert_eq!(m["repo"]["origin_id"], a_origin_id);
+    let worktrees = m["repo"]["worktrees"].as_array().unwrap();
+    assert!(
+        worktrees.iter().any(|w| w.as_str() == Some(path.as_str())),
+        "expected worktree path {path} in {worktrees:?}"
+    );
+
+    // filing_repo must resolve to B's ORIGIN id — never the per-workspace
+    // instance id `attach_no_link` returned.
+    assert_eq!(m["filing_repo"]["id"], b_origin_id);
+    assert_ne!(m["filing_repo"]["id"], b_instance_id);
+    assert_eq!(m["filing_repo"]["name"], "here-b");
+    assert_eq!(m["filing_repo"]["prefix"], b_prefix);
+
+    let roster = m["roster"].as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["id"], b_instance_id);
+}
+
+#[test]
+fn here_excludes_archived_workspace() {
+    let dir = TempDir::new().unwrap();
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws-archived-here", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/here-archived.git");
+
+    attach_no_link(
+        &dir,
+        &ws_id,
+        "git@github.com:o/here-archived.git",
+        "github.com/o/here-archived",
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "archive", &ws_id],
+    );
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(repo_dir.path());
+    let here = run_json(&mut cmd, &["here"]);
+    assert_eq!(here["canonical_url"], "github.com/o/here-archived");
+    assert!(here["matches"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn here_reports_one_match_per_workspace_with_own_roster() {
+    let dir = TempDir::new().unwrap();
+    let ws1 = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws1-here", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ws2 = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "ws2-here", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/shared-here.git");
+
+    attach_no_link(
+        &dir,
+        &ws1,
+        "git@github.com:o/shared-here.git",
+        "github.com/o/shared-here",
+    );
+    attach_no_link(
+        &dir,
+        &ws2,
+        "git@github.com:o/shared-here.git",
+        "github.com/o/shared-here",
+    );
+    // Give ws2 a sibling repo so its roster diverges from ws1's (empty).
+    attach_no_link(
+        &dir,
+        &ws2,
+        "git@github.com:o/sibling-here.git",
+        "github.com/o/sibling-here",
+    );
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(repo_dir.path());
+    let here = run_json(&mut cmd, &["here"]);
+
+    let matches = here["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+
+    let ws1_match = matches
+        .iter()
+        .find(|m| m["workspace"]["id"] == ws1)
+        .expect("ws1 match");
+    assert!(ws1_match["roster"].as_array().unwrap().is_empty());
+
+    let ws2_match = matches
+        .iter()
+        .find(|m| m["workspace"]["id"] == ws2)
+        .expect("ws2 match");
+    let roster = ws2_match["roster"].as_array().unwrap();
+    assert_eq!(roster.len(), 1);
+    assert_eq!(roster[0]["name"], "sibling-here");
+}
+
 // ---------- agents docs ---------------------------------------------------
 
 #[test]

@@ -28,17 +28,17 @@ Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the author
 
 ## Working with `rl` as an agent
 
-**Before doing anything else in a session** — before reading the issue tracker, running `gh issue list`, scanning open PRs, or guessing from git history — run `rl query ready --workspace <id>` (or `rl query mine --workspace <id>`). The first entry is the next task. `rl` accounts for transitive blockers and local-only tasks the issue tracker cannot see, so it is **strictly more informative** than the GitHub view. This is a rule, not a suggestion. (Get `<id>` from the "This repo" block below; the detailed reference is under "Finding work".)
+**Before doing anything else in a session** — before reading the issue tracker, running `gh issue list`, scanning open PRs, or guessing from git history — run `rl query ready --workspace <id>` (or `rl query mine --workspace <id>`). The first entry is the next task. `rl` accounts for transitive blockers and local-only tasks the issue tracker cannot see, so it is **strictly more informative** than the GitHub view. This is a rule, not a suggestion. (Get `<id>` from `rl here`; the detailed reference is under "Finding work".)
 
-The "This repo" block below names the workspace(s) this checkout belongs to. Use the `workspace_id` from there as `--workspace <id>` in every command. If the block says `status: unbound`, follow its hint to attach the repo before doing anything else.
+Run `rl here` first. It resolves this checkout's git origin against every `rl` workspace and returns one match per membership; use each match's `workspace.id` as `--workspace <id>` in every command below. An empty `matches` array means this checkout is unbound — see the "This repo" section below for the attach hint.
 
 If you only know your `cwd` and need to recover workspace context mid-session, run:
 
 ```bash
-rl repo locate --path .
+rl here
 ```
 
-It returns every workspace this checkout is bound to (a repo can live in more than one).
+It returns every workspace this checkout is bound to (a repo can live in more than one), each workspace's attached project and filing repo, and the roster of sibling repos.
 
 Most hot flags have single-letter short forms (e.g. `-w` for `--workspace`). The examples below use the long forms for clarity; run `rl <subcommand> --help` to see the shorts for any specific command.
 
@@ -105,8 +105,8 @@ When a session is wrapping up, never leave local work unpushed. The flow is:
 
 ```bash
 rl query unsynced --workspace <id>           # see what's pending
-rl sync promote   <task-id>                  # Draft/Staged → create remote issue
-rl sync push      <task-id>                  # DirtyLocal → push local edits to remote
+rl sync promote   --task <task-id>           # Draft/Staged → create remote issue
+rl sync push      --task <task-id>           # DirtyLocal → push local edits to remote
 rl task complete  <task-id>                  # mark done locally (then push if needed)
 ```
 

@@ -92,6 +92,15 @@ pub(crate) enum Cmd {
     /// Manage the background reconciliation daemon (launchd / systemd unit).
     #[command(subcommand)]
     Daemon(daemon::DaemonCmd),
+    /// Resolve the current directory's full working context in one shot.
+    ///
+    /// Run this at the start of every session (and any time you need to
+    /// recover context mid-session) instead of grepping AGENTS.md or
+    /// guessing workspace ids. No arguments — always evaluates the cwd's
+    /// git origin, and archived workspaces are always excluded. Returns
+    /// every workspace membership for this checkout, each with its repo
+    /// binding, project + filing repo, and the sibling repo roster.
+    Here,
 }
 
 #[derive(Subcommand, Debug)]

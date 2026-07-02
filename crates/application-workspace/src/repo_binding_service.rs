@@ -196,6 +196,7 @@ impl RepoBindingService {
                 id: origin.id.to_string(),
                 name: origin.name,
                 canonical_url: origin.canonical_url,
+                prefix: origin.prefix,
             })),
             Err(PortError::NotFound(_)) => Ok(None),
             Err(e) => Err(ServiceError::Port(e)),
@@ -1041,6 +1042,7 @@ mod tests {
         );
         assert_eq!(filing.canonical_url, "github.com/o/r");
         assert_eq!(filing.name, attached.binding.name);
+        assert_eq!(filing.prefix, attached.binding.prefix);
 
         // The per-workspace instance id must NOT resolve as a filing origin —
         // it lives in a different id space (this is the old `show`-based bug).
