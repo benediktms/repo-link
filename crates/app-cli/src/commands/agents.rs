@@ -1,9 +1,9 @@
 //! `rl agents` dispatch — drives the [`crate::docs`] AGENTS.md writer.
 
 use anyhow::{Result, anyhow};
-use infra_git::discover_canonical;
 
 use crate::cli::AgentsCmd;
+use crate::commands::discover_canonical_or_none;
 use crate::docs;
 use crate::services::Services;
 
@@ -14,14 +14,7 @@ pub(crate) async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()
                 .map_err(|e| anyhow!("failed to read current directory: {e}"))?;
             let abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
 
-            // Only "not a git repo" / "no origin" maps to None — other
-            // errors (missing git, permission denied, etc.) surface as
-            // hard failures so the agent sees the real cause.
-            let canonical_url = match discover_canonical(&abs) {
-                Err(infra_git::GitError::NotARepo(_)) | Ok(None) => None,
-                Err(e) => return Err(anyhow!("{e}")),
-                Ok(Some(c)) => Some(c),
-            };
+            let canonical_url = discover_canonical_or_none(&abs)?;
 
             let bound = match canonical_url.as_deref() {
                 Some(c) => !svc

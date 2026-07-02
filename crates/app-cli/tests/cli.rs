@@ -1855,6 +1855,8 @@ fn here_reports_one_match_per_workspace_with_own_roster() {
         .find(|m| m["workspace"]["id"] == ws1)
         .expect("ws1 match");
     assert!(ws1_match["roster"].as_array().unwrap().is_empty());
+    // Neither workspace has a filing default — must render null, not error.
+    assert!(ws1_match["filing_repo"].is_null());
 
     let ws2_match = matches
         .iter()

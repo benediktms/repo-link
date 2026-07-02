@@ -5,8 +5,8 @@
 use anyhow::{Result, anyhow};
 use domain_core::RepoOriginId;
 use dto_shared::{HereMatchDto, HereRepoSummaryDto, HereResponseDto};
-use infra_git::{GitError, discover_canonical};
 
+use super::discover_canonical_or_none;
 use crate::render;
 use crate::services::Services;
 
@@ -16,14 +16,7 @@ pub(crate) async fn here_dispatch(svc: &Services) -> Result<()> {
     let abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
     let query_path = abs.display().to_string();
 
-    // Only "not a git repo" (or "git repo with no origin") maps to null —
-    // legitimate no-matches. Any other error (git binary missing, I/O
-    // failure, permission denied) propagates so it isn't mistaken for one.
-    let canonical_url = match discover_canonical(&abs) {
-        Err(GitError::NotARepo(_)) | Ok(None) => None,
-        Err(e) => return Err(anyhow!("{e}")),
-        Ok(Some(c)) => Some(c),
-    };
+    let canonical_url = discover_canonical_or_none(&abs)?;
 
     let mut matches = Vec::new();
     if let Some(canonical) = canonical_url.as_deref() {

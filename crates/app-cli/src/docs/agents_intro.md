@@ -118,7 +118,7 @@ When opening a pull request, the PR title, body, commit messages, and branch nam
 
 Do **not** paste an `rl` task UUID, the task's short prefix / friendly ID (`rpl-ev6`), a `task-id` of any form, a workspace UUID, or any other local-only identifier into a PR description, commit message, or branch name. Those identifiers are invisible to anyone reading the PR on GitHub and rot the moment the local DB is reset or the workspace is recreated.
 
-If a local-only task needs to be referenced from a PR, the correct flow is: `rl sync promote <task-id>` first (which creates the remote GitHub issue), then reference *that* issue (`#NNN`) in the PR. Never the reverse.
+If a local-only task needs to be referenced from a PR, the correct flow is: `rl sync promote --task <task-id>` first (which creates the remote GitHub issue), then reference *that* issue (`#NNN`) in the PR. Never the reverse.
 
 The same rule applies to commit trailers, changelog entries, and any other artifact that lives in the git history.
 
