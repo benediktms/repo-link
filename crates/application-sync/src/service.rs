@@ -261,6 +261,16 @@ impl SyncService {
             .provider
             .fetch_remote(&filing_canonical, &remote.remote_id)
             .await?;
+        // The remote was just observed — stamp the write-through freshness
+        // column before the reconcile decision. Freshness ≠ content change
+        // (same semantics as `--refresh`): a Noop pull, and even the
+        // manual-merge conflict that errors out below, still saw the live
+        // remote, so `last_refreshed_at` must advance. Only a failed fetch
+        // (early return above) skips the stamp. The whole-row saves further
+        // down can't clobber this: they deliberately never write `synced_at`.
+        self.tasks
+            .cache_synced_at(id, Timestamp::now(), SyncedSource::Pull)
+            .await?;
         // Backfill the GraphQL node id for a pre-project-sync task whose
         // remote was recorded before node ids were persisted. Without it the
         // task can never be added to a board (addProjectV2ItemById needs it),
@@ -2254,6 +2264,57 @@ mod tests {
         });
         let s = svc.pull(&task.id.to_string()).await.unwrap();
         assert_eq!(s.decision, "noop");
+    }
+
+    #[tokio::test]
+    async fn pull_stamps_synced_at_with_pull_source_even_on_noop() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert!(tasks.get(task.id).await.unwrap().synced_at.is_none());
+
+        // Remote mirrors the baseline → reconcile is a Noop, but the remote
+        // was still observed, so freshness must advance (freshness ≠ content
+        // change, matching `--refresh` semantics).
+        let before = tasks.get(task.id).await.unwrap();
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: before.title.clone(),
+            body: before.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: before.assignees.clone(),
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "noop");
+        let after = tasks.get(task.id).await.unwrap();
+        assert!(
+            after.synced_at.is_some(),
+            "a noop pull still stamps synced_at"
+        );
+        // Stamp-source discipline (RFC 0004 §6 tripwire 2): pull must stamp
+        // with `SyncedSource::Pull` — this completes the Polled / Push /
+        // Refresh / Pull set.
+        assert_eq!(
+            tasks.synced_stamps(),
+            vec![(task.id, SyncedSource::Pull)],
+            "pull must stamp with the Pull source"
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_fetch_error_does_not_stamp_synced_at() {
+        let (svc, tasks, task, _provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        // No fetch fixture set → the provider returns an error.
+
+        assert!(svc.pull(&task.id.to_string()).await.is_err());
+        assert!(
+            tasks.get(task.id).await.unwrap().synced_at.is_none(),
+            "a failed fetch must not stamp synced_at"
+        );
     }
 
     #[tokio::test]

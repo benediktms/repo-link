@@ -294,12 +294,11 @@ pub trait TaskRepository: Send + Sync {
     /// `sync_state` — observing the remote is on a separate axis from the
     /// mirrored content, so it can never flip dirty detection.
     ///
-    /// Stamped by exactly three callers, each after a *confirmed* network
-    /// response: the pull path, the drainer (push), and the poller. The
-    /// `source` records which one; it is NOT persisted (there is no column for
-    /// it) — it is carried so those write-through call sites (wired in later
-    /// RFC 0004 phases) route through the `mark_synced` helper in
-    /// `application-sync` with their own variant.
+    /// Stamped by exactly four callers, each after a *confirmed* network
+    /// response: the pull path, the drainer (push), the poller, and the
+    /// on-demand `task show --refresh` observe. The `source` records which
+    /// one; it is NOT persisted (there is no column for it) — it is carried
+    /// so each write-through call site passes its own variant.
     ///
     /// A zero-row match (task absent) is a benign no-op — return `Ok`.
     async fn cache_synced_at(
@@ -311,11 +310,9 @@ pub trait TaskRepository: Send + Sync {
     async fn delete(&self, id: TaskId) -> PortResult<()>;
 }
 
-/// Which of the three write-through callers stamped [`Task::synced_at`]
-/// (RFC 0004 D3). Carried into [`TaskRepository::cache_synced_at`] via the
-/// `mark_synced` helper in `application-sync` (the single funnel for the
-/// stamp). Not persisted. The pull/push/poll call sites that pass these
-/// variants are wired in later RFC 0004 phases.
+/// Which of the four write-through callers stamped [`Task::synced_at`]
+/// (RFC 0004 D3). Carried into [`TaskRepository::cache_synced_at`] so each
+/// call site records its own variant. Not persisted.
 ///
 /// [`Task::synced_at`]: domain_task::Task::synced_at
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
