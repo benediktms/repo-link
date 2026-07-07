@@ -19,7 +19,10 @@ pub use repo::{
     HereRepoSummaryDto, HereResponseDto, LinkWorktreeCmd, LocateResponseDto, RepoAttachOutcomeDto,
     RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd, WorktreeLinkDto,
 };
-pub use sync::{PromoteTaskCmd, PullTaskCmd, PushTaskCmd, SyncSummaryDto};
+pub use sync::{
+    PromoteTaskCmd, PullTaskCmd, PushTaskCmd, RelationChange, RelationReconciledNotice,
+    RelationTargetUntrackedNotice, SyncNoticeDto, SyncSummaryDto,
+};
 pub use task::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoteRefDto,
     RemoveTaskRelationCmd, TaskCommentDto, TaskDto, TaskRelationDto, UpdateTaskCmd,

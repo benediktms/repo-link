@@ -190,14 +190,7 @@ impl RestClient {
         }
         Ok(issues
             .into_iter()
-            .map(|issue| {
-                let child_canonical = canonical_from_repository_url(issue.repository_url.as_str())
-                    .unwrap_or_else(|| canonical_repo.to_string());
-                RemoteChildIssue {
-                    canonical_repo: child_canonical,
-                    snapshot: map_issue(issue),
-                }
-            })
+            .map(|issue| to_child_issue(issue, canonical_repo))
             .collect())
     }
 
@@ -267,16 +260,44 @@ impl RestClient {
         }
         Ok(issues
             .into_iter()
-            .map(|issue| {
-                let blocker_canonical =
-                    canonical_from_repository_url(issue.repository_url.as_str())
-                        .unwrap_or_else(|| canonical_repo.to_string());
-                RemoteChildIssue {
-                    canonical_repo: blocker_canonical,
-                    snapshot: map_issue(issue),
-                }
-            })
+            .map(|issue| to_child_issue(issue, canonical_repo))
             .collect())
+    }
+
+    /// Fetch an issue's parent via `GET /repos/{o}/{r}/issues/{n}/parent`. The
+    /// sub-issue API exposes the parent as a single object (not a paged list),
+    /// and returns 404 when the issue has no parent — so unlike
+    /// `fetch_sub_issues` there is no pagination/probe, and a `NotFound` maps to
+    /// an empty result (the normal no-parent case), mirroring
+    /// `resolve_issue_db_id_or_gone`. Returned as a 0-or-1 element vec so the
+    /// caller reuses the same slice-based relation reconcile. The parent's
+    /// canonical repo is derived from its own `repository_url`, so a cross-repo
+    /// parent is handled correctly.
+    pub(crate) async fn fetch_parent(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        // Same redirect-silence hazard as `fetch_sub_issues`: the `/parent`
+        // response doesn't name the subject's `repository_url`, so a transferred
+        // subject would otherwise resolve against the new repo.
+        self.ensure_not_moved(canonical_repo, remote_id).await?;
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let number = parse_issue_number(remote_id)?;
+        let route = format!("/repos/{owner}/{repo}/issues/{number}/parent");
+        let issue: Issue = match self
+            .detect_move_or_map(
+                canonical_repo,
+                remote_id,
+                self.http.get(route, None::<&()>).await,
+            )
+            .await
+        {
+            Ok(issue) => issue,
+            Err(PortError::NotFound(_)) => return Ok(Vec::new()), // no parent
+            Err(e) => return Err(e),
+        };
+        Ok(vec![to_child_issue(issue, canonical_repo)])
     }
 
     /// List an issue's comments, oldest first, paging through the typed
@@ -633,6 +654,18 @@ fn map_comment(c: Comment) -> RemoteComment {
         author: c.user.login,
         body: c.body.unwrap_or_default(),
         created_at: Timestamp::from_utc(c.created_at),
+    }
+}
+
+/// Map a related issue (sub-issue / blocker / parent) to a `RemoteChildIssue`,
+/// deriving its canonical repo from its own `repository_url` (so a cross-repo
+/// relation is preserved), falling back to `fallback_canonical`.
+fn to_child_issue(issue: Issue, fallback_canonical: &str) -> RemoteChildIssue {
+    let canonical_repo = canonical_from_repository_url(issue.repository_url.as_str())
+        .unwrap_or_else(|| fallback_canonical.to_string());
+    RemoteChildIssue {
+        canonical_repo,
+        snapshot: map_issue(issue),
     }
 }
 

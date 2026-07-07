@@ -8,8 +8,8 @@ use application_query::{
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
 use dto_shared::{
-    FindRepoResponseDto, HereResponseDto, LocateResponseDto, RepoAttachOutcomeDto, RepoBindingDto,
-    SyncSummaryDto, TaskDto, WorkspaceDto,
+    FindRepoResponseDto, HereResponseDto, LocateResponseDto, RelationChange, RepoAttachOutcomeDto,
+    RepoBindingDto, SyncNoticeDto, SyncSummaryDto, TaskDto, WorkspaceDto,
 };
 use serde::Serialize;
 
@@ -154,11 +154,36 @@ pub fn children(rollup: &ChildrenRollup) {
 // ---------- Sync / reconcile --------------------------------------------
 
 pub fn sync(summary: &SyncSummaryDto) {
-    // Caveats land on stderr so the JSON on stdout stays scriptable.
+    // Caveats and notices land on stderr so the JSON on stdout stays scriptable.
     if let Some(note) = &summary.note {
         eprintln!("note: {note}");
     }
+    for msg in &summary.messages {
+        eprintln!("note: {}", sync_notice_line(msg));
+    }
     print_json(summary);
+}
+
+/// Format a structured sync notice into a one-line human message for stderr.
+/// The structured form stays in the stdout JSON for scripts; this is the prose.
+fn sync_notice_line(notice: &SyncNoticeDto) -> String {
+    match notice {
+        SyncNoticeDto::RelationReconciled(n) => {
+            let (verb, prep) = match n.change {
+                RelationChange::Added => ("added", "now"),
+                RelationChange::Removed => ("removed", "was"),
+            };
+            format!(
+                "{} edge {verb} ({prep} {}) — reconciled from the remote",
+                n.relation_kind, n.other_task_id,
+            )
+        }
+        SyncNoticeDto::RelationTargetUntracked(n) => format!(
+            "remote {} target {}#{} is not tracked locally — run \
+             `rl sync import https://{}/issues/{}` to replicate it",
+            n.relation_kind, n.canonical_repo, n.remote_id, n.canonical_repo, n.remote_id,
+        ),
+    }
 }
 
 pub fn reconcile(summary: &ReconcileSummary) {

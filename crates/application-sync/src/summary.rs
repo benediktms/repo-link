@@ -3,7 +3,7 @@
 
 use domain_sync::SyncDecision;
 use domain_task::{Lifecycle, SyncState, Task, TaskSnapshot};
-use dto_shared::{RemoteRefDto, SyncSummaryDto};
+use dto_shared::{RemoteRefDto, SyncNoticeDto, SyncSummaryDto};
 use ports::RemoteTaskSnapshot;
 use serde::Serialize;
 
@@ -52,6 +52,7 @@ pub(crate) fn link_summary(
             remote_id: r.remote_id.clone(),
         }),
         note,
+        messages: Vec::new(),
     }
 }
 
@@ -66,6 +67,21 @@ pub(crate) fn summary_with_note(
     note: Option<String>,
 ) -> SyncSummaryDto {
     SyncSummaryDto {
+        note,
+        ..summary_with_messages(task, prev, decision, Vec::new())
+    }
+}
+
+/// Build a summary carrying structured [`SyncNoticeDto`]s — used by `pull` to
+/// report inbound relation reconciles. `note` stays `None`; the two channels
+/// are independent.
+pub(crate) fn summary_with_messages(
+    task: &Task,
+    prev: SyncState,
+    decision: SyncDecision,
+    messages: Vec<SyncNoticeDto>,
+) -> SyncSummaryDto {
+    SyncSummaryDto {
         task_id: task.id.to_string(),
         previous_state: enum_str(&prev),
         new_state: enum_str(&task.sync),
@@ -74,7 +90,8 @@ pub(crate) fn summary_with_note(
             provider: r.provider.clone(),
             remote_id: r.remote_id.clone(),
         }),
-        note,
+        note: None,
+        messages,
     }
 }
 
@@ -86,7 +103,7 @@ pub(crate) fn provider_label(canonical: &str) -> String {
     }
 }
 
-fn enum_str<T: Serialize>(t: &T) -> String {
+pub(crate) fn enum_str<T: Serialize>(t: &T) -> String {
     serde_json::to_value(t)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
