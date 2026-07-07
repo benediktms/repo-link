@@ -68,18 +68,25 @@ pub(crate) async fn query_dispatch(
             ws: WorkspaceArg { workspace },
             assignee,
         } => {
-            let _ = cfg; // RepoLinkConfig is currently the env-var fallback chain.
-            // Precedence: explicit --assignee > git config user.name >
-            // REPO_LINK_USER > $USER. Git user comes ahead of env vars so
-            // multi-repo dev setups where each repo has a different
-            // committer identity stay accurate by default.
-            let assignee = assignee
-                .or_else(git_user_name)
-                .or_else(|| std::env::var("REPO_LINK_USER").ok())
-                .or_else(|| std::env::var("USER").ok())
-                .ok_or_else(|| {
-                    anyhow!("set --assignee, configure `git config user.name`, or set REPO_LINK_USER / USER")
-                })?;
+            // Resolution chain — see `resolve_mine_assignee`. The cached
+            // GitHub login comes ahead of the git committer identity so a
+            // bare `query mine` round-trips with `task claim` (which assigns
+            // that login); git user.name / env vars remain as fallbacks. A
+            // token-file permission error degrades to "no login" rather than
+            // blocking a read-only view.
+            let assignee = resolve_mine_assignee(
+                assignee,
+                cfg.resolve_github_login().ok().flatten(),
+                git_user_name(),
+                std::env::var("REPO_LINK_USER").ok(),
+                std::env::var("USER").ok(),
+            )
+            .ok_or_else(|| {
+                anyhow!(
+                    "no assignee: pass --assignee, run `rl gh auth`, configure \
+                     `git config user.name`, or set REPO_LINK_USER / USER"
+                )
+            })?;
             let workspace = resolve_workspace(svc, workspace).await?;
             let v = svc.query.assigned_to(&workspace, &assignee).await?;
             render::assigned(&v);
@@ -93,4 +100,95 @@ pub(crate) async fn query_dispatch(
         }
     }
     Ok(())
+}
+
+/// Resolve the effective `query mine` assignee from the precedence chain,
+/// rejecting empty / whitespace-only candidates at every step:
+///
+/// `--assignee` > cached GitHub login > `git config user.name` >
+/// `REPO_LINK_USER` > `$USER`.
+///
+/// The GitHub login precedes the git committer identity so a bare
+/// `query mine` round-trips with `task claim` (which assigns that login).
+/// Pure over its inputs so the precedence is unit-testable without touching
+/// env vars, git, or the token file. Returns `None` when no source yields a
+/// non-empty value.
+fn resolve_mine_assignee(
+    explicit: Option<String>,
+    github_login: Option<String>,
+    git_user: Option<String>,
+    repo_link_user: Option<String>,
+    unix_user: Option<String>,
+) -> Option<String> {
+    [explicit, github_login, git_user, repo_link_user, unix_user]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_mine_assignee;
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn explicit_assignee_wins() {
+        let got = resolve_mine_assignee(s("explicit"), s("login"), s("git"), s("env"), s("user"));
+        assert_eq!(got.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn github_login_precedes_git_user_so_claim_round_trips() {
+        // The whole point of #84: `claim` assigns the GitHub login, so a bare
+        // `mine` must prefer it over the (display-name) git committer identity.
+        let got = resolve_mine_assignee(
+            None,
+            s("benediktms"),
+            s("Benedikt Schnatterbeck"),
+            None,
+            None,
+        );
+        assert_eq!(got.as_deref(), Some("benediktms"));
+    }
+
+    #[test]
+    fn falls_through_to_git_user_when_no_login() {
+        let got = resolve_mine_assignee(None, None, s("git-user"), s("env"), s("user"));
+        assert_eq!(got.as_deref(), Some("git-user"));
+    }
+
+    #[test]
+    fn repo_link_user_precedes_unix_user() {
+        let got = resolve_mine_assignee(None, None, None, s("env"), s("user"));
+        assert_eq!(got.as_deref(), Some("env"));
+    }
+
+    #[test]
+    fn empty_explicit_falls_through_instead_of_short_circuiting() {
+        let got = resolve_mine_assignee(s(""), None, s("git-user"), None, None);
+        assert_eq!(got.as_deref(), Some("git-user"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_env_values_are_rejected() {
+        // REPO_LINK_USER="" / USER="" must not resolve to an empty assignee.
+        let got = resolve_mine_assignee(None, None, None, s(""), s("   "));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn whitespace_is_trimmed_from_the_winner() {
+        let got = resolve_mine_assignee(s("  spaced  "), None, None, None, None);
+        assert_eq!(got.as_deref(), Some("spaced"));
+    }
+
+    #[test]
+    fn all_empty_yields_none() {
+        let got = resolve_mine_assignee(None, None, None, None, None);
+        assert_eq!(got, None);
+    }
 }
