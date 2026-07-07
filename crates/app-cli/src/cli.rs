@@ -606,11 +606,18 @@ pub(crate) enum QueryCmd {
         #[command(flatten)]
         ws: WorkspaceArg,
     },
-    /// Open tasks assigned to a user. Defaults to $REPO_LINK_USER or $USER.
+    /// Open tasks assigned to a user. Defaults to the cached GitHub login
+    /// (so it round-trips with `task claim`), then git config user.name,
+    /// then $REPO_LINK_USER, then $USER.
     Mine {
         #[command(flatten)]
         ws: WorkspaceArg,
-        #[arg(long, env = "REPO_LINK_USER")]
+        // No `env = "REPO_LINK_USER"` here: binding the env var to the arg
+        // makes clap pre-fill `assignee`, which collapses the explicit-flag
+        // and env-var precedence steps into one and makes the git user.name
+        // step unreachable whenever REPO_LINK_USER is set. The full chain is
+        // resolved in `query_dispatch` instead.
+        #[arg(long)]
         assignee: Option<String>,
     },
     /// Completion rollup of a parent task's children (done/total + per-child
