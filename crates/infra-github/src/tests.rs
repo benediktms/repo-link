@@ -382,6 +382,52 @@ async fn fetch_sub_issues_paginates_past_one_page() {
     assert_eq!(children.len(), 101); // 100 + 1 across two pages
 }
 
+#[tokio::test]
+async fn fetch_parent_maps_parent_with_canonical_repo() {
+    let server = MockServer::start().await;
+    mount_parent_issue_ok(&server, 1).await; // ensure_not_moved pre-flight
+    // The `/parent` endpoint returns a single Issue object (not an array).
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues/1/parent"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_payload(
+            5,
+            "the parent",
+            "b",
+            "open",
+        )))
+        .mount(&server)
+        .await;
+
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
+    let parent = provider.fetch_parent("github.com/o/r", "1").await.unwrap();
+    assert_eq!(parent.len(), 1, "parent returned as a 0-or-1 list");
+    assert_eq!(parent[0].snapshot.remote_id, "5");
+    assert_eq!(parent[0].snapshot.title, "the parent");
+    // issue_payload sets repository_url to .../repos/o/r → canonical github.com/o/r.
+    assert_eq!(parent[0].canonical_repo, "github.com/o/r");
+}
+
+#[tokio::test]
+async fn fetch_parent_returns_empty_on_404() {
+    let server = MockServer::start().await;
+    mount_parent_issue_ok(&server, 1).await;
+    // GitHub 404s `/parent` when the issue has no parent — the normal case.
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues/1/parent"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_json(serde_json::json!({"message": "Not Found"})),
+        )
+        .mount(&server)
+        .await;
+
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
+    let parent = provider.fetch_parent("github.com/o/r", "1").await.unwrap();
+    assert!(
+        parent.is_empty(),
+        "404 (no parent) maps to empty: {parent:?}"
+    );
+}
+
 /// Build an Issue payload that pretends to live in a non-default repo —
 /// the post-follow state octocrab sees after a GitHub transfer (which the
 /// tower-http FollowRedirect layer silently resolves on GETs).

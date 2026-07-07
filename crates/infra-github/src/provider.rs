@@ -101,6 +101,14 @@ impl RemoteTaskProvider for GithubAdapter {
         self.rest.fetch_blocked_by(canonical_repo, remote_id).await
     }
 
+    async fn fetch_parent(
+        &self,
+        canonical_repo: &str,
+        remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        self.rest.fetch_parent(canonical_repo, remote_id).await
+    }
+
     async fn fetch_comments(
         &self,
         canonical_repo: &str,

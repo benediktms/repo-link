@@ -9,7 +9,10 @@ use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
 
 use crate::enqueue;
-use dto_shared::SyncSummaryDto;
+use dto_shared::{
+    RelationChange, RelationReconciledNotice, RelationTargetUntrackedNotice, SyncNoticeDto,
+    SyncSummaryDto,
+};
 use ports::{
     PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, SyncedSource,
     TaskRepository, WorkspaceRepository,
@@ -18,6 +21,7 @@ use ports::{
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
+    summary_with_messages,
 };
 
 /// Outcome of [`SyncService::refresh`] (`rl task show --refresh`, RFC 0004 D4).
@@ -356,15 +360,6 @@ impl SyncService {
             .await?;
         self.tasks.replace_comments(id, &comments).await?;
 
-        // Inbound relation reconcile (#150): bring local parent/child + blocked_by
-        // edges in line with the issue's GitHub sub-issues and dependencies.
-        // Orthogonal to the title/body drift decision (like comments), so it runs
-        // on every pull including Noop / conflict. Applied via a plain save — NOT
-        // save_with_outbox — so a relation pulled FROM GitHub does not re-enqueue
-        // an outbound mutation back TO GitHub (which would loop).
-        self.reconcile_relations_inbound(&mut task, &filing_canonical, &remote.remote_id)
-            .await?;
-
         // Persist the node-id backfill with a targeted single-column write.
         // Redundant after a PullRemote whole-row save (it already wrote the
         // mutated ref) but idempotent, and it's the *only* persistence on the
@@ -374,11 +369,27 @@ impl SyncService {
             self.tasks.cache_remote_node_id(id, nid).await?;
         }
 
+        // Bail on a content conflict BEFORE reconciling relations. Reconcile
+        // mutates and saves the local graph, but the merge path returns an Err
+        // with no summary to carry the resulting notices — so reconciling here
+        // would change the graph silently. Relations reconcile on the next clean
+        // pull, once the human has resolved the merge.
         if let Some(tid) = manual_merge {
             return Err(SyncError::ManualMerge(tid));
         }
 
-        Ok(summary(&task, prev, decision))
+        // Inbound relation reconcile (#150): bring local parent/child + blocked_by
+        // edges in line with the issue's GitHub sub-issues, dependencies, and
+        // parent. Orthogonal to the title/body drift decision. Applied via a plain
+        // save — NOT save_with_outbox — so a relation pulled FROM GitHub does not
+        // re-enqueue an outbound mutation back TO GitHub (which would loop). Its
+        // notices ride out on the returned summary so a graph change is never
+        // silent.
+        let messages = self
+            .reconcile_relations_inbound(&mut task, &filing_canonical, &remote.remote_id)
+            .await?;
+
+        Ok(summary_with_messages(&task, prev, decision, messages))
     }
 
     /// `rl task show --refresh` (RFC 0004 D4): observe the remote to stamp
@@ -737,12 +748,20 @@ impl SyncService {
     /// edges whose far end isn't a tracked local task (cross-repo, or never
     /// imported) are left untouched, as are edges to local-only tasks the remote
     /// can't represent. Saves via plain `save_many` so no outbound re-enqueue.
+    ///
+    /// Returns the [`SyncNoticeDto`]s describing what it did: a
+    /// `RelationReconciled` per edge added/removed, and a
+    /// `RelationTargetUntracked` per remote related-issue that has no local task
+    /// (so the "new parent isn't tracked — import it" case is never silent).
     async fn reconcile_relations_inbound(
         &self,
         task: &mut Task,
         filing_canonical: &str,
         remote_id: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<SyncNoticeDto>> {
+        // ponytail: three serial fetches, not concurrent — tokio is a dev-only
+        // dep here and this is a cold manual-pull path; add try_join if pull
+        // latency is ever measured to matter.
         let subs = self
             .provider
             .fetch_sub_issues(filing_canonical, remote_id)
@@ -751,14 +770,26 @@ impl SyncService {
             .provider
             .fetch_blocked_by(filing_canonical, remote_id)
             .await?;
-        let desired_children = self.map_remote_to_local(task.workspace_id, &subs).await?;
-        let desired_blockers = self
-            .map_remote_to_local(task.workspace_id, &blockers)
+        let parents = self
+            .provider
+            .fetch_parent(filing_canonical, remote_id)
             .await?;
 
+        let mut notices: Vec<SyncNoticeDto> = Vec::new();
         // Neighbor tasks whose reciprocal edge we touch, accumulated so each is
-        // loaded and saved once even if it appears in both families.
+        // loaded and saved once even if it appears in more than one family.
         let mut neighbors: HashMap<TaskId, Task> = HashMap::new();
+
+        // Sub-issues (children) and dependencies (blockers) are many-valued and
+        // GitHub returns the COMPLETE set, so an empty list authoritatively means
+        // "remote dropped these" — remove-on-empty is correct. Untracked far-ends
+        // here are dropped silently (a parent with many un-imported children would
+        // otherwise emit a notice per child on every pull); only the parent edge,
+        // the motivating case, surfaces untracked targets.
+        let (desired_children, _) = self.map_remote_to_local(task.workspace_id, &subs).await?;
+        let (desired_blockers, _) = self
+            .map_remote_to_local(task.workspace_id, &blockers)
+            .await?;
         let mut task_changed = self
             .reconcile_family(
                 task,
@@ -766,6 +797,7 @@ impl SyncService {
                 RelationKind::ChildOf,
                 &desired_children,
                 &mut neighbors,
+                &mut notices,
             )
             .await?;
         task_changed |= self
@@ -775,7 +807,13 @@ impl SyncService {
                 RelationKind::Blocks,
                 &desired_blockers,
                 &mut neighbors,
+                &mut notices,
             )
+            .await?;
+        // The subject's own parent edge (`ChildOf`) needs distinct, conservative
+        // handling — see `reconcile_parent`.
+        task_changed |= self
+            .reconcile_parent(task, &parents, &mut neighbors, &mut notices)
             .await?;
 
         // Persist whenever the subject task changed — not gated on
@@ -787,27 +825,32 @@ impl SyncService {
             batch.extend(neighbors.values().map(|n| (n, SnapshotSource::Pull)));
             self.tasks.save_many(&batch).await?;
         }
-        Ok(())
+        Ok(notices)
     }
 
-    /// Resolve each remote related issue to its local task id, dropping any that
-    /// aren't tracked locally (binding for the issue's repo not attached, or the
-    /// issue never imported). Keyed on the FILING repo per D6 `find_by_remote`.
+    /// Resolve each remote related issue to its local task id. Returns the
+    /// resolved local ids plus the remote issues that are **not** tracked
+    /// locally (binding for the issue's repo not attached, or the issue never
+    /// imported) — the caller turns the latter into `RelationTargetUntracked`
+    /// notices instead of dropping them silently. Keyed on the FILING repo per
+    /// D6 `find_by_remote`.
     async fn map_remote_to_local(
         &self,
         workspace_id: domain_core::WorkspaceId,
         related: &[ports::RemoteChildIssue],
-    ) -> Result<Vec<TaskId>> {
+    ) -> Result<(Vec<TaskId>, Vec<ports::RemoteChildIssue>)> {
         let mut ids = Vec::new();
+        let mut untracked = Vec::new();
         for item in related {
             let Some(binding) = self
                 .bindings
                 .find_by_canonical_url(workspace_id, &item.canonical_repo)
                 .await?
             else {
-                continue; // related issue's repo not tracked in this workspace
+                untracked.push(item.clone()); // related issue's repo not tracked here
+                continue;
             };
-            if let Some(t) = self
+            match self
                 .tasks
                 .find_by_remote(
                     binding.instance.origin_id,
@@ -816,10 +859,11 @@ impl SyncService {
                 )
                 .await?
             {
-                ids.push(t.id);
+                Some(t) => ids.push(t.id),
+                None => untracked.push(item.clone()), // repo tracked, issue never imported
             }
         }
-        Ok(ids)
+        Ok((ids, untracked))
     }
 
     /// Reconcile one relation family on `task` toward `desired` (the local task
@@ -828,8 +872,10 @@ impl SyncService {
     /// itself issue-backed (remotely representable); a local-only neighbor the
     /// remote can't express is left alone. Reciprocals are mirrored onto the
     /// neighbors, which collect into `neighbors` for the caller's batch save.
-    /// Returns whether `task`'s own edge set changed (so the caller knows to
-    /// persist the subject even if it ever stops loading a neighbor per change).
+    /// Pushes a `RelationReconciled` notice per edge added/removed into
+    /// `notices`. Returns whether `task`'s own edge set changed (so the caller
+    /// knows to persist the subject even if it ever stops loading a neighbor per
+    /// change).
     async fn reconcile_family(
         &self,
         task: &mut Task,
@@ -837,6 +883,7 @@ impl SyncService {
         inverse: RelationKind,
         desired: &[TaskId],
         neighbors: &mut HashMap<TaskId, Task>,
+        notices: &mut Vec<SyncNoticeDto>,
     ) -> Result<bool> {
         let task_id = task.id;
         let mut changed = false;
@@ -857,6 +904,12 @@ impl SyncService {
             let neighbor = self.load_neighbor(neighbors, other).await?;
             task.add_relation(kind, other);
             neighbor.add_relation(inverse, task_id);
+            notices.push(reconciled_notice(
+                task_id,
+                kind,
+                RelationChange::Added,
+                other,
+            ));
             changed = true;
         }
         // Removals: local has the edge, remote dropped it — only when the far
@@ -867,13 +920,80 @@ impl SyncService {
             }
             let neighbor = self.load_neighbor(neighbors, other).await?;
             if neighbor.remote.is_none() {
-                continue; // remote can't represent a local-only neighbor
+                // Local-only far-end: the remote can't represent it, so leave the
+                // edge — and drop it back out of the cache so it isn't stamped into
+                // the Pull save batch (it was never mutated).
+                neighbors.remove(&other);
+                continue;
             }
             task.remove_relation(kind, other);
             neighbor.remove_relation(inverse, task_id);
+            notices.push(reconciled_notice(
+                task_id,
+                kind,
+                RelationChange::Removed,
+                other,
+            ));
             changed = true;
         }
         Ok(changed)
+    }
+
+    /// Reconcile the subject's parent edge (`ChildOf`) from `fetch_parent`.
+    ///
+    /// GitHub's `/parent` is ambiguous on absence — an empty result means "no
+    /// parent" OR the sub-issue API is off OR a 404 for another reason OR an
+    /// outbound parent-link that hasn't drained yet. So absence is a **no-op**:
+    /// we never remove a `child_of` edge just because the remote reported nothing
+    /// (that would destroy a pending-push or mis-404'd link). The cost is that a
+    /// parent removed entirely on GitHub isn't reflected until it changes to a
+    /// *different* parent — an acceptable trade against silent data loss.
+    ///
+    /// When the remote names a parent we can RESOLVE to a local task, it's a
+    /// genuine parent signal: reuse the guarded [`reconcile_family`] so the same
+    /// self-edge and local-only protections apply — it adds the reported parent
+    /// and removes any *other issue-backed* `child_of` edge (a real re-parent),
+    /// leaving local-only edges the remote has no authority over. When the named
+    /// parent can't be resolved (binding detached, or never imported) we can't
+    /// tell a re-parent from the current parent merely being unresolvable, so we
+    /// only surface a `RelationTargetUntracked` notice and touch no edges.
+    async fn reconcile_parent(
+        &self,
+        task: &mut Task,
+        parents: &[ports::RemoteChildIssue],
+        neighbors: &mut HashMap<TaskId, Task>,
+        notices: &mut Vec<SyncNoticeDto>,
+    ) -> Result<bool> {
+        if parents.is_empty() {
+            return Ok(false); // ambiguous absence — never remove on empty
+        }
+        let (mut desired, untracked) = self.map_remote_to_local(task.workspace_id, parents).await?;
+        desired.retain(|&id| id != task.id); // a self-parent is meaningless
+
+        // A reported parent we can't resolve locally — surface it for import, but
+        // touch no edges (see doc comment: can't distinguish re-parent from a
+        // still-current-but-unresolvable parent).
+        push_untracked_notices(
+            notices,
+            &task.id.to_string(),
+            RelationKind::ChildOf,
+            &untracked,
+        );
+        if desired.is_empty() {
+            return Ok(false);
+        }
+
+        // A resolved parent is authoritative. reconcile_family's remove-on-empty
+        // can't fire spuriously here because `desired` is non-empty.
+        self.reconcile_family(
+            task,
+            RelationKind::ChildOf,
+            RelationKind::ParentOf,
+            &desired,
+            neighbors,
+            notices,
+        )
+        .await
     }
 
     /// Load `id` into the neighbor cache if absent, returning a mutable handle.
@@ -890,6 +1010,41 @@ impl SyncService {
             neighbors.insert(id, t);
         }
         Ok(neighbors.get_mut(&id).expect("just inserted"))
+    }
+}
+
+/// Build a `RelationReconciled` notice for an edge the pull added/removed.
+fn reconciled_notice(
+    task_id: TaskId,
+    kind: RelationKind,
+    change: RelationChange,
+    other: TaskId,
+) -> SyncNoticeDto {
+    SyncNoticeDto::RelationReconciled(RelationReconciledNotice {
+        task_id: task_id.to_string(),
+        relation_kind: crate::summary::enum_str(&kind),
+        change,
+        other_task_id: other.to_string(),
+    })
+}
+
+/// Append a `RelationTargetUntracked` notice for each remote related-issue that
+/// has no local task, so the user can import it and re-link.
+fn push_untracked_notices(
+    notices: &mut Vec<SyncNoticeDto>,
+    subject: &str,
+    kind: RelationKind,
+    untracked: &[ports::RemoteChildIssue],
+) {
+    for item in untracked {
+        notices.push(SyncNoticeDto::RelationTargetUntracked(
+            RelationTargetUntrackedNotice {
+                task_id: subject.to_string(),
+                relation_kind: crate::summary::enum_str(&kind),
+                canonical_repo: item.canonical_repo.clone(),
+                remote_id: item.snapshot.remote_id.clone(),
+            },
+        ));
     }
 }
 
@@ -966,6 +1121,7 @@ mod tests {
         fetch_moved: Mutex<Option<(String, String)>>,
         sub_issues: Mutex<Vec<ports::RemoteChildIssue>>,
         blocked_by: Mutex<Vec<ports::RemoteChildIssue>>,
+        parent: Mutex<Vec<ports::RemoteChildIssue>>,
     }
 
     impl FakeProvider {
@@ -985,6 +1141,11 @@ mod tests {
 
         fn set_blocked_by(&self, items: &[(&str, &str)]) {
             *self.blocked_by.lock().unwrap() = items.iter().map(|(c, n)| child(c, n)).collect();
+        }
+
+        /// Seed the issue's GitHub parent (0-or-1) for inbound parent reconcile.
+        fn set_parent(&self, items: &[(&str, &str)]) {
+            *self.parent.lock().unwrap() = items.iter().map(|(c, n)| child(c, n)).collect();
         }
 
         fn set_move_target(&self, canonical: &str, remote_id: &str) {
@@ -1078,6 +1239,10 @@ mod tests {
             _: &str,
         ) -> PortResult<Vec<ports::RemoteChildIssue>> {
             Ok(self.blocked_by.lock().unwrap().clone())
+        }
+
+        async fn fetch_parent(&self, _: &str, _: &str) -> PortResult<Vec<ports::RemoteChildIssue>> {
+            Ok(self.parent.lock().unwrap().clone())
         }
 
         async fn create_comment(&self, _: &str, _: &str, body: &str) -> PortResult<RemoteComment> {
@@ -1392,6 +1557,229 @@ mod tests {
                 .any(|r| r.kind == RelationKind::ParentOf),
             "remote dropped the sub-issue ⇒ local parent_of removed: {:?}",
             back.relations
+        );
+    }
+
+    /// Minimal `fetch_remote` snapshot for a pull whose only interest is the
+    /// relation reconcile (title/body match nothing in particular).
+    fn pull_snap(remote_id: &str) -> RemoteTaskSnapshot {
+        RemoteTaskSnapshot {
+            remote_id: remote_id.into(),
+            node_id: None,
+            title: format!("issue {remote_id}"),
+            body: String::new(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_reconciles_reparented_child() {
+        // Subject #100 is child_of old parent #200. GitHub now reports its parent
+        // is #300 (also tracked). Pulling the child alone must swap the child_of
+        // edge #200 → #300, mirror the reciprocal parent_of, and emit reconciled
+        // notices — with no outbound enqueue.
+        let (svc, tasks, _b, outbox, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
+        let old_parent = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
+        let new_parent = seed_promoted(&tasks, ws, repo_id, filing_id, "300").await;
+
+        subject.add_relation(RelationKind::ChildOf, old_parent.id);
+        subject.confirm_synced(SnapshotSource::Pull).ok();
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+        let mut old_parent_m = tasks.get(old_parent.id).await.unwrap();
+        old_parent_m.add_relation(RelationKind::ParentOf, subject.id);
+        tasks
+            .save(&old_parent_m, SnapshotSource::Pull)
+            .await
+            .unwrap();
+
+        provider.set_fetch(pull_snap("100"));
+        provider.set_parent(&[("github.com/o/r", "300")]);
+
+        let summary = svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        let kinds: Vec<_> = back.relations.iter().map(|r| (r.kind, r.other)).collect();
+        assert!(
+            kinds.contains(&(RelationKind::ChildOf, new_parent.id)),
+            "re-parented to #300: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&(RelationKind::ChildOf, old_parent.id)),
+            "old parent #200 dropped: {kinds:?}"
+        );
+        // Reciprocal parent_of mirrored onto the new parent, dropped from the old.
+        assert!(
+            tasks
+                .get(new_parent.id)
+                .await
+                .unwrap()
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ParentOf && r.other == subject.id)
+        );
+        assert!(
+            !tasks
+                .get(old_parent.id)
+                .await
+                .unwrap()
+                .relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ParentOf && r.other == subject.id)
+        );
+        assert!(
+            outbox.all().is_empty(),
+            "inbound reconcile must not enqueue outbound"
+        );
+
+        // Notices: child_of added(#300) + removed(#200).
+        assert!(
+            summary.messages.iter().any(|m| matches!(
+                m,
+                SyncNoticeDto::RelationReconciled(n)
+                    if n.relation_kind == "child_of"
+                        && n.change == RelationChange::Added
+                        && n.other_task_id == new_parent.id.to_string()
+            )),
+            "expected added notice: {:?}",
+            summary.messages
+        );
+        assert!(
+            summary.messages.iter().any(|m| matches!(
+                m,
+                SyncNoticeDto::RelationReconciled(n)
+                    if n.relation_kind == "child_of"
+                        && n.change == RelationChange::Removed
+                        && n.other_task_id == old_parent.id.to_string()
+            )),
+            "expected removed notice: {:?}",
+            summary.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_untracked_parent_notifies_without_touching_edges() {
+        // Subject #100 is child_of tracked #200. GitHub reports its parent is
+        // #999, which isn't imported locally. Because an unresolvable reported
+        // parent can't be told apart from the current parent merely being
+        // unresolvable, pull must NOT drop the existing edge (that would orphan
+        // the task) — it only emits a RelationTargetUntracked notice for import.
+        let (svc, tasks, _b, _o, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
+        let old_parent = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
+        subject.add_relation(RelationKind::ChildOf, old_parent.id);
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+        let mut old_parent_m = tasks.get(old_parent.id).await.unwrap();
+        old_parent_m.add_relation(RelationKind::ParentOf, subject.id);
+        tasks
+            .save(&old_parent_m, SnapshotSource::Pull)
+            .await
+            .unwrap();
+
+        provider.set_fetch(pull_snap("100"));
+        // #999 shares the tracked repo but was never imported → untracked.
+        provider.set_parent(&[("github.com/o/r", "999")]);
+
+        let summary = svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        assert!(
+            back.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == old_parent.id),
+            "existing child_of edge must survive an unresolvable reported parent: {:?}",
+            back.relations
+        );
+        assert!(
+            summary.messages.iter().any(|m| matches!(
+                m,
+                SyncNoticeDto::RelationTargetUntracked(n)
+                    if n.relation_kind == "child_of"
+                        && n.canonical_repo == "github.com/o/r"
+                        && n.remote_id == "999"
+            )),
+            "expected untracked-parent notice: {:?}",
+            summary.messages
+        );
+        // No edge changed, so no reconciled notice.
+        assert!(
+            !summary
+                .messages
+                .iter()
+                .any(|m| matches!(m, SyncNoticeDto::RelationReconciled(_))),
+            "no edge should have been reconciled: {:?}",
+            summary.messages
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_keeps_local_only_parent_when_remote_names_another() {
+        // Subject #100 is child_of a LOCAL-ONLY epic (never promoted) AND GitHub
+        // reports a tracked parent #300. The remote has no authority over the
+        // local-only edge, so pull adds #300 but must NOT delete the local-only
+        // parent (matching reconcile_family's local-only protection).
+        let (svc, tasks, _b, _o, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
+        let new_parent = seed_promoted(&tasks, ws, repo_id, filing_id, "300").await;
+        let epic = Task::new_draft(ws, Some(repo_id), "local epic".into()).unwrap();
+        tasks.save(&epic, SnapshotSource::LocalEdit).await.unwrap();
+        subject.add_relation(RelationKind::ChildOf, epic.id);
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+
+        provider.set_fetch(pull_snap("100"));
+        provider.set_parent(&[("github.com/o/r", "300")]);
+
+        svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        assert!(
+            back.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == epic.id),
+            "local-only parent must survive: {:?}",
+            back.relations
+        );
+        assert!(
+            back.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == new_parent.id),
+            "tracked remote parent must be added: {:?}",
+            back.relations
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_with_empty_parent_preserves_child_of_edge() {
+        // Regression: an empty fetch_parent is ambiguous (no-parent OR sub-issue
+        // API off OR a 404 for another reason OR a not-yet-pushed link), so pull
+        // must NOT delete an existing child_of edge on absence — that would lose a
+        // relationship the user just set (link then pull before the drainer runs).
+        let (svc, tasks, _b, _o, ws, repo_id, filing_id, provider) = setup_with_outbox().await;
+        let mut subject = seed_promoted(&tasks, ws, repo_id, filing_id, "100").await;
+        let parent = seed_promoted(&tasks, ws, repo_id, filing_id, "200").await;
+        subject.add_relation(RelationKind::ChildOf, parent.id);
+        tasks.save(&subject, SnapshotSource::Pull).await.unwrap();
+
+        provider.set_fetch(pull_snap("100"));
+        // No set_parent → fetch_parent returns empty (ambiguous absence).
+
+        let summary = svc.pull(&subject.id.to_string()).await.unwrap();
+
+        let back = tasks.get(subject.id).await.unwrap();
+        assert!(
+            back.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ChildOf && r.other == parent.id),
+            "empty fetch_parent must not delete the child_of edge: {:?}",
+            back.relations
+        );
+        assert!(
+            summary.messages.is_empty(),
+            "no reconcile happened, so no notices: {:?}",
+            summary.messages
         );
     }
 

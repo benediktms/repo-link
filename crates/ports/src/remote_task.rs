@@ -127,6 +127,21 @@ pub trait RemoteTaskProvider: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Fetch the remote task's parent, if any — the inbound read counterpart
+    /// of [`add_sub_issue`](Self::add_sub_issue) from the child's side, backing
+    /// parent-edge reconcile on pull. Returned as a 0-or-1 element list (a task
+    /// has at most one parent) so relation reconcile reuses the same slice-based
+    /// mapping as sub-issues/dependencies. The entry carries the parent's
+    /// canonical repo (a parent may be cross-repo). Providers without a
+    /// sub-issue concept inherit the default empty result; GitHub overrides.
+    async fn fetch_parent(
+        &self,
+        _canonical_repo: &str,
+        _remote_id: &str,
+    ) -> PortResult<Vec<RemoteChildIssue>> {
+        Ok(Vec::new())
+    }
+
     /// List the comments on a remote task, oldest first. Providers without a
     /// comment concept inherit the default empty result; GitHub overrides.
     async fn fetch_comments(
