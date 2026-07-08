@@ -116,12 +116,17 @@ impl TaskSnapshot {
     /// Whether this snapshot represents a moment of remote alignment that
     /// dirty detection should diff against. Stricter than
     /// [`SnapshotSource::is_baseline`]: a `Link` snapshot is baseline-eligible
-    /// only when the task ended up `Synced` (verified relink); a bare link
-    /// flips to `Conflict` and explicitly does NOT establish alignment, so
-    /// loading that row as the baseline would mis-anchor diff detection.
+    /// only when the task ended up `Synced` (the verified-relink path). A bare
+    /// link flips to `Conflict` and explicitly does NOT establish alignment,
+    /// and no other `sync_state` is reachable for a `Link` snapshot (see
+    /// `SyncService::link`), so gate strictly on `Synced` rather than the
+    /// looser "anything but `Conflict`" — loading a non-aligned row as the
+    /// baseline would mis-anchor diff detection.
     pub fn is_baseline(&self) -> bool {
+        if self.source == SnapshotSource::Link {
+            return self.sync_state == SyncState::Synced;
+        }
         self.source.is_baseline()
-            && !(self.source == SnapshotSource::Link && self.sync_state == SyncState::Conflict)
     }
 }
 
@@ -140,5 +145,75 @@ mod tests {
             SnapshotSource::FilingRepoRepair.is_baseline(),
             "FilingRepoRepair must be baseline-eligible — see rpl-sv2"
         );
+    }
+
+    fn snap(source: SnapshotSource, sync_state: SyncState) -> TaskSnapshot {
+        TaskSnapshot {
+            task_id: TaskId::new(),
+            version: 1,
+            title: String::new(),
+            body: String::new(),
+            lifecycle: Lifecycle::Open,
+            sync_state,
+            priority: Priority::P3,
+            assignees: vec![],
+            remote: None,
+            repo_id: None,
+            repo_id_recorded: true,
+            filing_repo_id: None,
+            source,
+            captured_at: Timestamp::now(),
+        }
+    }
+
+    /// A `Link` snapshot is a baseline ONLY when the relink verified and left
+    /// the task `Synced`; every other state (including the reachable bare-link
+    /// `Conflict`) must be rejected. Regression guard for the old predicate,
+    /// which admitted `Link` in every state but `Conflict`.
+    #[test]
+    fn link_snapshot_is_baseline_only_when_synced() {
+        assert!(snap(SnapshotSource::Link, SyncState::Synced).is_baseline());
+        for other in [
+            SyncState::Conflict,
+            SyncState::DirtyLocal,
+            SyncState::DirtyRemote,
+            SyncState::Staged,
+            SyncState::LocalOnly,
+        ] {
+            assert!(
+                !snap(SnapshotSource::Link, other).is_baseline(),
+                "Link snapshot in {other:?} must NOT be a baseline"
+            );
+        }
+    }
+
+    /// Non-`Link` baseline sources are state-independent — their eligibility
+    /// is decided purely by [`SnapshotSource::is_baseline`], so even a
+    /// `Conflict` sync_state does not demote them.
+    #[test]
+    fn non_link_baseline_sources_ignore_sync_state() {
+        for source in [
+            SnapshotSource::Promote,
+            SnapshotSource::Push,
+            SnapshotSource::Pull,
+            SnapshotSource::ConflictResolve,
+            SnapshotSource::FilingRepoRepair,
+        ] {
+            assert!(
+                snap(source, SyncState::Conflict).is_baseline(),
+                "{source:?} must be a baseline regardless of sync_state"
+            );
+        }
+        for source in [
+            SnapshotSource::Created,
+            SnapshotSource::LocalEdit,
+            SnapshotSource::PrePull,
+            SnapshotSource::Rollback,
+        ] {
+            assert!(
+                !snap(source, SyncState::Synced).is_baseline(),
+                "{source:?} is not a baseline source"
+            );
+        }
     }
 }
