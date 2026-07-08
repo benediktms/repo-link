@@ -808,12 +808,14 @@ async fn load_latest_baseline(
                filing_repo_id, source, captured_at
         FROM task_snapshots
         WHERE task_id = ?
-          -- `link` is baseline-eligible only on the verified-relink path
-          -- (task stays Synced); bare links flip to Conflict and explicitly
-          -- do NOT establish remote alignment.
+          -- Mirror of `domain_task::TaskSnapshot::is_baseline` — keep in sync.
+          -- `filing_repo_repair` rebaselines an authoritative doctor re-point.
+          -- `link` is baseline-eligible only on the verified-relink path (task
+          -- stays 'synced'); bare links flip to 'conflict' and explicitly do
+          -- NOT establish remote alignment (no other state is reachable).
           AND (
-              source IN ('promote', 'push', 'pull', 'conflict_resolve')
-              OR (source = 'link' AND sync_state != 'conflict')
+              source IN ('promote', 'push', 'pull', 'conflict_resolve', 'filing_repo_repair')
+              OR (source = 'link' AND sync_state = 'synced')
           )
         ORDER BY version DESC
         LIMIT 1

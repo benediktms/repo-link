@@ -1686,6 +1686,81 @@ async fn load_latest_baseline_carries_filing_repo_id() {
     );
 }
 
+/// Regression for the `load_latest_baseline` `source IN (...)` list, which
+/// omitted `filing_repo_repair` even though `SnapshotSource::is_baseline`
+/// includes it. An authoritative doctor re-point must rebaseline on reload,
+/// otherwise the next `sync pull` fires phantom drift on the now-correct
+/// canonical.
+#[tokio::test]
+async fn load_latest_baseline_hydrates_filing_repo_repair() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-repair").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let binding = seed_binding(
+        &rb,
+        workspace.id,
+        "git@github.com:o/r.git",
+        "github.com/o/r",
+        None,
+    )
+    .await;
+    let mut task = Task::new_draft(workspace.id, Some(binding.id), "repair".into()).unwrap();
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "8"))
+        .unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap(); // v1 baseline
+    // A later, authoritative doctor re-point — must displace the promote baseline.
+    ts.save(&task, SnapshotSource::FilingRepoRepair)
+        .await
+        .unwrap(); // v2
+    let baseline = ts.get(task.id).await.unwrap().synced_baseline.unwrap();
+    assert_eq!(
+        baseline.source,
+        SnapshotSource::FilingRepoRepair,
+        "filing_repo_repair must rebaseline on reload"
+    );
+}
+
+/// `load_latest_baseline` must admit a `link` snapshot as the baseline ONLY
+/// when it left the task `synced` (the verified-relink path), mirroring
+/// `TaskSnapshot::is_baseline`. The reachable bare-link `conflict` and the
+/// defensively-rejected `dirty_local` must both be ignored. Rows are inserted
+/// raw because the domain never mints a `link` snapshot outside synced/conflict.
+#[tokio::test]
+async fn load_latest_baseline_admits_link_only_when_synced() {
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-link").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    let task = Task::new_draft(workspace.id, None, "link".into()).unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap(); // v1 promote baseline
+
+    // v10 link@synced is eligible; v11 link@conflict and v12 link@dirty_local
+    // are not. If either were admitted, the baseline would be v11/v12, not v10.
+    for (version, sync_state) in [(10, "synced"), (11, "conflict"), (12, "dirty_local")] {
+        sqlx::query(
+            "INSERT INTO task_snapshots \
+             (task_id, version, title, body, status, lifecycle, sync_state, priority, assignees_json, \
+              remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at) \
+             VALUES (?, ?, 'l', '', 'open', 'open', ?, 'p3', '[]', NULL, NULL, NULL, 1, NULL, 'link', ?)",
+        )
+        .bind(task.id.to_string())
+        .bind(version)
+        .bind(sync_state)
+        .bind(domain_core::Timestamp::now().into_inner())
+        .execute(&db.writes)
+        .await
+        .unwrap();
+    }
+
+    let baseline = ts.get(task.id).await.unwrap().synced_baseline.unwrap();
+    assert_eq!(
+        baseline.version, 10,
+        "only the synced link snapshot is baseline-eligible"
+    );
+    assert_eq!(baseline.source, SnapshotSource::Link);
+    assert_eq!(baseline.sync_state, SyncState::Synced);
+}
+
 /// RFC 0002 #118: snapshot rows pre-dating the `filing_repo_id` column (or with
 /// an empty value) must read back as `None` gracefully — the same tolerance the
 /// `repo_id` non-empty/parse path established. We simulate a pre-column row by
