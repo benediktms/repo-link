@@ -2252,18 +2252,17 @@ mod tests {
         assert_eq!(recorded.state_reason, None);
     }
 
-    /// RFC 0003 D5 (rpl-xq6) synchronous-path parity: the synchronous
-    /// `push` uses `confirm_synced_fields` (per-field rebaseline) the
-    /// same way the drainer does, so a title-only push rebaselines
-    /// ONLY the title on the post-push baseline — body / status /
+    /// RFC 0003 D5 synchronous-path parity: the synchronous `push`
+    /// uses `confirm_synced_fields` (per-field rebaseline) the same
+    /// way the drainer does, so a title-only push rebaselines ONLY
+    /// the title on the post-push baseline — body / status /
     /// assignees stay at their pre-push baseline values, and a
     /// subsequent un-pushed edit to any of those fields is still
-    /// detected as a diff. (rpl-vvf nails the byte-identical
-    /// assertion across both paths; this test confirms the call site
-    /// moved and the basic happy-path property holds on the sync
-    /// path too — without it, a `rl task claim` post-promote would
-    /// still drop the assignee because the synchronous push was
-    /// whole-snapshot rebaselining.)
+    /// detected as a diff. This test confirms the call site moved and
+    /// the basic happy-path property holds on the sync path too —
+    /// without it, a `rl task claim` post-promote would still drop the
+    /// assignee because the synchronous push was whole-snapshot
+    /// rebaselining.
     #[tokio::test]
     async fn push_uses_confirm_synced_fields_per_field_baseline() {
         let (svc, tasks, task, _provider) = setup().await;

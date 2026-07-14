@@ -327,7 +327,7 @@ impl OutboxDrainer {
                 // live task + its baseline cannot race a coalesced
                 // sibling; the payload's captured fields are ignored.
                 //
-                // Re-baseline on success (RFC 0003 D5, rpl-xq6):
+                // Re-baseline on success (RFC 0003 D5):
                 // advance the baseline ONLY for the fields actually
                 // transmitted in the patch, via
                 // `confirm_synced_fields` — a field whose channel is
@@ -917,14 +917,15 @@ mod tests {
 
     #[tokio::test]
     async fn drain_update_remote_rebaselines_on_success_rfc0003_d5() {
-        // RFC 0003 D5 (rpl-xq6): a successful drain of an `UpdateRemote`
-        // must re-baseline the task so a later reconcile does not see
-        // the same diff and re-push it. The rebaseline advances
-        // per-field — the patched field moves to the transmitted
-        // value, the un-patched fields stay at the pre-drain baseline
-        // entry (rpl-vvf nails the byte-identical assertion; this
+        // RFC 0003 D5: a successful drain of an `UpdateRemote` must
+        // re-baseline the task so a later reconcile does not see the
+        // same diff and re-push it. The rebaseline advances per-field —
+        // the patched field moves to the transmitted value, the
+        // un-patched fields stay at the pre-drain baseline entry. This
         // happy-path test confirms the basic rebaseline + the
-        // Staged/DirtyLocal → Synced transition the old code skipped).
+        // Staged/DirtyLocal → Synced transition the old code skipped;
+        // `drain_later_body_edit_detected_after_title_rebaseline` guards
+        // the per-field isolation across a second drain.
         let h = harness(test_backoff(5)).await;
         let ws = WorkspaceId::new();
         let task = seed_issue_task(&h, ws, "1").await;
@@ -966,8 +967,7 @@ mod tests {
         assert_eq!(post_baseline.title, "1-edited", "title rebaselined");
         assert_eq!(
             post_baseline.body, pre_baseline.body,
-            "body baseline entry must be unchanged (rpl-xq6 happy path; \
-             rpl-vvf nails the byte-identical assertion across the wire)"
+            "body baseline entry must be unchanged (per-field rebaseline)"
         );
         assert_eq!(post_baseline.lifecycle, pre_baseline.lifecycle);
         assert_eq!(post_baseline.assignees, pre_baseline.assignees);
@@ -1209,7 +1209,7 @@ mod tests {
         // stagger enqueued_at: the in-memory claim tie-breaks on insertion
         // order (mirroring the SQLite `rowid` contract).
         //
-        // RFC 0003 D5 (rpl-xq6) change: with the per-field rebaseline on
+        // RFC 0003 D5 change: with the per-field rebaseline on
         // success, the FIRST drain PATCHes + rebaselines the title so the
         // task is Synced. The second and third drains then see a Synced
         // task with an empty diff and the new drainer code (gated on
@@ -1245,7 +1245,7 @@ mod tests {
         assert_eq!(
             remote_ids,
             vec!["r-started".to_string()],
-            "only the first entry PATCHes (post-rpl-xq6 rebaseline collapses the rest)"
+            "only the first entry PATCHes (the per-field rebaseline on success collapses the rest)"
         );
 
         // FIFO claim order is preserved: every entry lands in
@@ -1702,9 +1702,9 @@ mod tests {
     /// Parallel to `update_remote_pushes_live_task_title_body_not_payload_snapshot`:
     /// the drainer must re-derive assignees from the live task, not from any
     /// payload snapshot. `OutboxMutation::UpdateRemote` carries NO `assignees`
-    /// field (the drainer is the sole source — the rpl-x2v invariant), so the
+    /// field (the drainer is the sole source of assignees), so the
     /// LIVE task's assignees must reach the wire even if the entry was enqueued
-    /// earlier with no assignees. RFC 0003 §7 case 2 (rpl-oa6).
+    /// earlier with no assignees. RFC 0003 §7 case 2.
     #[tokio::test]
     async fn drainer_rerederives_assignees_from_live_task() {
         let h = harness(test_backoff(5)).await;
@@ -1737,7 +1737,7 @@ mod tests {
         assert_eq!(
             updates[0].assignees.as_deref(),
             Some(&["carol".to_string()][..]),
-            "drainer re-derives assignees from the live task (rpl-x2v invariant)"
+            "drainer re-derives assignees from the live task (sole source of assignees)"
         );
         // The other fields stay None because seed_issue_task's title edit
         // is the only diff in MirrorPatch; assignees join it.
@@ -1748,6 +1748,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_later_body_edit_detected_after_title_rebaseline() {
+        // Regression guard for the per-field rebaseline (RFC 0003 §7 case 6,
+        // §D5). Draining a title-only diff must rebaseline ONLY the title.
+        // If the drainer over-rebaselined — snapshotting the whole live task
+        // instead of the transmitted fields — a body edit made *after* that
+        // drain would be silently folded into the baseline and never pushed.
+        // So: drain a title-only diff, then edit the body and re-drain, and
+        // assert the body change still reaches the wire.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+
+        // `seed_issue_task` leaves the task DirtyLocal with a title-only diff
+        // ("task 1" baseline → live "1-edited"); the body baseline is empty.
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        // Drain #1: title-only PATCH. Title rebaselines; body stays empty.
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        h.drainer.drain_once().await.unwrap();
+
+        let mid = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(mid.sync, SyncState::Synced);
+        let mid_baseline = mid.synced_baseline.clone().expect("baseline");
+        assert_eq!(mid_baseline.title, "1-edited", "title rebaselined");
+        assert_eq!(
+            mid_baseline.body, "",
+            "body baseline untouched by a title-only drain"
+        );
+
+        // Now edit ONLY the body on the live task and re-drain.
+        let mut t = h.tasks.get(task.id).await.unwrap();
+        t.set_body("fresh body".into());
+        h.tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let entry2 = OutboxEntry::new(
+            task.id,
+            OutboxMutation::UpdateRemote {
+                canonical_repo: "github.com/o/r".into(),
+                remote_id: "1".into(),
+                title: None,
+                body: None,
+                closed: None,
+            },
+        );
+        h.outbox.enqueue(&entry2).await.unwrap();
+        h.drainer.drain_once().await.unwrap();
+
+        // The body diff must survive the earlier title rebaseline: the second
+        // PATCH carries the new body, and the title is absent (already at
+        // baseline, so nothing to re-push).
+        let updates = h.remote_tasks.updates();
+        assert_eq!(updates.len(), 2, "one PATCH per drain");
+        assert_eq!(
+            updates[1].body.as_deref(),
+            Some("fresh body"),
+            "body edit made after the title rebaseline still reaches the wire"
+        );
+        assert_eq!(
+            updates[1].title, None,
+            "title already at baseline — not re-pushed"
+        );
+
+        // The task settles back to Synced with the body now rebaselined and
+        // no residual diff.
+        let post = h.tasks.get(task.id).await.unwrap();
+        assert_eq!(post.sync, SyncState::Synced);
+        assert_eq!(
+            post.synced_baseline.as_ref().expect("baseline").body,
+            "fresh body",
+            "body rebaselined after its own drain"
+        );
+        assert!(post.diff_against_baseline().is_empty());
+    }
+
+    #[tokio::test]
     async fn drain_update_remote_skips_provider_when_patch_empty() {
         // Empty `MirrorPatch` ⇒ helper returns None ⇒ drainer does NOT
         // call `update_remote` at all. The entry still succeeds (no
@@ -1755,7 +1839,7 @@ mod tests {
         // behavior — a coalesced empty head, a comment-only push, etc.
         // all collapse to a no-op.
         //
-        // RFC 0003 D5 (rpl-xq6): the drainer also gates the entire
+        // RFC 0003 D5: the drainer also gates the entire
         // PATCH+confirm+save block on `confirmable` state. After
         // reverting the title to its baseline value, the task is
         // `Synced` (not confirmable), so the block is skipped entirely
