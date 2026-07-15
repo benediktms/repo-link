@@ -581,7 +581,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_project_skips_issue_with_no_node_id() {
-        // rpl-4ui: a pre-project-sync task carries a remote_id but no GraphQL
+        // A pre-project-sync task carries a remote_id but no GraphQL
         // node id, so it can't be AddItem'd. It's skipped (and logged — the
         // skip is no longer silent), not enqueued with a bogus node id.
         let ws_repo = Arc::new(InMemoryWorkspaceRepository::new());

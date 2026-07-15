@@ -24,7 +24,7 @@ pub struct RecordedUpdate {
     /// field (leave remote unchanged); `Some(vec![])` ⇒ clear;
     /// `Some(non-empty)` ⇒ the set to apply. Mirrors
     /// [`RemoteTaskUpdate::assignees`] so drainer tests can assert the
-    /// field-level PATCH shape end-to-end (rpl-x2v).
+    /// field-level PATCH shape end-to-end.
     pub assignees: Option<Vec<String>>,
 }
 

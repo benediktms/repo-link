@@ -374,7 +374,7 @@ mod tests {
         }
     }
 
-    // --- D1 follow-up (rpl-47f): planner payload is intentionally coarse ----
+    // --- D1 follow-up: planner payload is intentionally coarse ----
     //
     // The UpdateRemote arm of `plan_mutations` hand-rolls a 2-field payload
     // (title, body) and tags `closed: None`. The drainer ignores those

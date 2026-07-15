@@ -515,7 +515,7 @@ impl TaskService {
     /// value (or `None`). Bypasses the [`Task::set_filing_repo_id`]
     /// immutability guard via [`Task::force_set_filing_repo_id`], which is
     /// the only place a recorded filing repo can be changed. Used by the
-    /// `rl repo doctor --repair` path (rpl-sv2) to heal tasks whose
+    /// `rl repo doctor --repair` path to heal tasks whose
     /// filing binding was deleted out from under them (e.g. after a
     /// GitHub org-move replaced the canonical binding with a new UUID
     /// and never re-pointed the recorded column).
@@ -4226,7 +4226,7 @@ mod tests {
 
     /// `repoint_filing_repo` re-points the recorded `filing_repo_id` and
     /// tags the resulting snapshot with `FilingRepoRepair` so the audit
-    /// trail makes every doctor re-point greppable. rpl-sv2.
+    /// trail makes every doctor re-point greppable.
     #[tokio::test]
     async fn repoint_filing_repo_writes_repair_snapshot() {
         let (svc, bindings) = svc_with_bindings();
@@ -4340,7 +4340,7 @@ mod tests {
     /// `repoint_filing_repo` must pre-validate the target binding
     /// exists before persisting the re-point. Otherwise a typo or
     /// stale binding handle would silently write ANOTHER dangling
-    /// pointer (the bug class rpl-sv2 exists to heal, just on a
+    /// pointer (the bug class the doctor exists to heal, just on a
     /// different column). CodeRabbit review flagged this as a Major
     /// defensive-programming miss.
     #[tokio::test]

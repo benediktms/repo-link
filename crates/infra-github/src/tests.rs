@@ -97,7 +97,7 @@ async fn create_issue_returns_snapshot() {
         .await
         .unwrap();
     assert_eq!(snap.remote_id, "42");
-    // The REST create response's node_id is surfaced on the snapshot (rpl-4ui)
+    // The REST create response's node_id is surfaced on the snapshot
     // — it's what makes the promoted task board-eligible downstream.
     assert_eq!(snap.node_id.as_deref(), Some("I_kwDOAAAAAA"));
     assert_eq!(snap.title, "ship it");

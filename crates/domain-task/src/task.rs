@@ -649,7 +649,7 @@ impl Task {
     }
 
     /// Deliberate override of a recorded `filing_repo_id`, used only by the
-    /// `rl repo doctor --repair` path (rpl-sv2 / RFC 0002 D2 repair). Unlike
+    /// `rl repo doctor --repair` path (RFC 0002 D2 repair). Unlike
     /// [`set_filing_repo_id`], this method does NOT reject changes to a
     /// recorded value — its sole purpose is to break the immutability guard
     /// when a binding is deleted out from under a task (e.g. after a GitHub
@@ -812,8 +812,8 @@ impl Task {
 
 /// The fields GitHub mirrors on a task's backing issue — the single source of
 /// truth (RFC 0003 D1) for what counts as remote-observable content. Dirty
-/// detection here, the field-level diff ([`Task::diff_against_baseline`], rpl-day),
-/// and the outbound/inbound field sets (`application-sync`, rpl-47f) all reference
+/// detection here, the field-level diff ([`Task::diff_against_baseline`]),
+/// and the outbound/inbound field sets (`application-sync`) all reference
 /// this set so the definitions cannot drift apart. `priority`, `relations`, and
 /// the project-status axis are deliberately NOT mirrored.
 ///
@@ -829,7 +829,7 @@ pub enum MirrorField {
 }
 
 /// Canonical iteration order over [`MirrorField`]. Detection folds this with
-/// [`MirrorField::differs`]; the field-level diff (rpl-day) walks the same set.
+/// [`MirrorField::differs`]; the field-level diff walks the same set.
 pub const MIRRORED_FIELDS: [MirrorField; 4] = [
     MirrorField::Title,
     MirrorField::Body,
@@ -858,7 +858,7 @@ impl MirrorField {
 /// A field-level diff of a task against its [`Task::synced_baseline`]: each field is
 /// `Some(current value)` iff it differs from the baseline (per
 /// [`MirrorField::differs`]), else `None`. Built by [`Task::diff_against_baseline`]
-/// so the outbound push (rpl-x2v / rpl-47f) can send only the fields that changed.
+/// so the outbound push can send only the fields that changed.
 /// Carries domain values — `status` is the [`Lifecycle`] value; the open/closed +
 /// state_reason → REST mapping happens at the outbound boundary, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -999,7 +999,7 @@ mod tests {
     #[test]
     fn mirrored_fields_set_is_canonical_and_complete() {
         // Tripwire: adding a mirrored field to `Task` without extending the set
-        // (or vice versa) fails here. Supports the rpl-3j3 labels decision.
+        // (or vice versa) fails here. Supports the labels decision.
         assert_eq!(MIRRORED_FIELDS.len(), 4);
         for f in [
             MirrorField::Title,
@@ -1945,7 +1945,7 @@ mod tests {
 
     #[test]
     fn force_set_filing_repo_id_repairs_a_recorded_value() {
-        // rpl-sv2: the recorded value is dangling (its binding was deleted
+        // The recorded value is dangling (its binding was deleted
         // out from under us by an org-move). The doctor flow's deliberate
         // override path is the only way out of the immutability guard.
         let mut t = draft();

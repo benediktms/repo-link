@@ -23,7 +23,7 @@ pub struct RepoBindingService {
     workspaces: Arc<dyn WorkspaceRepository>,
     bindings: Arc<dyn RepoBindingRepository>,
     /// Optional task repo — the `doctor` method walks tasks to
-    /// re-point dangling `filing_repo_id` values (rpl-sv2). When
+    /// re-point dangling `filing_repo_id` values. When
     /// `None`, `doctor` returns an error regardless of mode (it
     /// can't operate without a task repo); the CLI is the only
     /// caller that wires one, via `with_tasks`. Keeping this
@@ -505,7 +505,7 @@ impl RepoBindingService {
 
     /// Inspect every task in `workspace_id` and report (or repair) any
     /// whose recorded `filing_repo_id` references a binding that no
-    /// longer exists (rpl-sv2). Two modes:
+    /// longer exists. Two modes:
     ///
     /// - `repair = false` (the default): list-only. For each affected
     ///   task, produce a `DoctorRow` with the proposed `target_repo_id`.
@@ -554,7 +554,7 @@ impl RepoBindingService {
         // per-task loop, so a phantom `RepoId` (typo, stale handle,
         // cross-workspace id mistake) fails loud and fast — never
         // silently writes another dangling pointer, the exact bug
-        // class rpl-sv2 exists to heal. The CLI already guards
+        // class the doctor exists to heal. The CLI already guards
         // this via `resolve_repo_handle_required`; this is the
         // service-layer net for direct API callers.
         if let Some(forced) = target_override {
@@ -655,7 +655,7 @@ impl RepoBindingService {
     ) -> Result<Option<RepoOriginId>> {
         // Step 1: the task's *logical* `repo_id`, if it still resolves
         // to a live binding. Org-moves update `repo_id` correctly
-        // (this is the divergence rpl-sv2 describes), so the live
+        // (this is the divergence the doctor repairs), so the live
         // logical binding is the new filing home for the common case.
         //
         // Only `NotFound` is "binding gone" (→ fall through to step
@@ -1516,7 +1516,7 @@ mod tests {
         );
     }
 
-    // ---------- Doctor (rpl-sv2) ------------------------------------------
+    // ---------- Doctor ------------------------------------------
 
     /// Seed a workspace + a single task whose `filing_repo_id` references
     /// a binding that's about to be deleted. The doctor flow's
@@ -1667,7 +1667,7 @@ mod tests {
     /// (the CLI also guards this in its handle resolver). Without
     /// it, a phantom `RepoId` would silently re-point every
     /// affected task to ANOTHER dangling binding — the exact
-    /// bug class rpl-sv2 exists to heal.
+    /// bug class the doctor exists to heal.
     #[tokio::test]
     async fn doctor_repair_rejects_unknown_target_override() {
         let (bsvc, tasks, _bindings, workspaces) = setup_with_tasks();

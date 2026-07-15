@@ -42,7 +42,7 @@ pub enum SnapshotSource {
     /// source while leaving the task in `Conflict` for the user to resolve.
     Link,
     /// Local state after `rl repo doctor --repair` re-pointed a task's
-    /// `filing_repo_id` to a live binding (rpl-sv2 / RFC 0002 D2 repair).
+    /// `filing_repo_id` to a live binding (RFC 0002 D2 repair).
     /// Baseline-eligible because the doctor is an authoritative user action:
     /// the recorded value is no longer dangling, so subsequent pull should
     /// NOT fire a phantom drift on the new (now-correct) canonical.
@@ -134,7 +134,7 @@ impl TaskSnapshot {
 mod tests {
     use super::*;
 
-    /// Tripwire pinning which sources are baseline-eligible (rpl-sv2). A new
+    /// Tripwire pinning which sources are baseline-eligible. A new
     /// snapshot source MUST be a deliberate addition to this set; the
     /// alternative (default-ineligible) is wrong because the doctor
     /// re-point relies on `FilingRepoRepair` rebaselining the task so the
@@ -143,7 +143,7 @@ mod tests {
     fn filing_repo_repair_is_baseline_eligible() {
         assert!(
             SnapshotSource::FilingRepoRepair.is_baseline(),
-            "FilingRepoRepair must be baseline-eligible — see rpl-sv2"
+            "FilingRepoRepair must be baseline-eligible for the filing-repo repair path"
         );
     }
 

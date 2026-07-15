@@ -442,7 +442,7 @@ fn task_batch_lifecycle_commands_emit_per_task_results() {
     }
 }
 
-/// `rl task relate` (rpl-7oz) must wrap its return in a `{ok, task}` /
+/// `rl task relate` must wrap its return in a `{ok, task}` /
 /// `{ok: false, error}` envelope so a caller can tell whether the edge was
 /// actually added. The pre-fix shape was a bare `TaskDto` (success) or
 /// `Error: ...` on stderr (failure) — indistinguishable to a JSON-pipe
@@ -3785,7 +3785,7 @@ fn workspace_set_filing_repo_requires_repo_or_none() {
     );
 }
 
-/// `rl repo doctor` is the user-initiated repair verb for rpl-sv2 (the
+/// `rl repo doctor` is the user-initiated repair verb for the
 /// silent-divergence bug where a binding is deleted out from under a
 /// task's recorded `filing_repo_id`). On a healthy workspace (no
 /// affected tasks), the command emits the doctor envelope with

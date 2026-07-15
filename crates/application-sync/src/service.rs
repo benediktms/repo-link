@@ -249,11 +249,11 @@ impl SyncService {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
-        // rpl-s7k: pull resolves the filing repo via the same D2 chain as
+        // Pull resolves the filing repo via the same D2 chain as
         // promote (recorded `filing_repo_id` → workspace default → logical
         // `repo_id`) — see `filing_canonical_for`. A `NotFound` here means
         // a binding has been deleted; the durable fix is `rl repo doctor
-        // --repair` to re-point the column. The previous rpl-sv2 soft-fall
+        // --repair` to re-point the column. The previous soft-fall
         // is gone: it could only ever look up the same `repo_id` the
         // helper already tried, so it never resolved a binding the helper
         // missed.
@@ -1107,11 +1107,11 @@ mod tests {
         last_create_canonical: Mutex<Option<String>>,
         last_update: Mutex<Option<RecordedUpdate>>,
         // Canonical URL of the most recent `fetch_remote` call — pinned
-        // by the rpl-s7k tests to assert the D2 chain resolved to the
+        // by the D2-chain tests to assert the D2 chain resolved to the
         // expected repo (workspace default, not logical).
         last_fetch_canonical: Mutex<Option<String>>,
         // Canonical URL of the most recent `update_remote` call —
-        // pinned by the rpl-s7k tests to assert push's D2 chain
+        // pinned by the D2-chain tests to assert push's D2 chain
         // resolved to the expected repo.
         last_update_canonical: Mutex<Option<String>>,
         fetch_returns: Mutex<Option<RemoteTaskSnapshot>>,
@@ -1890,7 +1890,7 @@ mod tests {
         );
     }
 
-    /// D2-chain test fixture (rpl-s7k): a workspace with a filing default
+    /// D2-chain test fixture: a workspace with a filing default
     /// and two bindings (default + logical code), and a saga task that
     /// lives in the default repo with a recorded `remote_id` but no
     /// `filing_repo_id` on the task. The `default_binding_id` lets the
@@ -2004,7 +2004,7 @@ mod tests {
         assert_eq!(
             provider.last_fetch_canonical.lock().unwrap().as_deref(),
             Some("github.com/o/filing"),
-            "pull fetched from the workspace default, not the logical code repo (rpl-s7k)"
+            "pull fetched from the workspace default, not the logical code repo"
         );
         assert_eq!(s.decision, "noop");
     }
@@ -2043,7 +2043,7 @@ mod tests {
         assert_eq!(
             provider.last_update_canonical.lock().unwrap().as_deref(),
             Some("github.com/o/filing"),
-            "push PATCH'd the workspace default, not the logical code repo (rpl-s7k)"
+            "push PATCH'd the workspace default, not the logical code repo"
         );
     }
 
@@ -2141,7 +2141,7 @@ mod tests {
 
     /// Positive counterpart of `push_sends_only_changed_fields`: a local
     /// assignee edit MUST ride the PATCH as `Some(&[..])`, and every other
-    /// mirrored field must stay `None`. RFC 0003 §7 case 1 (rpl-oa6).
+    /// mirrored field must stay `None`. RFC 0003 §7 case 1.
     #[tokio::test]
     async fn push_sends_changed_assignee() {
         let (svc, tasks, task, provider) = setup().await;
@@ -2170,7 +2170,7 @@ mod tests {
     /// a local reorder (set-equivalent lists in different order) is NOT a
     /// PATCH. `assignees_equal` (domain-task) is order-insensitive, so
     /// `reconcile_dirty_against_baseline` collapses the would-be dirty task
-    /// back to Synced before `push` runs. RFC 0003 §7 case 4 (rpl-oa6).
+    /// back to Synced before `push` runs. RFC 0003 §7 case 4.
     #[tokio::test]
     async fn push_does_not_publish_on_pure_assignee_reorder() {
         let (svc, tasks, task, provider) = setup().await;
@@ -2209,7 +2209,7 @@ mod tests {
     /// `set_assignees(vec![])` is an explicit CLEAR, distinct from omitting
     /// the field. The diff helper must emit `Some(vec![])` (which the wire
     /// adapter serializes as `"assignees": []`), not `None`. RFC 0003 §7
-    /// case 5 (rpl-oa6).
+    /// case 5.
     #[tokio::test]
     async fn push_with_empty_assignees_sends_explicit_clear() {
         let (svc, tasks, task, provider) = setup().await;
@@ -2741,7 +2741,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_errors_when_filing_binding_is_gone() {
-        // rpl-s7k: the rpl-sv2 soft-fall to the logical repo is gone. A
+        // The soft-fall to the logical repo is gone. A
         // dangling `filing_repo_id` (binding deleted, no live binding
         // anywhere on the chain) surfaces as a `NotFound` error so the
         // user runs `rl repo doctor --repair` instead of silently
@@ -2854,7 +2854,7 @@ mod tests {
 
     #[tokio::test]
     async fn pull_hard_fails_when_neither_filing_nor_logical_resolves() {
-        // rpl-s7k: the rpl-sv2 soft-fall is gone, so this is now the
+        // The soft-fall is gone, so this is now the
         // *primary* "no resolvable home" test. With no workspace default
         // and both the recorded `filing_repo_id` and `repo_id` pointing
         // at a deleted binding, the D2 chain has nothing to resolve

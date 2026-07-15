@@ -303,7 +303,7 @@ pub(crate) enum RepoCmd {
     /// hit is returned.
     Find { query: String },
     /// Inspect (and optionally repair) tasks whose recorded
-    /// `filing_repo_id` references a deleted binding (rpl-sv2). Without
+    /// `filing_repo_id` references a deleted binding. Without
     /// `--repair`: list each affected task with the auto-resolved
     /// target — the user audits before committing. With `--repair`:
     /// re-point every affected task's `filing_repo_id` to the target

@@ -428,7 +428,7 @@ impl QueryService {
             let (project_status, project_status_expected, project_drift) =
                 project_axis(project.as_ref(), t);
 
-            // rpl-sv2: a third axis that catches the silent divergence
+            // A third axis that catches the silent divergence
             // where a task's recorded `filing_repo_id` references a
             // binding that's been deleted out from under it (e.g. an
             // org-move replaced the canonical binding with a new UUID
@@ -1447,7 +1447,7 @@ mod tests {
         assert_eq!(rows[0].status, "missing_path");
     }
 
-    /// rpl-sv2: a `Synced` task whose recorded `filing_repo_id`
+    /// A `Synced` task whose recorded `filing_repo_id`
     /// references a binding that's been deleted (e.g. an org-move
     /// replaced the binding, but the recorded UUID was never
     /// re-pointed) is the load-bearing case for the new

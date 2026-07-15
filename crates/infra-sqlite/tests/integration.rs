@@ -1942,7 +1942,7 @@ async fn cache_project_status_does_not_clobber_concurrent_whole_row_edit() {
     );
 }
 
-/// rpl-4ui (RFC 0001 §9 / §D1) — `cache_remote_node_id` backfills ONLY the
+/// RFC 0001 §9 / §D1 — `cache_remote_node_id` backfills ONLY the
 /// `remote_node_id` column for a pre-project-sync task, and survives a
 /// concurrent whole-row edit just like `cache_project_status`. Promote with a
 /// bare `RemoteRef::new` (node id `None`, the pre-Stage-2 shape), confirm it
@@ -2013,7 +2013,7 @@ async fn cache_remote_node_id_backfills_without_clobbering_concurrent_edit() {
         .expect("cache_remote_node_id for an absent task is a no-op Ok");
 }
 
-/// rpl-4ui (Greptile review on #109) — `cache_remote_node_id` must NOT strand a
+/// Greptile review on #109 — `cache_remote_node_id` must NOT strand a
 /// node id on a remote-less (local-only / draft) task. The SQLite write is
 /// guarded by `remote_id IS NOT NULL`, matching the in-memory fixture's no-op,
 /// so the two implementations can't diverge.
@@ -2749,7 +2749,7 @@ async fn rfc0005_migration_splits_identity_keeps_instances_and_dedups_remote() {
     drop(dir);
 }
 
-/// rpl-sv2 follow-up: `find_by_remote_mapping` must be
+/// A follow-up to the filing-repo repair path: `find_by_remote_mapping` must be
 /// workspace-scoped and ambiguous (≥2 matches in the same workspace)
 /// must surface as `None` (so the doctor surfaces the situation as
 /// `unresolved` rather than arbitrarily picking a binding during
@@ -2812,7 +2812,7 @@ async fn find_by_remote_mapping_is_workspace_scoped_and_ambiguity_returns_none()
     // return w2's binding. (If it did, `rl repo doctor --repair`
     // would silently re-point a w1 task to a w2 binding — a
     // cross-workspace data corruption, the exact silent-divergence
-    // class rpl-sv2 exists to heal.)
+    // class the doctor exists to heal.)
     let w1_hit = rb
         .find_by_remote_mapping(w1.id, "github", "shared-1")
         .await
