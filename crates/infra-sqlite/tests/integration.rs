@@ -430,6 +430,73 @@ async fn remote_dedup_keyed_on_filing_repo_when_it_diverges() {
     );
 }
 
+/// `tracked_remote_ids` is the batched companion to `find_by_remote` behind
+/// `sync list-remote`: given candidate remote ids in one filing repo, it
+/// returns the subset a local task mirrors — in a single `IN (…)` query,
+/// scoped by filing repo + provider.
+#[tokio::test]
+async fn tracked_remote_ids_returns_matching_subset_scoped_by_filing_repo() {
+    let (_dir, ws, rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let filing = seed_binding(
+        &rb,
+        w.id,
+        "git@github.com:o/filing.git",
+        "github.com/o/filing",
+        None,
+    )
+    .await;
+    let other = seed_binding(
+        &rb,
+        w.id,
+        "git@github.com:o/other.git",
+        "github.com/o/other",
+        None,
+    )
+    .await;
+    let filing_origin = RepoOriginId::from_uuid(filing.origin_id.as_uuid());
+    let other_origin = RepoOriginId::from_uuid(other.origin_id.as_uuid());
+
+    // Two tasks filed in `filing` (#1, #2); none in `other`.
+    for num in ["1", "2"] {
+        let mut t = Task::new_draft(w.id, Some(filing.id), format!("issue {num}")).unwrap();
+        t.set_filing_repo_id(Some(RepoId::from_uuid(filing.origin_id.as_uuid())))
+            .unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", num)).unwrap();
+        ts.save(&t, SnapshotSource::Promote).await.unwrap();
+    }
+
+    // #1 and #2 are tracked; #3 is not. Order-independent, so compare as a set.
+    let candidates = ["1".to_string(), "2".to_string(), "3".to_string()];
+    let hit = ts
+        .tracked_remote_ids(filing_origin, "github", &candidates)
+        .await
+        .unwrap();
+    assert_eq!(
+        hit,
+        std::collections::HashSet::from(["1".to_string(), "2".to_string()])
+    );
+
+    // Scoped by filing repo: the `other` repo tracks none of them.
+    assert!(
+        ts.tracked_remote_ids(other_origin, "github", &candidates)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Empty input short-circuits to an empty set.
+    assert!(
+        ts.tracked_remote_ids(filing_origin, "github", &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// RFC 0005 §D4: the COALESCE-to-logical fallback is GONE — `find_by_remote`
 /// keys on `filing_repo_id` alone (ORIGIN id space). A task whose logical repo
 /// is its filing repo records the logical repo's *origin* as the filing repo

@@ -61,6 +61,13 @@ pub(crate) async fn sync_dispatch(
         return sync_import(provider.as_ref(), svc, &workspace, &url, cascade).await;
     }
 
+    let sync = SyncService::new(
+        svc.tasks_repo.clone(),
+        svc.bindings_repo.clone(),
+        svc.workspaces_repo.clone(),
+        provider,
+    );
+
     // `list-remote` is a read-only discovery query with its own repo-resolution
     // precedence, not part of the promote/push/pull task reconciliation.
     if let SyncCmd::ListRemote {
@@ -69,21 +76,9 @@ pub(crate) async fn sync_dispatch(
         ws: WorkspaceArg { workspace },
     } = cmd
     {
-        let sync = SyncService::new(
-            svc.tasks_repo.clone(),
-            svc.bindings_repo.clone(),
-            svc.workspaces_repo.clone(),
-            provider,
-        );
         return sync_list_remote(svc, &sync, workspace, repo, since).await;
     }
 
-    let sync = SyncService::new(
-        svc.tasks_repo.clone(),
-        svc.bindings_repo.clone(),
-        svc.workspaces_repo.clone(),
-        provider,
-    );
     // Resolve the friendly task reference (UUID / bare hash / prefix-hash)
     // to a UUID here, at the CLI boundary, so `sync` accepts the same id
     // forms as every other task command. `SyncService` stays UUID-only.

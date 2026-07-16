@@ -272,6 +272,33 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(Some(task))
     }
 
+    async fn tracked_remote_ids(
+        &self,
+        filing_repo_id: RepoOriginId,
+        provider: &str,
+        remote_ids: &[String],
+    ) -> PortResult<std::collections::HashSet<String>> {
+        if remote_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        // Single `IN (…)` lookup rather than N point-queries. Only the matching
+        // `remote_id`s are selected — no full-task hydration (relations /
+        // baseline / comments), which the tracked/untracked check doesn't need.
+        let placeholders = vec!["?"; remote_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT remote_id FROM tasks \
+             WHERE filing_repo_id = ? AND remote_provider = ? AND remote_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_scalar::<_, String>(&sql)
+            .bind(filing_repo_id.to_string())
+            .bind(provider);
+        for id in remote_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(&self.db.reads).await.map_err(map_sqlx_err)?;
+        Ok(rows.into_iter().collect())
+    }
+
     async fn replace_comments(
         &self,
         task_id: TaskId,

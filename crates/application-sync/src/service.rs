@@ -703,21 +703,23 @@ impl SyncService {
             .provider
             .list_changed_since(canonical_url, since)
             .await?;
-        let mut issues = Vec::with_capacity(snaps.len());
-        for snap in snaps {
-            let tracked = self
-                .tasks
-                .find_by_remote(origin_id, &provider, &snap.remote_id)
-                .await?
-                .is_some();
-            issues.push(RemoteIssueRow {
+        // Single batched tracked-lookup for the whole page rather than an N+1
+        // per-issue query (each issue's `tracked` flag is then a set lookup).
+        let remote_ids: Vec<String> = snaps.iter().map(|s| s.remote_id.clone()).collect();
+        let tracked = self
+            .tasks
+            .tracked_remote_ids(origin_id, &provider, &remote_ids)
+            .await?;
+        let issues = snaps
+            .into_iter()
+            .map(|snap| RemoteIssueRow {
+                tracked: tracked.contains(&snap.remote_id),
                 remote_id: snap.remote_id,
                 title: snap.title,
                 closed: snap.closed,
                 updated_at: snap.updated_at,
-                tracked,
-            });
-        }
+            })
+            .collect();
         Ok(ListRemoteGroup {
             repo: repo_name.to_string(),
             canonical_url: canonical_url.to_string(),

@@ -193,6 +193,18 @@ pub trait TaskRepository: Send + Sync {
         provider: &str,
         remote_id: &str,
     ) -> PortResult<Option<Task>>;
+    /// Batch companion to [`find_by_remote`]: given candidate `remote_id`s in
+    /// one filing repo, return the subset a local task already mirrors — one
+    /// query instead of N. Used by `sync list-remote` (and the RFC 0001 §D4
+    /// poller) to mark tracked/untracked without an N+1. An empty input
+    /// returns an empty set without touching the store. Returns only the
+    /// `remote_id`s (not full tasks) since callers just need set membership.
+    async fn tracked_remote_ids(
+        &self,
+        filing_repo_id: RepoOriginId,
+        provider: &str,
+        remote_ids: &[String],
+    ) -> PortResult<std::collections::HashSet<String>>;
     /// Replace the task's *synced* comments with `comments` (always
     /// remote-backed — taking [`RemoteComment`] rather than `TaskComment`
     /// makes pending input unrepresentable), leaving any pending local-only
