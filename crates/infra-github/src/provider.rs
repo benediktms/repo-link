@@ -5,6 +5,7 @@
 //! method to whichever protocol GitHub exposes the capability on.
 
 use async_trait::async_trait;
+use domain_core::Timestamp;
 use ports::{
     PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteProjectProvider,
     RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
@@ -136,6 +137,14 @@ impl RemoteTaskProvider for GithubAdapter {
         self.rest
             .discover_move_target(canonical_repo, remote_id)
             .await
+    }
+
+    async fn list_changed_since(
+        &self,
+        canonical_repo: &str,
+        since: Timestamp,
+    ) -> PortResult<Vec<RemoteTaskSnapshot>> {
+        self.rest.list_issues(canonical_repo, since).await
     }
 
     async fn add_sub_issue(

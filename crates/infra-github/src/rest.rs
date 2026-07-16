@@ -123,6 +123,59 @@ impl RestClient {
         Ok(map_issue(issue))
     }
 
+    /// List issues in `canonical_repo` whose `updatedAt` is at or after
+    /// `since`, most-recently-updated first. Backs both `rl sync list-remote`
+    /// and the RFC 0001 §D4 REST polling fallback for projectless workspaces.
+    /// GitHub's issues endpoint interleaves pull requests; they carry a
+    /// `pull_request` link and are filtered out — only true issues map to
+    /// tasks. Pages through until a short page or the safety cap.
+    pub(crate) async fn list_issues(
+        &self,
+        canonical_repo: &str,
+        since: Timestamp,
+    ) -> PortResult<Vec<RemoteTaskSnapshot>> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        let since_iso = since.as_inner().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 50;
+        let mut snapshots: Vec<RemoteTaskSnapshot> = Vec::new();
+        let mut cap_page_full = false;
+        for page in 1..=MAX_PAGES {
+            let route = format!(
+                "/repos/{owner}/{repo}/issues\
+                 ?state=all&since={since_iso}&sort=updated&direction=desc\
+                 &per_page={PER_PAGE}&page={page}"
+            );
+            let batch: Vec<Issue> = self.http.get(route, None::<&()>).await.map_err(map_err)?;
+            // Pagination is keyed off the raw page size (GitHub counts PRs in
+            // the page), so measure fullness before filtering them out.
+            let full = batch.len() == PER_PAGE;
+            snapshots.extend(
+                batch
+                    .into_iter()
+                    .filter(|i| i.pull_request.is_none())
+                    .map(map_issue),
+            );
+            if !full {
+                break;
+            }
+            if page == MAX_PAGES {
+                cap_page_full = true;
+            }
+        }
+        // Hitting the cap on a full final page means the window is too wide to
+        // page exhaustively. Fail loud (never silently truncate) and point the
+        // caller at a narrower `--since`.
+        if cap_page_full {
+            return Err(PortError::Backend(format!(
+                "{canonical_repo} has more than {} issues updated since {since_iso}; \
+                 narrow the window with --since",
+                MAX_PAGES as usize * PER_PAGE
+            )));
+        }
+        Ok(snapshots)
+    }
+
     /// List the direct sub-issues of an issue. octocrab has no typed handler
     /// for `/sub_issues`, so we hit it via the generic `get` and decode into
     /// the typed `Issue` model. Each child carries its own canonical repo
