@@ -459,8 +459,9 @@ async fn tracked_remote_ids_returns_matching_subset_scoped_by_filing_repo() {
     let filing_origin = RepoOriginId::from_uuid(filing.origin_id.as_uuid());
     let other_origin = RepoOriginId::from_uuid(other.origin_id.as_uuid());
 
-    // Two tasks filed in `filing` (#1, #2); none in `other`.
-    for num in ["1", "2"] {
+    // Tasks filed in `filing` (#1, #2, and #1500 — the last lands in a later
+    // chunk for the parameter-cap test below); none in `other`.
+    for num in ["1", "2", "1500"] {
         let mut t = Task::new_draft(w.id, Some(filing.id), format!("issue {num}")).unwrap();
         t.set_filing_repo_id(Some(RepoId::from_uuid(filing.origin_id.as_uuid())))
             .unwrap();
@@ -494,6 +495,20 @@ async fn tracked_remote_ids_returns_matching_subset_scoped_by_filing_repo() {
             .await
             .unwrap()
             .is_empty()
+    );
+
+    // A candidate list well past SQLite's per-statement parameter cap (the
+    // chunking guard): 2000 ids must resolve without a "too many variables"
+    // error, and hits are unioned across chunks — #1500 lands in a later chunk
+    // than #1/#2.
+    let many: Vec<String> = (0..2000).map(|n| n.to_string()).collect();
+    let hit = ts
+        .tracked_remote_ids(filing_origin, "github", &many)
+        .await
+        .unwrap();
+    assert_eq!(
+        hit,
+        std::collections::HashSet::from(["1".to_string(), "2".to_string(), "1500".to_string()])
     );
 }
 
