@@ -2,6 +2,7 @@
 //! `(closed, state_reason)` of every `update_remote` call so a test can assert
 //! the drainer re-derives lifecycle correctly, with a one-shot failure knob.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -50,6 +51,12 @@ pub struct InMemoryRemoteTaskProvider {
     /// returns); set it to a DIFFERENT list to drive the drainer's
     /// assignee-conflict tripwire (a remote that didn't apply the assignees).
     update_assignees_returns: Mutex<Option<Vec<String>>>,
+    /// Canned `list_changed_since` results, keyed by canonical repo. A repo
+    /// with no entry returns an empty list. Drives `sync list-remote` tests.
+    list_returns: Mutex<HashMap<String, Vec<RemoteTaskSnapshot>>>,
+    /// Records every `list_changed_since` call as `(canonical_repo, since)`,
+    /// in order — lets a test assert which repos were queried (and the window).
+    list_calls: Mutex<Vec<(String, Timestamp)>>,
 }
 
 impl InMemoryRemoteTaskProvider {
@@ -67,6 +74,19 @@ impl InMemoryRemoteTaskProvider {
     /// tripwire.
     pub fn set_update_assignees_returns(&self, assignees: Vec<String>) {
         *self.update_assignees_returns.lock().unwrap() = Some(assignees);
+    }
+
+    /// Set the issues `list_changed_since` returns for `canonical_repo`.
+    pub fn set_list_returns(&self, canonical_repo: &str, snaps: Vec<RemoteTaskSnapshot>) {
+        self.list_returns
+            .lock()
+            .unwrap()
+            .insert(canonical_repo.into(), snaps);
+    }
+
+    /// The `(canonical_repo, since)` of every `list_changed_since` call, in order.
+    pub fn list_calls(&self) -> Vec<(String, Timestamp)> {
+        self.list_calls.lock().unwrap().clone()
     }
 
     pub fn updates(&self) -> Vec<RecordedUpdate> {
@@ -161,6 +181,24 @@ impl RemoteTaskProvider for InMemoryRemoteTaskProvider {
 
     async fn fetch_remote(&self, _: &str, _: &str) -> PortResult<RemoteTaskSnapshot> {
         Err(PortError::NotFound("fetch_remote not stubbed".into()))
+    }
+
+    async fn list_changed_since(
+        &self,
+        canonical_repo: &str,
+        since: Timestamp,
+    ) -> PortResult<Vec<RemoteTaskSnapshot>> {
+        self.list_calls
+            .lock()
+            .unwrap()
+            .push((canonical_repo.into(), since));
+        Ok(self
+            .list_returns
+            .lock()
+            .unwrap()
+            .get(canonical_repo)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn create_comment(&self, _: &str, _: &str, _: &str) -> PortResult<RemoteComment> {

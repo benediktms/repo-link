@@ -4,6 +4,8 @@
 //! their code in `rest.rs`.
 
 use crate::GithubAdapter;
+use chrono::{DateTime, Utc};
+use domain_core::Timestamp;
 use ports::{RemoteStateReason, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskUpdate};
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -70,6 +72,53 @@ fn issue_payload(number: u64, title: &str, body: &str, state: &str) -> serde_jso
         "updated_at": "2026-05-20T12:00:00Z",
         "author_association": "OWNER"
     })
+}
+
+/// An issue JSON body that is actually a pull request. GitHub's issues
+/// endpoint interleaves PRs, distinguished only by a `pull_request` link —
+/// used to assert `list_changed_since` filters them out.
+fn pr_payload(number: u64, title: &str) -> serde_json::Value {
+    let mut v = issue_payload(number, title, "", "open");
+    v["pull_request"] = serde_json::json!({
+        "url": format!("https://api.github.com/repos/o/r/pulls/{number}"),
+        "html_url": format!("https://github.com/o/r/pull/{number}"),
+        "diff_url": format!("https://github.com/o/r/pull/{number}.diff"),
+        "patch_url": format!("https://github.com/o/r/pull/{number}.patch")
+    });
+    v
+}
+
+#[tokio::test]
+async fn list_changed_since_returns_issues_and_filters_prs() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r/issues"))
+        .and(query_param("state", "all"))
+        .and(query_param("since", "2026-01-01T00:00:00Z"))
+        .and(query_param("sort", "updated"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            issue_payload(10, "open issue", "b", "open"),
+            pr_payload(11, "a pull request"),
+            issue_payload(12, "closed issue", "b", "closed"),
+        ])))
+        .mount(&server)
+        .await;
+
+    let provider = GithubAdapter::with_base_url("t0k", server.uri()).unwrap();
+    let since = Timestamp::from_utc("2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap());
+    let snaps = provider
+        .list_changed_since("github.com/o/r", since)
+        .await
+        .unwrap();
+
+    // The PR (#11) is filtered out; only the two real issues survive, in the
+    // order GitHub returned them.
+    let ids: Vec<&str> = snaps.iter().map(|s| s.remote_id.as_str()).collect();
+    assert_eq!(ids, vec!["10", "12"]);
+    assert!(
+        snaps.iter().any(|s| s.remote_id == "12" && s.closed),
+        "closed issue is included and marked closed"
+    );
 }
 
 #[tokio::test]

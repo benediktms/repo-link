@@ -306,6 +306,28 @@ impl TaskRepository for InMemoryTaskRepository {
         Ok(Some(task))
     }
 
+    async fn tracked_remote_ids(
+        &self,
+        filing_repo_id: RepoOriginId,
+        provider: &str,
+        remote_ids: &[String],
+    ) -> PortResult<std::collections::HashSet<String>> {
+        let wanted: std::collections::HashSet<&str> =
+            remote_ids.iter().map(String::as_str).collect();
+        let g = self.inner.lock().unwrap();
+        Ok(g.values()
+            .filter_map(|t| {
+                let fid_match = t
+                    .filing_repo_id
+                    .as_ref()
+                    .is_some_and(|fid| fid.as_uuid() == filing_repo_id.as_uuid());
+                let r = t.remote.as_ref()?;
+                (fid_match && r.provider == provider && wanted.contains(r.remote_id.as_str()))
+                    .then(|| r.remote_id.clone())
+            })
+            .collect())
+    }
+
     async fn replace_comments(
         &self,
         task_id: TaskId,

@@ -658,6 +658,26 @@ pub(crate) enum SyncCmd {
     /// their retries and were permanently parked (RFC 0001 Stage 6, #54).
     /// Local read; no GitHub token required.
     Outbox,
+    /// List remote GitHub issues, marking each `tracked` (a local task already
+    /// mirrors it) or `untracked` (an import candidate). Read-only; requires a
+    /// GitHub token. Repo selection: `--repo` lists just that repo; otherwise,
+    /// if the workspace has a filing default the output is grouped (filing repo
+    /// first, then each bound canonical repo); otherwise the current
+    /// directory's repo is listed.
+    ListRemote {
+        /// Repo to list, as UUID / prefix / name / alias. When omitted,
+        /// resolution falls back to the workspace filing default (grouped) or
+        /// the cwd checkout.
+        #[arg(short = 'r', long)]
+        repo: Option<String>,
+        /// Only list issues updated at or after this instant (GitHub filters by
+        /// `updatedAt`). Accepts `YYYY-MM-DD` or an RFC 3339 timestamp.
+        /// Defaults to 90 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        #[command(flatten)]
+        ws: WorkspaceArg,
+    },
 }
 
 #[derive(Subcommand, Debug)]

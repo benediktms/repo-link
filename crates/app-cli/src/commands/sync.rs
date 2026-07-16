@@ -67,6 +67,18 @@ pub(crate) async fn sync_dispatch(
         svc.workspaces_repo.clone(),
         provider,
     );
+
+    // `list-remote` is a read-only discovery query with its own repo-resolution
+    // precedence, not part of the promote/push/pull task reconciliation.
+    if let SyncCmd::ListRemote {
+        repo,
+        since,
+        ws: WorkspaceArg { workspace },
+    } = cmd
+    {
+        return sync_list_remote(svc, &sync, workspace, repo, since).await;
+    }
+
     // Resolve the friendly task reference (UUID / bare hash / prefix-hash)
     // to a UUID here, at the CLI boundary, so `sync` accepts the same id
     // forms as every other task command. `SyncService` stays UUID-only.
@@ -95,10 +107,101 @@ pub(crate) async fn sync_dispatch(
                 .await
                 .map_err(|e| enrich_issue_moved(&task, e))?
         }
-        SyncCmd::Import { .. } | SyncCmd::Outbox => unreachable!("handled above"),
+        SyncCmd::Import { .. } | SyncCmd::Outbox | SyncCmd::ListRemote { .. } => {
+            unreachable!("handled above")
+        }
     };
     render::sync(&summary);
     Ok(())
+}
+
+/// `rl sync list-remote` (#3): resolve the repo scope, list remote issues, and
+/// print the grouped `tracked`/`untracked` result as JSON.
+///
+/// Resolution precedence: an explicit `--repo` lists just that repo; otherwise,
+/// if the workspace has a filing default the whole workspace is grouped
+/// (`repo_override = None`); otherwise the cwd checkout's repo is listed.
+async fn sync_list_remote(
+    svc: &Services,
+    sync: &SyncService,
+    workspace: Option<String>,
+    repo: Option<String>,
+    since: Option<String>,
+) -> Result<()> {
+    use crate::commands::repo::{
+        resolve_repo_handle_required, resolve_repo_or_cwd, resolve_workspace,
+    };
+
+    let workspace_id: domain_core::WorkspaceId =
+        resolve_workspace(svc, workspace)
+            .await?
+            .parse()
+            .map_err(|e| anyhow!("invalid workspace id: {e}"))?;
+    let since = parse_since(since.as_deref())?;
+
+    let repo_override: Option<domain_core::RepoId> = if let Some(handle) = repo {
+        // `--repo`: list exactly this repo.
+        Some(
+            resolve_repo_handle_required(svc, &handle)
+                .await?
+                .parse()
+                .map_err(|e| anyhow!("invalid repo id: {e}"))?,
+        )
+    } else {
+        let ws = svc
+            .workspaces_repo
+            .get(workspace_id)
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+        if ws.filing_repo_id.is_some() {
+            // A filing default exists → group the whole workspace.
+            None
+        } else {
+            // No filing default → fall back to the current directory's repo.
+            Some(
+                resolve_repo_or_cwd(svc, None)
+                    .await?
+                    .parse()
+                    .map_err(|e| anyhow!("invalid repo id: {e}"))?,
+            )
+        }
+    };
+
+    let dto = sync
+        .list_remote(workspace_id, repo_override, since)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&dto).unwrap_or_else(|_| "{}".into())
+    );
+    Ok(())
+}
+
+/// Parse the `--since` argument: an `YYYY-MM-DD` date (midnight UTC) or an
+/// RFC 3339 timestamp. `None` defaults to 90 days before now.
+fn parse_since(raw: Option<&str>) -> Result<domain_core::Timestamp> {
+    use chrono::{DateTime, NaiveDate, Utc};
+    match raw {
+        None => Ok(domain_core::Timestamp::from_utc(
+            Utc::now() - chrono::Duration::days(90),
+        )),
+        Some(s) => {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+                return Ok(domain_core::Timestamp::from_utc(dt.with_timezone(&Utc)));
+            }
+            if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                return Ok(domain_core::Timestamp::from_utc(
+                    d.and_hms_opt(0, 0, 0)
+                        .expect("midnight is always valid")
+                        .and_utc(),
+                ));
+            }
+            Err(anyhow!(
+                "invalid --since '{s}': expected YYYY-MM-DD or an RFC 3339 timestamp"
+            ))
+        }
+    }
 }
 
 /// Render the dead-letter queue as a JSON array. Minimal by design (#54):

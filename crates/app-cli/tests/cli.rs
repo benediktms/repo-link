@@ -4554,3 +4554,112 @@ fn repo_arg_errors_when_cwd_repo_spans_multiple_workspaces() {
         "ambiguous cwd must ask for --repo, got: {stderr}"
     );
 }
+
+// ---------- sync list-remote (#3) ------------------------------------------
+
+/// `rl sync list-remote --repo` end-to-end: CLI parse → `--repo` resolution →
+/// `SyncService::list_remote` → mocked GitHub issues list → JSON. Uses an empty
+/// issue list (`[]`) so the test needs no full octocrab payload — the adapter
+/// tests cover REST deserialization + PR filtering; this pins the CLI wiring,
+/// the single-repo group shape, and that an explicitly-named repo keeps its
+/// (here empty) group.
+#[test]
+fn sync_list_remote_repo_flag_queries_repo_and_emits_group() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let repo_dir = TempDir::new().unwrap();
+    init_git_repo_with_origin(repo_dir.path(), "git@github.com:o/r.git");
+    let attach = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:o/r.git",
+            "--canonical",
+            "github.com/o/r",
+            "--branch",
+            "main",
+            "--path",
+            &repo_dir.path().display().to_string(),
+        ],
+    );
+    let repo_id = attach["binding"]["id"].as_str().unwrap().to_string();
+
+    // Multi-thread runtime keeps the mock serving on worker threads while the
+    // blocking `assert_cmd` subprocess hits it.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let dto = run_json(
+        &mut cmd,
+        &[
+            "sync",
+            "list-remote",
+            "--workspace",
+            &workspace,
+            "--repo",
+            &repo_id,
+            "--since",
+            "2020-01-01",
+        ],
+    );
+
+    let groups = dto["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["role"], "repo");
+    assert_eq!(groups[0]["canonical_url"], "github.com/o/r");
+    assert!(groups[0]["issues"].as_array().unwrap().is_empty());
+    // `rt`/`server` stay alive until the function returns — past the blocking
+    // subprocess call above.
+}
+
+/// `--since` is validated at the CLI boundary, before any network call: a
+/// malformed value fails fast with an actionable message.
+#[test]
+fn sync_list_remote_rejects_bad_since() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+
+    let output = bin("repo-link", &dir)
+        .env("REPO_LINK_GITHUB_TOKEN", "t0k")
+        .args([
+            "sync",
+            "list-remote",
+            "--workspace",
+            &workspace,
+            "--since",
+            "not-a-date",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("invalid --since"),
+        "expected a --since parse error, got: {stderr}"
+    );
+}

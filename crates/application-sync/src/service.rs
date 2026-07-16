@@ -9,6 +9,7 @@ use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
 
 use crate::enqueue;
+use crate::list_remote::{ListRemoteDto, ListRemoteGroup, ListRemoteRole, RemoteIssueRow};
 use dto_shared::{
     RelationChange, RelationReconciledNotice, RelationTargetUntrackedNotice, SyncNoticeDto,
     SyncSummaryDto,
@@ -601,6 +602,132 @@ impl SyncService {
         ))
     }
 
+    /// `rl sync list-remote` (#3): discover remote issues with no local task.
+    ///
+    /// `repo_override` encodes the CLI's resolution precedence: `Some(repo)`
+    /// when `--repo`/`-r` was passed or the cwd checkout was resolved (list
+    /// only that repo); `None` when the workspace has a filing default and the
+    /// whole workspace should be grouped — filing repo first, then each bound
+    /// canonical repo, de-duped, empty groups omitted. `since` bounds the
+    /// listing (GitHub filters by `updatedAt`). Read-only, no side effects.
+    pub async fn list_remote(
+        &self,
+        workspace_id: WorkspaceId,
+        repo_override: Option<RepoId>,
+        since: Timestamp,
+    ) -> Result<ListRemoteDto> {
+        let mut groups = Vec::new();
+
+        match repo_override {
+            // Explicit single repo (from `--repo` or cwd): one group, kept even
+            // when empty — the user named this repo, so an empty result is a
+            // meaningful "nothing here" rather than noise to suppress.
+            Some(repo_id) => {
+                let view = self.bindings.get(repo_id).await?;
+                groups.push(
+                    self.list_remote_group(
+                        &view.origin.name,
+                        &view.instance.canonical_url,
+                        view.instance.origin_id,
+                        ListRemoteRole::Repo,
+                        since,
+                    )
+                    .await?,
+                );
+            }
+            // Whole workspace: filing default first, then each bound canonical
+            // repo, de-duped; empty groups omitted.
+            None => {
+                let ws = self.workspaces.get(workspace_id).await?;
+                // `filing_repo_id` holds ORIGIN id bytes (RFC 0005 §D4).
+                let filing_origin = ws
+                    .filing_repo_id
+                    .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+                let bindings = self.bindings.list_by_workspace(workspace_id).await?;
+
+                // Ordered, de-duped repo set: (origin_id, name, canonical, role).
+                let mut ordered: Vec<(RepoOriginId, String, String, ListRemoteRole)> = Vec::new();
+                let mut seen: HashSet<RepoOriginId> = HashSet::new();
+                if let Some(fo) = filing_origin {
+                    // Prefer the binding row (carries the name); fall back to a
+                    // direct origin fetch if the default isn't a workspace binding.
+                    let (name, canonical) =
+                        match bindings.iter().find(|v| v.instance.origin_id == fo) {
+                            Some(v) => (v.origin.name.clone(), v.instance.canonical_url.clone()),
+                            None => {
+                                let o = self.bindings.get_origin(fo).await?;
+                                (o.name.clone(), o.canonical_url.clone())
+                            }
+                        };
+                    ordered.push((fo, name, canonical, ListRemoteRole::Filing));
+                    seen.insert(fo);
+                }
+                for v in &bindings {
+                    if seen.insert(v.instance.origin_id) {
+                        ordered.push((
+                            v.instance.origin_id,
+                            v.origin.name.clone(),
+                            v.instance.canonical_url.clone(),
+                            ListRemoteRole::Canonical,
+                        ));
+                    }
+                }
+
+                for (origin_id, name, canonical, role) in ordered {
+                    let group = self
+                        .list_remote_group(&name, &canonical, origin_id, role, since)
+                        .await?;
+                    if !group.issues.is_empty() {
+                        groups.push(group);
+                    }
+                }
+            }
+        }
+
+        Ok(ListRemoteDto { groups })
+    }
+
+    /// List one repo's issues (since `since`) and mark each `tracked` iff a
+    /// local task already mirrors it (filing repo origin + provider +
+    /// `remote_id`). Shared by both arms of [`Self::list_remote`].
+    async fn list_remote_group(
+        &self,
+        repo_name: &str,
+        canonical_url: &str,
+        origin_id: RepoOriginId,
+        role: ListRemoteRole,
+        since: Timestamp,
+    ) -> Result<ListRemoteGroup> {
+        let provider = provider_label(canonical_url);
+        let snaps = self
+            .provider
+            .list_changed_since(canonical_url, since)
+            .await?;
+        // Single batched tracked-lookup for the whole page rather than an N+1
+        // per-issue query (each issue's `tracked` flag is then a set lookup).
+        let remote_ids: Vec<String> = snaps.iter().map(|s| s.remote_id.clone()).collect();
+        let tracked = self
+            .tasks
+            .tracked_remote_ids(origin_id, &provider, &remote_ids)
+            .await?;
+        let issues = snaps
+            .into_iter()
+            .map(|snap| RemoteIssueRow {
+                tracked: tracked.contains(&snap.remote_id),
+                remote_id: snap.remote_id,
+                title: snap.title,
+                closed: snap.closed,
+                updated_at: snap.updated_at,
+            })
+            .collect();
+        Ok(ListRemoteGroup {
+            repo: repo_name.to_string(),
+            canonical_url: canonical_url.to_string(),
+            role,
+            issues,
+        })
+    }
+
     /// Canonical URL of the task's **logical** repo — also the repo the issue
     /// is filed in today (until RFC 0002). Errors with `NoRepo` for an orphan
     /// task, since there is no repo to address.
@@ -1122,6 +1249,11 @@ mod tests {
         sub_issues: Mutex<Vec<ports::RemoteChildIssue>>,
         blocked_by: Mutex<Vec<ports::RemoteChildIssue>>,
         parent: Mutex<Vec<ports::RemoteChildIssue>>,
+        // Canned `list_changed_since` results keyed by canonical repo, plus a
+        // recorder of the `(canonical, since)` calls (order preserved) so the
+        // list-remote tests can assert filing-first grouping + the window.
+        list_returns: Mutex<HashMap<String, Vec<RemoteTaskSnapshot>>>,
+        list_calls: Mutex<Vec<(String, Timestamp)>>,
     }
 
     impl FakeProvider {
@@ -1157,10 +1289,41 @@ mod tests {
         fn set_fetch_moved(&self, to_canonical: &str, to_remote_id: &str) {
             *self.fetch_moved.lock().unwrap() = Some((to_canonical.into(), to_remote_id.into()));
         }
+
+        /// Seed the issues `list_changed_since` returns for `canonical`.
+        fn set_list_returns(&self, canonical: &str, snaps: Vec<RemoteTaskSnapshot>) {
+            self.list_returns
+                .lock()
+                .unwrap()
+                .insert(canonical.into(), snaps);
+        }
+
+        /// The `(canonical, since)` of every `list_changed_since` call, in order.
+        fn list_calls(&self) -> Vec<(String, Timestamp)> {
+            self.list_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl RemoteTaskProvider for FakeProvider {
+        async fn list_changed_since(
+            &self,
+            canonical_repo: &str,
+            since: Timestamp,
+        ) -> PortResult<Vec<RemoteTaskSnapshot>> {
+            self.list_calls
+                .lock()
+                .unwrap()
+                .push((canonical_repo.into(), since));
+            Ok(self
+                .list_returns
+                .lock()
+                .unwrap()
+                .get(canonical_repo)
+                .cloned()
+                .unwrap_or_default())
+        }
+
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
             *self.last_create.lock().unwrap() = Some(cmd.title.to_string());
             *self.last_create_canonical.lock().unwrap() = Some(cmd.canonical_repo.to_string());
@@ -1968,6 +2131,237 @@ mod tests {
             task,
             default_binding_id: domain_core::RepoId::from_uuid(default_origin.id.as_uuid()),
         }
+    }
+
+    // ---- sync list-remote (#3) --------------------------------------------
+
+    /// Minimal `RemoteTaskSnapshot` for list-remote canned results — only the
+    /// fields `list_remote` projects (remote_id / title / closed) matter.
+    fn list_snap(remote_id: &str, title: &str, closed: bool) -> RemoteTaskSnapshot {
+        RemoteTaskSnapshot {
+            remote_id: remote_id.into(),
+            node_id: None,
+            title: title.into(),
+            body: String::new(),
+            closed,
+            updated_at: Timestamp::from_utc(chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap()),
+            assignees: Vec::new(),
+            labels: Vec::new(),
+        }
+    }
+
+    struct ListRemoteFixture {
+        svc: SyncService,
+        provider: Arc<FakeProvider>,
+        workspace_id: WorkspaceId,
+        /// Instance id of the bound code repo — for the `--repo` override path.
+        code_instance_id: RepoId,
+    }
+
+    /// A workspace whose filing default is `github.com/o/filing` and which also
+    /// binds a canonical code repo `github.com/o/code`, plus one local task
+    /// already tracking issue #5 in the filing repo (so `find_by_remote`
+    /// reports it `tracked`).
+    async fn setup_list_remote_workspace() -> ListRemoteFixture {
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("lr-ws").unwrap(), None, true);
+        let filing_origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save_origin(&filing_origin).await.unwrap();
+        bindings
+            .save_instance(
+                &RepoInstance::new(
+                    workspace.id,
+                    filing_origin.id,
+                    "github.com/o/filing".into(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let code_origin = RepoOrigin::new(
+            "git@github.com:o/code.git".into(),
+            "github.com/o/code".into(),
+        )
+        .unwrap();
+        bindings.save_origin(&code_origin).await.unwrap();
+        let code_instance = RepoInstance::new(
+            workspace.id,
+            code_origin.id,
+            "github.com/o/code".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_instance(&code_instance).await.unwrap();
+        workspace.filing_repo_id = Some(RepoId::from_uuid(filing_origin.id.as_uuid()));
+        workspaces.save(&workspace).await.unwrap();
+
+        // A local task already mirroring filing issue #5 — filing_repo_id is in
+        // origin id space, matching `find_by_remote`'s scoping.
+        let mut tracked =
+            Task::new_draft(workspace.id, Some(code_instance.id), "tracked one".into()).unwrap();
+        tracked.filing_repo_id = Some(RepoId::from_uuid(filing_origin.id.as_uuid()));
+        tracked.remote = Some(RemoteRef::new("github", "5"));
+        tasks
+            .save(&tracked, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        let svc = SyncService::new(tasks, bindings, workspaces, provider.clone());
+        ListRemoteFixture {
+            svc,
+            provider,
+            workspace_id: workspace.id,
+            code_instance_id: code_instance.id,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_remote_groups_filing_first_and_marks_tracked() {
+        let ListRemoteFixture {
+            svc,
+            provider,
+            workspace_id,
+            ..
+        } = setup_list_remote_workspace().await;
+        provider.set_list_returns(
+            "github.com/o/filing",
+            vec![
+                list_snap("5", "tracked one", false),
+                list_snap("6", "an untracked closed one", true),
+            ],
+        );
+        provider.set_list_returns(
+            "github.com/o/code",
+            vec![list_snap("9", "code issue", false)],
+        );
+
+        let since = Timestamp::from_utc(chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let dto = svc.list_remote(workspace_id, None, since).await.unwrap();
+
+        // Two groups: filing default first, then the canonical code repo.
+        assert_eq!(dto.groups.len(), 2);
+        assert_eq!(dto.groups[0].role, ListRemoteRole::Filing);
+        assert_eq!(dto.groups[0].canonical_url, "github.com/o/filing");
+        assert_eq!(dto.groups[1].role, ListRemoteRole::Canonical);
+        assert_eq!(dto.groups[1].canonical_url, "github.com/o/code");
+
+        // #5 is tracked (a local task mirrors it); #6 is not, and its closed
+        // bit survives. #9 in the code repo is untracked.
+        let filing = &dto.groups[0].issues;
+        assert_eq!(filing.len(), 2);
+        assert!(filing.iter().any(|i| i.remote_id == "5" && i.tracked));
+        assert!(
+            filing
+                .iter()
+                .any(|i| i.remote_id == "6" && !i.tracked && i.closed)
+        );
+        assert_eq!(
+            dto.groups[1].issues,
+            vec![RemoteIssueRow {
+                remote_id: "9".into(),
+                title: "code issue".into(),
+                closed: false,
+                updated_at: since,
+                tracked: false,
+            }]
+        );
+
+        // Filing repo is queried before the canonical repo, both with `since`.
+        let calls = provider.list_calls();
+        assert_eq!(
+            calls,
+            vec![
+                ("github.com/o/filing".to_string(), since),
+                ("github.com/o/code".to_string(), since),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_remote_omits_empty_groups() {
+        let ListRemoteFixture {
+            svc,
+            provider,
+            workspace_id,
+            ..
+        } = setup_list_remote_workspace().await;
+        // Only the filing repo has issues; the code repo returns nothing.
+        provider.set_list_returns(
+            "github.com/o/filing",
+            vec![list_snap("5", "tracked one", false)],
+        );
+
+        let since = Timestamp::from_utc(chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let dto = svc.list_remote(workspace_id, None, since).await.unwrap();
+
+        // The empty code-repo group is omitted; only filing survives.
+        assert_eq!(dto.groups.len(), 1);
+        assert_eq!(dto.groups[0].canonical_url, "github.com/o/filing");
+    }
+
+    #[tokio::test]
+    async fn list_remote_single_repo_override_queries_only_that_repo() {
+        let ListRemoteFixture {
+            svc,
+            provider,
+            workspace_id,
+            code_instance_id,
+        } = setup_list_remote_workspace().await;
+        provider.set_list_returns(
+            "github.com/o/filing",
+            vec![list_snap("5", "tracked one", false)],
+        );
+        provider.set_list_returns(
+            "github.com/o/code",
+            vec![list_snap("9", "code issue", false)],
+        );
+
+        let since = Timestamp::from_utc(chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let dto = svc
+            .list_remote(workspace_id, Some(code_instance_id), since)
+            .await
+            .unwrap();
+
+        // One group for the named repo, role Repo; the filing default is NOT
+        // queried at all.
+        assert_eq!(dto.groups.len(), 1);
+        assert_eq!(dto.groups[0].role, ListRemoteRole::Repo);
+        assert_eq!(dto.groups[0].canonical_url, "github.com/o/code");
+        assert_eq!(dto.groups[0].issues.len(), 1);
+        assert_eq!(
+            provider.list_calls(),
+            vec![("github.com/o/code".to_string(), since)]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_remote_single_repo_override_keeps_empty_group() {
+        let ListRemoteFixture {
+            svc,
+            workspace_id,
+            code_instance_id,
+            ..
+        } = setup_list_remote_workspace().await;
+        // No canned result for the code repo ⇒ empty listing.
+        let since = Timestamp::from_utc(chrono::DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let dto = svc
+            .list_remote(workspace_id, Some(code_instance_id), since)
+            .await
+            .unwrap();
+
+        // An explicitly-named repo keeps its group even when empty — a
+        // meaningful "nothing here" rather than suppressed noise.
+        assert_eq!(dto.groups.len(), 1);
+        assert!(dto.groups[0].issues.is_empty());
     }
 
     #[tokio::test]
