@@ -24,6 +24,7 @@
 mod drainer;
 pub mod enqueue;
 mod error;
+mod list_remote;
 mod poller;
 mod service;
 mod summary;
@@ -34,6 +35,7 @@ use ports::{RemoteStateReason, RemoteTaskUpdate};
 
 pub use drainer::{BackoffSchedule, OutboxDrainer};
 pub use error::{Result, SyncError};
+pub use list_remote::{ListRemoteDto, ListRemoteGroup, ListRemoteRole, RemoteIssueRow};
 pub use poller::{PollReport, ProjectPoller};
 pub use service::{RefreshOutcome, SyncService};
 
