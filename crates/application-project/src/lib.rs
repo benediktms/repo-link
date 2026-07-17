@@ -16,4 +16,4 @@ mod status;
 
 pub use error::{Result, ServiceError};
 pub use org_issue_type_service::OrgIssueTypeService;
-pub use service::ProjectService;
+pub use service::{LinkOutcome, ProjectService};

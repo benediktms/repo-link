@@ -7,7 +7,9 @@
 //! `rl project map`.
 
 use crate::field::FieldOption;
+use crate::priority::PriorityMapping;
 use crate::status::StatusMapping;
+use domain_task::Priority;
 
 /// Normalize an option name for vocabulary matching: lowercase and drop
 /// whitespace plus `-`/`_` separators.
@@ -96,6 +98,48 @@ pub fn derive_status_mappings(options: &[FieldOption]) -> Vec<StatusMapping> {
     );
 
     out
+}
+
+/// The local priorities in ordinal order. The index in this array is `k` in the
+/// RFC 0006 D3 clamp formula `Pk → option[min(k, N-1)]`.
+const PRIORITIES_BY_ORDINAL: [Priority; 4] =
+    [Priority::P0, Priority::P1, Priority::P2, Priority::P3];
+
+/// Seed the local-priority → option mapping from a freshly-fetched `Priority`
+/// option catalog, keyed on the local `P0..P3` enum (RFC 0006 D3).
+///
+/// The mapping is **positional ("incremental"), never by name** — `Pk` lands on
+/// the option at ordinal `k`, so it works on any board regardless of what the
+/// options are called (`High/Med/Low`, `Urgent/High/Med/Low`, `P0..P3`, …). The
+/// catalog is ordered by each option's declared `ordinal` first, so the result
+/// follows the board's own severity order rather than whatever order the fetch
+/// happened to return.
+///
+/// **Count mismatch** — `P0..P3` is four buckets; boards have `N`. The default
+/// is to clamp: `Pk → option[min(k, N-1)]` (mirroring how `derive_status_mappings`
+/// falls back to first/last). When `N < 4` this collapses two or more
+/// priorities onto the last option; the caller detects that collapse (two
+/// distinct priorities sharing one `option_id`) and surfaces an advisory. When
+/// `N > 4` the trailing options are simply unused.
+///
+/// An empty option list yields no mappings (and `Project::from_fields` accepts
+/// that). The result satisfies `Project`'s invariants directly: every entry
+/// references an option in `options`, and each `Priority` appears exactly once.
+pub fn derive_priority_mappings(options: &[FieldOption]) -> Vec<PriorityMapping> {
+    if options.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered: Vec<&FieldOption> = options.iter().collect();
+    ordered.sort_by_key(|o| o.ordinal);
+    let last = ordered.len() - 1;
+    PRIORITIES_BY_ORDINAL
+        .iter()
+        .enumerate()
+        .map(|(k, &priority)| PriorityMapping {
+            priority,
+            option_id: ordered[k.min(last)].option_id.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -229,5 +273,103 @@ mod tests {
         assert_eq!(mapped(&m, true), Some("o0")); // Open (open vocab)
         // "Not done" normalizes to "notdone" ∉ vocab → closed falls back to last.
         assert_eq!(mapped(&m, false), Some("o1"));
+    }
+
+    // ---------- derive_priority_mappings (RFC 0006 D3) ----------------------
+
+    /// Helper: the option_id mapped to a given priority, if any.
+    fn prio_opt(m: &[PriorityMapping], p: Priority) -> Option<&str> {
+        m.iter()
+            .find(|x| x.priority == p)
+            .map(|x| x.option_id.as_str())
+    }
+
+    #[test]
+    fn priority_four_option_board_maps_one_to_one() {
+        // Exact fit: P0..P3 land on options 0..3 by ordinal, name-agnostically.
+        let o = opts(&["Urgent", "High", "Medium", "Low"]);
+        let m = derive_priority_mappings(&o);
+        assert_eq!(m.len(), 4);
+        assert_eq!(prio_opt(&m, Priority::P0), Some("o0"));
+        assert_eq!(prio_opt(&m, Priority::P1), Some("o1"));
+        assert_eq!(prio_opt(&m, Priority::P2), Some("o2"));
+        assert_eq!(prio_opt(&m, Priority::P3), Some("o3"));
+    }
+
+    #[test]
+    fn priority_three_option_board_clamps_the_tail() {
+        // N=3 < 4: P0→0, P1→1, P2→2, and P3 clamps onto the last option (2),
+        // collapsing P2 and P3 onto the same board option.
+        let o = opts(&["High", "Medium", "Low"]);
+        let m = derive_priority_mappings(&o);
+        assert_eq!(m.len(), 4);
+        assert_eq!(prio_opt(&m, Priority::P0), Some("o0"));
+        assert_eq!(prio_opt(&m, Priority::P1), Some("o1"));
+        assert_eq!(prio_opt(&m, Priority::P2), Some("o2"));
+        assert_eq!(prio_opt(&m, Priority::P3), Some("o2")); // clamp: P3 shares P2's option
+    }
+
+    #[test]
+    fn priority_five_option_board_leaves_the_trailing_option_unused() {
+        // N=5 > 4: P0..P3 map exactly to options 0..3; option 4 is never a
+        // derived target.
+        let o = opts(&["P0", "P1", "P2", "P3", "P4-ish"]);
+        let m = derive_priority_mappings(&o);
+        assert_eq!(m.len(), 4);
+        assert_eq!(prio_opt(&m, Priority::P0), Some("o0"));
+        assert_eq!(prio_opt(&m, Priority::P1), Some("o1"));
+        assert_eq!(prio_opt(&m, Priority::P2), Some("o2"));
+        assert_eq!(prio_opt(&m, Priority::P3), Some("o3"));
+        assert!(
+            !m.iter().any(|x| x.option_id == "o4"),
+            "the trailing 5th option must stay unmapped"
+        );
+    }
+
+    #[test]
+    fn priority_maps_by_ordinal_not_slice_order() {
+        // A board whose options arrive out of order must still map by the
+        // declared `ordinal`, not by the order the fetch returned them.
+        let o = vec![
+            FieldOption {
+                option_id: "low".into(),
+                name: "Low".into(),
+                ordinal: 3,
+            },
+            FieldOption {
+                option_id: "urgent".into(),
+                name: "Urgent".into(),
+                ordinal: 0,
+            },
+            FieldOption {
+                option_id: "med".into(),
+                name: "Medium".into(),
+                ordinal: 2,
+            },
+            FieldOption {
+                option_id: "high".into(),
+                name: "High".into(),
+                ordinal: 1,
+            },
+        ];
+        let m = derive_priority_mappings(&o);
+        assert_eq!(prio_opt(&m, Priority::P0), Some("urgent")); // ordinal 0
+        assert_eq!(prio_opt(&m, Priority::P1), Some("high")); // ordinal 1
+        assert_eq!(prio_opt(&m, Priority::P2), Some("med")); // ordinal 2
+        assert_eq!(prio_opt(&m, Priority::P3), Some("low")); // ordinal 3
+    }
+
+    #[test]
+    fn priority_single_option_board_collapses_everything() {
+        // Degenerate N=1: all four priorities clamp onto the one option.
+        let o = opts(&["Only"]);
+        let m = derive_priority_mappings(&o);
+        assert_eq!(m.len(), 4);
+        assert!(m.iter().all(|x| x.option_id == "o0"));
+    }
+
+    #[test]
+    fn priority_empty_options_yield_no_mappings() {
+        assert!(derive_priority_mappings(&[]).is_empty());
     }
 }

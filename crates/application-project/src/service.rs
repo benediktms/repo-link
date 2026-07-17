@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use std::collections::HashSet;
+
 use domain_core::{ProjectId, Timestamp};
 use domain_project::{
     FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping, assign_field_kinds,
-    derive_status_mappings,
+    derive_priority_mappings, derive_status_mappings,
 };
 use dto_shared::{LinkProjectCmd, MapStatusCmd, ProjectDto};
 use ports::{PortError, ProjectRepository, RemoteProjectSnapshot};
@@ -14,6 +16,20 @@ use ports::{PortError, ProjectRepository, RemoteProjectSnapshot};
 use crate::dto::project_to_dto;
 use crate::error::{Result, ServiceError};
 use crate::status::parse_status;
+
+/// Outcome of [`ProjectService::link_from_snapshot`]: the linked project plus
+/// any plain advisory notes for the CLI to surface on stderr.
+///
+/// This is the lazy form of RFC 0006 D10 — advisories are plain strings, NOT
+/// structured `SyncNoticeDto` variants (those stay unbuilt until a task
+/// actually consumes them, #228). Today the only advisory is the priority
+/// clamp-collapse note (D3): a board with fewer than four Priority options
+/// forces two local priorities onto one board option.
+#[derive(Debug, Clone)]
+pub struct LinkOutcome {
+    pub project: ProjectDto,
+    pub advisories: Vec<String>,
+}
 
 /// `<project-spec>` resolver. Accepts either a `PVT_…` node id directly or
 /// `owner/number`. The `owner/number` path scans `list_all` because we
@@ -113,7 +129,7 @@ impl ProjectService {
     /// (RFC 0001 §3) and persist. Re-linking an existing project refreshes
     /// its schema and re-seeds the mapping — `save` is an upsert keyed on the
     /// node id.
-    pub async fn link_from_snapshot(&self, snap: RemoteProjectSnapshot) -> Result<ProjectDto> {
+    pub async fn link_from_snapshot(&self, snap: RemoteProjectSnapshot) -> Result<LinkOutcome> {
         let id = ProjectId::parse(snap.node_id)?;
         // Map the retained single-selects into domain fields and classify them
         // by name (RFC 0006 D9) — Status-vs-other selection is a domain concern,
@@ -146,6 +162,33 @@ impl ProjectService {
             Some(status) => derive_status_mappings(&status.options),
             None => return Err(ServiceError::NoStatusField(id.as_str().to_string())),
         };
+
+        // Priority mapping (RFC 0006 D3) is opt-in: derive by ordinal ONLY when
+        // a Priority field was classified. No Priority field → no mapping, not
+        // an error. When the board has fewer than four options the clamp
+        // collapses two local priorities onto one board option; surface that as
+        // a plain advisory (D10, lazy form) — detected as two distinct
+        // priorities sharing an `option_id`.
+        let mut advisories = Vec::new();
+        let priority_mappings = match fields.iter().find(|f| f.kind == ProjectFieldKind::Priority) {
+            Some(priority) => {
+                let mappings = derive_priority_mappings(&priority.options);
+                let distinct: HashSet<&str> =
+                    mappings.iter().map(|m| m.option_id.as_str()).collect();
+                if !mappings.is_empty() && distinct.len() < mappings.len() {
+                    advisories.push(format!(
+                        "Priority clamp: board '{}' exposes {} priority option(s) for 4 local \
+                         priorities (P0..P3), so two or more collapse onto one board option \
+                         (RFC 0006 D3; edit the mapping to override)",
+                        snap.title,
+                        distinct.len(),
+                    ));
+                }
+                mappings
+            }
+            None => Vec::new(),
+        };
+
         let project = Project::from_fields(
             id,
             snap.owner_login,
@@ -153,11 +196,15 @@ impl ProjectService {
             snap.title,
             fields,
             status_mappings,
+            priority_mappings,
             false,
             Timestamp::now(),
         )?;
         self.repo.save(&project).await?;
-        Ok(project_to_dto(&project))
+        Ok(LinkOutcome {
+            project: project_to_dto(&project),
+            advisories,
+        })
     }
 
     pub async fn get(&self, spec: &str) -> Result<ProjectDto> {
@@ -433,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn link_from_snapshot_auto_derives_mappings_by_name() {
         let svc = service();
-        let dto = svc.link_from_snapshot(snapshot()).await.unwrap();
+        let dto = svc.link_from_snapshot(snapshot()).await.unwrap().project;
         assert_eq!(dto.id, "PVT_snap");
         assert_eq!(dto.status_options.len(), 3);
         let m = |s: &str| {
@@ -502,5 +549,111 @@ mod tests {
         s.fields = vec![];
         let err = svc.link_from_snapshot(s).await.unwrap_err();
         assert!(matches!(err, ServiceError::NoStatusField(_)), "got {err:?}");
+    }
+
+    // ---------- priority mapping derivation at link (RFC 0006 D3) ----------
+
+    /// A snapshot with a Status field (Backlog/Done) plus a Priority field
+    /// carrying `prio_options` (in the given order, ordinals 0..N).
+    fn snapshot_with_priority(prio_options: &[&str]) -> RemoteProjectSnapshot {
+        RemoteProjectSnapshot {
+            node_id: "PVT_prio".into(),
+            number: 4,
+            title: "priority board".into(),
+            owner_login: "benediktms".into(),
+            fields: vec![
+                ports::RemoteProjectField {
+                    field_id: "PVTSSF_x".into(),
+                    name: "Status".into(),
+                    options: vec![
+                        ports::RemoteProjectFieldOption {
+                            option_id: "s_open".into(),
+                            name: "Backlog".into(),
+                            ordinal: 0,
+                        },
+                        ports::RemoteProjectFieldOption {
+                            option_id: "s_done".into(),
+                            name: "Done".into(),
+                            ordinal: 1,
+                        },
+                    ],
+                },
+                ports::RemoteProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    options: prio_options
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| ports::RemoteProjectFieldOption {
+                            option_id: format!("po{i}"),
+                            name: (*name).to_string(),
+                            ordinal: u32::try_from(i).unwrap(),
+                        })
+                        .collect(),
+                },
+            ],
+        }
+    }
+
+    async fn link_and_load(snap: RemoteProjectSnapshot) -> (Project, Vec<String>) {
+        let repo = Arc::new(InMemoryProjectRepository::new());
+        let svc = ProjectService::new(repo.clone());
+        let id = ProjectId::parse(snap.node_id.clone()).unwrap();
+        let outcome = svc.link_from_snapshot(snap).await.unwrap();
+        let project = repo.get(id).await.unwrap();
+        (project, outcome.advisories)
+    }
+
+    #[tokio::test]
+    async fn link_derives_priority_mappings_by_ordinal_four_options() {
+        // Exact fit: four options → four one-to-one mappings, no clamp advisory.
+        let (project, advisories) =
+            link_and_load(snapshot_with_priority(&["Urgent", "High", "Medium", "Low"])).await;
+        assert_eq!(project.priority_mappings.len(), 4);
+        let targets: Vec<&str> = project
+            .priority_mappings
+            .iter()
+            .map(|m| m.option_id.as_str())
+            .collect();
+        // Ordinal mapping: P0..P3 → po0..po3, distinct.
+        assert_eq!(targets, ["po0", "po1", "po2", "po3"]);
+        assert!(
+            advisories.is_empty(),
+            "no clamp on a 4-option board: {advisories:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_clamp_collapse_on_three_options_emits_advisory() {
+        // Three options for four priorities → the tail clamps (two priorities
+        // share the last option) and a plain advisory is surfaced.
+        let (project, advisories) =
+            link_and_load(snapshot_with_priority(&["High", "Medium", "Low"])).await;
+        assert_eq!(project.priority_mappings.len(), 4);
+        let targets: Vec<&str> = project
+            .priority_mappings
+            .iter()
+            .map(|m| m.option_id.as_str())
+            .collect();
+        // P0→po0, P1→po1, P2→po2, P3 clamps onto po2.
+        assert_eq!(targets, ["po0", "po1", "po2", "po2"]);
+        assert_eq!(advisories.len(), 1, "one clamp advisory expected");
+        assert!(
+            advisories[0].contains("Priority clamp"),
+            "advisory should be the clamp note, got: {}",
+            advisories[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn link_without_priority_field_derives_no_mapping_and_no_advisory() {
+        // Opt-in: the base snapshot's Priority field removed → no priority
+        // mapping, no advisory, and linking still succeeds.
+        let mut s = snapshot();
+        s.fields.retain(|f| f.name != "Priority");
+        let (project, advisories) = link_and_load(s).await;
+        assert!(project.priority_mappings.is_empty());
+        assert!(project.priority_field().is_none());
+        assert!(advisories.is_empty());
     }
 }

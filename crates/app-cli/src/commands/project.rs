@@ -30,11 +30,20 @@ pub(crate) async fn project_dispatch(
             // Link first — the org issue-type refresh below is a best-effort
             // side task and must neither gate nor precede the primary link.
             let owner_login = snapshot.owner_login.clone();
-            let dto = svc
+            let outcome = svc
                 .projects
                 .link_from_snapshot(snapshot)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
+            let dto = outcome.project;
+
+            // Link-time advisories (RFC 0006 D10, lazy form) — e.g. the priority
+            // clamp-collapse note (D3). Plain stderr notes, mirroring the
+            // "Type unavailable" advisory below; stdout stays the clean project
+            // JSON per the repo's stdout-JSON / stderr-notice split.
+            for note in &outcome.advisories {
+                eprintln!("{note}");
+            }
 
             // `project link` is also the org (re)fetch point for the native
             // issue-type registry (RFC 0006 D5). Fully best-effort and only

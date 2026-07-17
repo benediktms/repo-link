@@ -1330,6 +1330,133 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
 }
 
 #[tokio::test]
+async fn project_roundtrip_preserves_priority_mappings() {
+    // RFC 0006 D3: a project with a Priority field and its derived
+    // local-priority → option mapping must survive persist + load, and the
+    // domain resolver must read it back. `Project::new` never carries a
+    // Priority field, so build the aggregate via `from_fields`.
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::{
+        FieldOption, PriorityMapping, Project, ProjectField, ProjectFieldKind, StatusMapping,
+    };
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db);
+    let id = ProjectId::parse("PVT_kwHO_priority").unwrap();
+
+    let status = ProjectField {
+        field_id: "PVTSSF_status".into(),
+        name: "Status".into(),
+        kind: ProjectFieldKind::Status,
+        options: vec![
+            FieldOption {
+                option_id: "s_open".into(),
+                name: "Backlog".into(),
+                ordinal: 0,
+            },
+            FieldOption {
+                option_id: "s_done".into(),
+                name: "Done".into(),
+                ordinal: 1,
+            },
+        ],
+    };
+    // Three-option Priority field: P3 clamps onto the last option (shared with
+    // P2), exercising the many-to-one collapse across the DB round trip.
+    let priority = ProjectField {
+        field_id: "PVTSSF_prio".into(),
+        name: "Priority".into(),
+        kind: ProjectFieldKind::Priority,
+        options: vec![
+            FieldOption {
+                option_id: "po0".into(),
+                name: "High".into(),
+                ordinal: 0,
+            },
+            FieldOption {
+                option_id: "po1".into(),
+                name: "Medium".into(),
+                ordinal: 1,
+            },
+            FieldOption {
+                option_id: "po2".into(),
+                name: "Low".into(),
+                ordinal: 2,
+            },
+        ],
+    };
+
+    let saved = Project::from_fields(
+        id.clone(),
+        "acme".into(),
+        11,
+        "Priority Board".into(),
+        vec![status, priority],
+        vec![
+            StatusMapping {
+                is_open: true,
+                option_id: "s_open".into(),
+            },
+            StatusMapping {
+                is_open: false,
+                option_id: "s_done".into(),
+            },
+        ],
+        vec![
+            PriorityMapping {
+                priority: Priority::P0,
+                option_id: "po0".into(),
+            },
+            PriorityMapping {
+                priority: Priority::P1,
+                option_id: "po1".into(),
+            },
+            PriorityMapping {
+                priority: Priority::P2,
+                option_id: "po2".into(),
+            },
+            PriorityMapping {
+                priority: Priority::P3,
+                option_id: "po2".into(),
+            },
+        ],
+        false,
+        Timestamp::now(),
+    )
+    .unwrap();
+
+    projects.save(&saved).await.unwrap();
+    let loaded = projects.get(id.clone()).await.unwrap();
+
+    // The Priority field and its options round-trip.
+    assert_eq!(loaded.priority_options().len(), 3);
+    assert_eq!(loaded.priority_mappings.len(), 4);
+    // The resolver reads each priority back, including the clamp collapse
+    // (P2 and P3 share "po2").
+    assert_eq!(
+        loaded.resolved_priority_option_id_for(Priority::P0),
+        Some("po0")
+    );
+    assert_eq!(
+        loaded.resolved_priority_option_id_for(Priority::P1),
+        Some("po1")
+    );
+    assert_eq!(
+        loaded.resolved_priority_option_id_for(Priority::P2),
+        Some("po2")
+    );
+    assert_eq!(
+        loaded.resolved_priority_option_id_for(Priority::P3),
+        Some("po2")
+    );
+    // Status rail is unaffected.
+    assert_eq!(loaded.resolved_option_id_for(true), Some("s_open"));
+    assert_eq!(loaded.resolved_option_id_for(false), Some("s_done"));
+}
+
+#[tokio::test]
 async fn project_roundtrip_preserves_many_to_one_mapping() {
     // Regression for #80: the Stage 3 scalar `default_for` column could hold
     // at most one TaskStatus per option, so saving a Project where two

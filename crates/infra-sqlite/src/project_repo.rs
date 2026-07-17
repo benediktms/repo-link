@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
-use domain_project::{FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping};
+use domain_project::{
+    FieldOption, PriorityMapping, Project, ProjectField, ProjectFieldKind, StatusMapping,
+};
+use domain_task::Priority;
 use ports::{PortError, PortResult, ProjectRepository};
 use sqlx::Row;
 
 use crate::Db;
-use crate::mapping::map_sqlx_err;
+use crate::mapping::{enum_from_str, enum_to_str, map_sqlx_err};
 
 pub(crate) const PROJECT_COLS: &str =
     "id, provider, owner_login, number, title, archived, created_at, updated_at";
@@ -74,8 +77,14 @@ impl ProjectRepository for SqliteProjectRepository {
         // adds no value and would mishandle renames (same id, different name).
         // Delete in FK-safe child-first order (mappings → options → fields) so
         // the ordering is explicit and doesn't lean on cascade timing, then
-        // re-insert parent-first below.
+        // re-insert parent-first below. Both mapping tables (status + priority)
+        // are leaves off `project_field_options`.
         sqlx::query("DELETE FROM project_status_mappings WHERE project_id = ?")
+            .bind(project.id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        sqlx::query("DELETE FROM project_priority_mappings WHERE project_id = ?")
             .bind(project.id.as_str())
             .execute(&mut *tx)
             .await
@@ -148,6 +157,31 @@ impl ProjectRepository for SqliteProjectRepository {
                 .bind(project.id.as_str())
                 .bind(status_field_id)
                 .bind(i64::from(m.is_open))
+                .bind(&m.option_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+            }
+        }
+
+        // Priority mappings (RFC 0006 D3) mirror the status-mapping shape: each
+        // row carries the Priority field's id so the composite FK
+        // `(project_id, field_id, option_id) → project_field_options` holds, and
+        // the `(project_id, priority)` PK rejects a duplicate priority bucket.
+        // Mappings only exist when the project has a Priority field, so the
+        // guard never skips a row that should have been written.
+        if let Some(priority_field_id) = project.priority_field().map(|f| f.field_id.as_str()) {
+            for m in &project.priority_mappings {
+                sqlx::query(
+                    r#"
+                    INSERT INTO project_priority_mappings
+                        (project_id, field_id, priority, option_id)
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(project.id.as_str())
+                .bind(priority_field_id)
+                .bind(enum_to_str(&m.priority)?)
                 .bind(&m.option_id)
                 .execute(&mut *tx)
                 .await
@@ -336,6 +370,34 @@ async fn row_to_project(
         });
     }
 
+    // Priority mappings (RFC 0006 D3) — one row per `(project, priority)`. Like
+    // the status mappings, the redundant `field_id` column is ignored on load
+    // (re-derived from the Priority field on save); `Project::from_fields`
+    // re-validates each references an owned Priority option. Ordered by
+    // `priority` (p0 < p1 < p2 < p3) for a stable read.
+    let priority_rows = sqlx::query(
+        r#"
+        SELECT priority, option_id
+          FROM project_priority_mappings
+         WHERE project_id = ?
+         ORDER BY priority ASC
+        "#,
+    )
+    .bind(id.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(map_sqlx_err)?;
+
+    let mut priority_mappings = Vec::with_capacity(priority_rows.len());
+    for m in priority_rows.iter() {
+        let priority_str: String = m.try_get("priority").map_err(map_sqlx_err)?;
+        let option_id: String = m.try_get("option_id").map_err(map_sqlx_err)?;
+        priority_mappings.push(PriorityMapping {
+            priority: enum_from_str::<Priority>("priority", &priority_str)?,
+            option_id,
+        });
+    }
+
     // Round-trip through `Project::from_fields` so the domain invariants
     // (≤1 Status field, mapping references an owned option, no duplicate
     // bucket) re-validate every load. A corrupted row surfaces as a typed
@@ -347,6 +409,7 @@ async fn row_to_project(
         title,
         fields,
         status_mappings,
+        priority_mappings,
         archived != 0,
         Timestamp::from_utc(created_at),
     )
