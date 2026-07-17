@@ -10,11 +10,13 @@
 mod field;
 mod issue_type;
 mod mapping;
+mod priority;
 mod project;
 mod status;
 
 pub use field::{FieldOption, ProjectField, ProjectFieldKind, assign_field_kinds};
 pub use issue_type::{OrgIssueType, OrgIssueTypeRegistry};
-pub use mapping::derive_status_mappings;
+pub use mapping::{derive_priority_mappings, derive_status_mappings};
+pub use priority::PriorityMapping;
 pub use project::Project;
 pub use status::StatusMapping;
