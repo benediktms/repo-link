@@ -76,6 +76,19 @@ impl Project {
             .map(|f| f.options.as_slice())
             .unwrap_or_default();
         Self::validate_mappings(&status_mappings, status_options)?;
+        // Unlike Status (the classifier guarantees a single one via status_idx),
+        // assign_field_kinds tags EVERY field named "Priority" as Priority — so
+        // reject >1 rather than silently using the first (snapshot-order
+        // dependent). Mirrors the Status guard above.
+        let priority_count = fields
+            .iter()
+            .filter(|f| f.kind == ProjectFieldKind::Priority)
+            .count();
+        if priority_count > 1 {
+            return Err(DomainError::validation(format!(
+                "project has {priority_count} Priority fields; expected at most one"
+            )));
+        }
         let priority_options = fields
             .iter()
             .find(|f| f.kind == ProjectFieldKind::Priority)
@@ -746,6 +759,36 @@ mod tests {
                     option_id: "p1".into(),
                 },
             ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn from_fields_rejects_more_than_one_priority_field() {
+        // assign_field_kinds tags every field named "Priority", so from_fields
+        // must reject >1 (mirroring the Status guard) rather than silently pick
+        // the first in snapshot order.
+        let prio = |id: &str| ProjectField {
+            field_id: id.into(),
+            name: "Priority".into(),
+            kind: ProjectFieldKind::Priority,
+            options: vec![opt("p0", "P0", 0)],
+        };
+        let err = Project::from_fields(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            vec![
+                status_field("PVTSSF_s", vec![opt("o1", "Backlog", 0)]),
+                prio("PVTSSF_a"),
+                prio("PVTSSF_b"),
+            ],
+            vec![],
+            vec![],
             false,
             Timestamp::now(),
         )
