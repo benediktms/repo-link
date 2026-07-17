@@ -6,7 +6,8 @@
 //! vocabularies below and let the user refine the result via
 //! `rl project map`.
 
-use crate::status::{StatusMapping, StatusOption};
+use crate::field::FieldOption;
+use crate::status::StatusMapping;
 
 /// Normalize an option name for vocabulary matching: lowercase and drop
 /// whitespace plus `-`/`_` separators.
@@ -32,13 +33,13 @@ fn normalize(name: &str) -> String {
 }
 
 /// The first option whose normalized name is one of `vocab`.
-fn first_matching<'a>(options: &'a [StatusOption], vocab: &[&str]) -> Option<&'a StatusOption> {
+fn first_matching<'a>(options: &'a [FieldOption], vocab: &[&str]) -> Option<&'a FieldOption> {
     options
         .iter()
         .find(|o| vocab.contains(&normalize(&o.name).as_str()))
 }
 
-fn push_mapping(out: &mut Vec<StatusMapping>, is_open: bool, opt: Option<&StatusOption>) {
+fn push_mapping(out: &mut Vec<StatusMapping>, is_open: bool, opt: Option<&FieldOption>) {
     if let Some(o) = opt {
         out.push(StatusMapping {
             is_open,
@@ -67,7 +68,7 @@ fn push_mapping(out: &mut Vec<StatusMapping>, is_open: bool, opt: Option<&Status
 /// once. The two buckets *may* share one option (e.g. a single-option board
 /// maps both open→first and closed→last to the same row) — that many-to-one
 /// shape is valid by design.
-pub fn derive_status_mappings(options: &[StatusOption]) -> Vec<StatusMapping> {
+pub fn derive_status_mappings(options: &[FieldOption]) -> Vec<StatusMapping> {
     if options.is_empty() {
         return Vec::new();
     }
@@ -101,11 +102,11 @@ pub fn derive_status_mappings(options: &[StatusOption]) -> Vec<StatusMapping> {
 mod tests {
     use super::*;
 
-    fn opts(names: &[&str]) -> Vec<StatusOption> {
+    fn opts(names: &[&str]) -> Vec<FieldOption> {
         names
             .iter()
             .enumerate()
-            .map(|(i, name)| StatusOption {
+            .map(|(i, name)| FieldOption {
                 option_id: format!("o{i}"),
                 name: (*name).to_string(),
                 ordinal: u32::try_from(i).unwrap(),

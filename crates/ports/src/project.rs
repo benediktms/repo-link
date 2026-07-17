@@ -16,12 +16,21 @@ pub struct RemoteProjectSnapshot {
     pub number: u64,
     pub title: String,
     pub owner_login: String,
-    pub status_field_id: String,
-    pub status_options: Vec<RemoteProjectStatusOption>,
+    /// Every retained single-select field on the board (RFC 0006 D2). The
+    /// adapter no longer collapses to a single Status field — Status-vs-other
+    /// selection is a domain concern applied at link time (named matching).
+    pub fields: Vec<RemoteProjectField>,
 }
 
 #[derive(Clone, Debug)]
-pub struct RemoteProjectStatusOption {
+pub struct RemoteProjectField {
+    pub field_id: String,
+    pub name: String,
+    pub options: Vec<RemoteProjectFieldOption>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemoteProjectFieldOption {
     pub option_id: String,
     pub name: String,
     pub ordinal: u32,
@@ -63,7 +72,8 @@ pub struct PollPage {
 #[async_trait]
 pub trait RemoteProjectProvider: Send + Sync {
     /// Resolve `owner/number` → project schema. Called once per `rl project
-    /// link` to learn the project's Status field id and option catalog.
+    /// link` to learn the project's retained single-select fields (id + name +
+    /// option catalog); Status-vs-other classification happens in the domain.
     async fn fetch_project(&self, owner: &str, number: u64) -> PortResult<RemoteProjectSnapshot>;
 
     /// Attach an existing issue to a project. Returns the new item's

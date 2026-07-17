@@ -17,8 +17,8 @@
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use ports::{
-    PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectSnapshot,
-    RemoteProjectStatusOption,
+    PollPage, PortError, PortResult, RemoteProjectField, RemoteProjectFieldOption,
+    RemoteProjectItem, RemoteProjectSnapshot,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -195,48 +195,45 @@ impl GraphqlClient {
             .and_then(|o| o.project_v2)
             .ok_or_else(|| PortError::NotFound(format!("project {owner}/{number}")))?;
 
-        // Pick the single-select field literally named "Status"; else the
-        // first single-select field (RFC 0001 §3 D1).
-        let single_selects: Vec<&FieldNode> = project
-            .fields
-            .nodes
-            .iter()
-            .filter(|f| f.typename == "ProjectV2SingleSelectField")
-            .collect();
-        let status_field = single_selects
-            .iter()
-            .find(|f| f.name.as_deref() == Some("Status"))
-            .or_else(|| single_selects.first())
-            .ok_or_else(|| {
-                PortError::Backend(format!(
-                    "project {owner}/{number} has no single-select field to use as Status"
-                ))
-            })?;
-
-        let status_field_id = status_field
-            .id
-            .clone()
-            .ok_or_else(|| PortError::Backend("status field missing id".into()))?;
-        let status_options = status_field
-            .options
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .map(|(i, o)| RemoteProjectStatusOption {
-                option_id: o.id.clone(),
-                name: o.name.clone(),
-                ordinal: u32::try_from(i).unwrap_or(u32::MAX),
-            })
-            .collect();
+        // Retain EVERY single-select field (RFC 0006 D2) — don't collapse to
+        // one Status field here. Which one drives lifecycle is a domain concern
+        // (named matching over the retained set, at link time), so the adapter
+        // just maps the wire shape faithfully. A project with no single-select
+        // field yields an empty `fields` (a valid wire state); the "no field to
+        // use as Status" error moves to link-time classification.
+        let mut fields = Vec::new();
+        for f in &project.fields.nodes {
+            if f.typename != "ProjectV2SingleSelectField" {
+                continue;
+            }
+            let field_id =
+                f.id.clone()
+                    .ok_or_else(|| PortError::Backend("single-select field missing id".into()))?;
+            let options = f
+                .options
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(i, o)| RemoteProjectFieldOption {
+                    option_id: o.id.clone(),
+                    name: o.name.clone(),
+                    ordinal: u32::try_from(i).unwrap_or(u32::MAX),
+                })
+                .collect();
+            fields.push(RemoteProjectField {
+                field_id,
+                name: f.name.clone().unwrap_or_default(),
+                options,
+            });
+        }
 
         Ok(RemoteProjectSnapshot {
             node_id: project.id,
             number: project.number,
             title: project.title,
             owner_login: project.owner.login,
-            status_field_id,
-            status_options,
+            fields,
         })
     }
 
@@ -562,10 +559,12 @@ struct FieldNode {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    options: Option<Vec<FieldOption>>,
+    options: Option<Vec<SingleSelectOptionNode>>,
 }
+/// One `options` node under a `ProjectV2SingleSelectField`. Named to avoid
+/// confusion with the domain/ports `FieldOption` (neither is imported here).
 #[derive(Deserialize)]
-struct FieldOption {
+struct SingleSelectOptionNode {
     id: String,
     name: String,
 }

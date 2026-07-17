@@ -20,6 +20,8 @@ pub enum ServiceError {
     UnknownStatus(String),
     #[error("option_id '{0}' is not part of project '{1}'")]
     UnknownOption(String, String),
+    #[error("project '{0}' has no single-select field to use as Status")]
+    NoStatusField(String),
 }
 
 impl From<ProjectIdParseError> for ServiceError {

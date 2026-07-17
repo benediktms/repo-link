@@ -4,7 +4,10 @@
 use std::sync::Arc;
 
 use domain_core::{ProjectId, Timestamp};
-use domain_project::{Project, StatusMapping, StatusOption, derive_status_mappings};
+use domain_project::{
+    FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping, assign_field_kinds,
+    derive_status_mappings,
+};
 use dto_shared::{LinkProjectCmd, MapStatusCmd, ProjectDto};
 use ports::{PortError, ProjectRepository, RemoteProjectSnapshot};
 
@@ -68,10 +71,10 @@ impl ProjectService {
     /// GraphQL-fetched schema instead.
     pub async fn link(&self, cmd: LinkProjectCmd) -> Result<ProjectDto> {
         let id = ProjectId::parse(cmd.node_id.clone())?;
-        let status_options: Vec<StatusOption> = cmd
+        let status_options: Vec<FieldOption> = cmd
             .status_options
             .into_iter()
-            .map(|o| StatusOption {
+            .map(|o| FieldOption {
                 option_id: o.option_id,
                 name: o.name,
                 ordinal: o.ordinal,
@@ -112,23 +115,43 @@ impl ProjectService {
     /// node id.
     pub async fn link_from_snapshot(&self, snap: RemoteProjectSnapshot) -> Result<ProjectDto> {
         let id = ProjectId::parse(snap.node_id)?;
-        let status_options: Vec<StatusOption> = snap
-            .status_options
+        // Map the retained single-selects into domain fields and classify them
+        // by name (RFC 0006 D9) — Status-vs-other selection is a domain concern,
+        // not the adapter's. Every field is persisted (genuine round trip), but
+        // only the Status field drives lifecycle today.
+        let fields: Vec<ProjectField> = snap
+            .fields
             .into_iter()
-            .map(|o| StatusOption {
-                option_id: o.option_id,
-                name: o.name,
-                ordinal: o.ordinal,
+            .map(|f| {
+                ProjectField::new(
+                    f.field_id,
+                    f.name,
+                    f.options
+                        .into_iter()
+                        .map(|o| FieldOption {
+                            option_id: o.option_id,
+                            name: o.name,
+                            ordinal: o.ordinal,
+                        })
+                        .collect(),
+                )
             })
             .collect();
-        let status_mappings = derive_status_mappings(&status_options);
-        let project = Project::new(
+        let fields = assign_field_kinds(fields);
+
+        // Derive the local-status → option mapping from the Status field's
+        // catalog. A board with no single-select field can't be driven, so
+        // linking it is an error (RFC 0001 §3 D1 / 0006 D9).
+        let status_mappings = match fields.iter().find(|f| f.kind == ProjectFieldKind::Status) {
+            Some(status) => derive_status_mappings(&status.options),
+            None => return Err(ServiceError::NoStatusField(id.as_str().to_string())),
+        };
+        let project = Project::from_fields(
             id,
             snap.owner_login,
             snap.number,
             snap.title,
-            snap.status_field_id,
-            status_options,
+            fields,
             status_mappings,
             false,
             Timestamp::now(),
@@ -160,7 +183,7 @@ impl ProjectService {
         let mut project = resolve_project(&self.repo, &cmd.project_spec).await?;
         let is_open = parse_status(&cmd.status)?;
         if !project
-            .status_options
+            .status_options()
             .iter()
             .any(|o| o.option_id == cmd.option_id)
         {
@@ -358,27 +381,50 @@ mod tests {
     }
 
     fn snapshot() -> RemoteProjectSnapshot {
+        // Two retained single-selects: a Priority field (exercises retention)
+        // and the Status field the mapping is derived from.
         RemoteProjectSnapshot {
             node_id: "PVT_snap".into(),
             number: 3,
             title: "repo-link".into(),
             owner_login: "benediktms".into(),
-            status_field_id: "PVTSSF_x".into(),
-            status_options: vec![
-                ports::RemoteProjectStatusOption {
-                    option_id: "f7".into(),
-                    name: "Backlog".into(),
-                    ordinal: 0,
+            fields: vec![
+                ports::RemoteProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    options: vec![
+                        ports::RemoteProjectFieldOption {
+                            option_id: "p0".into(),
+                            name: "P0".into(),
+                            ordinal: 0,
+                        },
+                        ports::RemoteProjectFieldOption {
+                            option_id: "p1".into(),
+                            name: "P1".into(),
+                            ordinal: 1,
+                        },
+                    ],
                 },
-                ports::RemoteProjectStatusOption {
-                    option_id: "47".into(),
-                    name: "In progress".into(),
-                    ordinal: 2,
-                },
-                ports::RemoteProjectStatusOption {
-                    option_id: "98".into(),
-                    name: "Done".into(),
-                    ordinal: 4,
+                ports::RemoteProjectField {
+                    field_id: "PVTSSF_x".into(),
+                    name: "Status".into(),
+                    options: vec![
+                        ports::RemoteProjectFieldOption {
+                            option_id: "f7".into(),
+                            name: "Backlog".into(),
+                            ordinal: 0,
+                        },
+                        ports::RemoteProjectFieldOption {
+                            option_id: "47".into(),
+                            name: "In progress".into(),
+                            ordinal: 2,
+                        },
+                        ports::RemoteProjectFieldOption {
+                            option_id: "98".into(),
+                            name: "Done".into(),
+                            ordinal: 4,
+                        },
+                    ],
                 },
             ],
         }
@@ -419,5 +465,42 @@ mod tests {
         s.node_id = "not-a-node-id".into();
         let err = svc.link_from_snapshot(s).await.unwrap_err();
         assert!(matches!(err, ServiceError::BadProjectId(_)));
+    }
+
+    #[tokio::test]
+    async fn link_from_snapshot_retains_non_status_fields() {
+        // The Priority field in the snapshot must be persisted alongside the
+        // Status field, classified `Priority` — genuine round trip (it isn't
+        // surfaced on the Status-centric DTO, so assert on the aggregate).
+        let repo = Arc::new(InMemoryProjectRepository::new());
+        let svc = ProjectService::new(repo.clone());
+        svc.link_from_snapshot(snapshot()).await.unwrap();
+
+        let project = repo
+            .get(ProjectId::parse("PVT_snap".to_string()).unwrap())
+            .await
+            .unwrap();
+        // Both fields retained; the Status field derived the mappings.
+        assert_eq!(project.fields.len(), 2);
+        assert_eq!(project.status_field_id(), Some("PVTSSF_x"));
+        assert!(
+            project
+                .fields
+                .iter()
+                .any(|f| f.kind == domain_project::ProjectFieldKind::Priority
+                    && f.name == "Priority"
+                    && f.options.len() == 2),
+            "the Priority field must survive the link round trip: {:?}",
+            project.fields
+        );
+    }
+
+    #[tokio::test]
+    async fn link_from_snapshot_without_single_select_errors() {
+        let svc = service();
+        let mut s = snapshot();
+        s.fields = vec![];
+        let err = svc.link_from_snapshot(s).await.unwrap_err();
+        assert!(matches!(err, ServiceError::NoStatusField(_)), "got {err:?}");
     }
 }

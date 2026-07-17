@@ -735,6 +735,11 @@ impl OutboxDrainer {
             return Ok(());
         };
         let project = self.projects.get(project_id).await?;
+        // No Status field → nothing to project onto (parallels the no-option
+        // early return below).
+        let Some(status_field_id) = project.status_field_id() else {
+            return Ok(());
+        };
         let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open()) else {
             return Ok(());
         };
@@ -743,7 +748,7 @@ impl OutboxDrainer {
             OutboxMutation::SetProjectStatus {
                 project_node_id: project_node_id.to_string(),
                 item_node_id: item_id.to_string(),
-                status_field_id: project.status_field_id.clone(),
+                status_field_id: status_field_id.to_string(),
                 option_id: option_id.to_string(),
             },
         );
@@ -756,7 +761,7 @@ impl OutboxDrainer {
 mod tests {
     use super::*;
     use domain_core::{ProjectId, Timestamp, WorkspaceId};
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use domain_sync::{OutboxEntry, OutboxMutation, OutboxStatus};
     use domain_task::{RemoteRef, SyncState, Task};
     use domain_workspace::{Workspace, WorkspaceName};
@@ -843,17 +848,17 @@ mod tests {
             "Board".into(),
             "PVTSSF_field".into(),
             vec![
-                StatusOption {
+                FieldOption {
                     option_id: "o_backlog".into(),
                     name: "Backlog".into(),
                     ordinal: 0,
                 },
-                StatusOption {
+                FieldOption {
                     option_id: "o_wip".into(),
                     name: "In progress".into(),
                     ordinal: 1,
                 },
-                StatusOption {
+                FieldOption {
                     option_id: "o_done".into(),
                     name: "Done".into(),
                     ordinal: 2,

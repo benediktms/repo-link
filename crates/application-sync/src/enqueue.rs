@@ -133,11 +133,13 @@ pub async fn project_for_workspace(
 /// task isn't attached yet.
 pub fn set_project_status_mutation(project: &Project, task: &Task) -> Option<OutboxMutation> {
     let item_node_id = task.project_item_id.clone()?;
+    // No Status field → nothing to project onto; `?` short-circuits to `None`.
+    let status_field_id = project.status_field_id()?.to_string();
     let option_id = crate::board_option_for_lifecycle(project, task.is_open())?;
     Some(OutboxMutation::SetProjectStatus {
         project_node_id: project.id.as_str().to_string(),
         item_node_id,
-        status_field_id: project.status_field_id.clone(),
+        status_field_id,
         option_id,
     })
 }
@@ -277,7 +279,7 @@ pub fn plan_mutations(
 mod tests {
     use super::*;
     use domain_core::{ProjectId, WorkspaceId};
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use domain_task::{RemoteRef, SyncState, Task};
 
     fn make_project(id: &str) -> Project {
@@ -287,7 +289,7 @@ mod tests {
             1,
             "Board".into(),
             "PVTSSF_f".into(),
-            vec![StatusOption {
+            vec![FieldOption {
                 option_id: "o1".into(),
                 name: "Backlog".into(),
                 ordinal: 0,

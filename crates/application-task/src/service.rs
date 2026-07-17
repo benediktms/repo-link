@@ -2224,7 +2224,7 @@ mod tests {
 
     // ---------- Stage 6 (#54): lifecycle enqueue matrix --------------------
 
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use domain_sync::OutboxStatus;
     use domain_workspace::{Workspace, WorkspaceName};
 
@@ -2273,17 +2273,17 @@ mod tests {
             "Board".into(),
             "PVTSSF_field".into(),
             vec![
-                StatusOption {
+                FieldOption {
                     option_id: "o_backlog".into(),
                     name: "Backlog".into(),
                     ordinal: 0,
                 },
-                StatusOption {
+                FieldOption {
                     option_id: "o_wip".into(),
                     name: "In progress".into(),
                     ordinal: 1,
                 },
-                StatusOption {
+                FieldOption {
                     option_id: "o_done".into(),
                     name: "Done".into(),
                     ordinal: 2,

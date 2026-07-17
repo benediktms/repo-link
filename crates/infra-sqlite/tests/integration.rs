@@ -1211,7 +1211,7 @@ async fn aliases_check_rejects_non_array_json() {
 #[tokio::test]
 async fn project_roundtrip_preserves_options_and_default_mapping() {
     use domain_core::{ProjectId, Timestamp};
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use infra_sqlite::SqliteProjectRepository;
     use ports::ProjectRepository;
 
@@ -1225,17 +1225,17 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
         "Repo Link".into(),
         "PVTSSF_field".into(),
         vec![
-            StatusOption {
+            FieldOption {
                 option_id: "o1".into(),
                 name: "Backlog".into(),
                 ordinal: 0,
             },
-            StatusOption {
+            FieldOption {
                 option_id: "o2".into(),
                 name: "Done".into(),
                 ordinal: 1,
             },
-            StatusOption {
+            FieldOption {
                 option_id: "o3".into(),
                 name: "Triage".into(),
                 ordinal: 2,
@@ -1264,13 +1264,13 @@ async fn project_roundtrip_preserves_options_and_default_mapping() {
     assert_eq!(loaded.owner_login, "acme");
     assert_eq!(loaded.number, 7);
     assert_eq!(loaded.title, "Repo Link");
-    assert_eq!(loaded.status_field_id, "PVTSSF_field");
+    assert_eq!(loaded.status_field_id(), Some("PVTSSF_field"));
     assert!(!loaded.archived);
 
     // Options come back in the order they were stored (sorted by ordinal).
-    assert_eq!(loaded.status_options.len(), 3);
+    assert_eq!(loaded.status_options().len(), 3);
     let names: Vec<&str> = loaded
-        .status_options
+        .status_options()
         .iter()
         .map(|o| o.name.as_str())
         .collect();
@@ -1290,7 +1290,7 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
     // dedicated `project_status_mappings` table stores both rows; this test
     // pins that they survive the round-trip.
     use domain_core::{ProjectId, Timestamp};
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use infra_sqlite::SqliteProjectRepository;
     use ports::ProjectRepository;
 
@@ -1307,12 +1307,12 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
         "Tight Board".into(),
         "PVTSSF_field".into(),
         vec![
-            StatusOption {
+            FieldOption {
                 option_id: "backlog".into(),
                 name: "Backlog".into(),
                 ordinal: 0,
             },
-            StatusOption {
+            FieldOption {
                 option_id: "done".into(),
                 name: "Done".into(),
                 ordinal: 1,
@@ -1341,6 +1341,149 @@ async fn project_roundtrip_preserves_many_to_one_mapping() {
     assert_eq!(loaded.status_mappings.len(), 2);
     assert_eq!(loaded.option_id_for(true), Some("backlog"));
     assert_eq!(loaded.option_id_for(false), Some("done"));
+}
+
+/// RFC 0006 D2 — the additive project-field generalization, exercised ACROSS
+/// the rebuild. Seeds a PRE-generalization project (status_field_id +
+/// project_status_options + project_status_mappings) BEFORE 20260717000001
+/// applies, then runs it and asserts the Status field + options + mappings
+/// migrated into the generalized tables with correct field_id/ordinal, the old
+/// project_status_options table and projects.status_field_id column are gone,
+/// and FK integrity holds. Mirrors `rfc0002_migration_sequence_data_integrity`.
+#[tokio::test]
+async fn rfc0006_migration_backfills_status_into_generalized_fields() {
+    // The generalization migration version (filename prefix 20260717000001).
+    const GEN_VERSION: i64 = 20260717000001;
+    const TS: &str = "2026-01-01T00:00:00Z";
+
+    let dir = TempDir::new().unwrap();
+    let url = format!("sqlite://{}", dir.path().join("gen-audit.db").display());
+    let pool = infra_sqlite::open_write_pool(&url)
+        .await
+        .expect("open write pool (no migrations yet)");
+
+    let migrator = sqlx::migrate!("./migrations");
+
+    // (1) Apply every migration up to — but NOT including — the generalization.
+    for m in migrator.iter() {
+        if m.version < GEN_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("pre-gen migration {} failed: {e}", m.version));
+        }
+    }
+
+    // Sanity: the pre-gen schema still carries projects.status_field_id, so the
+    // backfill assertions below genuinely test the data-copy.
+    let pre = column_names(&pool, "projects").await;
+    assert!(
+        pre.contains(&"status_field_id".to_string()),
+        "pre-gen projects must have status_field_id; got {pre:?}"
+    );
+
+    // (2) Seed a pre-gen project + Status options + open/closed mappings.
+    sqlx::raw_sql(&format!(
+        "INSERT INTO projects (id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at)
+           VALUES ('PVT_gen', 'github', 'acme', 5, 'Board', 'PVTSSF_stat', 0, '{TS}', '{TS}');
+         INSERT INTO project_status_options (project_id, option_id, name, ordinal)
+           VALUES ('PVT_gen', 'o_open', 'Backlog', 0),
+                  ('PVT_gen', 'o_done', 'Done', 1);
+         INSERT INTO project_status_mappings (project_id, is_open, option_id)
+           VALUES ('PVT_gen', 1, 'o_open'),
+                  ('PVT_gen', 0, 'o_done');"
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed pre-gen project/options/mappings");
+
+    // (3) Apply the generalization migration and anything after it.
+    for m in migrator.iter() {
+        if m.version >= GEN_VERSION {
+            sqlx::raw_sql(m.sql.as_ref())
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("gen+ migration {} failed: {e}", m.version));
+        }
+    }
+
+    // --- (a) The Status field landed in project_fields, tagged kind='status'.
+    let (field_id, name, kind): (String, String, String) = sqlx::query_as(
+        "SELECT field_id, name, kind FROM project_fields WHERE project_id = 'PVT_gen'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(field_id, "PVTSSF_stat");
+    assert_eq!(name, "Status");
+    assert_eq!(kind, "status");
+
+    // --- (b) Options landed in project_field_options carrying the field id +
+    // preserved ordinals.
+    let opts: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT option_id, name, ordinal FROM project_field_options
+          WHERE project_id = 'PVT_gen' AND field_id = 'PVTSSF_stat' ORDER BY ordinal",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        opts,
+        vec![
+            ("o_open".to_string(), "Backlog".to_string(), 0),
+            ("o_done".to_string(), "Done".to_string(), 1),
+        ]
+    );
+
+    // --- (c) Mappings re-keyed with the Status field id; bucket→option intact.
+    let maps: Vec<(String, i64, String)> = sqlx::query_as(
+        "SELECT field_id, is_open, option_id FROM project_status_mappings
+          WHERE project_id = 'PVT_gen' ORDER BY is_open DESC",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        maps,
+        vec![
+            ("PVTSSF_stat".to_string(), 1, "o_open".to_string()),
+            ("PVTSSF_stat".to_string(), 0, "o_done".to_string()),
+        ]
+    );
+
+    // --- (d) The orphan options table is gone, as is projects.status_field_id.
+    let (opts_table,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='project_status_options'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(opts_table, 0, "project_status_options must be dropped");
+    let post = column_names(&pool, "projects").await;
+    assert!(
+        !post.contains(&"status_field_id".to_string()),
+        "projects.status_field_id must be dropped after generalization; got {post:?}"
+    );
+
+    // --- (e) No FK orphans after the full sequence + seed.
+    let orphans: Vec<String> = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let table: String = sqlx::Row::get(&r, "table");
+            let rowid: i64 = sqlx::Row::get(&r, "rowid");
+            let parent: String = sqlx::Row::get(&r, "parent");
+            format!("{table} rowid={rowid} → {parent}")
+        })
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "PRAGMA foreign_key_check must find no orphans after the RFC 0006 sequence; got {orphans:?}"
+    );
+
+    drop(dir);
 }
 
 #[tokio::test]

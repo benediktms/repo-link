@@ -1,20 +1,11 @@
-//! Status field value objects: the option catalog and the
-//! local-status → option mapping rows.
+//! The local-status → project-option mapping row.
+//!
+//! The option catalog itself moved to [`crate::field`] as the generic
+//! [`crate::FieldOption`] once every retained single-select field grew its own
+//! catalog (RFC 0006 D2). The mapping below stays here: it is lifecycle-specific
+//! and does not generalize.
 
 use serde::{Deserialize, Serialize};
-
-/// One option on a Project's single-select Status field.
-///
-/// - `option_id` is GitHub's stable identifier for the option (an 8-char
-///   hex prefix like `47fc9ee4`). The mapping below references this value.
-/// - `ordinal` is the option's index in the field definition — kept so the
-///   CLI can echo the user-facing order from GitHub without re-sorting.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StatusOption {
-    pub option_id: String,
-    pub name: String,
-    pub ordinal: u32,
-}
 
 /// One row of the local lifecycle → project-option mapping. Keyed on the
 /// open/closed bit (RFC 0004 D1): an open task maps to one board option, a
