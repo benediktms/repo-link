@@ -1,7 +1,6 @@
 //! Standalone serde enums with no behaviour.
 
 use std::fmt;
-use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -125,25 +124,38 @@ impl fmt::Display for IssueType {
     }
 }
 
-impl From<&str> for IssueType {
-    /// Infallible, case-insensitive parse (RFC D7: unknown → `Custom`). The
-    /// well-known names match regardless of case; anything else is preserved
-    /// verbatim as `Custom`.
-    fn from(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "task" => IssueType::Task,
-            "bug" => IssueType::Bug,
-            "feature" => IssueType::Feature,
-            _ => IssueType::Custom(s.to_string()),
+impl IssueType {
+    /// Match `s` (any case) to a well-known variant, or `None` for a custom
+    /// type. The single source of truth for the string → variant direction,
+    /// shared by both `From` impls; must stay the inverse of [`fmt::Display`]
+    /// (the `issue_type_well_known_round_trips` test guards that).
+    fn well_known(s: &str) -> Option<IssueType> {
+        if s.eq_ignore_ascii_case("task") {
+            Some(IssueType::Task)
+        } else if s.eq_ignore_ascii_case("bug") {
+            Some(IssueType::Bug)
+        } else if s.eq_ignore_ascii_case("feature") {
+            Some(IssueType::Feature)
+        } else {
+            None
         }
     }
 }
 
-impl FromStr for IssueType {
-    type Err = std::convert::Infallible;
+impl From<&str> for IssueType {
+    /// Infallible, case-insensitive parse (RFC D7: unknown → `Custom`). The
+    /// well-known names match regardless of case **without allocating**;
+    /// anything else is preserved verbatim as `Custom`.
+    fn from(s: &str) -> Self {
+        IssueType::well_known(s).unwrap_or_else(|| IssueType::Custom(s.to_string()))
+    }
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(IssueType::from(s))
+impl From<String> for IssueType {
+    /// Owned counterpart of [`From<&str>`]: moves the buffer straight into
+    /// `Custom` instead of re-allocating it (the deserialize hot path).
+    fn from(s: String) -> Self {
+        IssueType::well_known(&s).unwrap_or(IssueType::Custom(s))
     }
 }
 
@@ -166,7 +178,7 @@ impl<'de> Deserialize<'de> for IssueType {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(IssueType::from(s.as_str()))
+        Ok(IssueType::from(s))
     }
 }
 
@@ -308,12 +320,16 @@ mod tests {
         assert_eq!(IssueType::from("Feature"), IssueType::Feature);
         // Unknown → Custom, payload preserved verbatim (original case kept).
         assert_eq!(IssueType::from("Epic"), IssueType::Custom("Epic".into()));
-        // FromStr delegates to the infallible From<&str>.
-        assert_eq!("bug".parse::<IssueType>().unwrap(), IssueType::Bug);
-        assert_eq!(
-            "Epic".parse::<IssueType>().unwrap(),
-            IssueType::Custom("Epic".into())
-        );
+    }
+
+    /// The well-known variants must survive `Display` → `From` unchanged, so
+    /// the two independently-maintained maps stay exact inverses — a new
+    /// variant added to one but not the other trips this.
+    #[test]
+    fn issue_type_well_known_round_trips() {
+        for v in [IssueType::Task, IssueType::Bug, IssueType::Feature] {
+            assert_eq!(IssueType::from(v.to_string().as_str()), v);
+        }
     }
 
     /// Deserialization applies the same unknown → `Custom` rule.

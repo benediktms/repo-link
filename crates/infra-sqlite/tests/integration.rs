@@ -662,6 +662,20 @@ async fn task_issue_type_roundtrip() {
     assert_eq!(unset.issue_type, None);
     ts.save(&unset, SnapshotSource::LocalEdit).await.unwrap();
     assert_eq!(ts.get(unset.id).await.unwrap().issue_type, None);
+
+    // ON CONFLICT DO UPDATE: re-saving an existing task with a changed issue
+    // type must persist the new value (guards the silent-never-persists-on-
+    // update bug class — INSERT-only coverage would miss a dropped upsert
+    // clause), and clearing it back to None must also stick.
+    custom.set_issue_type(Some(IssueType::Feature));
+    ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(custom.id).await.unwrap().issue_type,
+        Some(IssueType::Feature)
+    );
+    custom.set_issue_type(None);
+    ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(ts.get(custom.id).await.unwrap().issue_type, None);
 }
 
 #[tokio::test]

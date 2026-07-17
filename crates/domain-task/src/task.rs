@@ -577,6 +577,12 @@ impl Task {
     /// [`Task::reconcile_dirty_against_baseline`] (it must never flip sync
     /// state). Setting the same value is an idempotent no-op.
     ///
+    /// Note the parity with `priority` is not yet total: unlike `priority`,
+    /// `issue_type` is **not** captured in `snapshot_view`/`TaskSnapshot`, so a
+    /// `rollback` does not restore it. That fidelity is deferred to #228 along
+    /// with the sync rail; today `issue_type` is only settable in-process, so
+    /// the gap is not user-reachable.
+    ///
     /// [`set_priority`]: Task::set_priority
     pub fn set_issue_type(&mut self, issue_type: Option<IssueType>) {
         if self.issue_type != issue_type {
@@ -1833,10 +1839,15 @@ mod tests {
     #[test]
     fn set_issue_type_touches_updated_at_and_is_idempotent() {
         let mut t = draft();
+        // Force an old baseline so "advances" is a real guard: a bare `>=`
+        // against a just-captured wall-clock now() is trivially true even if
+        // touch() is removed. From the epoch, any real touch() is strictly `>`
+        // and non-flaky (no clock-resolution race).
+        t.updated_at = Timestamp::epoch();
         let before = t.updated_at;
         t.set_issue_type(Some(IssueType::Custom("Epic".into())));
         assert_eq!(t.issue_type, Some(IssueType::Custom("Epic".into())));
-        assert!(t.updated_at >= before, "a real change advances updated_at");
+        assert!(t.updated_at > before, "a real change advances updated_at");
 
         // Setting the same value again is a no-op — updated_at is unchanged.
         let after_first = t.updated_at;
