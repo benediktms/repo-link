@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
-use domain_project::Project;
+use domain_project::{OrgIssueTypeRegistry, Project};
 
 use crate::error::PortResult;
 
@@ -34,6 +34,15 @@ pub struct RemoteProjectFieldOption {
     pub option_id: String,
     pub name: String,
     pub ordinal: u32,
+}
+
+/// One org-level native issue type as returned by the provider (RFC 0006
+/// D5/D8). The org-decoupled counterpart of [`RemoteProjectFieldOption`]:
+/// issue types are an organization catalog, not a per-board field.
+#[derive(Clone, Debug)]
+pub struct RemoteIssueType {
+    pub issue_type_id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +165,23 @@ pub trait RemoteProjectProvider: Send + Sync {
         status_field_id: &str,
         query: &str,
     ) -> PortResult<PollPage>;
+
+    /// Fetch the owner's org-level native issue-type catalog (RFC 0006
+    /// D5/D8). Called at `rl project link` time to (re)build the org registry
+    /// cache. Per D8 a user-owned owner (personal account) or an org with the
+    /// feature disabled has no types — that is an empty vec, NEVER an error;
+    /// the GitHub adapter reaches this via `repositoryOwner(login:)` + an
+    /// `... on Organization` fragment so a non-org owner deserializes to an
+    /// empty set rather than a GraphQL error.
+    ///
+    /// The default returns an empty catalog so the non-GitHub implementors
+    /// (the in-memory fixture + the daemon's project-provider test doubles)
+    /// compile untouched; only [`crate`]'s GitHub adapter overrides it. A
+    /// maintainer tidying this default away must add overrides to those
+    /// doubles.
+    async fn fetch_org_issue_types(&self, _owner_login: &str) -> PortResult<Vec<RemoteIssueType>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
@@ -169,4 +195,20 @@ pub trait ProjectRepository: Send + Sync {
     /// so the resolver scans this set).
     async fn list_all(&self) -> PortResult<Vec<Project>>;
     async fn delete(&self, id: ProjectId) -> PortResult<()>;
+}
+
+/// Persistence for the org-level native issue-type registry (RFC 0006 D5).
+///
+/// Kept as its own trait — separate from [`ProjectRepository`] — because the
+/// registry is org-scoped and decoupled from any board (D5): one owner's types
+/// are shared across every project it owns, so they do not belong on the
+/// per-project aggregate.
+#[async_trait]
+pub trait OrgIssueTypeRepository: Send + Sync {
+    /// Replace the owner's cached registry wholesale.
+    async fn save(&self, registry: &OrgIssueTypeRegistry) -> PortResult<()>;
+    /// Load the owner's cached registry. An owner with no cached rows returns
+    /// an empty registry (`is_available() == false`), NEVER `NotFound` — the
+    /// D8 availability signal is an empty set, not an error.
+    async fn get(&self, owner_login: &str) -> PortResult<OrgIssueTypeRegistry>;
 }

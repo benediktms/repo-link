@@ -3,6 +3,7 @@
 mod event_sink;
 mod mapping;
 mod migrate;
+mod org_issue_type_repo;
 mod outbox_repo;
 mod pool;
 mod project_repo;
@@ -15,6 +16,7 @@ pub use event_sink::SqliteEventSink;
 pub use migrate::{
     backfill_empty_repo_names, backfill_empty_repo_prefixes, backfill_empty_task_hashes, migrate,
 };
+pub use org_issue_type_repo::SqliteOrgIssueTypeRepository;
 pub use outbox_repo::SqliteOutboxRepository;
 pub use pool::{Db, PoolError, open_db, open_from_path, open_read_pool, open_write_pool};
 pub use project_repo::SqliteProjectRepository;
@@ -77,6 +79,10 @@ mod schema_const_consistency {
             ),
             ("projects", crate::project_repo::PROJECT_COLS),
             ("workspaces", crate::workspace_repo::WORKSPACE_COLS),
+            (
+                "org_issue_types",
+                crate::org_issue_type_repo::ORG_ISSUE_TYPE_COLS,
+            ),
         ];
 
         for (table, cols) in cases {

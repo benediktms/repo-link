@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use application_project::ProjectService;
+use application_project::{OrgIssueTypeService, ProjectService};
 use application_query::QueryService;
 use application_sync::SyncService;
 use application_task::TaskService;
@@ -13,8 +13,9 @@ use application_workspace::{RepoBindingService, WorkspaceService};
 use infra_config::RepoLinkConfig;
 use infra_github::GithubAdapter;
 use infra_sqlite::{
-    SqliteOutboxRepository, SqliteProjectRepository, SqliteRepoBindingRepository,
-    SqliteTaskRepository, SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
+    SqliteOrgIssueTypeRepository, SqliteOutboxRepository, SqliteProjectRepository,
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteTaskSnapshotRepository,
+    SqliteWorkspaceRepository, open_from_path,
 };
 
 pub(crate) struct Services {
@@ -23,6 +24,9 @@ pub(crate) struct Services {
     pub(crate) tasks: TaskService,
     pub(crate) query: QueryService,
     pub(crate) projects: ProjectService,
+    /// Org-level native issue-type registry (RFC 0006 D5/D8). Refreshed at
+    /// `rl project link`; #228 consumes it for type-on-tasks resolution.
+    pub(crate) org_issue_types: OrgIssueTypeService,
     pub(crate) tasks_repo: Arc<dyn ports::TaskRepository>,
     pub(crate) bindings_repo: Arc<dyn ports::RepoBindingRepository>,
     /// Raw workspace repo — `build_sync_service` needs it for the RFC 0002 D2
@@ -44,6 +48,9 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
         Arc::new(SqliteTaskSnapshotRepository::new(db.clone()));
     let projects_repo: Arc<dyn ports::ProjectRepository> =
         Arc::new(SqliteProjectRepository::new(db.clone()));
+    // Built before the outbox repo below consumes the last `db` clone.
+    let org_issue_types_repo: Arc<dyn ports::OrgIssueTypeRepository> =
+        Arc::new(SqliteOrgIssueTypeRepository::new(db.clone()));
     let outbox_repo: Arc<dyn ports::OutboxRepository> = Arc::new(SqliteOutboxRepository::new(db));
 
     Ok(Services {
@@ -79,6 +86,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             projects_repo.clone(),
         ),
         projects: ProjectService::new(projects_repo),
+        org_issue_types: OrgIssueTypeService::new(org_issue_types_repo),
         tasks_repo,
         bindings_repo,
         workspaces_repo,

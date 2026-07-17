@@ -26,6 +26,29 @@ pub(crate) async fn project_dispatch(
                 .fetch_project(&owner, number)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
+
+            // `project link` is also the org (re)fetch point for the native
+            // issue-type registry (RFC 0006 D5). Best-effort: a hard failure
+            // (e.g. an older GHE schema without `issueTypes`) logs a warning and
+            // treats the org as type-unavailable rather than failing the link.
+            // Availability is a stderr advisory only — stdout stays the clean
+            // project JSON per the repo's stdout-JSON / stderr-notice split.
+            let owner_login = snapshot.owner_login.clone();
+            let type_available = match provider.fetch_org_issue_types(&owner_login).await {
+                Ok(types) => svc
+                    .org_issue_types
+                    .refresh(&owner_login, types)
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?,
+                Err(e) => {
+                    eprintln!("warning: could not fetch native issue types for {owner_login}: {e}");
+                    false
+                }
+            };
+            if !type_available {
+                eprintln!("Type unavailable for this org ({owner_login})");
+            }
+
             let dto = svc
                 .projects
                 .link_from_snapshot(snapshot)

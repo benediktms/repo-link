@@ -17,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
 use ports::{
-    PollPage, PortError, PortResult, RemoteProjectField, RemoteProjectFieldOption,
+    PollPage, PortError, PortResult, RemoteIssueType, RemoteProjectField, RemoteProjectFieldOption,
     RemoteProjectItem, RemoteProjectSnapshot,
 };
 use serde::Deserialize;
@@ -92,6 +92,24 @@ query($owner: String!, $number: Int!) {
             ... on ProjectV2SingleSelectField { id name options { id name } }
           }
         }
+      }
+    }
+  }
+}"#;
+
+/// Fetch an owner's org-level native issue-type catalog (RFC 0006 D5/D8).
+/// Reaches the owner via `repositoryOwner(login:)` + an `... on Organization`
+/// fragment — the same technique as `FETCH_PROJECT` — so a user-owned owner
+/// (personal account, no `issueTypes`) OR a missing owner both deserialize to
+/// an empty set rather than raising a GraphQL error. That is what keeps the D8
+/// "type unavailable" case error-free.
+const FETCH_ORG_ISSUE_TYPES: &str = r#"
+query($owner: String!) {
+  repositoryOwner(login: $owner) {
+    __typename
+    ... on Organization {
+      issueTypes(first: 100) {
+        nodes { id name }
       }
     }
   }
@@ -235,6 +253,31 @@ impl GraphqlClient {
             owner_login: project.owner.login,
             fields,
         })
+    }
+
+    /// Fetch the owner's org-level native issue types (RFC 0006 D5/D8). A null
+    /// owner (missing login) OR a non-org owner (a `User`, which has no
+    /// `issueTypes` field) both collapse to an empty vec here — the
+    /// `repositoryOwner` + `... on Organization` fragment shape means neither
+    /// is a GraphQL error, satisfying the D8 no-error requirement.
+    pub(crate) async fn fetch_org_issue_types(
+        &self,
+        owner_login: &str,
+    ) -> PortResult<Vec<RemoteIssueType>> {
+        let data: OrgIssueTypesData = self
+            .run(FETCH_ORG_ISSUE_TYPES, json!({ "owner": owner_login }))
+            .await?;
+        Ok(data
+            .repository_owner
+            .and_then(|o| o.issue_types)
+            .map(|c| c.nodes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| RemoteIssueType {
+                issue_type_id: n.id,
+                name: n.name,
+            })
+            .collect())
     }
 
     pub(crate) async fn add_item(
@@ -565,6 +608,30 @@ struct FieldNode {
 /// confusion with the domain/ports `FieldOption` (neither is imported here).
 #[derive(Deserialize)]
 struct SingleSelectOptionNode {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrgIssueTypesData {
+    repository_owner: Option<OrgIssueTypesOwner>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrgIssueTypesOwner {
+    // Absent for a non-org owner (a `User` has no `issueTypes` field) — the
+    // `#[serde(default)]` keeps that a `None`, i.e. an empty catalog, rather
+    // than a deserialize error (D8 no-error).
+    #[serde(default)]
+    issue_types: Option<IssueTypesConn>,
+}
+#[derive(Deserialize)]
+struct IssueTypesConn {
+    nodes: Vec<IssueTypeNode>,
+}
+#[derive(Deserialize)]
+struct IssueTypeNode {
     id: String,
     name: String,
 }

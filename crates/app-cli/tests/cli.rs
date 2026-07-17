@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn bin(name: &str, dir: &TempDir) -> Command {
@@ -3434,6 +3434,22 @@ fn link_demo_project(dir: &TempDir) -> String {
             })))
             .mount(&server)
             .await;
+        // `project link` also (re)fetches the org native issue-type registry
+        // (RFC 0006 D5). Serve a small non-empty catalog so the extra call
+        // succeeds end-to-end. Disjoint from the fetch_project mock above:
+        // that one requires `variables.number`, which the issueTypes query
+        // omits, and this one matches on the `issueTypes` field name.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": {
+                    "__typename": "Organization",
+                    "issueTypes": { "nodes": [ { "id": "IT_bug", "name": "Bug" } ] }
+                } }
+            })))
+            .mount(&server)
+            .await;
         server
     });
 
@@ -3445,6 +3461,77 @@ fn link_demo_project(dir: &TempDir) -> String {
     // `rt`/`server` stay alive until the function returns — i.e. past the
     // blocking link call above.
     dto["id"].as_str().unwrap().to_string()
+}
+
+/// RFC 0006 D8: when the org has no native issue types (a user-owned owner, or
+/// the feature disabled), `project link` still succeeds — printing the clean
+/// project JSON to stdout — and emits a `Type unavailable` advisory to stderr.
+#[test]
+fn project_link_reports_type_unavailable_for_userowned() {
+    let dir = TempDir::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        // The project schema fetch (has `number`) still resolves fine.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_partial_json(
+                json!({ "variables": { "owner": "auser", "number": 7 } }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": { "projectV2": {
+                    "id": "PVT_user_1",
+                    "number": 7,
+                    "title": "Personal Board",
+                    "owner": { "login": "auser" },
+                    "fields": { "nodes": [
+                        { "__typename": "ProjectV2SingleSelectField",
+                          "id": "PVTSSF_x", "name": "Status", "options": [
+                            { "id": "o1", "name": "Backlog" },
+                            { "id": "o2", "name": "Done" }
+                        ] }
+                    ] }
+                } } }
+            })))
+            .mount(&server)
+            .await;
+        // The issue-types fetch: a User owner → no `issueTypes` → empty. D8
+        // says this is Ok(empty), so link must NOT fail.
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": { "__typename": "User" } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let output = cmd
+        .args(["project", "link", "auser/7"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    // stdout is still the clean project JSON dto.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let dto: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must stay valid JSON ({e}): {stdout}"));
+    assert_eq!(dto["id"], "PVT_user_1");
+
+    // The availability advisory rides on stderr.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("Type unavailable"),
+        "expected a 'Type unavailable' stderr note, got: {stderr}"
+    );
+
+    let _ = rt; // keep the runtime + server alive past the blocking call
 }
 
 #[test]

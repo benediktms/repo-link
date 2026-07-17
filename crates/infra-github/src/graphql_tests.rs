@@ -685,6 +685,95 @@ async fn poll_project_items_stops_on_missing_cursor() {
 }
 
 #[tokio::test]
+async fn fetch_org_issue_types_maps_registry() {
+    let server = MockServer::start().await;
+    // An organization owner exposing two native issue types → both map through
+    // with their ids and names, in order.
+    mount_graphql(
+        &server,
+        "issueTypes",
+        serde_json::json!({ "repositoryOwner": {
+            "__typename": "Organization",
+            "issueTypes": { "nodes": [
+                { "id": "IT_bug", "name": "Bug" },
+                { "id": "IT_feat", "name": "Feature" }
+            ] }
+        } }),
+    )
+    .await;
+
+    let types = provider(&server)
+        .fetch_org_issue_types("acme")
+        .await
+        .unwrap();
+    assert_eq!(types.len(), 2);
+    assert_eq!(types[0].issue_type_id, "IT_bug");
+    assert_eq!(types[0].name, "Bug");
+    assert_eq!(types[1].issue_type_id, "IT_feat");
+    assert_eq!(types[1].name, "Feature");
+}
+
+#[tokio::test]
+async fn fetch_org_issue_types_user_owner_is_empty_not_error() {
+    let server = MockServer::start().await;
+    // The D8 core case: the owner exists but is a User, so the `... on
+    // Organization` fragment doesn't apply and `issueTypes` is absent. This
+    // MUST be Ok(empty), never Err — a user-owned repo simply has no native
+    // issue types.
+    mount_graphql(
+        &server,
+        "issueTypes",
+        serde_json::json!({ "repositoryOwner": { "__typename": "User" } }),
+    )
+    .await;
+
+    let result = provider(&server).fetch_org_issue_types("some-user").await;
+    assert!(
+        matches!(result, Ok(ref v) if v.is_empty()),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn fetch_org_issue_types_missing_owner_is_empty() {
+    let server = MockServer::start().await;
+    // A login that resolves to no owner at all → repositoryOwner: null → empty.
+    mount_graphql(
+        &server,
+        "issueTypes",
+        serde_json::json!({ "repositoryOwner": null }),
+    )
+    .await;
+
+    let types = provider(&server)
+        .fetch_org_issue_types("ghost")
+        .await
+        .unwrap();
+    assert!(types.is_empty());
+}
+
+#[tokio::test]
+async fn fetch_org_issue_types_empty_registry() {
+    let server = MockServer::start().await;
+    // An org that has the feature but defines no types → empty nodes → empty.
+    mount_graphql(
+        &server,
+        "issueTypes",
+        serde_json::json!({ "repositoryOwner": {
+            "__typename": "Organization",
+            "issueTypes": { "nodes": [] }
+        } }),
+    )
+    .await;
+
+    let types = provider(&server)
+        .fetch_org_issue_types("acme")
+        .await
+        .unwrap();
+    assert!(types.is_empty());
+}
+
+#[tokio::test]
 async fn graphql_errors_map_to_backend() {
     let server = MockServer::start().await;
     // A GraphQL `errors` array (no usable `data`) → backend failure.
