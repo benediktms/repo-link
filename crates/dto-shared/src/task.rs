@@ -44,6 +44,14 @@ pub struct TaskDto {
     /// Sync state: `local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`.
     pub sync_state: String,
     pub priority: String,
+    /// Local extensible issue type (RFC 0006 D7) as its canonical string: the
+    /// lowercase well-known name (`"task"` / `"bug"` / `"feature"`) or a
+    /// verbatim custom type (`"Epic"`). Read-only surface; the wire projection
+    /// and org-registry validation are a follow-up (#228 / RFC §6 Q3). OMITTED
+    /// from the JSON (not `null`) when unset, matching `last_refreshed_at`, so
+    /// existing consumers and golden output are unaffected. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRefDto>,
     pub relations: Vec<TaskRelationDto>,

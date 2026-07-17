@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use domain_core::{RepoId, RepoOriginId};
 use domain_repo::{RepoInstance, RepoOrigin};
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
+use domain_task::{IssueType, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::{Workspace, WorkspaceName};
 use infra_sqlite::{
     SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository,
@@ -629,6 +629,53 @@ async fn task_with_relations_and_remote_roundtrip() {
     assert_eq!(live.len(), 1);
     let all = ts.list(TaskFilter::default()).await.unwrap();
     assert_eq!(all.len(), 2);
+}
+
+/// RFC 0006 D7 / #227 — the local `issue_type` column survives a save/reload
+/// round-trip for a custom type, a well-known type, and the unset (`None`) case.
+#[tokio::test]
+async fn task_issue_type_roundtrip() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    // Custom(open-set) survives verbatim.
+    let mut custom = Task::new_draft(w.id, None, "custom".into()).unwrap();
+    custom.set_issue_type(Some(IssueType::Custom("Epic".into())));
+    ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(custom.id).await.unwrap().issue_type,
+        Some(IssueType::Custom("Epic".into()))
+    );
+
+    // Well-known variant survives.
+    let mut bug = Task::new_draft(w.id, None, "bug".into()).unwrap();
+    bug.set_issue_type(Some(IssueType::Bug));
+    ts.save(&bug, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(bug.id).await.unwrap().issue_type,
+        Some(IssueType::Bug)
+    );
+
+    // Unset reloads as None.
+    let unset = Task::new_draft(w.id, None, "unset".into()).unwrap();
+    assert_eq!(unset.issue_type, None);
+    ts.save(&unset, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(ts.get(unset.id).await.unwrap().issue_type, None);
+
+    // ON CONFLICT DO UPDATE: re-saving an existing task with a changed issue
+    // type must persist the new value (guards the silent-never-persists-on-
+    // update bug class — INSERT-only coverage would miss a dropped upsert
+    // clause), and clearing it back to None must also stick.
+    custom.set_issue_type(Some(IssueType::Feature));
+    ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(
+        ts.get(custom.id).await.unwrap().issue_type,
+        Some(IssueType::Feature)
+    );
+    custom.set_issue_type(None);
+    ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
+    assert_eq!(ts.get(custom.id).await.unwrap().issue_type, None);
 }
 
 #[tokio::test]
