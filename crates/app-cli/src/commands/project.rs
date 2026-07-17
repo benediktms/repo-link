@@ -27,33 +27,36 @@ pub(crate) async fn project_dispatch(
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
 
-            // `project link` is also the org (re)fetch point for the native
-            // issue-type registry (RFC 0006 D5). Best-effort: a hard failure
-            // (e.g. an older GHE schema without `issueTypes`) logs a warning and
-            // treats the org as type-unavailable rather than failing the link.
-            // Availability is a stderr advisory only — stdout stays the clean
-            // project JSON per the repo's stdout-JSON / stderr-notice split.
+            // Link first — the org issue-type refresh below is a best-effort
+            // side task and must neither gate nor precede the primary link.
             let owner_login = snapshot.owner_login.clone();
-            let type_available = match provider.fetch_org_issue_types(&owner_login).await {
-                Ok(types) => svc
-                    .org_issue_types
-                    .refresh(&owner_login, types)
-                    .await
-                    .map_err(|e| anyhow!("{e}"))?,
-                Err(e) => {
-                    eprintln!("warning: could not fetch native issue types for {owner_login}: {e}");
-                    false
-                }
-            };
-            if !type_available {
-                eprintln!("Type unavailable for this org ({owner_login})");
-            }
-
             let dto = svc
                 .projects
                 .link_from_snapshot(snapshot)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
+
+            // `project link` is also the org (re)fetch point for the native
+            // issue-type registry (RFC 0006 D5). Fully best-effort and only
+            // after the link commits: a fetch or persist failure logs one
+            // warning and leaves any cached registry intact — it never fails
+            // the link or clobbers good data. "Type unavailable" is printed only
+            // on a genuine empty catalog (D8), not on an error where the cache
+            // may still be populated. Advisories go to stderr; stdout stays the
+            // clean project JSON per the repo's stdout-JSON / stderr-notice split.
+            match provider.fetch_org_issue_types(&owner_login).await {
+                Ok(types) => match svc.org_issue_types.refresh(&owner_login, types).await {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!("Type unavailable for this org ({owner_login})"),
+                    Err(e) => eprintln!(
+                        "warning: could not persist native issue types for {owner_login}: {e}"
+                    ),
+                },
+                Err(e) => {
+                    eprintln!("warning: could not fetch native issue types for {owner_login}: {e}")
+                }
+            }
+
             println!("{}", serde_json::to_string_pretty(&dto)?);
         }
         ProjectCmd::List => {

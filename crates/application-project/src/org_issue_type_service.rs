@@ -1,11 +1,9 @@
 //! Org-level native issue-type registry orchestration (RFC 0006 D5/D8).
 //!
 //! [`OrgIssueTypeService::refresh`] is the org (re)fetch point invoked at `rl
-//! project link`: it takes the provider-fetched types, persists them as the
-//! owner's registry, then reads the registry back and reports availability
-//! (D8). The read-back is deliberate — it genuinely exercises the D5 read path
-//! (so nothing here is dead code) and reports availability against the exact
-//! rows the type-on-tasks follow-up (#228) will resolve against.
+//! project link`: it persists the provider-fetched types as the owner's
+//! registry and reports availability (D8). An empty catalog is a no-op write
+//! (see `refresh`) so a blank fetch never clobbers a previously good cache.
 
 use std::sync::Arc;
 
@@ -26,15 +24,20 @@ impl OrgIssueTypeService {
     /// Persist the owner's freshly-fetched issue-type catalog and report
     /// whether native types are available for the org (D8).
     ///
-    /// Returns `Ok(false)` — not an error — for a user-owned owner or a
-    /// feature-disabled org (both produce an empty catalog). The persisted set
-    /// is read back so the returned availability reflects what is actually
-    /// cached, not merely what was passed in.
+    /// Non-destructive: an empty catalog — a user-owned owner, a
+    /// feature-disabled org, or a transient empty response — returns
+    /// `Ok(false)` **without touching the cache**, so a blank fetch can never
+    /// wipe a previously good registry (`save` is replace-wholesale). A
+    /// non-empty catalog is persisted, replacing the prior set. Availability is
+    /// derivable from the input, so no read-back is needed.
     pub async fn refresh(
         &self,
         owner_login: &str,
         remote_types: Vec<RemoteIssueType>,
     ) -> Result<bool> {
+        if remote_types.is_empty() {
+            return Ok(false);
+        }
         let types = remote_types
             .into_iter()
             .map(|t| OrgIssueType {
@@ -44,9 +47,7 @@ impl OrgIssueTypeService {
             .collect();
         let registry = OrgIssueTypeRegistry::new(owner_login, types);
         self.repo.save(&registry).await?;
-
-        let stored = self.repo.get(owner_login).await?;
-        Ok(stored.is_available())
+        Ok(true)
     }
 }
 
@@ -105,5 +106,21 @@ mod tests {
         let stored = repo.get("acme").await.unwrap();
         assert_eq!(stored.types.len(), 1);
         assert_eq!(stored.types[0].issue_type_id, "IT_c");
+    }
+
+    #[tokio::test]
+    async fn refresh_empty_does_not_wipe_existing() {
+        // A transient empty-but-successful fetch must NOT clobber a good cache.
+        let repo = Arc::new(InMemoryOrgIssueTypeRepository::new());
+        let svc = OrgIssueTypeService::new(repo.clone());
+
+        svc.refresh("acme", vec![rt("IT_bug", "Bug"), rt("IT_feat", "Feature")])
+            .await
+            .unwrap();
+
+        let available = svc.refresh("acme", vec![]).await.unwrap();
+        assert!(!available); // reported unavailable...
+        let stored = repo.get("acme").await.unwrap();
+        assert_eq!(stored.types.len(), 2); // ...but the cached registry is intact
     }
 }

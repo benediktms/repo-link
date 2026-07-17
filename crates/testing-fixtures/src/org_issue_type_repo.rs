@@ -34,12 +34,16 @@ impl OrgIssueTypeRepository for InMemoryOrgIssueTypeRepository {
     async fn get(&self, owner_login: &str) -> PortResult<OrgIssueTypeRegistry> {
         // Absent owner → empty registry (is_available() == false), never
         // NotFound — mirrors the SQLite repo's D8 contract.
-        Ok(self
+        let mut registry = self
             .by_owner
             .lock()
             .unwrap()
             .get(owner_login)
             .cloned()
-            .unwrap_or_else(|| OrgIssueTypeRegistry::new(owner_login, Vec::new())))
+            .unwrap_or_else(|| OrgIssueTypeRegistry::new(owner_login, Vec::new()));
+        // Match SqliteOrgIssueTypeRepository::get's `ORDER BY name` so the two
+        // doubles are behaviour-identical on ordering.
+        registry.types.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(registry)
     }
 }
