@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
-use domain_project::{Project, StatusMapping, StatusOption};
+use domain_project::{FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping};
 use ports::{PortError, PortResult, ProjectRepository};
 use sqlx::Row;
 
@@ -9,14 +9,14 @@ use crate::Db;
 use crate::mapping::map_sqlx_err;
 
 pub(crate) const PROJECT_COLS: &str =
-    "id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at";
+    "id, provider, owner_login, number, title, archived, created_at, updated_at";
 
 // Same column set as `PROJECT_COLS`, qualified to the `projects` table for use
 // in joins where bare names like `id` / `created_at` / `updated_at` collide
 // with the joined table (e.g. `workspaces`). Pinning the projection (rather
 // than `SELECT projects.*`) keeps `column_count()` constant across a
 // cross-process `ALTER TABLE projects ADD COLUMN`, which is the #110 fix.
-pub(crate) const PROJECT_COLS_QUALIFIED: &str = "projects.id, projects.provider, projects.owner_login, projects.number, projects.title, projects.status_field_id, projects.archived, projects.created_at, projects.updated_at";
+pub(crate) const PROJECT_COLS_QUALIFIED: &str = "projects.id, projects.provider, projects.owner_login, projects.number, projects.title, projects.archived, projects.created_at, projects.updated_at";
 
 pub struct SqliteProjectRepository {
     db: Db,
@@ -32,8 +32,8 @@ impl SqliteProjectRepository {
 impl ProjectRepository for SqliteProjectRepository {
     async fn save(&self, project: &Project) -> PortResult<()> {
         // BEGIN IMMEDIATE grabs the writer lock up front so the
-        // DELETE-then-INSERT for `project_status_options` can't race with
-        // a concurrent reader claiming a stale option set. Same trick as
+        // DELETE-then-INSERT for the field/option child rows can't race with
+        // a concurrent reader claiming a stale set. Same trick as
         // `SqliteRepoBindingRepository::save`.
         let mut tx = self
             .db
@@ -45,24 +45,23 @@ impl ProjectRepository for SqliteProjectRepository {
         sqlx::query(
             r#"
             INSERT INTO projects
-                (id, provider, owner_login, number, title, status_field_id, archived, created_at, updated_at)
-            VALUES (?, 'github', ?, ?, ?, ?, ?, ?, ?)
+                (id, provider, owner_login, number, title, archived, created_at, updated_at)
+            VALUES (?, 'github', ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 owner_login = excluded.owner_login,
                 number = excluded.number,
                 title = excluded.title,
-                status_field_id = excluded.status_field_id,
                 archived = excluded.archived,
                 updated_at = excluded.updated_at
             "#,
         )
         .bind(project.id.as_str())
         .bind(&project.owner_login)
-        .bind(i64::try_from(project.number).map_err(|e| {
-            PortError::Backend(format!("project.number overflow: {e}"))
-        })?)
+        .bind(
+            i64::try_from(project.number)
+                .map_err(|e| PortError::Backend(format!("project.number overflow: {e}")))?,
+        )
         .bind(&project.title)
-        .bind(&project.status_field_id)
         .bind(if project.archived { 1_i64 } else { 0 })
         .bind(project.created_at.into_inner())
         .bind(project.updated_at.into_inner())
@@ -70,63 +69,90 @@ impl ProjectRepository for SqliteProjectRepository {
         .await
         .map_err(map_sqlx_err)?;
 
-        // Replace the option set wholesale. Options are a 100% mirror of
-        // the remote field definition — diffing locally adds no value and
-        // would mishandle renames (same option_id, different name). The
-        // mappings rows FK onto options with ON DELETE CASCADE, so clearing
-        // options also clears the project's mappings; we re-insert both from
-        // the domain object below. Delete mappings first anyway so the
-        // ordering is explicit and doesn't lean on cascade timing.
+        // Replace the field/option/mapping child rows wholesale. The retained
+        // fields are a 100% mirror of the remote definition — diffing locally
+        // adds no value and would mishandle renames (same id, different name).
+        // Delete in FK-safe child-first order (mappings → options → fields) so
+        // the ordering is explicit and doesn't lean on cascade timing, then
+        // re-insert parent-first below.
         sqlx::query("DELETE FROM project_status_mappings WHERE project_id = ?")
             .bind(project.id.as_str())
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_err)?;
-        sqlx::query("DELETE FROM project_status_options WHERE project_id = ?")
+        sqlx::query("DELETE FROM project_field_options WHERE project_id = ?")
+            .bind(project.id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx_err)?;
+        sqlx::query("DELETE FROM project_fields WHERE project_id = ?")
             .bind(project.id.as_str())
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_err)?;
 
-        for opt in &project.status_options {
+        // Every retained single-select field, and its option catalog. Fields
+        // are inserted before their options to satisfy the composite FK
+        // `project_field_options(project_id, field_id) → project_fields`.
+        for field in &project.fields {
             sqlx::query(
                 r#"
-                INSERT INTO project_status_options
-                    (project_id, option_id, name, ordinal)
+                INSERT INTO project_fields
+                    (project_id, field_id, name, kind)
                 VALUES (?, ?, ?, ?)
                 "#,
             )
             .bind(project.id.as_str())
-            .bind(&opt.option_id)
-            .bind(&opt.name)
-            .bind(i64::from(opt.ordinal))
+            .bind(&field.field_id)
+            .bind(&field.name)
+            .bind(field.kind.as_db_str())
             .execute(&mut *tx)
             .await
             .map_err(map_sqlx_err)?;
+
+            for opt in &field.options {
+                sqlx::query(
+                    r#"
+                    INSERT INTO project_field_options
+                        (project_id, field_id, option_id, name, ordinal)
+                    VALUES (?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(project.id.as_str())
+                .bind(&field.field_id)
+                .bind(&opt.option_id)
+                .bind(&opt.name)
+                .bind(i64::from(opt.ordinal))
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+            }
         }
 
-        // Write mappings from `status_mappings` — the domain source of truth
-        // — rather than reverse-deriving a single `default_for` per option.
-        // That's the whole point of the dedicated table: a `(status,
-        // option_id)` pair per mapping means many statuses can share one
-        // option (Open + Blocked → "Backlog") without loss. The
-        // `(project_id, status)` PK rejects a duplicate status at the DB,
-        // matching the `Project::new` invariant. Options are all inserted
-        // above, so the composite FK is satisfied.
-        for m in &project.status_mappings {
-            sqlx::query(
-                r#"
-                INSERT INTO project_status_mappings
-                    (project_id, is_open, option_id)
-                VALUES (?, ?, ?)
-                "#,
-            )
-            .bind(project.id.as_str())
-            .bind(i64::from(m.is_open))
-            .bind(&m.option_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_err)?;
+        // Write mappings from `status_mappings` — the domain source of truth.
+        // Each row carries the Status field's id so the composite FK
+        // `(project_id, field_id, option_id) → project_field_options` holds.
+        // The `(project_id, is_open)` PK rejects a duplicate bucket at the DB,
+        // matching the `Project` invariant. Mappings only exist when the
+        // project has a Status field, so the `status_field_id()` guard never
+        // skips a row that should have been written.
+        if let Some(status_field_id) = project.status_field_id() {
+            for m in &project.status_mappings {
+                sqlx::query(
+                    r#"
+                    INSERT INTO project_status_mappings
+                        (project_id, field_id, is_open, option_id)
+                    VALUES (?, ?, ?, ?)
+                    "#,
+                )
+                .bind(project.id.as_str())
+                .bind(status_field_id)
+                .bind(i64::from(m.is_open))
+                .bind(&m.option_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx_err)?;
+            }
         }
 
         tx.commit().await.map_err(map_sqlx_err)?;
@@ -190,11 +216,12 @@ impl ProjectRepository for SqliteProjectRepository {
     }
 
     async fn delete(&self, id: ProjectId) -> PortResult<()> {
-        // `project_status_options.project_id` and
-        // `project_status_mappings.project_id` are both ON DELETE CASCADE, so
-        // the option and mapping rows clear automatically. Workspaces with a
-        // `project_id` pointing here are ON DELETE SET NULL — they become
-        // projectless.
+        // `project_fields.project_id` is ON DELETE CASCADE; the option and
+        // mapping rows chain off it (`project_field_options` → `project_fields`
+        // → and `project_status_mappings` → `project_field_options`, all ON
+        // DELETE CASCADE), so deleting the project clears the whole subtree.
+        // Workspaces with a `project_id` pointing here are ON DELETE SET NULL —
+        // they become projectless.
         sqlx::query("DELETE FROM projects WHERE id = ?")
             .bind(id.as_str())
             .execute(&self.db.writes)
@@ -214,7 +241,6 @@ async fn row_to_project(
     let owner_login: String = row.try_get("owner_login").map_err(map_sqlx_err)?;
     let number: i64 = row.try_get("number").map_err(map_sqlx_err)?;
     let title: String = row.try_get("title").map_err(map_sqlx_err)?;
-    let status_field_id: String = row.try_get("status_field_id").map_err(map_sqlx_err)?;
     let archived: i64 = row.try_get("archived").map_err(map_sqlx_err)?;
     let created_at: DateTime<Utc> = row.try_get("created_at").map_err(map_sqlx_err)?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
@@ -222,12 +248,15 @@ async fn row_to_project(
     let number_u64 = u64::try_from(number)
         .map_err(|e| PortError::Backend(format!("project.number overflow on load: {e}")))?;
 
-    let option_rows = sqlx::query(
+    // Load the retained fields (kind persisted, not re-derived) and each
+    // field's option catalog. Field order doesn't affect classification — the
+    // Status field is found by `kind` — so order by field_id for a stable read.
+    let field_rows = sqlx::query(
         r#"
-        SELECT option_id, name, ordinal
-          FROM project_status_options
+        SELECT field_id, name, kind
+          FROM project_fields
          WHERE project_id = ?
-         ORDER BY ordinal ASC
+         ORDER BY field_id ASC
         "#,
     )
     .bind(id.as_str())
@@ -235,30 +264,54 @@ async fn row_to_project(
     .await
     .map_err(map_sqlx_err)?;
 
-    let mut status_options = Vec::with_capacity(option_rows.len());
-    for opt in option_rows.iter() {
-        let option_id: String = opt.try_get("option_id").map_err(map_sqlx_err)?;
-        let name: String = opt.try_get("name").map_err(map_sqlx_err)?;
-        let ordinal_raw: i64 = opt.try_get("ordinal").map_err(map_sqlx_err)?;
-        let ordinal = u32::try_from(ordinal_raw)
-            .map_err(|e| PortError::Backend(format!("ordinal overflow: {e}")))?;
-        status_options.push(StatusOption {
-            option_id,
+    let mut fields = Vec::with_capacity(field_rows.len());
+    for f in field_rows.iter() {
+        let field_id: String = f.try_get("field_id").map_err(map_sqlx_err)?;
+        let name: String = f.try_get("name").map_err(map_sqlx_err)?;
+        let kind_str: String = f.try_get("kind").map_err(map_sqlx_err)?;
+        let kind = ProjectFieldKind::from_db_str(&kind_str)
+            .map_err(|e| PortError::Backend(format!("decode project field kind: {e}")))?;
+
+        let option_rows = sqlx::query(
+            r#"
+            SELECT option_id, name, ordinal
+              FROM project_field_options
+             WHERE project_id = ? AND field_id = ?
+             ORDER BY ordinal ASC
+            "#,
+        )
+        .bind(id.as_str())
+        .bind(&field_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(map_sqlx_err)?;
+
+        let mut options = Vec::with_capacity(option_rows.len());
+        for opt in option_rows.iter() {
+            let option_id: String = opt.try_get("option_id").map_err(map_sqlx_err)?;
+            let opt_name: String = opt.try_get("name").map_err(map_sqlx_err)?;
+            let ordinal_raw: i64 = opt.try_get("ordinal").map_err(map_sqlx_err)?;
+            let ordinal = u32::try_from(ordinal_raw)
+                .map_err(|e| PortError::Backend(format!("ordinal overflow: {e}")))?;
+            options.push(FieldOption {
+                option_id,
+                name: opt_name,
+                ordinal,
+            });
+        }
+
+        fields.push(ProjectField {
+            field_id,
             name,
-            ordinal,
+            kind,
+            options,
         });
     }
 
-    // Mappings live in their own table now — one row per `(project, status)`,
-    // many of which may share one `option_id`. Read them all; the `Project`
-    // re-validation below re-checks they reference an owned option.
-    //
-    // Order by workflow position (Open → InProgress → Blocked → Done) so the
-    // load is deterministic. It matters downstream: `project_to_dto` picks
-    // the *first* mapping per option for the inline `default_for` field, so a
-    // many-to-one option (e.g. Open + Blocked → "Backlog") would otherwise
-    // surface an unstable status across reads. Lowest workflow status wins,
-    // which reads as the option's primary status.
+    // Mappings live in their own table — one row per `(project, is_open)`. Read
+    // is_open + option_id; the redundant `field_id` column is ignored on load
+    // (it is re-derived from the Status field on save). The `Project`
+    // re-validation below re-checks each references an owned option.
     // Order open (is_open=1) before closed (0) for a stable read order.
     let mapping_rows = sqlx::query(
         r#"
@@ -283,17 +336,16 @@ async fn row_to_project(
         });
     }
 
-    // Round-trip through `Project::new` so the domain invariants
-    // (mapping references owned option, no duplicate `status`) re-validate
-    // every load. A corrupted row surfaces as a typed error instead of a
-    // silently-skewed `option_id_for` result.
-    Project::new(
+    // Round-trip through `Project::from_fields` so the domain invariants
+    // (≤1 Status field, mapping references an owned option, no duplicate
+    // bucket) re-validate every load. A corrupted row surfaces as a typed
+    // error instead of a silently-skewed `option_id_for` result.
+    Project::from_fields(
         id,
         owner_login,
         number_u64,
         title,
-        status_field_id,
-        status_options,
+        fields,
         status_mappings,
         archived != 0,
         Timestamp::from_utc(created_at),

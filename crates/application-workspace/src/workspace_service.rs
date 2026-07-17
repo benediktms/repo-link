@@ -497,7 +497,7 @@ mod tests {
 
     // ---------- Stage 6 (#54): eager set-project backfill ------------------
 
-    use domain_project::{Project, StatusMapping, StatusOption};
+    use domain_project::{FieldOption, Project, StatusMapping};
     use domain_task::{RemoteRef, SnapshotSource, Task};
     use ports::OutboxRepository;
     use testing_fixtures::{
@@ -511,7 +511,7 @@ mod tests {
             5,
             "Board".into(),
             "PVTSSF_field".into(),
-            vec![StatusOption {
+            vec![FieldOption {
                 option_id: "o1".into(),
                 name: "Backlog".into(),
                 ordinal: 0,

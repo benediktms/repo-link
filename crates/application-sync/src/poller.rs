@@ -178,6 +178,11 @@ impl ProjectPoller {
         let mut completed_projects: HashSet<ProjectId> = HashSet::new();
 
         for project in &projects {
+            // A project with no Status field has nothing to poll against —
+            // skip it rather than poll an empty field id.
+            let Some(status_field_id) = project.status_field_id() else {
+                continue;
+            };
             report.projects_polled += 1;
             let project_id = project.id.clone();
             let since = self.watermark(&project_id);
@@ -185,7 +190,7 @@ impl ProjectPoller {
             // Per-project span so the reconcile events below nest under it.
             let res = async {
                 self.remote_projects
-                    .poll_project_items(project.id.as_str(), &project.status_field_id, POLL_QUERY)
+                    .poll_project_items(project.id.as_str(), status_field_id, POLL_QUERY)
                     .await
             }
             .instrument(info_span!(

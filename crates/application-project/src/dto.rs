@@ -7,7 +7,7 @@ use crate::status::status_to_str;
 
 pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
     let mut options: Vec<StatusOptionDto> = p
-        .status_options
+        .status_options()
         .iter()
         .map(|o| {
             let default_for = p
@@ -29,7 +29,7 @@ pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
         owner_login: p.owner_login.clone(),
         number: p.number,
         title: p.title.clone(),
-        status_field_id: p.status_field_id.clone(),
+        status_field_id: p.status_field_id().unwrap_or_default().to_string(),
         status_options: options,
         status_mappings: p
             .status_mappings

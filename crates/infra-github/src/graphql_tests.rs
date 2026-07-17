@@ -66,21 +66,27 @@ async fn fetch_project_maps_schema_and_ordinals() {
     assert_eq!(snap.number, 3);
     assert_eq!(snap.title, "repo-link");
     assert_eq!(snap.owner_login, "benediktms");
-    assert_eq!(snap.status_field_id, "PVTSSF_lAHOAukuJ84BYZR7zhTfceU");
-    assert_eq!(snap.status_options.len(), 5);
+    // Only the single-select field is retained (the "Title" text field is not).
+    assert_eq!(snap.fields.len(), 1);
+    assert_eq!(snap.fields[0].name, "Status");
+    assert_eq!(snap.fields[0].field_id, "PVTSSF_lAHOAukuJ84BYZR7zhTfceU");
+    let options = &snap.fields[0].options;
+    assert_eq!(options.len(), 5);
     // Ordinal is the array index — preserves the board's column order.
-    assert_eq!(snap.status_options[0].name, "Backlog");
-    assert_eq!(snap.status_options[0].ordinal, 0);
-    assert_eq!(snap.status_options[2].option_id, "47fc9ee4");
-    assert_eq!(snap.status_options[2].ordinal, 2);
-    assert_eq!(snap.status_options[4].name, "Done");
+    assert_eq!(options[0].name, "Backlog");
+    assert_eq!(options[0].ordinal, 0);
+    assert_eq!(options[2].option_id, "47fc9ee4");
+    assert_eq!(options[2].ordinal, 2);
+    assert_eq!(options[4].name, "Done");
 }
 
 #[tokio::test]
-async fn fetch_project_prefers_field_named_status() {
+async fn fetch_project_retains_all_single_selects() {
     let server = MockServer::start().await;
-    // Two single-select fields; "Status" is NOT first. The adapter must
-    // still pick it over the earlier "Priority".
+    // Two single-select fields — Priority AND Status. The adapter no longer
+    // collapses to one Status field (RFC 0006 D2); BOTH must survive into
+    // `snap.fields`, in wire order. (Status-vs-other selection now lives in the
+    // domain classifier, covered by domain-project tests.)
     mount_graphql(
         &server,
         "repositoryOwner",
@@ -97,14 +103,20 @@ async fn fetch_project_prefers_field_named_status() {
     .await;
 
     let snap = provider(&server).fetch_project("acme", 7).await.unwrap();
-    assert_eq!(snap.status_field_id, "PVTSSF_status");
-    assert_eq!(snap.status_options[0].name, "Todo");
+    assert_eq!(snap.fields.len(), 2, "both single-selects retained");
+    assert_eq!(snap.fields[0].name, "Priority");
+    assert_eq!(snap.fields[0].field_id, "PVTSSF_prio");
+    assert_eq!(snap.fields[0].options[0].name, "P0");
+    assert_eq!(snap.fields[1].name, "Status");
+    assert_eq!(snap.fields[1].field_id, "PVTSSF_status");
+    assert_eq!(snap.fields[1].options[0].name, "Todo");
 }
 
 #[tokio::test]
-async fn fetch_project_falls_back_to_first_single_select() {
+async fn fetch_project_retains_single_select_alongside_non_single_select() {
     let server = MockServer::start().await;
-    // No field literally named "Status" → first single-select wins.
+    // A text field ("Title") plus one single-select ("Stage"): only the
+    // single-select is retained, and it survives verbatim (id, name, options).
     mount_graphql(
         &server,
         "repositoryOwner",
@@ -120,7 +132,9 @@ async fn fetch_project_falls_back_to_first_single_select() {
     .await;
 
     let snap = provider(&server).fetch_project("acme", 7).await.unwrap();
-    assert_eq!(snap.status_field_id, "PVTSSF_stage");
+    assert_eq!(snap.fields.len(), 1);
+    assert_eq!(snap.fields[0].name, "Stage");
+    assert_eq!(snap.fields[0].field_id, "PVTSSF_stage");
 }
 
 #[tokio::test]
@@ -159,10 +173,11 @@ async fn fetch_project_null_project_maps_to_not_found() {
 }
 
 #[tokio::test]
-async fn fetch_project_without_single_select_maps_to_backend() {
+async fn fetch_project_without_single_select_returns_empty_fields() {
     let server = MockServer::start().await;
-    // A project whose fields contain no single-select at all → there is no
-    // Status field to drive, which is a backend/data problem, not "not found".
+    // A project whose fields contain no single-select at all is a valid wire
+    // state now (RFC 0006 D2): the adapter returns Ok with an empty `fields`.
+    // The "no field to use as Status" error moved to link-time classification.
     mount_graphql(
         &server,
         "repositoryOwner",
@@ -170,6 +185,28 @@ async fn fetch_project_without_single_select_maps_to_backend() {
             "id": "PVT_x", "number": 7, "title": "t", "owner": { "login": "acme" },
             "fields": { "nodes": [
                 { "__typename": "ProjectV2Field", "id": "PVTF_t", "name": "Title" }
+            ] }
+        } } }),
+    )
+    .await;
+
+    let snap = provider(&server).fetch_project("acme", 7).await.unwrap();
+    assert!(snap.fields.is_empty(), "no single-select → empty fields");
+}
+
+#[tokio::test]
+async fn fetch_project_single_select_missing_id_maps_to_backend() {
+    let server = MockServer::start().await;
+    // A single-select field that came back without an `id` can't be addressed
+    // for status writes — a backend/data problem, surfaced as Backend.
+    mount_graphql(
+        &server,
+        "repositoryOwner",
+        serde_json::json!({ "repositoryOwner": { "projectV2": {
+            "id": "PVT_x", "number": 7, "title": "t", "owner": { "login": "acme" },
+            "fields": { "nodes": [
+                { "__typename": "ProjectV2SingleSelectField",
+                  "name": "Status", "options": [ { "id": "s0", "name": "Todo" } ] }
             ] }
         } } }),
     )

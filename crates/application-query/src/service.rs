@@ -1145,9 +1145,9 @@ mod tests {
         projects: &Arc<InMemoryProjectRepository>,
     ) -> domain_project::Project {
         use domain_core::ProjectId;
-        use domain_project::{Project, StatusMapping, StatusOption};
+        use domain_project::{FieldOption, Project, StatusMapping};
         let pid = ProjectId::parse("PVT_drift_test").unwrap();
-        let opt = |id: &str, name: &str, ord: u32| StatusOption {
+        let opt = |id: &str, name: &str, ord: u32| FieldOption {
             option_id: id.into(),
             name: name.into(),
             ordinal: ord,
