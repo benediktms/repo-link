@@ -3,7 +3,7 @@
 use domain_core::{Aggregate, DomainError, RepoId, Result, TaskId, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
-use crate::enums::{Lifecycle, Priority, RelationKind, SyncState};
+use crate::enums::{IssueType, Lifecycle, Priority, RelationKind, SyncState};
 use crate::relation::{RemoteRef, TaskComment, TaskRelation};
 use crate::snapshot::{SnapshotSource, TaskSnapshot};
 
@@ -37,6 +37,15 @@ pub struct Task {
     pub lifecycle: Lifecycle,
     pub sync: SyncState,
     pub priority: Priority,
+    /// Extensible issue type (RFC 0006 D7): `Task` / `Bug` / `Feature` or a
+    /// `Custom(String)` for org-specific kinds. `None` = unset. Like
+    /// `priority` at this stage this is **local-only metadata** — GitHub's
+    /// issue-type rail and org-registry validation are a follow-up
+    /// (#228 / RFC §6 Q3), so changing it does NOT flip sync state and it is
+    /// deliberately NOT a [`MirrorField`]. `#[serde(default)]` keeps any
+    /// pre-existing serialized `Task` JSON deserializable.
+    #[serde(default)]
+    pub issue_type: Option<IssueType>,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
     pub relations: Vec<TaskRelation>,
@@ -116,6 +125,8 @@ impl Task {
             lifecycle: Lifecycle::Open,
             sync: SyncState::LocalOnly,
             priority: Priority::P3,
+            // Local-only metadata (RFC 0006 D7); unset on a fresh draft.
+            issue_type: None,
             assignees: Vec::new(),
             remote: None,
             relations: Vec::new(),
@@ -174,6 +185,9 @@ impl Task {
             },
             sync: SyncState::Synced,
             priority: Priority::P3,
+            // Local-only metadata (RFC 0006 D7); the remote issue-type rail is
+            // #228, so a cold import records no issue type yet.
+            issue_type: None,
             assignees,
             remote: Some(remote),
             relations: Vec::new(),
@@ -553,6 +567,20 @@ impl Task {
     pub fn set_priority(&mut self, priority: Priority) {
         if self.priority != priority {
             self.priority = priority;
+            self.touch();
+        }
+    }
+
+    /// Set the extensible issue type (RFC 0006 D7). Like [`set_priority`],
+    /// this is **local-only metadata** at this stage — the remote issue-type
+    /// rail is #228 — so a change touches `updated_at` but must NOT call
+    /// [`Task::reconcile_dirty_against_baseline`] (it must never flip sync
+    /// state). Setting the same value is an idempotent no-op.
+    ///
+    /// [`set_priority`]: Task::set_priority
+    pub fn set_issue_type(&mut self, issue_type: Option<IssueType>) {
+        if self.issue_type != issue_type {
+            self.issue_type = issue_type;
             self.touch();
         }
     }
@@ -1779,6 +1807,44 @@ mod tests {
         t.set_priority(Priority::P0);
         // Priority isn't a remote field — no spurious DirtyLocal flip.
         assert_eq!(t.sync, SyncState::Synced);
+    }
+
+    #[test]
+    fn issue_type_defaults_to_none_on_a_fresh_draft() {
+        assert_eq!(draft().issue_type, None);
+    }
+
+    #[test]
+    fn set_issue_type_is_local_only_and_does_not_dirty() {
+        // Regression guard mirroring `priority_is_local_only_and_does_not_dirty`
+        // (RFC 0006 D7): setting the issue type on a Synced task must NOT flip
+        // sync state nor produce a mirror diff — the issue-type rail is #228.
+        let mut t = synced();
+        assert_eq!(t.sync, SyncState::Synced);
+        t.set_issue_type(Some(IssueType::Bug));
+        assert_eq!(t.issue_type, Some(IssueType::Bug));
+        assert_eq!(t.sync, SyncState::Synced);
+        assert!(
+            t.diff_against_baseline().is_empty(),
+            "issue_type is not a mirrored field — the diff must stay empty"
+        );
+    }
+
+    #[test]
+    fn set_issue_type_touches_updated_at_and_is_idempotent() {
+        let mut t = draft();
+        let before = t.updated_at;
+        t.set_issue_type(Some(IssueType::Custom("Epic".into())));
+        assert_eq!(t.issue_type, Some(IssueType::Custom("Epic".into())));
+        assert!(t.updated_at >= before, "a real change advances updated_at");
+
+        // Setting the same value again is a no-op — updated_at is unchanged.
+        let after_first = t.updated_at;
+        t.set_issue_type(Some(IssueType::Custom("Epic".into())));
+        assert_eq!(
+            t.updated_at, after_first,
+            "re-setting the same value is a no-op"
+        );
     }
 
     #[test]

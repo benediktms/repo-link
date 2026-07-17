@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{
-    Lifecycle, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task, TaskComment,
-    TaskRelation, TaskSnapshot,
+    IssueType, Lifecycle, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task,
+    TaskComment, TaskRelation, TaskSnapshot,
 };
 use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
@@ -32,7 +32,7 @@ impl SqliteTaskRepository {
 // per the #110 every-live-column contract) but `row_to_task` no longer reads it —
 // the lifecycle axis is read from `lifecycle` (RFC 0004 D1). `synced_at` is the
 // RFC 0004 D3 write-through cache column.
-pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at";
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at, issue_type";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
@@ -549,8 +549,8 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_instance_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tasks (id, workspace_id, repo_instance_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at, issue_type)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             repo_instance_id = excluded.repo_instance_id,
@@ -561,6 +561,11 @@ async fn write_task_in_tx(
             lifecycle = excluded.lifecycle,
             sync_state = excluded.sync_state,
             priority = excluded.priority,
+            -- RFC 0006 D7 / #227: `issue_type` is local metadata but IS a
+            -- persisted aggregate field, so it MUST update on upsert. Omitting
+            -- it is the silent-never-persists-on-update bug class (unlike
+            -- `synced_at`, whose exclusion below is deliberate).
+            issue_type = excluded.issue_type,
             assignees_json = excluded.assignees_json,
             remote_provider = excluded.remote_provider,
             remote_id = excluded.remote_id,
@@ -604,6 +609,10 @@ async fn write_task_in_tx(
     .bind(&t.hash)
     .bind(t.created_at.into_inner())
     .bind(t.updated_at.into_inner())
+    // RFC 0006 D7 / #227: canonical single-string form (`task`/`bug`/`feature`
+    // or verbatim custom), or NULL when unset. `enum_to_str` reuses the enum's
+    // string Serialize; `transpose()` maps `Option<Result<_>>` → `Result<Option<_>>`.
+    .bind(t.issue_type.as_ref().map(enum_to_str).transpose()?)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
@@ -732,6 +741,8 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let updated_at: DateTime<Utc> = row.try_get("updated_at").map_err(map_sqlx_err)?;
     // RFC 0004 D3: write-through "remote last observed" stamp. NULL = never observed.
     let synced_at: Option<DateTime<Utc>> = row.try_get("synced_at").map_err(map_sqlx_err)?;
+    // RFC 0006 D7 / #227: local extensible issue type. NULL = unset.
+    let issue_type: Option<String> = row.try_get("issue_type").map_err(map_sqlx_err)?;
 
     let repo_id = repo_id_str
         .as_deref()
@@ -765,6 +776,12 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
         lifecycle: enum_from_str::<Lifecycle>("task lifecycle", &lifecycle)?,
         sync: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
+        // Infallible for any string (unknown → Custom), but goes through the
+        // same helper as siblings so a future strict parse (#228) has one seam.
+        issue_type: issue_type
+            .as_deref()
+            .map(|s| enum_from_str::<IssueType>("issue_type", s))
+            .transpose()?,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         relations: Vec::new(),

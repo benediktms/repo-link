@@ -54,6 +54,9 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
         state_reason: t.lifecycle.state_reason().map(str::to_string),
         sync_state: enum_str(&t.sync),
         priority: enum_str(&t.priority),
+        // Local extensible issue type (RFC 0006 D7): its canonical string via
+        // the enum's Serialize, mirroring `priority`. `None` ⇒ key omitted.
+        issue_type: t.issue_type.as_ref().map(enum_str),
         assignees: t.assignees.clone(),
         remote: t.remote.as_ref().map(|r| RemoteRefDto {
             provider: r.provider.clone(),
@@ -141,6 +144,35 @@ mod tests {
         t.synced_at = Some(Timestamp::now());
         let json = serde_json::to_value(task_to_dto(&t, None)).unwrap();
         assert!(json.as_object().unwrap().contains_key("last_refreshed_at"));
+    }
+
+    /// RFC 0006 D7 / #227 — `task_to_dto` surfaces the local issue type as its
+    /// canonical string, and OMITS the key (not `null`) when unset, mirroring
+    /// the `last_refreshed_at` omission contract.
+    #[test]
+    fn issue_type_surfaces_as_canonical_string_and_omits_when_unset() {
+        use domain_task::IssueType;
+
+        // Well-known variant → lowercase canonical name.
+        let mut t = Task::new_draft(WorkspaceId::new(), None, "t".into()).unwrap();
+        t.set_issue_type(Some(IssueType::Bug));
+        assert_eq!(task_to_dto(&t, None).issue_type.as_deref(), Some("bug"));
+
+        // Custom variant → verbatim payload.
+        t.set_issue_type(Some(IssueType::Custom("Epic".into())));
+        assert_eq!(task_to_dto(&t, None).issue_type.as_deref(), Some("Epic"));
+
+        // Unset → the `issue_type` key is OMITTED from the serialized JSON.
+        let unset = Task::new_draft(WorkspaceId::new(), None, "t".into()).unwrap();
+        assert_eq!(unset.issue_type, None);
+        let json = serde_json::to_value(task_to_dto(&unset, None)).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("issue_type"),
+            "issue_type must be omitted, not null, when unset"
+        );
+        // …and present once set.
+        let json = serde_json::to_value(task_to_dto(&t, None)).unwrap();
+        assert!(json.as_object().unwrap().contains_key("issue_type"));
     }
 
     /// The flat `blocked_by` list is derived from the `blocked_by` relation

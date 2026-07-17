@@ -1,0 +1,25 @@
+-- RFC 0006 D7 / #227 — add the local extensible issue type to `tasks`.
+--
+-- The domain models this as `Option<IssueType>` where
+-- `IssueType = Task | Bug | Feature | Custom(String)`, stored as its canonical
+-- single-string form (`task` / `bug` / `feature`, or the verbatim custom name).
+-- NULL = unset (matching `Task.issue_type: Option<_>`); NO backfill.
+--
+-- ## Deliberately NO CHECK constraint
+--
+-- Unlike `priority` (a closed, ordinal set, `CHECK (priority IN ('p0'..'p3'))`),
+-- `IssueType::Custom(String)` is an **open** set: an `IN (...)` allow-list would
+-- reject any org-specific type (e.g. `'Epic'`, `'Chore'`). Validation
+-- (reject-vs-warn against the org registry) is deferred to RFC §6 Q3 / #228 —
+-- do NOT "add a CHECK for symmetry" with `priority`.
+--
+-- ## Plain ADD COLUMN, no rebuild
+--
+-- `tasks` is a PARENT table (`task_snapshots`, `task_relations`,
+-- `remote_mappings` FK into it `ON DELETE CASCADE`). sqlx runs each migration in
+-- a forced transaction where `PRAGMA foreign_keys = OFF` is a no-op, so a
+-- rename-copy-DROP rebuild would cascade-delete those child rows. This is
+-- therefore strictly additive: nullable, no default, no index.
+--
+-- No wire write consumes this column yet — the GitHub issue-type rail is #228.
+ALTER TABLE tasks ADD COLUMN issue_type TEXT;

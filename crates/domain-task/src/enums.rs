@@ -1,6 +1,9 @@
 //! Standalone serde enums with no behaviour.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The task lifecycle axis (RFC 0004 D1): the open/closed bit fused with its
 /// GitHub `state_reason` into a single closed set of legal states, so an
@@ -72,6 +75,99 @@ pub enum Priority {
     P1,
     P2,
     P3,
+}
+
+/// A task's issue type (RFC 0006 D7): an **extensible, open** classification
+/// — the three well-known kinds plus a `Custom(String)` escape hatch for any
+/// org-specific type (e.g. `"Epic"`, `"Chore"`). Like `priority` was before
+/// its own sync work, this is **local-only metadata** at this stage: GitHub's
+/// issue-type rail and org-registry mapping/validation are a follow-up
+/// (#228 / RFC §6 Q3), so a change to it must NOT flip sync state.
+///
+/// ## Why not `#[derive(Serialize, Deserialize)]`
+///
+/// Unlike `Priority` (all unit variants, so a plain derive with
+/// `rename_all = "lowercase"` yields a single JSON string), the data-carrying
+/// `Custom(String)` variant would serialize under the default externally-tagged
+/// representation as an object (`{"custom":"Epic"}`), not a string. The DB and
+/// query helpers (`enum_to_str` / `enum_from_str` / `enum_str`) all require the
+/// serialized value to be a single JSON string, so this type instead has a
+/// canonical single-string form (`Display`) and manual serde over it.
+///
+/// ## Round-trip semantics (RFC D7: "unknown → Custom")
+///
+/// Parsing is infallible and case-insensitive: `"task"` / `"bug"` / `"feature"`
+/// (any case) map to the well-known variants, and everything else becomes
+/// `Custom(verbatim)`. A degenerate `Custom(builtin)` (e.g. `Custom("Task")`)
+/// therefore collapses to the well-known variant on round-trip — acceptable per
+/// D7. Strict reject-vs-warn validation against an org registry is deferred to
+/// RFC §6 Q3 / #228.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum IssueType {
+    Task,
+    Bug,
+    Feature,
+    /// Any type outside the well-known set — org-specific (`"Epic"`, `"Chore"`,
+    /// …). Held verbatim; the wire/registry projection is #228.
+    Custom(String),
+}
+
+impl fmt::Display for IssueType {
+    /// The canonical single-string form: `task` / `bug` / `feature` for the
+    /// well-known variants, and the verbatim payload for `Custom`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IssueType::Task => f.write_str("task"),
+            IssueType::Bug => f.write_str("bug"),
+            IssueType::Feature => f.write_str("feature"),
+            IssueType::Custom(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<&str> for IssueType {
+    /// Infallible, case-insensitive parse (RFC D7: unknown → `Custom`). The
+    /// well-known names match regardless of case; anything else is preserved
+    /// verbatim as `Custom`.
+    fn from(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "task" => IssueType::Task,
+            "bug" => IssueType::Bug,
+            "feature" => IssueType::Feature,
+            _ => IssueType::Custom(s.to_string()),
+        }
+    }
+}
+
+impl FromStr for IssueType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(IssueType::from(s))
+    }
+}
+
+impl Serialize for IssueType {
+    /// Serialize as the single canonical string (via [`fmt::Display`]) so the
+    /// DB/query helpers that expect a JSON string keep working.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for IssueType {
+    /// Deserialize from a single string, applying the same infallible
+    /// unknown → `Custom` rule as [`IssueType::from`].
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(IssueType::from(s.as_str()))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,5 +275,74 @@ mod tests {
         assert_eq!(RelationKind::ParentOf.inverse(), RelationKind::ChildOf);
         assert_eq!(RelationKind::RelatedTo.inverse(), RelationKind::RelatedTo);
         assert_eq!(RelationKind::Duplicates.inverse(), RelationKind::Duplicates);
+    }
+
+    /// RFC 0006 D7 — the well-known variants project their canonical lowercase
+    /// name through both `Display` and serde, and a `Custom` payload is emitted
+    /// verbatim as a single JSON string (never an object).
+    #[test]
+    fn issue_type_serializes_to_a_single_canonical_string() {
+        for (it, want) in [
+            (IssueType::Task, "task"),
+            (IssueType::Bug, "bug"),
+            (IssueType::Feature, "feature"),
+            (IssueType::Custom("Epic".into()), "Epic"),
+        ] {
+            // Display and the serialized JSON string agree.
+            assert_eq!(it.to_string(), want, "Display for {it:?}");
+            assert_eq!(
+                serde_json::to_value(&it).unwrap(),
+                serde_json::Value::String(want.to_string()),
+                "serde for {it:?} must be the same single string as Display"
+            );
+        }
+    }
+
+    /// RFC 0006 D7 — parsing is infallible and case-insensitive for the
+    /// well-known set, and unknown strings become `Custom(verbatim)`.
+    #[test]
+    fn issue_type_parses_case_insensitively_unknown_to_custom() {
+        assert_eq!(IssueType::from("bug"), IssueType::Bug);
+        assert_eq!(IssueType::from("Task"), IssueType::Task);
+        assert_eq!(IssueType::from("TASK"), IssueType::Task);
+        assert_eq!(IssueType::from("Feature"), IssueType::Feature);
+        // Unknown → Custom, payload preserved verbatim (original case kept).
+        assert_eq!(IssueType::from("Epic"), IssueType::Custom("Epic".into()));
+        // FromStr delegates to the infallible From<&str>.
+        assert_eq!("bug".parse::<IssueType>().unwrap(), IssueType::Bug);
+        assert_eq!(
+            "Epic".parse::<IssueType>().unwrap(),
+            IssueType::Custom("Epic".into())
+        );
+    }
+
+    /// Deserialization applies the same unknown → `Custom` rule.
+    #[test]
+    fn issue_type_deserializes_from_a_single_string() {
+        assert_eq!(
+            serde_json::from_value::<IssueType>(serde_json::Value::String("bug".into())).unwrap(),
+            IssueType::Bug
+        );
+        assert_eq!(
+            serde_json::from_value::<IssueType>(serde_json::Value::String("Epic".into())).unwrap(),
+            IssueType::Custom("Epic".into())
+        );
+    }
+
+    /// Round-trip is lossless for a `Custom` payload outside the well-known
+    /// set, and documented-lossy for a `Custom` that spells a built-in
+    /// (`Custom("task")` collapses to `Task`) — acceptable per D7.
+    #[test]
+    fn issue_type_round_trip_is_lossless_except_for_degenerate_custom() {
+        let lossless = IssueType::Custom("Epic".into());
+        let s = lossless.to_string();
+        assert_eq!(IssueType::from(s.as_str()), lossless);
+
+        // Degenerate: a Custom that spells a built-in collapses on round-trip.
+        let degenerate = IssueType::Custom("task".into());
+        assert_eq!(
+            IssueType::from(degenerate.to_string().as_str()),
+            IssueType::Task
+        );
     }
 }

@@ -16,7 +16,7 @@ mod relation;
 mod snapshot;
 mod task;
 
-pub use enums::{Lifecycle, Priority, RelationKind, SyncState};
+pub use enums::{IssueType, Lifecycle, Priority, RelationKind, SyncState};
 pub use hash::{MAX_HASH_LEN, MIN_HASH_LEN, is_valid_hash, random_lowercase_base32};
 pub use relation::{RemoteRef, TaskComment, TaskRelation};
 pub use snapshot::{SnapshotSource, TaskSnapshot};
