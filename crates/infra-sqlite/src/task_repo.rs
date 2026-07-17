@@ -278,25 +278,31 @@ impl TaskRepository for SqliteTaskRepository {
         provider: &str,
         remote_ids: &[String],
     ) -> PortResult<std::collections::HashSet<String>> {
-        if remote_ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
+        // Batched `IN (…)` lookups rather than N point-queries. Only the
+        // matching `remote_id`s are selected — no full-task hydration
+        // (relations / baseline / comments), which the tracked/untracked check
+        // doesn't need. Chunk well under SQLite's per-statement host-parameter
+        // cap (999 on older builds) so a wide `--since` window returning
+        // thousands of issues can't blow the limit at runtime. An empty input
+        // yields no chunks, so the result is empty without a query.
+        const CHUNK: usize = 900;
+        let mut hits = std::collections::HashSet::new();
+        for chunk in remote_ids.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT remote_id FROM tasks \
+                 WHERE filing_repo_id = ? AND remote_provider = ? AND remote_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query_scalar::<_, String>(&sql)
+                .bind(filing_repo_id.to_string())
+                .bind(provider);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            let rows = q.fetch_all(&self.db.reads).await.map_err(map_sqlx_err)?;
+            hits.extend(rows);
         }
-        // Single `IN (…)` lookup rather than N point-queries. Only the matching
-        // `remote_id`s are selected — no full-task hydration (relations /
-        // baseline / comments), which the tracked/untracked check doesn't need.
-        let placeholders = vec!["?"; remote_ids.len()].join(", ");
-        let sql = format!(
-            "SELECT remote_id FROM tasks \
-             WHERE filing_repo_id = ? AND remote_provider = ? AND remote_id IN ({placeholders})"
-        );
-        let mut q = sqlx::query_scalar::<_, String>(&sql)
-            .bind(filing_repo_id.to_string())
-            .bind(provider);
-        for id in remote_ids {
-            q = q.bind(id);
-        }
-        let rows = q.fetch_all(&self.db.reads).await.map_err(map_sqlx_err)?;
-        Ok(rows.into_iter().collect())
+        Ok(hits)
     }
 
     async fn replace_comments(
