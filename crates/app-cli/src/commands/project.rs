@@ -26,11 +26,37 @@ pub(crate) async fn project_dispatch(
                 .fetch_project(&owner, number)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
+
+            // Link first — the org issue-type refresh below is a best-effort
+            // side task and must neither gate nor precede the primary link.
+            let owner_login = snapshot.owner_login.clone();
             let dto = svc
                 .projects
                 .link_from_snapshot(snapshot)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
+
+            // `project link` is also the org (re)fetch point for the native
+            // issue-type registry (RFC 0006 D5). Fully best-effort and only
+            // after the link commits: a fetch or persist failure logs one
+            // warning and leaves any cached registry intact — it never fails
+            // the link or clobbers good data. "Type unavailable" is printed only
+            // on a genuine empty catalog (D8), not on an error where the cache
+            // may still be populated. Advisories go to stderr; stdout stays the
+            // clean project JSON per the repo's stdout-JSON / stderr-notice split.
+            match provider.fetch_org_issue_types(&owner_login).await {
+                Ok(types) => match svc.org_issue_types.refresh(&owner_login, types).await {
+                    Ok(true) => {}
+                    Ok(false) => eprintln!("Type unavailable for this org ({owner_login})"),
+                    Err(e) => eprintln!(
+                        "warning: could not persist native issue types for {owner_login}: {e}"
+                    ),
+                },
+                Err(e) => {
+                    eprintln!("warning: could not fetch native issue types for {owner_login}: {e}")
+                }
+            }
+
             println!("{}", serde_json::to_string_pretty(&dto)?);
         }
         ProjectCmd::List => {

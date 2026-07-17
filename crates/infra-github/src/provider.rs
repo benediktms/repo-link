@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use domain_core::Timestamp;
 use ports::{
-    PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteProjectProvider,
+    PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteIssueType, RemoteProjectProvider,
     RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
     RemoteTaskUpdate,
 };
@@ -279,5 +279,9 @@ impl RemoteProjectProvider for GithubAdapter {
         self.graphql
             .poll_project_items(project_node_id, status_field_id, query)
             .await
+    }
+
+    async fn fetch_org_issue_types(&self, owner_login: &str) -> PortResult<Vec<RemoteIssueType>> {
+        self.graphql.fetch_org_issue_types(owner_login).await
     }
 }

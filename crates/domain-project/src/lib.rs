@@ -8,11 +8,13 @@
 //! parent many workspaces.
 
 mod field;
+mod issue_type;
 mod mapping;
 mod project;
 mod status;
 
 pub use field::{FieldOption, ProjectField, ProjectFieldKind, assign_field_kinds};
+pub use issue_type::{OrgIssueType, OrgIssueTypeRegistry};
 pub use mapping::derive_status_mappings;
 pub use project::Project;
 pub use status::StatusMapping;

@@ -3120,3 +3120,93 @@ async fn blocked_by_to_nonexistent_task_is_rejected_by_fk() {
         "expected a foreign-key violation, got: {err:?}"
     );
 }
+
+// ---------- org issue-type registry (RFC 0006 D5/D8) -----------------------
+
+#[tokio::test]
+async fn org_issue_types_save_then_get_roundtrips() {
+    use domain_project::{OrgIssueType, OrgIssueTypeRegistry};
+    use infra_sqlite::SqliteOrgIssueTypeRepository;
+    use ports::OrgIssueTypeRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let repo = SqliteOrgIssueTypeRepository::new(db.clone());
+
+    let registry = OrgIssueTypeRegistry::new(
+        "acme",
+        vec![
+            OrgIssueType {
+                issue_type_id: "IT_feat".into(),
+                name: "Feature".into(),
+            },
+            OrgIssueType {
+                issue_type_id: "IT_bug".into(),
+                name: "Bug".into(),
+            },
+        ],
+    );
+    repo.save(&registry).await.unwrap();
+
+    let got = repo.get("acme").await.unwrap();
+    assert_eq!(got.owner_login, "acme");
+    assert!(got.is_available());
+    // ORDER BY name → Bug before Feature.
+    assert_eq!(
+        got.types
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Bug", "Feature"]
+    );
+    assert_eq!(got.types[0].issue_type_id, "IT_bug");
+}
+
+#[tokio::test]
+async fn org_issue_types_save_replaces_wholesale() {
+    use domain_project::{OrgIssueType, OrgIssueTypeRegistry};
+    use infra_sqlite::SqliteOrgIssueTypeRepository;
+    use ports::OrgIssueTypeRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let repo = SqliteOrgIssueTypeRepository::new(db.clone());
+
+    let mk = |id: &str, name: &str| OrgIssueType {
+        issue_type_id: id.into(),
+        name: name.into(),
+    };
+
+    repo.save(&OrgIssueTypeRegistry::new(
+        "acme",
+        vec![mk("IT_a", "Alpha"), mk("IT_b", "Beta")],
+    ))
+    .await
+    .unwrap();
+    // A second save for the same owner replaces the whole set, not merges.
+    repo.save(&OrgIssueTypeRegistry::new(
+        "acme",
+        vec![mk("IT_c", "Gamma")],
+    ))
+    .await
+    .unwrap();
+
+    let got = repo.get("acme").await.unwrap();
+    assert_eq!(got.types.len(), 1);
+    assert_eq!(got.types[0].issue_type_id, "IT_c");
+    assert_eq!(got.types[0].name, "Gamma");
+}
+
+#[tokio::test]
+async fn org_issue_types_get_unknown_owner_returns_empty_registry() {
+    use infra_sqlite::SqliteOrgIssueTypeRepository;
+    use ports::OrgIssueTypeRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let repo = SqliteOrgIssueTypeRepository::new(db.clone());
+
+    // An owner with no cached rows (a user-owned owner, or one never fetched)
+    // is an empty registry — is_available() == false — NOT a NotFound error.
+    let got = repo.get("never-seen").await.unwrap();
+    assert_eq!(got.owner_login, "never-seen");
+    assert!(got.types.is_empty());
+    assert!(!got.is_available());
+}

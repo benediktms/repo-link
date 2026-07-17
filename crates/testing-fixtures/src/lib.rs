@@ -14,6 +14,7 @@
 mod clock;
 mod event_sink;
 mod filesystem_probe;
+mod org_issue_type_repo;
 mod outbox_repo;
 mod project_repo;
 mod remote_project_provider;
@@ -26,6 +27,7 @@ mod workspace_repo;
 pub use clock::FixedClock;
 pub use event_sink::CapturingEventSink;
 pub use filesystem_probe::StubFilesystemProbe;
+pub use org_issue_type_repo::InMemoryOrgIssueTypeRepository;
 pub use outbox_repo::InMemoryOutboxRepository;
 pub use project_repo::InMemoryProjectRepository;
 pub use remote_project_provider::{InMemoryRemoteProjectProvider, ProjectCall};
