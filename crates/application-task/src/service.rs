@@ -482,7 +482,33 @@ impl TaskService {
             );
             return Ok(None);
         }
-        Ok(enqueue::set_project_priority_mutation(&project, task))
+        match enqueue::set_project_priority_mutation(&project, task) {
+            Some(mutation) => Ok(Some(mutation)),
+            // Not yet on the board: the projection is deferred, not lost — the
+            // first-attach follow-up (`enqueue_status_follow_up`) enqueues it
+            // when the card is created. Expected transient state, so debug.
+            None if task.project_item_id.is_none() => {
+                tracing::debug!(
+                    project_id = %project.id,
+                    task_id = %task.id,
+                    "priority changed but the task has no board item yet; will project on first attach"
+                );
+                Ok(None)
+            }
+            // Priority field present, but this priority has no board-option
+            // mapping (a zero-option field, or a partial/hand-edited mapping).
+            // Unlike Status there is no natural fallback option, so surface it
+            // rather than silently leaving the board column stale.
+            None => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    task_id = %task.id,
+                    priority = ?task.priority,
+                    "priority changed but has no board-option mapping; not projected (PriorityUnmapped)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Plan the outbound mutations an *edit* owes. Distinct from
@@ -3035,6 +3061,74 @@ mod tests {
         assert!(
             outbox.all().is_empty(),
             "no Priority field on the board — warn, don't enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_edit_with_unmapped_priority_warns_and_enqueues_nothing() {
+        // The board HAS a Priority field but the task's priority has no
+        // board-option mapping (here: a zero-option Priority field, so every
+        // priority is unmapped). Unlike Status there is no fallback option, so
+        // this must warn and enqueue nothing — never silently drop the change.
+        use domain_project::{ProjectField, ProjectFieldKind};
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = Project::from_fields(
+            domain_core::ProjectId::parse("PVT_kwHO_svc_prio_unmapped").unwrap(),
+            "acme".into(),
+            3,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_status".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o_open".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: ProjectFieldKind::Priority,
+                    options: vec![], // zero options → no mapping for any priority
+                },
+            ],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let t = save_issue_mirror(&repo, ws.id, Some("I_nid3"), Some("PVTI_attached3")).await;
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: Some("p2".into()),
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "priority unmapped on the board — warn, don't enqueue"
         );
     }
 

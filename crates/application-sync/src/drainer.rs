@@ -597,9 +597,15 @@ impl OutboxDrainer {
                 // 0004 D7) — but unlike Status it does not gate the issue-axis
                 // sync state at all, so a disagreeing board value must never
                 // contaminate `sync_state`. Ok → Stamped regardless of the
-                // read-back; only a transient provider error retries. This
-                // asymmetry with `SetProjectStatus` is deliberate, not an
-                // oversight — see the `SetProjectPriority` outbox variant doc.
+                // read-back *value* (we never compare applied vs sent, so a
+                // mismatch can't Conflict); only a transient provider error
+                // retries. Note a *wholly-missing* read-back value is surfaced
+                // by the adapter as a transient `Backend` error (not `Ok`), so
+                // it retries here exactly as it does for `SetProjectStatus` —
+                // that is a shared adapter behaviour, not a priority-specific
+                // rule. This asymmetry with `SetProjectStatus` (no Conflict on a
+                // value mismatch) is deliberate — see the `SetProjectPriority`
+                // outbox variant doc.
                 match self
                     .remote_projects
                     .set_single_select_option(
