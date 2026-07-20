@@ -111,7 +111,10 @@ pub trait RemoteProjectProvider: Send + Sync {
         body: Option<&str>,
     ) -> PortResult<()>;
 
-    /// Convert a draft item to a real issue in `repo_node_id`. The item
+    /// Convert a draft item to a real issue in the filing repo. New callers
+    /// pass its `github.com/<owner>/<repo>` canonical; adapters also accept a
+    /// repository node ID so persisted entries from older versions can drain.
+    /// The item
     /// retains its node ID; only the content union shifts from
     /// `ProjectV2DraftIssue` to `Issue`. Returns the newly-created issue's
     /// `I_…` node ID **and** its REST `number` — the caller needs both to
@@ -124,7 +127,7 @@ pub trait RemoteProjectProvider: Send + Sync {
     async fn convert_draft_to_issue(
         &self,
         item_node_id: &str,
-        repo_node_id: &str,
+        repo_ref: &str,
     ) -> PortResult<(String, u64)>;
 
     /// Set an item's single-select field to `option_id` (RFC 0006 D4 — the

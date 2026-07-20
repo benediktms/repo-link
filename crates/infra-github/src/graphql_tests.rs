@@ -317,8 +317,18 @@ async fn update_draft_issue_errors_when_item_is_not_a_draft() {
 }
 
 #[tokio::test]
-async fn convert_draft_to_issue_returns_issue_node_id() {
+async fn convert_draft_to_issue_resolves_canonical_to_repo_node_id() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/o/r"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 1,
+            "node_id": "R_repo",
+            "name": "r",
+            "url": "https://api.github.com/repos/o/r"
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
         .and(body_string_contains(
@@ -336,7 +346,7 @@ async fn convert_draft_to_issue_returns_issue_node_id() {
         .await;
 
     let (issue_id, number) = provider(&server)
-        .convert_draft_to_issue("PVTI_draft", "R_repo")
+        .convert_draft_to_issue("PVTI_draft", "github.com/o/r")
         .await
         .unwrap();
     assert_eq!(issue_id, "I_converted");

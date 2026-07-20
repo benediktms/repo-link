@@ -55,8 +55,9 @@ pub enum OutboxMutation {
     /// GraphQL `convertProjectV2DraftIssueItemToIssue` — fires when an
     /// orphan task gets `--repo` attached and graduates from draft to issue.
     /// The project item retains its node ID; only the content union shifts.
-    /// `repo_node_id` is the repo the issue is filed in — today the task's
-    /// logical repo, until RFC 0002 lets a separate filing repo decide this.
+    /// `repo_node_id` is a legacy field name: new entries carry the filing
+    /// repo canonical URL, which the adapter resolves before the mutation.
+    /// Older persisted entries may already contain a repository node ID.
     ConvertDraftToIssue {
         item_node_id: String,
         repo_node_id: String,
