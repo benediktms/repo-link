@@ -1,11 +1,37 @@
 # RFC 0006 — Priority and Type field propagation
 
-Status: Draft (2026-07-17)
+Status: Draft (2026-07-17; **amended 2026-07-20** post-implementation — see §0)
 Tracking epic: **#222**
 Amends:
-- RFC 0001 §6 "Port and schema sketches" (the `projects` schema, the `RemoteProjectSnapshot` shape, and the `set_status` mutation, which becomes a general single-select setter).
-- RFC 0003 §D1 "canonical mirrored-field set" (adds native issue **type** to the issue-side mirror set) and §D2–D6 (type rides the same diff/patch/re-baseline rail as assignees).
+- RFC 0001 §6 "Port and schema sketches" (the `projects` schema, the `RemoteProjectSnapshot` shape, and the `set_status` mutation, which becomes the general `set_single_select_option` setter).
+- ~~RFC 0003 §D1 "canonical mirrored-field set" (adds native issue **type** to the issue-side mirror set) and §D2–D6 (type rides the same diff/patch/re-baseline rail as assignees).~~ **Retracted (§0, A1):** implementation proved type CANNOT ride the issue mirror — it is a separate GraphQL `updateIssue` projection, so `MIRRORED_FIELDS` is left unchanged and RFC 0003 is not amended after all.
 - The `Task::set_priority` "priority is local-only metadata, never synced" decision in `domain-task` — this RFC flips priority to a synced, outbound projection.
+
+## 0. Amendments (2026-07-20, post-implementation)
+
+The §2 decisions below are preserved as originally written; the corrections learned while building #223–#228 are recorded here and cross-referenced inline. Where this section conflicts with a §2 decision, **this section wins**.
+
+### A1 — Type is a GraphQL `updateIssue` projection, NOT an issue-mirror field (supersedes D6, D1's Type bullet, the §1 table's Type row, and Appendix A's Type rail)
+
+D6 assumed type rides the issue's REST PATCH inside RFC 0003's `MIRRORED_FIELDS`. That is **impossible**: octocrab 0.51's issue builder (`RestClient::update_issue`) has no `issue_type` slot, and GitHub only sets a native type via GraphQL `updateIssue(input: { id, issueTypeId })`. Joining `MIRRORED_FIELDS` would also be self-defeating (dirty-detection is computed *over* that set, and it would route type into the REST patch that can't express it — the no-op-REST trap).
+
+So type is modeled **exactly like Priority (A2)**: a dedicated `OutboxMutation::SetIssueType { issue_node_id, issue_type_id: Option<String> }`, its own drainer arm (Ok→Stamped / Err→Retry, **no read-back Conflict**), **off** the issue sync-axis. `set_issue_type` does not enter `MIRRORED_FIELDS`/`MirrorPatch`/`TaskSnapshot`; the enqueued outbox entry is the durable retry unit (no baseline column). Resolution: local `IssueType` → canonical name → `issue_type_id` via the org registry (**case-insensitive** — local Display is lowercase, registry stores capitalized), at the app layer (`TaskService`), owner taken from the filing repo. `issue_type_id: None` clears the type. This resolves **§6 Q4** (GraphQL, not REST) and **§6 Q5** (`null` clears).
+
+### A2 — Priority uses a dedicated `SetProjectPriority` outbox variant (resolves §6 Q1)
+
+Not a reuse of `SetProjectStatus`. Its drainer arm Stamps on any `Ok` (a value mismatch never Conflicts — a priority board disagreement must not flip the issue-axis `sync_state`) and Retries on transient error. `TaskService::update` plans it on a dedicated branch (not via `plan_update_mutations`) so a priority-only edit never emits a no-op issue `UpdateRemote`.
+
+### A3 — No structured `SyncNoticeDto` variants; advisories are plain `tracing::warn!`/`debug!` (supersedes D10)
+
+D10 proposed new `SyncNoticeDto` variants. **Dropped.** The advisory cases (`PriorityClamped`/`PriorityFieldMissing`/`PriorityUnmapped`; type `Unavailable`/`Unmapped`/dropped) all occur on the async drainer or on off-axis projections that never return a `SyncSummaryDto`, so there is no synchronous surface to render a structured notice into. They are surfaced with plain `tracing::warn!` (misconfiguration) / `tracing::debug!` (expected-transient, e.g. not-yet-attached), consistent across #224/#225/#226/#228. Reintroduce a structured variant only if a synchronous CLI surface later needs it.
+
+### A4 — Parse is infallible; relation-aware defaulting is a separate follow-up (supersedes D7's "validated at set time / rejected", resolves §6 Q3)
+
+`IssueType::from` is infallible (unknown → `Custom`, never rejected). The **relation-aware default policy** — a sub-issue (`child_of`) defaults to the org's sub-issue type (e.g. Task/Subtask), a free-standing issue to the standalone default (e.g. Story), always overridable — was **not** in this RFC's scope (D7 only modelled the enum + explicit set). It is split to a follow-up task (`rpl-qa5`, blocked on #228). Its defaults are org-specific, dynamic names and must be **validated against the live `org_issue_types` registry** (A1's cache), not hardcoded; config location (workspace setting vs mapping) is that task's open question.
+
+### A5 — Delivery
+
+Sliced into six tasks under epic #222: #223 (generalized field model, D2/D9), #224 (priority mapping, D3), #225 (priority projection, D4/A2), #226 (org issue-type registry, D5), #227 (local `IssueType` enum, D7), #228 (type-on-issue mechanism, A1). #223/#224/#225/#226/#227 are merged; #228 is in progress; defaulting (`rpl-qa5`) is a follow-up. Recommended order held: Priority track before Type.
 
 ## 1. Context
 
@@ -82,6 +108,8 @@ board options (ordinal order)     P0  P1  P2  P3
 
 ### D4 — Priority is an outbound project-item projection (amends `set_priority` local-only)
 
+> **Refined — see §0 A2.** The open "which outbox mutation" question (§6 Q1) resolved to a dedicated `SetProjectPriority` variant (no read-back Conflict), planned off `plan_update_mutations`.
+
 - Generalize `GraphqlClient::set_status` into a field-agnostic `set_single_select_option(project_id, item_id, field_id, option_id)`; `set_status` becomes a caller with the Status field id, and Priority a caller with the Priority field id + `resolved` option from `project_priority_mappings`.
 - `Task::set_priority` **flips from local-only to a synced projection**: a priority change now marks the task's board projection dirty, the same way a status change drives the board Status option. Priority rides the *project-item* dirty/outbox path, **not** the issue PATCH / `MirrorPatch` diff (D6).
 - Like Status (RFC 0003 §D7), Priority is an **outbound-only projection**: pulling remote priority back onto the local `P0..P3` is a non-goal (§3). The exact outbox representation reuses whatever mechanism sets the board Status option today; confirming that wiring is an implementation task (§6).
@@ -97,11 +125,15 @@ board options (ordinal order)     P0  P1  P2  P3
 
 ### D6 — Type joins the RFC 0003 issue mirror set, set by name via REST
 
+> **⚠ Superseded — see §0 A1.** This decision is wrong: octocrab can't carry `type` in the REST PATCH, so type is a dedicated GraphQL `updateIssue` projection (a `SetIssueType` outbox mutation), **not** a `MIRRORED_FIELDS` member. Text retained for history.
+
 - Add native `type` to RFC 0003's canonical `MIRRORED_FIELDS` and to `MirrorPatch`, `RemoteTaskCreate`, `RemoteTaskUpdate`, with the same `Option` set-semantics (`None` = leave unchanged, `Some(name)` = set, `Some(clear)` = remove).
 - `RestClient::create_issue` / `update_issue` set the type **by name** (`"type": "<issue_type_name>"`) — octocrab serializes it in the same PATCH as title/body/assignees, so it stays **one request**. GraphQL `updateIssue(issueTypeId:)` is the alternative if the REST `type` name proves unreliable; the mapping stores both name and id to keep that option open (§6).
 - Re-baseline only the transmitted `type` (RFC 0003 §D5), so a silently-dropped type (D8) stays dirty and retries rather than being hidden.
 
 ### D7 — A local `IssueType` enum on `Task`: well-known variants + `Custom` passthrough
+
+> **Refined — see §0 A4.** Parse is infallible (unknown → `Custom`, not rejected); the relation-aware *defaulting* policy is split to follow-up `rpl-qa5`.
 
 Issue types are an open, org-configurable set — a *closed* enum would be too rigid, but a plain string gives no ergonomics for the common case. Model it as an **extensible enum** on the task:
 
@@ -128,6 +160,8 @@ Native issue types have two hard constraints the design must handle gracefully, 
 `fetch_project` retains all single-select fields (it already fetches them) so the Priority field's id + options survive into `RemoteProjectSnapshot` and `project_field_options`. Field selection (which is Status, which is Priority) moves out of the adapter into named matching over the retained set.
 
 ### D10 — Surface unmappable / unavailable field cases as `SyncNoticeDto`, not errors
+
+> **⚠ Superseded — see §0 A3.** No structured `SyncNoticeDto` variants were built; advisories are plain `tracing::warn!`/`debug!` (the drainer/off-axis paths have no synchronous summary to render into). Text retained for history.
 
 Both fields have advisory cases that must **not** hard-fail a sync — reuse the existing notice channel (§1) with new variants rather than a parallel mechanism. New `SyncNoticeDto` variants:
 
