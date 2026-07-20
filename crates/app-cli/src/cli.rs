@@ -89,6 +89,10 @@ pub(crate) enum Cmd {
     /// accepts hand-entered schema; Stage 5 swaps the GraphQL fetch in).
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Org-level GitHub resources (RFC 0006 D5) — currently just the native
+    /// issue-type registry.
+    #[command(subcommand)]
+    Org(OrgCmd),
     /// Manage the background reconciliation daemon (launchd / systemd unit).
     #[command(subcommand)]
     Daemon(daemon::DaemonCmd),
@@ -746,6 +750,23 @@ pub(crate) enum ProjectCmd {
     /// Unlink a project locally. Workspaces attached to it have their
     /// `project_id` reset to NULL via the storage cascade.
     Unlink { spec: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum OrgCmd {
+    /// (Re)fetch and persist an org's native issue-type registry over
+    /// GraphQL (RFC 0006 D5/D8) — the same op `rl project link` performs for
+    /// the *project* owner, exposed here as a standalone trigger for any
+    /// owner. Requires a GitHub token (see `rl gh auth`). Prints
+    /// `{ owner, available, types }` to stdout; when the catalog is empty
+    /// (a user account, or the org feature disabled), an advisory rides on
+    /// stderr instead of failing the command.
+    FetchIssueTypes {
+        /// GitHub org/user login to (re)fetch. When omitted, it's derived
+        /// from the current directory's GitHub git origin — errors if the
+        /// cwd isn't a GitHub checkout with a resolvable origin.
+        owner: Option<String>,
+    },
 }
 
 /// CLI surface for `domain_task::RelationKind`. Kept as a clap-local mirror so

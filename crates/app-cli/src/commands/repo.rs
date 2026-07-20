@@ -8,15 +8,20 @@ use anyhow::{Result, anyhow};
 use dto_shared::{
     AttachRepoCmd, LinkWorktreeCmd, LocateResponseDto, RepoMembershipDto, UnlinkWorktreeCmd,
 };
+use infra_config::RepoLinkConfig;
 use infra_filesystem::{TokioFilesystemProbe, discover_repos_under};
 use infra_git::{GitError, discover_canonical};
 
 use crate::cli::{AliasArg, BranchArg, RepoAliasCmd, RepoCmd, WorkspaceArg, WorktreeCmd};
-use crate::commands::handle_ambiguous;
+use crate::commands::{github_owner_from_canonical, handle_ambiguous};
 use crate::render;
-use crate::services::Services;
+use crate::services::{Services, build_github_provider, refresh_org_issue_types};
 
-pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
+pub(crate) async fn repo_dispatch(
+    cmd: RepoCmd,
+    svc: &Services,
+    cfg: &RepoLinkConfig,
+) -> Result<()> {
     match cmd {
         RepoCmd::Attach {
             ws: WorkspaceArg { workspace },
@@ -47,6 +52,44 @@ pub(crate) async fn repo_dispatch(cmd: RepoCmd, svc: &Services) -> Result<()> {
                     prefix,
                 })
                 .await?;
+
+            // Best-effort org issue-type registry auto-populate (RFC 0006 D5
+            // amendment): #226 only refreshed this at `rl project link`, for
+            // the *project* owner, but #228's Type sync resolves against the
+            // *filing repo* owner — often a different one. Attach is the
+            // natural point to warm that owner's registry too. This must
+            // never gate or fail the attach: only attempted when a token is
+            // already available (attach must stay usable offline/tokenless),
+            // and any fetch/persist error is just a warning. Idempotent
+            // (replace-wholesale refresh) — re-attaching just re-refreshes.
+            // stdout stays the unchanged attach JSON; advisories are log-only.
+            if let Some(owner) = github_owner_from_canonical(&outcome.binding.canonical_url) {
+                match cfg.resolve_github_token() {
+                    Ok(Some(token)) => match build_github_provider(&token, cfg) {
+                        Ok(provider) => {
+                            if let Err(e) = refresh_org_issue_types(svc, &provider, &owner).await {
+                                tracing::warn!(
+                                    "repo attach: could not refresh org issue types for \
+                                     {owner}: {e}"
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            "repo attach: could not build GitHub provider to refresh org \
+                             issue types for {owner}: {e}"
+                        ),
+                    },
+                    Ok(None) => tracing::debug!(
+                        "repo attach: no GitHub token available; skipping org issue-type \
+                         refresh for {owner}"
+                    ),
+                    Err(e) => tracing::debug!(
+                        "repo attach: could not resolve GitHub token; skipping org \
+                         issue-type refresh for {owner}: {e}"
+                    ),
+                }
+            }
+
             render::attach_outcome(&outcome);
         }
         RepoCmd::Detach { id } => {

@@ -108,6 +108,44 @@ pub(crate) fn build_github_provider(
     GithubAdapter::from_env_parts(token, cfg.github_api_base_url.as_deref())
 }
 
+/// Outcome of [`refresh_org_issue_types`]. `names` is captured before the
+/// fetched `Vec<RemoteIssueType>` is consumed by `OrgIssueTypeService::refresh`,
+/// so callers that want to render the catalog (e.g. `rl org
+/// fetch-issue-types`'s stdout JSON) don't need to re-derive it.
+pub(crate) struct OrgIssueTypesRefresh {
+    pub(crate) available: bool,
+    pub(crate) names: Vec<String>,
+}
+
+/// Fetch + persist an owner's native issue-type registry (RFC 0006 D5):
+/// GraphQL `organization.issueTypes` via the provider, then
+/// `OrgIssueTypeService::refresh` (persists, replace-wholesale, reports
+/// availability per D8 — never errors on an empty/user-owned catalog).
+///
+/// `rl project link` inlines this same fetch+refresh pair for the *project*
+/// owner (#226). This is the shared version used by the two other
+/// population triggers added in #228: the manual `rl org fetch-issue-types`
+/// command, and the best-effort auto-populate at `rl repo attach` — needed
+/// because #228's Type sync resolves against the *filing repo* owner, which
+/// `project link` never touches.
+pub(crate) async fn refresh_org_issue_types(
+    svc: &Services,
+    provider: &impl ports::RemoteProjectProvider,
+    owner_login: &str,
+) -> Result<OrgIssueTypesRefresh> {
+    let types = provider
+        .fetch_org_issue_types(owner_login)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let names = types.iter().map(|t| t.name.clone()).collect();
+    let available = svc
+        .org_issue_types
+        .refresh(owner_login, types)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(OrgIssueTypesRefresh { available, names })
+}
+
 /// Resolve the GitHub token or fail with a command-specific "set token or
 /// run `rl gh auth`" message. Centralised so the wording — including the
 /// resolved token-file path — stays in one place.
