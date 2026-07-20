@@ -393,7 +393,7 @@ impl GraphqlClient {
         field_id: &str,
         option_id: &str,
     ) -> PortResult<String> {
-        let data: SetStatusData = self
+        let data: SetSingleSelectOptionData = self
             .run(
                 SET_SINGLE_SELECT_OPTION,
                 json!({ "input": {
@@ -722,17 +722,17 @@ struct ConvertIssueContent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetStatusData {
+struct SetSingleSelectOptionData {
     update_project_v2_item_field_value: ProjectV2ItemWrap,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectV2ItemWrap {
-    project_v2_item: SetStatusItem,
+    project_v2_item: SetSingleSelectOptionItem,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetStatusItem {
+struct SetSingleSelectOptionItem {
     #[allow(dead_code)]
     id: String,
     #[serde(default)]
