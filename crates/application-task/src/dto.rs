@@ -256,6 +256,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(RepoId::new().to_string()),
+            issue_type: None,
         };
         let import = ImportMirrorCmd {
             workspace_id: WorkspaceId::new().to_string(),

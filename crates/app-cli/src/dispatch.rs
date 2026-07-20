@@ -10,6 +10,7 @@ use crate::cli::{Cli, Cmd};
 use crate::commands::agents::agents_dispatch;
 use crate::commands::gh::gh_dispatch;
 use crate::commands::here::here_dispatch;
+use crate::commands::org::org_dispatch;
 use crate::commands::project::project_dispatch;
 use crate::commands::query::query_dispatch;
 use crate::commands::repo::repo_dispatch;
@@ -38,7 +39,7 @@ pub async fn run() -> Result<()> {
 pub(crate) async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> Result<()> {
     match cli.cmd {
         Cmd::Workspace(c) => workspace_dispatch(c, svc).await,
-        Cmd::Repo(c) => repo_dispatch(c, svc).await,
+        Cmd::Repo(c) => repo_dispatch(c, svc, cfg).await,
         Cmd::Worktree(c) => worktree_dispatch(c, svc).await,
         Cmd::Task(c) => task_dispatch(c, svc, cfg).await,
         Cmd::Query(c) => query_dispatch(c, svc, cfg).await,
@@ -46,6 +47,7 @@ pub(crate) async fn dispatch(cli: Cli, svc: &Services, cfg: &RepoLinkConfig) -> 
         Cmd::Gh(c) => gh_dispatch(c, cfg).await,
         Cmd::Agents(c) => agents_dispatch(c, svc).await,
         Cmd::Project(c) => project_dispatch(c, svc, cfg).await,
+        Cmd::Org(c) => org_dispatch(c, svc, cfg).await,
         Cmd::Daemon(c) => daemon::dispatch(c, cfg).await,
         Cmd::Here => here_dispatch(svc).await,
     }

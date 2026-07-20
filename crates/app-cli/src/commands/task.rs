@@ -186,6 +186,7 @@ async fn claim_one(
                 priority: None,
                 assignees: Some(next),
                 repo_id: None,
+                issue_type: None,
             })
             .await
             .map_err(|e| anyhow!("{e}"))?;
@@ -324,6 +325,8 @@ pub(crate) async fn task_dispatch(
             priority,
             assignees,
             repo,
+            issue_type,
+            clear_type,
         } => {
             // Reject the empty case at the CLI boundary. The service layer
             // intentionally accepts a no-op UpdateTaskCmd (a future API
@@ -334,14 +337,26 @@ pub(crate) async fn task_dispatch(
                 && priority.is_none()
                 && assignees.is_empty()
                 && repo.is_none()
+                && issue_type.is_none()
+                && !clear_type
             {
                 return Err(anyhow!(
-                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo"
+                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo, --type, --clear-type"
                 ));
             }
             // Collapse clap's accumulated Vec into the DTO's "None = no
             // change" shape. The trade-off is that "clear all assignees"
             // is unreachable via `edit`; the spec explicitly accepts this.
+            // `--type`/`--clear-type` collapse onto `UpdateTaskCmd`'s
+            // `Option<Option<String>>` shape (RFC 0006 §0 A1 / #228): outer
+            // `None` = leave unchanged, `Some(None)` = clear, `Some(Some(_))`
+            // = set. clap's `conflicts_with` on both flags guarantees they
+            // are never both present.
+            let issue_type_cmd = if clear_type {
+                Some(None)
+            } else {
+                issue_type.map(Some)
+            };
             let dto = svc
                 .tasks
                 .update(UpdateTaskCmd {
@@ -351,6 +366,7 @@ pub(crate) async fn task_dispatch(
                     priority,
                     assignees: (!assignees.is_empty()).then_some(assignees),
                     repo_id: resolve_repo_handle(svc, repo).await?,
+                    issue_type: issue_type_cmd,
                 })
                 .await?;
             render::task(&dto);

@@ -187,6 +187,32 @@ pub trait RemoteProjectProvider: Send + Sync {
     async fn fetch_org_issue_types(&self, _owner_login: &str) -> PortResult<Vec<RemoteIssueType>> {
         Ok(Vec::new())
     }
+
+    /// Set (or clear) an issue's native "Type" field via GraphQL
+    /// `updateIssue(input: { id, issueTypeId })` (RFC 0006 §0 A1 / #228).
+    /// `issue_type_id` is an `OrgIssueType::issue_type_id` (`IT_…`) resolved
+    /// by the caller against the org registry; `None` clears the type.
+    ///
+    /// Deliberately OFF the issue-mirror axis: this is a dedicated GraphQL
+    /// projection, not a REST PATCH field — octocrab's issue builder has no
+    /// `issue_type` slot, so type can never ride `update_remote`/`MirrorPatch`.
+    /// No read-back comparison: unlike `set_single_select_option`, the drainer
+    /// never flips the task to `Conflict` on this projection (see the
+    /// `OutboxMutation::SetIssueType` doc) — `Ok(())` is success regardless of
+    /// what the remote echoes.
+    ///
+    /// The default returns `Ok(())` so the non-GitHub implementors (the
+    /// in-memory fixture + the daemon's project-provider test doubles)
+    /// compile untouched; only [`crate`]'s GitHub adapter overrides it. A
+    /// maintainer tidying this default away must add overrides to those
+    /// doubles.
+    async fn set_issue_type(
+        &self,
+        _issue_node_id: &str,
+        _issue_type_id: Option<&str>,
+    ) -> PortResult<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]

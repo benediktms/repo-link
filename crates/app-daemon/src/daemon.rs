@@ -839,9 +839,9 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use testing_fixtures::{
-        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRemoteProjectProvider,
-        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
-        StubFilesystemProbe,
+        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryProjectRepository,
+        InMemoryRemoteProjectProvider, InMemoryRepoBindingRepository, InMemoryTaskRepository,
+        InMemoryWorkspaceRepository, StubFilesystemProbe,
     };
 
     /// Poll `cond` until it returns true or `timeout` elapses, then return.
@@ -976,6 +976,8 @@ mod tests {
         let remote_tasks: Arc<dyn RemoteTaskProvider> = provider.clone();
         let remote_projects: Arc<dyn ports::RemoteProjectProvider> = projects_provider.clone();
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
+        let org_issue_types: Arc<dyn ports::OrgIssueTypeRepository> =
+            Arc::new(InMemoryOrgIssueTypeRepository::new());
         let drainer = Arc::new(OutboxDrainer::new(
             outbox_dyn.clone(),
             task_repo.clone(),
@@ -983,6 +985,7 @@ mod tests {
             proj_repo.clone(),
             remote_tasks,
             remote_projects,
+            org_issue_types,
         ));
         let daemon = Daemon::new(
             workspaces,
@@ -1885,6 +1888,8 @@ mod tests {
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
         let remote_tasks: Arc<dyn RemoteTaskProvider> = provider.clone();
         let remote_projects: Arc<dyn ports::RemoteProjectProvider> = proj_provider.clone();
+        let org_issue_types: Arc<dyn ports::OrgIssueTypeRepository> =
+            Arc::new(InMemoryOrgIssueTypeRepository::new());
         let drainer = Arc::new(OutboxDrainer::new(
             outbox_dyn.clone(),
             task_repo.clone(),
@@ -1892,6 +1897,7 @@ mod tests {
             proj_repo.clone(),
             remote_tasks,
             remote_projects.clone(),
+            org_issue_types,
         ));
         let poller = Arc::new(ProjectPoller::new(
             proj_repo.clone(),

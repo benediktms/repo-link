@@ -51,6 +51,14 @@ pub enum ProjectCall {
         status_field_id: String,
         query: String,
     },
+    /// One `set_issue_type` invocation (RFC 0006 §0 A1 / #228) — the
+    /// off-axis GraphQL `updateIssue` projection, distinct from
+    /// `SetSingleSelectOption` (which only ever addresses a project-item
+    /// field, never the issue itself). `issue_type_id: None` is a clear.
+    SetIssueType {
+        issue_node_id: String,
+        issue_type_id: Option<String>,
+    },
 }
 
 #[derive(Default)]
@@ -307,5 +315,20 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
             .copied()
             .unwrap_or(false);
         Ok(PollPage { items, truncated })
+    }
+
+    async fn set_issue_type(
+        &self,
+        issue_node_id: &str,
+        issue_type_id: Option<&str>,
+    ) -> PortResult<()> {
+        if self.should_fail() {
+            return Err(PortError::Backend("stub: set_issue_type transient".into()));
+        }
+        self.calls.lock().unwrap().push(ProjectCall::SetIssueType {
+            issue_node_id: issue_node_id.to_string(),
+            issue_type_id: issue_type_id.map(str::to_owned),
+        });
+        Ok(())
     }
 }

@@ -4750,3 +4750,281 @@ fn sync_list_remote_rejects_bad_since() {
         "expected a --since parse error, got: {stderr}"
     );
 }
+
+// ---------- RFC 0006 D5 amendment — org issue-type registry population ----
+
+/// Open the same sqlite db the CLI subprocess just used and read back the
+/// persisted org issue-type registry's type names for `owner`. Runs in a
+/// fresh runtime, after the CLI subprocess (which owns its own pool) has
+/// already exited, so there's no lock contention over the file.
+fn stored_org_issue_type_names(dir: &TempDir, owner: &str) -> Vec<String> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = infra_sqlite::open_from_path(&dir.path().join("repo-link.db"))
+            .await
+            .unwrap();
+        let repo = infra_sqlite::SqliteOrgIssueTypeRepository::new(db);
+        let registry = ports::OrgIssueTypeRepository::get(&repo, owner)
+            .await
+            .unwrap();
+        registry.types.into_iter().map(|t| t.name).collect()
+    })
+}
+
+/// `rl org fetch-issue-types <owner>` with a stubbed provider serving a
+/// non-empty catalog: persists the registry (verified by reading it back
+/// straight out of the sqlite db) and prints it as `{ owner, available,
+/// types }`.
+#[test]
+fn org_fetch_issue_types_persists_and_prints() {
+    let dir = TempDir::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": {
+                    "__typename": "Organization",
+                    "issueTypes": { "nodes": [
+                        { "id": "IT_bug", "name": "Bug" },
+                        { "id": "IT_feat", "name": "Feature" }
+                    ] }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let dto = run_json(&mut cmd, &["org", "fetch-issue-types", "acme"]);
+
+    assert_eq!(dto["owner"], "acme");
+    assert_eq!(dto["available"], true);
+    assert_eq!(dto["types"], json!(["Bug", "Feature"]));
+
+    let _ = rt; // keep the runtime + server alive past the blocking CLI call
+
+    let stored = stored_org_issue_type_names(&dir, "acme");
+    assert_eq!(stored, vec!["Bug".to_string(), "Feature".to_string()]);
+}
+
+/// D8: a user-owned owner (or a feature-disabled org) yields an empty
+/// catalog over GraphQL. `org fetch-issue-types` must still succeed —
+/// printing `available: false` — with the advisory on stderr, not an error.
+#[test]
+fn org_fetch_issue_types_reports_unavailable_for_userowned() {
+    let dir = TempDir::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": { "__typename": "User" } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let output = cmd
+        .args(["org", "fetch-issue-types", "auser"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let dto: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must stay valid JSON ({e}): {stdout}"));
+    assert_eq!(dto["owner"], "auser");
+    assert_eq!(dto["available"], false);
+    assert_eq!(dto["types"], json!([]));
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("no native issue types for auser"),
+        "expected the unavailable advisory, got: {stderr}"
+    );
+
+    let _ = rt;
+}
+
+/// Omitting `<owner>` derives it from the cwd's GitHub git origin.
+#[test]
+fn org_fetch_issue_types_derives_owner_from_cwd_git_origin() {
+    let dir = TempDir::new().unwrap();
+    let checkout = TempDir::new().unwrap();
+    init_git_repo_with_origin(checkout.path(), "git@github.com:acme/r.git");
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": {
+                    "__typename": "Organization",
+                    "issueTypes": { "nodes": [ { "id": "IT_bug", "name": "Bug" } ] }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    cmd.current_dir(checkout.path());
+    let dto = run_json(&mut cmd, &["org", "fetch-issue-types"]);
+
+    assert_eq!(dto["owner"], "acme");
+    assert_eq!(dto["available"], true);
+    assert_eq!(dto["types"], json!(["Bug"]));
+
+    let _ = rt;
+}
+
+/// No `<owner>` and a cwd that isn't a GitHub checkout with a resolvable
+/// origin: a clear error, no network attempted, no token required.
+#[test]
+fn org_fetch_issue_types_requires_owner_outside_a_github_checkout() {
+    let dir = TempDir::new().unwrap();
+    let neutral = TempDir::new().unwrap();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.current_dir(neutral.path());
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let output = cmd
+        .args(["org", "fetch-issue-types"])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("requires <owner>"),
+        "expected the missing-owner error, got: {stderr}"
+    );
+}
+
+// ---------- RFC 0006 D5 amendment — repo attach auto-populate ----------
+
+/// Attaching a repo with a GitHub token available best-effort populates the
+/// attached repo owner's org issue-type registry — the gap #226 left, since
+/// it only ever refreshed the registry at `rl project link` for the
+/// *project* owner, not the *filing repo* owner #228's Type sync resolves
+/// against. Verified by reading the registry back straight out of the
+/// sqlite db; the attach's own stdout JSON is asserted unchanged elsewhere.
+#[test]
+fn repo_attach_auto_populates_org_issue_types_when_token_present() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("issueTypes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoryOwner": {
+                    "__typename": "Organization",
+                    "issueTypes": { "nodes": [ { "id": "IT_bug", "name": "Bug" } ] }
+                } }
+            })))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", server.uri());
+    cmd.env("REPO_LINK_GITHUB_TOKEN", "t0k");
+    let outcome = run_json(
+        &mut cmd,
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:acme2/rrepo.git",
+            "--canonical",
+            "github.com/acme2/rrepo",
+            "--no-link",
+        ],
+    );
+    // Attach's own stdout JSON stays the clean attach outcome — unaffected
+    // by the best-effort side task.
+    assert_eq!(
+        outcome["binding"]["canonical_url"],
+        "github.com/acme2/rrepo"
+    );
+
+    let _ = rt;
+
+    let stored = stored_org_issue_type_names(&dir, "acme2");
+    assert_eq!(stored, vec!["Bug".to_string()]);
+}
+
+/// Attaching with no GitHub token available still succeeds (attach must
+/// stay usable offline/tokenless) and simply skips the org issue-type
+/// auto-populate — no registry gets written for the attached owner.
+#[test]
+fn repo_attach_without_token_still_succeeds_and_populates_nothing() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut cmd = bin("repo-link", &dir);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    let outcome = run_json(
+        &mut cmd,
+        &[
+            "repo",
+            "attach",
+            "--workspace",
+            &workspace,
+            "--url",
+            "git@github.com:acme3/rrepo.git",
+            "--canonical",
+            "github.com/acme3/rrepo",
+            "--no-link",
+        ],
+    );
+    assert_eq!(
+        outcome["binding"]["canonical_url"],
+        "github.com/acme3/rrepo"
+    );
+
+    let stored = stored_org_issue_type_names(&dir, "acme3");
+    assert!(
+        stored.is_empty(),
+        "no token available; the registry must stay unpopulated, got: {stored:?}"
+    );
+}

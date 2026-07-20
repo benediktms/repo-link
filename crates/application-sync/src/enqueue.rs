@@ -16,11 +16,13 @@
 
 use std::sync::Arc;
 
-use domain_project::Project;
+use domain_project::{OrgIssueTypeRegistry, Project};
 use domain_sync::{OutboxEntry, OutboxMutation};
 use domain_task::{RelationKind, Task};
 use domain_workspace::Workspace;
-use ports::{OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository};
+use ports::{
+    OrgIssueTypeRepository, OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository,
+};
 
 /// The single GitHub-native outbound mutation a relation edge owes, keyed on
 /// the stated `kind` so the locally-mirrored reciprocal edge does NOT
@@ -171,6 +173,158 @@ pub fn set_project_priority_mutation(project: &Project, task: &Task) -> Option<O
     })
 }
 
+/// Outcome of resolving a task's local `IssueType` against the org registry
+/// (RFC 0006 §0 A1 / #228). A plain `Option<OutboxMutation>` can't distinguish
+/// the silent "defer" case (no issue node id yet — the task will project once
+/// it has one) from the advisory "unmapped" case (a real name that has no
+/// match in the registry) — the caller
+/// (`application-task::TaskService::plan_issue_type_mutation`) needs both to
+/// pick the right log severity, so this carries three cases instead of
+/// collapsing them.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IssueTypeResolution {
+    /// Resolved: enqueue this mutation.
+    Mutation(OutboxMutation),
+    /// The task's local `IssueType`'s canonical name has no case-insensitive
+    /// match in the org registry.
+    Unmapped,
+    /// The task has no GraphQL issue node id yet (not issue-backed, or not
+    /// pushed) — nothing to address the mutation at; defer, not lost.
+    NoNode,
+}
+
+/// Resolve the `SetIssueType` mutation a task's local issue type owes against
+/// an org's native issue-type registry (RFC 0006 §0 A1 / #228). Pure — no I/O,
+/// mirroring [`set_project_priority_mutation`]'s shape. The caller is
+/// responsible for checking `registry.is_available()` first (an unavailable
+/// registry is its own advisory case, distinct from "unmapped" — see
+/// `TaskService::plan_issue_type_mutation`).
+///
+/// - No issue node id (`task.remote.node_id` is `None`) → [`IssueTypeResolution::NoNode`].
+/// - `task.issue_type` is `None` (a clear) → `SetIssueType { issue_type_id: None }`.
+/// - `task.issue_type` is `Some(it)` → match `it.to_string()`
+///   case-insensitively against `registry.types[].name` (local `Display` is
+///   lowercase; the registry stores its own display casing, e.g. `"Bug"`) →
+///   `SetIssueType { issue_type_id: Some(id) }`, or
+///   [`IssueTypeResolution::Unmapped`] on no match.
+pub fn set_issue_type_mutation(
+    registry: &OrgIssueTypeRegistry,
+    task: &Task,
+) -> IssueTypeResolution {
+    let Some(issue_node_id) = task.remote.as_ref().and_then(|r| r.node_id.clone()) else {
+        return IssueTypeResolution::NoNode;
+    };
+    match &task.issue_type {
+        None => IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+            issue_node_id,
+            issue_type_id: None,
+        }),
+        Some(it) => {
+            let name = it.to_string();
+            match registry
+                .types
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+            {
+                Some(t) => IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+                    issue_node_id,
+                    issue_type_id: Some(t.issue_type_id.clone()),
+                }),
+                None => IssueTypeResolution::Unmapped,
+            }
+        }
+    }
+}
+
+/// Parse the owner login out of a `github.com/<owner>/<repo>` canonical URL
+/// (the shape both `SyncService::filing_canonical_for` and
+/// `application-task::TaskService::filing_canonical_for` return). `None` for
+/// any other shape (a non-GitHub canonical, or a malformed one) — mirrors
+/// `infra_github::rest::split_owner_repo`'s parse without adding an
+/// application → infra dependency (clean layering; the application layer
+/// stays infra-free).
+///
+/// Lives here (not on either caller) so the three issue-type-projection
+/// triggers — `TaskService::plan_issue_type_mutation` (edit-time),
+/// `SyncService::promote`, and `OutboxDrainer`'s `ConvertDraftToIssue`
+/// write-back (both first-issue-backed, #228 follow-up) — parse the owner
+/// identically.
+pub fn parse_github_owner(canonical: &str) -> Option<String> {
+    let rest = canonical.strip_prefix("github.com/")?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    // A well-formed canonical also has a non-empty repo segment and nothing
+    // after it; a malformed shape (missing repo, or extra segments) is not a
+    // resolvable owner.
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    let _ = repo;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
+/// Outcome of resolving a task's issue-type projection against its filing
+/// owner's native registry — the shared decision core behind all three
+/// issue-type-projection triggers (RFC 0006 §0 A1 / #228 follow-up):
+/// - `TaskService::plan_issue_type_mutation` (edit-time trigger — a type
+///   *change* on an already issue-backed mirror);
+/// - `SyncService::promote` (first-issue trigger for a repo-anchored task);
+/// - `OutboxDrainer`'s `ConvertDraftToIssue` write-back (first-issue trigger
+///   for an orphan draft that just gained a real issue).
+///
+/// Wraps the owner-registry fetch + [`set_issue_type_mutation`] so all three
+/// call sites reach the exact same decision from the same inputs — only the
+/// log wording differs per caller (an edit-time "changed" framing vs. a
+/// first-issue "became issue-backed" framing). Distinguishes `NoOwner` (the
+/// filing chain hasn't resolved yet — silent, symmetric with `NoNode`) from
+/// `RegistryUnavailable` (a resolved owner with no native issue types — an
+/// advisory case) so callers can pick the right log severity, mirroring
+/// [`IssueTypeResolution`]'s three-way split.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IssueTypeProjection {
+    /// Resolved: enqueue this mutation.
+    Mutation(OutboxMutation),
+    /// A real local `IssueType` name has no case-insensitive match in the
+    /// owner's native issue-type registry.
+    Unmapped { owner: String },
+    /// The task has no GraphQL issue node id yet — defer, not lost.
+    NoNode,
+    /// No filing owner could be resolved yet (e.g. an orphan draft with no
+    /// filing chain inputs) — defer, not lost.
+    NoOwner,
+    /// The resolved owner's native issue-type registry is unavailable (a
+    /// user-owned account, or the feature disabled for the org).
+    RegistryUnavailable { owner: String },
+}
+
+/// Resolve `task`'s issue-type projection against `filing_owner_login`'s org
+/// registry (fetched via `org_issue_types`). Pure decision + one I/O call
+/// (the registry fetch); the caller does the enqueue + logging. See
+/// [`IssueTypeProjection`] for the case breakdown.
+pub async fn resolve_issue_type_projection(
+    org_issue_types: &Arc<dyn OrgIssueTypeRepository>,
+    filing_owner_login: Option<&str>,
+    task: &Task,
+) -> PortResult<IssueTypeProjection> {
+    let Some(owner) = filing_owner_login else {
+        return Ok(IssueTypeProjection::NoOwner);
+    };
+    let registry = org_issue_types.get(owner).await?;
+    if !registry.is_available() {
+        return Ok(IssueTypeProjection::RegistryUnavailable {
+            owner: owner.to_string(),
+        });
+    }
+    Ok(match set_issue_type_mutation(&registry, task) {
+        IssueTypeResolution::Mutation(mutation) => IssueTypeProjection::Mutation(mutation),
+        IssueTypeResolution::Unmapped => IssueTypeProjection::Unmapped {
+            owner: owner.to_string(),
+        },
+        IssueTypeResolution::NoNode => IssueTypeProjection::NoNode,
+    })
+}
+
 /// Enqueue a single mutation for `task_id`.
 pub async fn enqueue(
     outbox: &Arc<dyn OutboxRepository>,
@@ -309,7 +463,8 @@ mod tests {
     use domain_project::{
         FieldOption, PriorityMapping, Project, ProjectField, ProjectFieldKind, StatusMapping,
     };
-    use domain_task::{Priority, RemoteRef, SyncState, Task};
+    use domain_project::{OrgIssueType, OrgIssueTypeRegistry};
+    use domain_task::{IssueType, Priority, RemoteRef, SyncState, Task};
 
     fn make_project(id: &str) -> Project {
         Project::new(
@@ -632,5 +787,221 @@ mod tests {
             mutations.is_empty(),
             "LocalOnly task must produce no mutations"
         );
+    }
+
+    // --- set_issue_type_mutation (RFC 0006 §0 A1 / #228) --------------------
+
+    fn ty(id: &str, name: &str) -> OrgIssueType {
+        OrgIssueType {
+            issue_type_id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn registry_with_bug_and_epic() -> OrgIssueTypeRegistry {
+        OrgIssueTypeRegistry::new("acme", vec![ty("IT_bug", "Bug"), ty("IT_epic", "Epic")])
+    }
+
+    #[test]
+    fn set_issue_type_mutation_resolves_name_to_id() {
+        let registry = registry_with_bug_and_epic();
+        let mut t = make_issue_backed_mirror("I_type_nid");
+        t.set_issue_type(Some(IssueType::Bug));
+
+        match set_issue_type_mutation(&registry, &t) {
+            IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            }) => {
+                assert_eq!(issue_node_id, "I_type_nid");
+                assert_eq!(issue_type_id, Some("IT_bug".to_string()));
+            }
+            other => panic!("expected a resolved SetIssueType mutation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_issue_type_mutation_is_case_insensitive_both_directions() {
+        // Local Display is lowercase ("bug"); the registry stores its own
+        // display casing ("Bug"). The match must ignore case regardless of
+        // which side varies — well-known AND Custom.
+        let registry = registry_with_bug_and_epic();
+
+        let mut well_known = make_issue_backed_mirror("I_ci_wellknown");
+        well_known.set_issue_type(Some(IssueType::Bug));
+        assert!(matches!(
+            set_issue_type_mutation(&registry, &well_known),
+            IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+                issue_type_id: Some(ref id),
+                ..
+            }) if id == "IT_bug"
+        ));
+
+        let mut custom = make_issue_backed_mirror("I_ci_custom");
+        custom.set_issue_type(Some(IssueType::Custom("epic".into())));
+        assert!(matches!(
+            set_issue_type_mutation(&registry, &custom),
+            IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+                issue_type_id: Some(ref id),
+                ..
+            }) if id == "IT_epic"
+        ));
+    }
+
+    #[test]
+    fn set_issue_type_mutation_unmapped_when_no_registry_match() {
+        let registry = registry_with_bug_and_epic();
+        let mut t = make_issue_backed_mirror("I_unmapped_nid");
+        t.set_issue_type(Some(IssueType::Custom("Chore".into())));
+
+        assert_eq!(
+            set_issue_type_mutation(&registry, &t),
+            IssueTypeResolution::Unmapped
+        );
+    }
+
+    #[test]
+    fn set_issue_type_mutation_clear_sends_none_regardless_of_registry() {
+        let registry = registry_with_bug_and_epic();
+        let mut t = make_issue_backed_mirror("I_clear_nid");
+        // Give it a type first, then clear — mirrors an edit that clears a
+        // previously-set local type.
+        t.set_issue_type(Some(IssueType::Bug));
+        t.set_issue_type(None);
+
+        match set_issue_type_mutation(&registry, &t) {
+            IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            }) => {
+                assert_eq!(issue_node_id, "I_clear_nid");
+                assert_eq!(issue_type_id, None);
+            }
+            other => panic!("expected a clearing SetIssueType mutation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_issue_type_mutation_no_node_when_not_issue_backed() {
+        let registry = registry_with_bug_and_epic();
+        let mut t = Task::new_draft(WorkspaceId::new(), None, "no node yet".into()).unwrap();
+        t.set_issue_type(Some(IssueType::Bug));
+        assert!(t.remote.is_none());
+
+        assert_eq!(
+            set_issue_type_mutation(&registry, &t),
+            IssueTypeResolution::NoNode
+        );
+    }
+
+    // --- parse_github_owner --------------------------------------------------
+
+    #[test]
+    fn parse_github_owner_extracts_owner_from_wellformed_canonical() {
+        assert_eq!(
+            parse_github_owner("github.com/acme/widgets"),
+            Some("acme".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_github_owner_none_for_non_github_canonical() {
+        assert_eq!(parse_github_owner("gitlab.com/acme/widgets"), None);
+    }
+
+    #[test]
+    fn parse_github_owner_none_for_malformed_shape() {
+        assert_eq!(parse_github_owner("github.com/acme"), None);
+        assert_eq!(parse_github_owner("github.com/acme/widgets/extra"), None);
+        assert_eq!(parse_github_owner("github.com/"), None);
+    }
+
+    // --- resolve_issue_type_projection (RFC 0006 §0 A1 / #228 follow-up) -----
+
+    #[tokio::test]
+    async fn resolve_issue_type_projection_no_owner_when_owner_unresolved() {
+        let org_issue_types: Arc<dyn OrgIssueTypeRepository> =
+            Arc::new(testing_fixtures::InMemoryOrgIssueTypeRepository::new());
+        let mut t = make_issue_backed_mirror("I_proj_noowner");
+        t.set_issue_type(Some(IssueType::Bug));
+
+        let outcome = resolve_issue_type_projection(&org_issue_types, None, &t)
+            .await
+            .unwrap();
+        assert_eq!(outcome, IssueTypeProjection::NoOwner);
+    }
+
+    #[tokio::test]
+    async fn resolve_issue_type_projection_registry_unavailable_for_unresolved_owner() {
+        let org_issue_types: Arc<dyn OrgIssueTypeRepository> =
+            Arc::new(testing_fixtures::InMemoryOrgIssueTypeRepository::new());
+        let mut t = make_issue_backed_mirror("I_proj_unavail");
+        t.set_issue_type(Some(IssueType::Bug));
+
+        let outcome = resolve_issue_type_projection(&org_issue_types, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IssueTypeProjection::RegistryUnavailable {
+                owner: "acme".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_issue_type_projection_resolves_mutation() {
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org_issue_types: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let mut t = make_issue_backed_mirror("I_proj_ok");
+        t.set_issue_type(Some(IssueType::Bug));
+
+        let outcome = resolve_issue_type_projection(&org_issue_types, Some("acme"), &t)
+            .await
+            .unwrap();
+        match outcome {
+            IssueTypeProjection::Mutation(OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            }) => {
+                assert_eq!(issue_node_id, "I_proj_ok");
+                assert_eq!(issue_type_id, Some("IT_bug".to_string()));
+            }
+            other => panic!("expected a resolved SetIssueType mutation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_issue_type_projection_unmapped_when_no_registry_match() {
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org_issue_types: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let mut t = make_issue_backed_mirror("I_proj_unmapped");
+        t.set_issue_type(Some(IssueType::Custom("Chore".into())));
+
+        let outcome = resolve_issue_type_projection(&org_issue_types, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            IssueTypeProjection::Unmapped {
+                owner: "acme".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_issue_type_projection_no_node_when_not_issue_backed() {
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org_issue_types: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let mut t = Task::new_draft(WorkspaceId::new(), None, "no node yet".into()).unwrap();
+        t.set_issue_type(Some(IssueType::Bug));
+
+        let outcome = resolve_issue_type_projection(&org_issue_types, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert_eq!(outcome, IssueTypeProjection::NoNode);
     }
 }

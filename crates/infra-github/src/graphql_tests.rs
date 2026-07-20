@@ -773,6 +773,76 @@ async fn fetch_org_issue_types_empty_registry() {
     assert!(types.is_empty());
 }
 
+// --- set_issue_type (RFC 0006 §0 A1 / #228) ---------------------------------
+
+#[tokio::test]
+async fn set_issue_type_sends_the_resolved_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateIssue"))
+        .and(body_partial_json(serde_json::json!({
+            "variables": { "input": { "id": "I_x", "issueTypeId": "IT_bug" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "updateIssue": { "issue": {
+                "id": "I_x",
+                "issueType": { "id": "IT_bug" }
+            } } }
+        })))
+        .mount(&server)
+        .await;
+
+    provider(&server)
+        .set_issue_type("I_x", Some("IT_bug"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn set_issue_type_clear_sends_json_null() {
+    let server = MockServer::start().await;
+    // `issue_type_id: None` must serialize the `issueTypeId` KEY as an
+    // explicit JSON `null` (clearing the type), never an omitted key (which
+    // GitHub would treat as "leave unchanged").
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateIssue"))
+        .and(body_partial_json(serde_json::json!({
+            "variables": { "input": { "id": "I_x", "issueTypeId": null } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "updateIssue": { "issue": { "id": "I_x", "issueType": null } } }
+        })))
+        .mount(&server)
+        .await;
+
+    provider(&server).set_issue_type("I_x", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_issue_type_graphql_errors_map_to_backend_and_are_retryable() {
+    let server = MockServer::start().await;
+    // A GraphQL `errors` array (e.g. an unresolvable node id, or an
+    // `issueTypeId` from a different org) → PortError::Backend, which the
+    // drainer's `SetIssueType` arm maps to a retryable disposition, never a
+    // hard failure.
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("updateIssue"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [ { "message": "Could not resolve to a node with the global id." } ]
+        })))
+        .mount(&server)
+        .await;
+
+    let err = provider(&server)
+        .set_issue_type("I_x", Some("IT_bug"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, PortError::Backend(_)), "got {err:?}");
+}
+
 #[tokio::test]
 async fn graphql_errors_map_to_backend() {
     let server = MockServer::start().await;

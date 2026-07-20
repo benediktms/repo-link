@@ -83,6 +83,25 @@ pub enum OutboxMutation {
         priority_field_id: String,
         option_id: String,
     },
+    /// GraphQL `updateIssue(input: { id, issueTypeId })` — set (or clear) the
+    /// issue's native "Type" field (RFC 0006 §0 A1 / #228). `issue_type_id`
+    /// is `None` to clear, `Some(id)` to set (an `OrgIssueType::issue_type_id`
+    /// resolved against the org registry at plan time).
+    ///
+    /// Deliberately OFF the issue mirror axis — NOT a `MIRRORED_FIELDS`
+    /// member and never folded into `MirrorPatch` / `UpdateRemote`: octocrab's
+    /// REST issue builder has no `issue_type` slot, so type can only be
+    /// projected via this dedicated GraphQL mutation, exactly as
+    /// `SetProjectPriority` sits off the project-item mirror. The outbox
+    /// entry itself is the durable retry unit — there is no baseline column
+    /// to re-confirm against (`Task::set_issue_type` does not call
+    /// `reconcile_dirty_against_baseline`), so the drainer's arm never flips
+    /// `sync_state` and never Conflicts on the read-back (there IS no
+    /// read-back — see `GraphqlClient::set_issue_type`).
+    SetIssueType {
+        issue_node_id: String,
+        issue_type_id: Option<String>,
+    },
     /// REST `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link an existing
     /// issue as a sub-issue of another (the GitHub-native projection of a
     /// `parent_of` / `child_of` relation). `parent_*` addresses the URL; GitHub
@@ -141,6 +160,7 @@ impl OutboxMutation {
             Self::ConvertDraftToIssue { .. } => "convert_draft_to_issue",
             Self::SetProjectStatus { .. } => "set_project_status",
             Self::SetProjectPriority { .. } => "set_project_priority",
+            Self::SetIssueType { .. } => "set_issue_type",
             Self::AddSubIssue { .. } => "add_sub_issue",
             Self::RemoveSubIssue { .. } => "remove_sub_issue",
             Self::AddBlockedBy { .. } => "add_blocked_by",
@@ -284,6 +304,31 @@ mod tests {
         assert_eq!(m.kind(), "set_project_priority");
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["kind"], "set_project_priority");
+    }
+
+    #[test]
+    fn set_issue_type_kind_matches_serde_tag() {
+        // Same lockstep guard as `set_project_priority_kind_matches_serde_tag`,
+        // for the new type-projection variant (RFC 0006 §0 A1 / #228): a serde
+        // rename here without a `kind()` arm update would silently desync the
+        // SQLite discriminator column from the payload. Cover both the "set"
+        // and "clear" (`issue_type_id: None`) shapes — both must serialize
+        // under the same `kind`.
+        let set = OutboxMutation::SetIssueType {
+            issue_node_id: "I_x".into(),
+            issue_type_id: Some("IT_bug".into()),
+        };
+        assert_eq!(set.kind(), "set_issue_type");
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["kind"], "set_issue_type");
+
+        let clear = OutboxMutation::SetIssueType {
+            issue_node_id: "I_x".into(),
+            issue_type_id: None,
+        };
+        assert_eq!(clear.kind(), "set_issue_type");
+        let json = serde_json::to_value(&clear).unwrap();
+        assert_eq!(json["kind"], "set_issue_type");
     }
 
     #[test]

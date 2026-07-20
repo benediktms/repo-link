@@ -148,6 +148,19 @@ mutation($input: ConvertProjectV2DraftIssueItemToIssueInput!) {
   }
 }"#;
 
+/// GraphQL `updateIssue` — the native issue-level "Type" field (RFC 0006 §0
+/// A1 / #228). NOT the Projects v2 single-select rail: `issueType` lives on
+/// the `Issue` itself, set via `updateIssue(input: { id, issueTypeId })`, so
+/// this is a dedicated mutation rather than a `set_single_select_option`
+/// caller. `issueTypeId: null` clears the type — the caller always sends the
+/// key (never omits it) so `None` maps to an explicit JSON `null`.
+const SET_ISSUE_TYPE: &str = r#"
+mutation($input: UpdateIssueInput!) {
+  updateIssue(input: $input) {
+    issue { id issueType { id } }
+  }
+}"#;
+
 const SET_SINGLE_SELECT_OPTION: &str = r#"
 mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   updateProjectV2ItemFieldValue(input: $input) {
@@ -422,6 +435,33 @@ impl GraphqlClient {
                     "set_single_select_option on item {item_node_id} returned no single-select value for field {field_id}"
                 ))
             })
+    }
+
+    /// Set (or clear) an issue's native "Type" field via `updateIssue` (RFC
+    /// 0006 §0 A1 / #228). `issue_type_id` is the org registry's
+    /// `issue_type_id` (`IT_…`) to apply, or `None` to clear — the `id` key
+    /// is always sent, so `None` serializes to an explicit JSON `null`
+    /// rather than being omitted (an omitted key would leave the field
+    /// unchanged instead of clearing it).
+    ///
+    /// Unlike [`Self::set_single_select_option`] this does NOT read back and
+    /// compare the applied value — the drainer's `SetIssueType` arm treats any
+    /// `Ok` as success (no read-back `Conflict`, mirroring
+    /// `SetProjectPriority`). The response is still deserialized into a typed
+    /// struct so a wrong shape surfaces as a deserialize error rather than a
+    /// silent no-op.
+    pub(crate) async fn set_issue_type(
+        &self,
+        issue_node_id: &str,
+        issue_type_id: Option<&str>,
+    ) -> PortResult<()> {
+        let _: SetIssueTypeData = self
+            .run(
+                SET_ISSUE_TYPE,
+                json!({ "input": { "id": issue_node_id, "issueTypeId": issue_type_id } }),
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn poll_project_items(
@@ -737,6 +777,21 @@ struct SetSingleSelectOptionItem {
     id: String,
     #[serde(default)]
     field_values: FieldValuesConn,
+}
+
+// Typed (rather than `serde_json::Value`) so a wrong response sub-shape is a
+// deserialize failure rather than a silent pass, mirroring `UpdateDraftData`
+// — the value itself is unused (RFC 0006 §0 A1: no read-back comparison).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetIssueTypeData {
+    #[allow(dead_code)]
+    update_issue: UpdateIssueWrap,
+}
+#[derive(Deserialize)]
+struct UpdateIssueWrap {
+    #[allow(dead_code)]
+    issue: OptionalIdNode,
 }
 
 #[derive(Deserialize)]

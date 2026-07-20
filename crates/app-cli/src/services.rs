@@ -34,6 +34,11 @@ pub(crate) struct Services {
     pub(crate) workspaces_repo: Arc<dyn ports::WorkspaceRepository>,
     /// Backs `rl sync outbox` so dead-lettered entries are visible.
     pub(crate) outbox_repo: Arc<dyn ports::OutboxRepository>,
+    /// Raw org issue-type registry repo — `build_sync_service` needs it so
+    /// `SyncService::promote`'s first-issue native-type projection (#228
+    /// follow-up) can resolve a task's local `IssueType` the same way
+    /// `TaskService`'s edit-time trigger does.
+    pub(crate) org_issue_types_repo: Arc<dyn ports::OrgIssueTypeRepository>,
 }
 
 pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
@@ -78,6 +83,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             bindings_repo.clone(),
             workspaces_repo.clone(),
             projects_repo.clone(),
+            org_issue_types_repo.clone(),
         ),
         query: QueryService::new(
             workspaces_repo.clone(),
@@ -86,11 +92,12 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             projects_repo.clone(),
         ),
         projects: ProjectService::new(projects_repo),
-        org_issue_types: OrgIssueTypeService::new(org_issue_types_repo),
+        org_issue_types: OrgIssueTypeService::new(org_issue_types_repo.clone()),
         tasks_repo,
         bindings_repo,
         workspaces_repo,
         outbox_repo,
+        org_issue_types_repo,
     })
 }
 
@@ -105,6 +112,44 @@ pub(crate) fn build_github_provider(
     // base-URL override identically — see #100, where the daemon used to build
     // the adapter via `new` and silently ignored REPO_LINK_GITHUB_API_BASE_URL.
     GithubAdapter::from_env_parts(token, cfg.github_api_base_url.as_deref())
+}
+
+/// Outcome of [`refresh_org_issue_types`]. `names` is captured before the
+/// fetched `Vec<RemoteIssueType>` is consumed by `OrgIssueTypeService::refresh`,
+/// so callers that want to render the catalog (e.g. `rl org
+/// fetch-issue-types`'s stdout JSON) don't need to re-derive it.
+pub(crate) struct OrgIssueTypesRefresh {
+    pub(crate) available: bool,
+    pub(crate) names: Vec<String>,
+}
+
+/// Fetch + persist an owner's native issue-type registry (RFC 0006 D5):
+/// GraphQL `organization.issueTypes` via the provider, then
+/// `OrgIssueTypeService::refresh` (persists, replace-wholesale, reports
+/// availability per D8 — never errors on an empty/user-owned catalog).
+///
+/// `rl project link` inlines this same fetch+refresh pair for the *project*
+/// owner (#226). This is the shared version used by the two other
+/// population triggers added in #228: the manual `rl org fetch-issue-types`
+/// command, and the best-effort auto-populate at `rl repo attach` — needed
+/// because #228's Type sync resolves against the *filing repo* owner, which
+/// `project link` never touches.
+pub(crate) async fn refresh_org_issue_types(
+    svc: &Services,
+    provider: &impl ports::RemoteProjectProvider,
+    owner_login: &str,
+) -> Result<OrgIssueTypesRefresh> {
+    let types = provider
+        .fetch_org_issue_types(owner_login)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    let names = types.iter().map(|t| t.name.clone()).collect();
+    let available = svc
+        .org_issue_types
+        .refresh(owner_login, types)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(OrgIssueTypesRefresh { available, names })
 }
 
 /// Resolve the GitHub token or fail with a command-specific "set token or
@@ -139,5 +184,6 @@ pub(crate) fn build_sync_service(
         svc.bindings_repo.clone(),
         svc.workspaces_repo.clone(),
         provider,
+        svc.org_issue_types_repo.clone(),
     ))
 }
