@@ -24,6 +24,7 @@ use clap::Parser;
 
 /// Library entrypoint shared by both `repo-link` and `rl` bin shims.
 pub async fn run() -> Result<()> {
+    crate::logging::init();
     let cli = Cli::parse();
     let mut cfg = RepoLinkConfig::from_env()?;
     if let Some(db) = cli.db.clone() {

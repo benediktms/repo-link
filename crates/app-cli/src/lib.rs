@@ -5,6 +5,7 @@ mod commands;
 mod daemon;
 mod dispatch;
 mod docs;
+mod logging;
 mod render;
 mod services;
 
