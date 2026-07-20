@@ -9,8 +9,8 @@ use infra_config::RepoLinkConfig;
 use infra_filesystem::TokioFilesystemProbe;
 use infra_github::GithubAdapter;
 use infra_sqlite::{
-    SqliteOutboxRepository, SqliteProjectRepository, SqliteRepoBindingRepository,
-    SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
+    SqliteOrgIssueTypeRepository, SqliteOutboxRepository, SqliteProjectRepository,
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteWorkspaceRepository, open_from_path,
 };
 use tracing::info;
 
@@ -91,6 +91,9 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Arc::new(SqliteTaskRepository::new(db.clone()));
     let projects_repo: Arc<dyn ports::ProjectRepository> =
         Arc::new(SqliteProjectRepository::new(db.clone()));
+    // Built before the outbox repo below consumes the last `db` clone.
+    let org_issue_types_repo: Arc<dyn ports::OrgIssueTypeRepository> =
+        Arc::new(SqliteOrgIssueTypeRepository::new(db.clone()));
     let outbox_repo: Arc<dyn ports::OutboxRepository> = Arc::new(SqliteOutboxRepository::new(db));
 
     let workspaces = WorkspaceService::new(workspaces_repo.clone());
@@ -126,6 +129,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
                 projects_repo.clone(),
                 remote_tasks,
                 remote_projects.clone(),
+                org_issue_types_repo.clone(),
             ));
             let poller = Arc::new(ProjectPoller::new(
                 projects_repo,

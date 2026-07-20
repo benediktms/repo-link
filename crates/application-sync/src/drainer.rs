@@ -87,8 +87,8 @@ use domain_core::Timestamp;
 use domain_sync::{ConflictKind, OutboxEntry, OutboxMutation};
 use domain_task::{RemoteRef, SnapshotSource, SyncState};
 use ports::{
-    OutboxRepository, ProjectRepository, RemoteProjectProvider, RemoteTaskProvider, SyncedSource,
-    TaskRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, OutboxRepository, ProjectRepository, RemoteProjectProvider,
+    RemoteTaskProvider, SyncedSource, TaskRepository, WorkspaceRepository,
 };
 use tracing::{debug, info, warn};
 
@@ -191,6 +191,13 @@ pub struct OutboxDrainer {
     projects: Arc<dyn ProjectRepository>,
     remote_tasks: Arc<dyn RemoteTaskProvider>,
     remote_projects: Arc<dyn RemoteProjectProvider>,
+    /// Org-level native issue-type registry (RFC 0006 D5/D8), consulted at
+    /// the `ConvertDraftToIssue` write-back to project an orphan draft's
+    /// local `IssueType` — set before the draft had a real issue — onto
+    /// GitHub's native Type the moment it first becomes issue-backed (#228
+    /// follow-up; the other first-issue hook is `SyncService::promote` for
+    /// repo-anchored tasks).
+    org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     backoff: BackoffSchedule,
 }
 
@@ -202,6 +209,7 @@ impl OutboxDrainer {
         projects: Arc<dyn ProjectRepository>,
         remote_tasks: Arc<dyn RemoteTaskProvider>,
         remote_projects: Arc<dyn RemoteProjectProvider>,
+        org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     ) -> Self {
         Self {
             outbox,
@@ -210,6 +218,7 @@ impl OutboxDrainer {
             projects,
             remote_tasks,
             remote_projects,
+            org_issue_types,
             backoff: BackoffSchedule::standard(),
         }
     }
@@ -521,35 +530,46 @@ impl OutboxDrainer {
                 // on startup. Re-running `convertProjectV2DraftIssueItemToIssue`
                 // on an already-converted item misbehaves, so if the task
                 // already carries a real issue node id the convert already
-                // landed — skip the remote call.
+                // landed — skip the remote call. The first-issue type
+                // follow-up below still runs on a replay (harmless — it's
+                // idempotent, #228), so it can't be permanently lost if a
+                // crash landed between the write-back and the follow-up
+                // enqueue on an earlier pass.
                 let task = self.tasks.get(entry.task_id).await?;
-                if task
+                let already_converted = task
                     .remote
                     .as_ref()
                     .and_then(|r| r.node_id.as_deref())
-                    .is_some()
-                {
+                    .is_some();
+                if already_converted {
                     debug!(
                         task_id = %entry.task_id,
                         "convert-draft replay: task already has an issue node id; skipping convert"
                     );
-                    return Ok(ApplyDisposition::Stamped);
+                } else {
+                    let (issue_node_id, issue_number) = match self
+                        .remote_projects
+                        .convert_draft_to_issue(item_node_id, repo_node_id)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
+                    };
+                    // The convert must yield a real issue handle: an `I_*` node id
+                    // AND a positive REST number. Junk back (empty id / number 0)
+                    // is a conflict, not a success.
+                    if !issue_node_id.starts_with("I_") || issue_number == 0 {
+                        return Ok(ApplyDisposition::Conflict(ConflictKind::TargetRemapped));
+                    }
+                    self.write_back_converted_issue(entry.task_id, &issue_node_id, issue_number)
+                        .await?;
                 }
-                let (issue_node_id, issue_number) = match self
-                    .remote_projects
-                    .convert_draft_to_issue(item_node_id, repo_node_id)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
-                };
-                // The convert must yield a real issue handle: an `I_*` node id
-                // AND a positive REST number. Junk back (empty id / number 0)
-                // is a conflict, not a success.
-                if !issue_node_id.starts_with("I_") || issue_number == 0 {
-                    return Ok(ApplyDisposition::Conflict(ConflictKind::TargetRemapped));
-                }
-                self.write_back_converted_issue(entry.task_id, &issue_node_id, issue_number)
+                // First-issue native-type projection (RFC 0006 §0 A1 / #228
+                // follow-up): the moment an orphan draft becomes issue-backed
+                // is the sibling hook to `SyncService::promote`'s first-issue
+                // trigger for repo-anchored tasks. Best-effort — never turns
+                // a successful convert into a failure.
+                self.enqueue_issue_type_follow_up(entry.task_id, repo_node_id)
                     .await?;
                 Ok(ApplyDisposition::Stamped)
             }
@@ -853,6 +873,87 @@ impl OutboxDrainer {
         }
         Ok(())
     }
+
+    /// Enqueue the `SetIssueType` first-issue projection an orphan draft's
+    /// conversion owes (RFC 0006 §0 A1 / #228 follow-up): the moment a draft
+    /// becomes issue-backed is one of the two "first issue" hooks (the other
+    /// is `SyncService::promote` for repo-anchored tasks) where a local
+    /// `issue_type` set before the task had a real issue gets projected onto
+    /// GitHub's native Type field. Mirrors [`Self::enqueue_status_follow_up`]'s
+    /// shape (fetch → resolve → enqueue, best-effort, no read-back) but on the
+    /// issue axis rather than the project-item axis.
+    ///
+    /// No-ops silently when the task has no local issue type set (nothing to
+    /// project) or has no issue node id yet (shouldn't happen right after a
+    /// successful convert, but symmetric with the other triggers); warns
+    /// (never fails — the caller must never turn this into a failed convert)
+    /// when the filing owner's native issue-type registry is unavailable or
+    /// has no match for the task's type.
+    ///
+    /// `filing_canonical` is the mutation's own `repo_node_id` field — despite
+    /// the name it carries the FILING repo's `github.com/<owner>/<repo>`
+    /// canonical URL (the same value `plan_update_mutations`'s
+    /// `ConvertDraftToIssue` branch resolves via `filing_canonical_for`), so
+    /// the owner is parsed straight off the already-resolved entry rather
+    /// than re-deriving it from the task.
+    async fn enqueue_issue_type_follow_up(
+        &self,
+        task_id: domain_core::TaskId,
+        filing_canonical: &str,
+    ) -> Result<()> {
+        // Re-fetch: on the fresh-convert path this picks up the issue node id
+        // `write_back_converted_issue` just committed; on the
+        // already-converted replay path it's the same real issue node id the
+        // top-of-arm guard already observed.
+        let task = self.tasks.get(task_id).await?;
+        if task.issue_type.is_none() {
+            return Ok(());
+        }
+        let owner = crate::enqueue::parse_github_owner(filing_canonical);
+        match crate::enqueue::resolve_issue_type_projection(
+            &self.org_issue_types,
+            owner.as_deref(),
+            &task,
+        )
+        .await?
+        {
+            crate::enqueue::IssueTypeProjection::Mutation(mutation) => {
+                let entry = OutboxEntry::new(task_id, mutation);
+                self.outbox.enqueue(&entry).await?;
+            }
+            crate::enqueue::IssueTypeProjection::NoOwner => {
+                debug!(
+                    task_id = %task_id,
+                    "converted draft to issue but no filing owner resolved; issue type not projected"
+                );
+            }
+            crate::enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
+                warn!(
+                    task_id = %task_id,
+                    owner = %owner,
+                    "converted draft to issue but native issue types are unavailable for this \
+                     owner (user-owned account or org feature disabled)"
+                );
+            }
+            crate::enqueue::IssueTypeProjection::Unmapped { owner } => {
+                warn!(
+                    task_id = %task_id,
+                    owner = %owner,
+                    issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "converted draft to issue but its issue type has no match in the org's \
+                     native issue-type registry; not projected (TypeUnmapped)"
+                );
+            }
+            crate::enqueue::IssueTypeProjection::NoNode => {
+                debug!(
+                    task_id = %task_id,
+                    "converted draft to issue but the task has no issue node id yet; will \
+                     project once known"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -867,9 +968,9 @@ mod tests {
         OutboxRepository, ProjectRepository, RemoteStateReason, TaskRepository, WorkspaceRepository,
     };
     use testing_fixtures::{
-        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRemoteProjectProvider,
-        InMemoryRemoteTaskProvider, InMemoryTaskRepository, InMemoryWorkspaceRepository,
-        ProjectCall,
+        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryProjectRepository,
+        InMemoryRemoteProjectProvider, InMemoryRemoteTaskProvider, InMemoryTaskRepository,
+        InMemoryWorkspaceRepository, ProjectCall,
     };
 
     struct Harness {
@@ -879,6 +980,7 @@ mod tests {
         projects: Arc<InMemoryProjectRepository>,
         remote_tasks: Arc<InMemoryRemoteTaskProvider>,
         remote_projects: Arc<InMemoryRemoteProjectProvider>,
+        org_issue_types: Arc<InMemoryOrgIssueTypeRepository>,
         drainer: OutboxDrainer,
     }
 
@@ -891,6 +993,7 @@ mod tests {
         let projects = Arc::new(InMemoryProjectRepository::new());
         let remote_tasks = Arc::new(InMemoryRemoteTaskProvider::new());
         let remote_projects = Arc::new(InMemoryRemoteProjectProvider::new());
+        let org_issue_types = Arc::new(InMemoryOrgIssueTypeRepository::new());
 
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
         let tasks_dyn: Arc<dyn TaskRepository> = tasks.clone();
@@ -898,9 +1001,12 @@ mod tests {
         let proj_dyn: Arc<dyn ProjectRepository> = projects.clone();
         let rt_dyn: Arc<dyn ports::RemoteTaskProvider> = remote_tasks.clone();
         let rp_dyn: Arc<dyn RemoteProjectProvider> = remote_projects.clone();
+        let oit_dyn: Arc<dyn OrgIssueTypeRepository> = org_issue_types.clone();
 
-        let drainer = OutboxDrainer::new(outbox_dyn, tasks_dyn, ws_dyn, proj_dyn, rt_dyn, rp_dyn)
-            .with_backoff(backoff);
+        let drainer = OutboxDrainer::new(
+            outbox_dyn, tasks_dyn, ws_dyn, proj_dyn, rt_dyn, rp_dyn, oit_dyn,
+        )
+        .with_backoff(backoff);
 
         Harness {
             outbox,
@@ -909,6 +1015,7 @@ mod tests {
             projects,
             remote_tasks,
             remote_projects,
+            org_issue_types,
             drainer,
         }
     }
@@ -1753,6 +1860,134 @@ mod tests {
         assert_eq!(
             remote.remote_id, "42",
             "remote_id is the REST number, never empty"
+        );
+    }
+
+    // --- first-issue native-type projection (RFC 0006 §0 A1 / #228 follow-up) --
+    //
+    // The convert-draft-to-issue write-back is the orphan-draft sibling of
+    // `SyncService::promote`'s first-issue trigger: an orphan draft that had a
+    // local `issue_type` set before it ever gained a repo must still project
+    // that type the moment it becomes issue-backed.
+
+    fn drainer_bug_registry(owner: &str) -> domain_project::OrgIssueTypeRegistry {
+        domain_project::OrgIssueTypeRegistry::new(
+            owner,
+            vec![domain_project::OrgIssueType {
+                issue_type_id: "IT_bug".into(),
+                name: "Bug".into(),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn convert_draft_to_issue_with_local_issue_type_enqueues_set_issue_type() {
+        let h = harness(test_backoff(5)).await;
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        let ws = WorkspaceId::new();
+
+        let mut task = Task::import_mirror(
+            ws,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.project_item_id = Some("PVTI_draft_type".into());
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+
+        h.remote_projects
+            .set_convert_returns_with_number("I_converted_type", 43);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::ConvertDraftToIssue {
+                item_node_id: "PVTI_draft_type".into(),
+                repo_node_id: "github.com/o/r".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        // The convert entry succeeded AND a fresh SetIssueType entry was
+        // enqueued in the same drain pass, addressed at the just-converted
+        // issue's node id.
+        let all = h.outbox.all();
+        let type_entries: Vec<_> = all
+            .iter()
+            .filter(|e| matches!(e.mutation, OutboxMutation::SetIssueType { .. }))
+            .collect();
+        assert_eq!(
+            type_entries.len(),
+            1,
+            "exactly one SetIssueType follow-up: {all:?}"
+        );
+        match &type_entries[0].mutation {
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            } => {
+                assert_eq!(issue_node_id, "I_converted_type");
+                assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn convert_draft_to_issue_without_issue_type_enqueues_nothing_extra() {
+        let h = harness(test_backoff(5)).await;
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        let ws = WorkspaceId::new();
+
+        let mut task = Task::import_mirror(
+            ws,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.project_item_id = Some("PVTI_draft_notype".into());
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+        assert!(task.issue_type.is_none());
+
+        h.remote_projects
+            .set_convert_returns_with_number("I_converted_notype", 44);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::ConvertDraftToIssue {
+                item_node_id: "PVTI_draft_notype".into(),
+                repo_node_id: "github.com/o/r".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let all = h.outbox.all();
+        assert_eq!(
+            all.len(),
+            1,
+            "no local issue type set — only the convert entry itself: {all:?}"
+        );
+        assert!(
+            !matches!(all[0].mutation, OutboxMutation::SetIssueType { .. }),
+            "no SetIssueType follow-up without a local issue type: {all:?}"
         );
     }
 

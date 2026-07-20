@@ -15,8 +15,8 @@ use dto_shared::{
     SyncSummaryDto,
 };
 use ports::{
-    PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository, SyncedSource,
-    TaskRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository,
+    SyncedSource, TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -45,6 +45,12 @@ pub struct SyncService {
     // step 2 of the RFC 0002 D2 chain when resolving where to file at promote.
     workspaces: Arc<dyn WorkspaceRepository>,
     provider: Arc<dyn RemoteTaskProvider>,
+    /// Org-level native issue-type registry (RFC 0006 D5/D8), consulted at
+    /// `promote` to project a task's local `IssueType` — set before the task
+    /// had a real issue — onto GitHub's native Type the moment it first
+    /// becomes issue-backed (#228 follow-up; mirrors
+    /// `application-task::TaskService`'s edit-time trigger).
+    org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     policy: SyncPolicy,
 }
 
@@ -54,12 +60,14 @@ impl SyncService {
         bindings: Arc<dyn RepoBindingRepository>,
         workspaces: Arc<dyn WorkspaceRepository>,
         provider: Arc<dyn RemoteTaskProvider>,
+        org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     ) -> Self {
         Self {
             tasks,
             bindings,
             workspaces,
             provider,
+            org_issue_types,
             policy: SyncPolicy::ManualMerge,
         }
     }
@@ -143,7 +151,72 @@ impl SyncService {
         // Enqueued atomically with the promote save (a torn write would leave the
         // relation permanently unsynced — relations have no dirty backstop).
         let this_coords = (filing_canonical.clone(), snap.remote_id.clone());
-        let entries = self.relation_backfill_entries(&task, &this_coords).await?;
+        let mut entries = self.relation_backfill_entries(&task, &this_coords).await?;
+
+        // First-issue native-type projection (RFC 0006 §0 A1 / #228
+        // follow-up): a type set locally *before* promote (the natural
+        // `rl task create` → `task edit --type` → `sync promote` flow) would
+        // otherwise be stranded — the edit-time trigger
+        // (`TaskService::plan_issue_type_mutation`) only fires on a type
+        // *change* while already issue-backed, and there was no issue to
+        // address the mutation at when the type was originally set. `task`
+        // just became issue-backed above (`promote_to_remote`), so if it
+        // carries a local type, resolve + enqueue the projection now,
+        // atomically with the same promote save (the entry rides `entries`
+        // into `save_with_outbox` below). Mirrors
+        // `OutboxDrainer::enqueue_status_follow_up`'s best-effort shape:
+        // advisory `debug`/`warn` on an unresolved owner or an
+        // unavailable/unmapped registry, never a hard failure — promote must
+        // succeed regardless. No local type at all → nothing to do here.
+        if task.issue_type.is_some() {
+            let owner = enqueue::parse_github_owner(&filing_canonical);
+            match enqueue::resolve_issue_type_projection(
+                &self.org_issue_types,
+                owner.as_deref(),
+                &task,
+            )
+            .await?
+            {
+                enqueue::IssueTypeProjection::Mutation(mutation) => {
+                    entries.push(OutboxEntry::new(task.id, mutation));
+                }
+                enqueue::IssueTypeProjection::NoOwner => {
+                    tracing::debug!(
+                        task_id = %task.id,
+                        "promoted with a local issue type set but no filing owner resolved; \
+                         will project once known"
+                    );
+                }
+                enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        owner = %owner,
+                        "promoted with a local issue type set but native issue types are \
+                         unavailable for this owner (user-owned account or org feature disabled)"
+                    );
+                }
+                enqueue::IssueTypeProjection::Unmapped { owner } => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        owner = %owner,
+                        issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
+                        "promoted with a local issue type set but it has no match in the org's \
+                         native issue-type registry; not projected (TypeUnmapped)"
+                    );
+                }
+                enqueue::IssueTypeProjection::NoNode => {
+                    // Shouldn't happen right after `promote_to_remote` unless
+                    // the provider returned no node id at all — defer rather
+                    // than assume, symmetric with the edit-time trigger.
+                    tracing::debug!(
+                        task_id = %task.id,
+                        "promoted but the task has no issue node id yet; will project the \
+                         issue type once known"
+                    );
+                }
+            }
+        }
+
         self.tasks
             .save_with_outbox(&task, SnapshotSource::Promote, &entries)
             .await?;
@@ -1181,17 +1254,18 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use domain_core::{RepoId, Timestamp, WorkspaceId};
+    use domain_project::{OrgIssueType, OrgIssueTypeRegistry};
     use domain_repo::{RepoInstance, RepoOrigin};
     use domain_sync::OutboxMutation;
-    use domain_task::Task;
+    use domain_task::{IssueType, Task};
     use domain_workspace::{Workspace, WorkspaceName};
     use ports::{
         PortResult, RemoteComment, RemoteStateReason, RemoteTaskSnapshot, RemoteTaskUpdate,
     };
     use std::sync::Mutex;
     use testing_fixtures::{
-        InMemoryOutboxRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
-        InMemoryWorkspaceRepository,
+        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryRepoBindingRepository,
+        InMemoryTaskRepository, InMemoryWorkspaceRepository,
     };
 
     /// Asserts the post-mutation task's inbound mirror set matches its
@@ -1473,6 +1547,7 @@ mod tests {
             bindings.clone(),
             workspaces.clone(),
             provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         (svc, tasks, bindings, task, provider)
     }
@@ -1534,6 +1609,7 @@ mod tests {
             bindings.clone(),
             workspaces.clone(),
             provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         (
             svc,
@@ -1997,6 +2073,160 @@ mod tests {
         );
     }
 
+    // --- first-issue native-type projection (RFC 0006 §0 A1 / #228 follow-up) --
+    //
+    // `rl task create` → `task edit --type Story` → `sync promote`: a type set
+    // BEFORE the task had a real issue must not be stranded. These tests pin
+    // down promote's own first-issue-backed hook, sibling of the edit-time
+    // trigger covered in `application-task::TaskService`'s own matrix.
+
+    /// Like `setup_with_bindings`, but also hands back the org issue-type
+    /// registry repo (so a test can seed/omit a registry for the bound repo's
+    /// owner, "o") and wires the task repo to a shared outbox (so a test can
+    /// inspect exactly what `promote` enqueued).
+    async fn setup_with_bindings_and_types() -> (
+        SyncService,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryOutboxRepository>,
+        Arc<InMemoryOrgIssueTypeRepository>,
+        Task,
+    ) {
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+        let org_issue_types = Arc::new(InMemoryOrgIssueTypeRepository::new());
+
+        let workspace = Workspace::new(WorkspaceName::new("type-ws").unwrap(), None, true);
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
+
+        let task = Task::new_draft(workspace_id, Some(repo_id), "ship it".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            provider.clone(),
+            org_issue_types.clone(),
+        );
+        (svc, tasks, outbox, org_issue_types, task)
+    }
+
+    fn bug_registry(owner: &str) -> OrgIssueTypeRegistry {
+        OrgIssueTypeRegistry::new(
+            owner,
+            vec![OrgIssueType {
+                issue_type_id: "IT_bug".into(),
+                name: "Bug".into(),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn promote_with_local_issue_type_enqueues_resolved_set_issue_type() {
+        // A type set before promote (draft-time `task edit --type`) must
+        // project onto the freshly-created issue's native Type in the SAME
+        // atomic promote write — exactly one SetIssueType, addressed at the
+        // node id the create response just returned.
+        let (svc, tasks, outbox, org_issue_types, mut task) = setup_with_bindings_and_types().await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+        task.set_issue_type(Some(IssueType::Bug));
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        let entries = outbox.all();
+        let type_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.mutation, OutboxMutation::SetIssueType { .. }))
+            .collect();
+        assert_eq!(
+            type_entries.len(),
+            1,
+            "exactly one SetIssueType on first promote: {entries:?}"
+        );
+        match &type_entries[0].mutation {
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            } => {
+                // FakeProvider::create_remote's fixed node id (RFC 0001 §9 /
+                // §D1 — the node id the REST create response carries).
+                assert_eq!(issue_node_id, "I_kwDOfake100");
+                assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_without_issue_type_enqueues_nothing_on_the_type_axis() {
+        // No local issue type set — nothing to project, and promote must not
+        // emit a spurious no-op UpdateRemote on the type axis either (a bare
+        // promote's only other candidate entry is the relation backfill,
+        // which is empty here — no relations).
+        let (svc, _tasks, outbox, org_issue_types, task) = setup_with_bindings_and_types().await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+        assert!(task.issue_type.is_none());
+
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "no local issue type set — promote must enqueue nothing: {:?}",
+            outbox.all()
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_with_issue_type_but_unavailable_registry_warns_and_skips() {
+        // No registry saved for owner "o" — `InMemoryOrgIssueTypeRepository::get`
+        // returns an empty (unavailable) registry, mirroring the D8 no-error
+        // contract. Promote must still SUCCEED — an unresolvable projection is
+        // advisory, never fatal to the promote itself.
+        let (svc, tasks, outbox, _org_issue_types, mut task) =
+            setup_with_bindings_and_types().await;
+        task.set_issue_type(Some(IssueType::Bug));
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let summary = svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            summary.new_state, "synced",
+            "promote succeeds despite an unavailable issue-type registry"
+        );
+        assert!(
+            outbox.all().is_empty(),
+            "native issue types unavailable for this owner — warn, don't enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_with_issue_type_unmapped_warns_and_skips() {
+        // The registry has entries, but none match the task's local type.
+        let (svc, tasks, outbox, org_issue_types, mut task) = setup_with_bindings_and_types().await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+        task.set_issue_type(Some(IssueType::Custom("Epic".into())));
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "no registry match for \"Epic\" — warn, don't enqueue (TypeUnmapped)"
+        );
+    }
+
     #[tokio::test]
     async fn promote_orphan_with_workspace_default_files_in_default_repo() {
         // RFC 0002 D2 step-2 edge case: an orphan task (no logical repo) whose
@@ -2036,6 +2266,7 @@ mod tests {
             bindings.clone(),
             workspaces.clone(),
             provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         svc.promote(&task.id.to_string()).await.unwrap();
 
@@ -2123,6 +2354,7 @@ mod tests {
             bindings.clone(),
             workspaces.clone(),
             provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         SagaFixture {
             svc,
@@ -2215,7 +2447,13 @@ mod tests {
             .await
             .unwrap();
 
-        let svc = SyncService::new(tasks, bindings, workspaces, provider.clone());
+        let svc = SyncService::new(
+            tasks,
+            bindings,
+            workspaces,
+            provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+        );
         ListRemoteFixture {
             svc,
             provider,
@@ -3200,6 +3438,7 @@ mod tests {
             bindings.clone(),
             workspaces.clone(),
             provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         svc.promote(&task.id.to_string()).await.unwrap();
 

@@ -560,26 +560,28 @@ impl TaskService {
     ///   project-item attach, there is no later write-back that revisits this;
     ///   the next edit that changes the type will replan it).
     async fn plan_issue_type_mutation(&self, task: &Task) -> Result<Option<OutboxMutation>> {
-        let Some(owner) = self.filing_repo_owner_login(task).await? else {
-            tracing::debug!(
-                task_id = %task.id,
-                "issue type changed but no filing repo is resolved yet; will project once known"
-            );
-            return Ok(None);
-        };
-        let registry = self.org_issue_types.get(&owner).await?;
-        if !registry.is_available() {
-            tracing::warn!(
-                task_id = %task.id,
-                owner = %owner,
-                "issue type changed but native issue types are unavailable for this owner \
-                 (user-owned account or org feature disabled)"
-            );
-            return Ok(None);
-        }
-        match enqueue::set_issue_type_mutation(&registry, task) {
-            enqueue::IssueTypeResolution::Mutation(mutation) => Ok(Some(mutation)),
-            enqueue::IssueTypeResolution::Unmapped => {
+        let owner = self.filing_repo_owner_login(task).await?;
+        match enqueue::resolve_issue_type_projection(&self.org_issue_types, owner.as_deref(), task)
+            .await?
+        {
+            enqueue::IssueTypeProjection::Mutation(mutation) => Ok(Some(mutation)),
+            enqueue::IssueTypeProjection::NoOwner => {
+                tracing::debug!(
+                    task_id = %task.id,
+                    "issue type changed but no filing repo is resolved yet; will project once known"
+                );
+                Ok(None)
+            }
+            enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    owner = %owner,
+                    "issue type changed but native issue types are unavailable for this owner \
+                     (user-owned account or org feature disabled)"
+                );
+                Ok(None)
+            }
+            enqueue::IssueTypeProjection::Unmapped { owner } => {
                 tracing::warn!(
                     task_id = %task.id,
                     owner = %owner,
@@ -588,7 +590,7 @@ impl TaskService {
                 );
                 Ok(None)
             }
-            enqueue::IssueTypeResolution::NoNode => {
+            enqueue::IssueTypeProjection::NoNode => {
                 tracing::debug!(
                     task_id = %task.id,
                     "issue type changed but the task has no issue node id yet; will project once known"
@@ -603,14 +605,16 @@ impl TaskService {
     /// governs `plan_issue_type_mutation`'s resolution (RFC 0006 §0 A1).
     /// Reuses `filing_canonical_for`'s D2 chain (recorded `filing_repo_id` →
     /// workspace default → logical `repo_id`, RFC 0002) and parses the
-    /// `github.com/<owner>/<repo>` canonical it returns. `None` when the
-    /// chain has no inputs yet (board-draft orphan) or the canonical isn't a
-    /// GitHub URL of that shape.
+    /// `github.com/<owner>/<repo>` canonical it returns via the shared
+    /// [`enqueue::parse_github_owner`] (also used by `SyncService::promote`
+    /// and `OutboxDrainer`'s `ConvertDraftToIssue` write-back, #228
+    /// follow-up). `None` when the chain has no inputs yet (board-draft
+    /// orphan) or the canonical isn't a GitHub URL of that shape.
     async fn filing_repo_owner_login(&self, task: &Task) -> Result<Option<String>> {
         let Some(canonical) = self.filing_canonical_for(task).await? else {
             return Ok(None);
         };
-        Ok(parse_github_owner(&canonical))
+        Ok(enqueue::parse_github_owner(&canonical))
     }
 
     /// Plan the outbound mutations an *edit* owes. Distinct from
@@ -1401,27 +1405,6 @@ impl TaskService {
             },
         )
     }
-}
-
-/// Parse the owner login out of a `github.com/<owner>/<repo>` canonical URL
-/// (the shape `filing_canonical_for` returns). `None` for any other shape
-/// (a non-GitHub canonical, or a malformed one) — mirrors
-/// `infra_github::rest::split_owner_repo`'s parse without adding an
-/// application → infra dependency (clean layering; `application-task` stays
-/// infra-free).
-fn parse_github_owner(canonical: &str) -> Option<String> {
-    let rest = canonical.strip_prefix("github.com/")?;
-    let mut parts = rest.split('/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    // A well-formed canonical also has a non-empty repo segment and nothing
-    // after it; a malformed shape (missing repo, or extra segments) is not a
-    // resolvable owner.
-    let repo = parts.next().filter(|s| !s.is_empty())?;
-    let _ = repo;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(owner.to_string())
 }
 
 /// Wrap each planned [`OutboxMutation`] in a fresh `Pending` [`OutboxEntry`]

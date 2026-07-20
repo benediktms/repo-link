@@ -34,6 +34,11 @@ pub(crate) struct Services {
     pub(crate) workspaces_repo: Arc<dyn ports::WorkspaceRepository>,
     /// Backs `rl sync outbox` so dead-lettered entries are visible.
     pub(crate) outbox_repo: Arc<dyn ports::OutboxRepository>,
+    /// Raw org issue-type registry repo — `build_sync_service` needs it so
+    /// `SyncService::promote`'s first-issue native-type projection (#228
+    /// follow-up) can resolve a task's local `IssueType` the same way
+    /// `TaskService`'s edit-time trigger does.
+    pub(crate) org_issue_types_repo: Arc<dyn ports::OrgIssueTypeRepository>,
 }
 
 pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
@@ -87,11 +92,12 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             projects_repo.clone(),
         ),
         projects: ProjectService::new(projects_repo),
-        org_issue_types: OrgIssueTypeService::new(org_issue_types_repo),
+        org_issue_types: OrgIssueTypeService::new(org_issue_types_repo.clone()),
         tasks_repo,
         bindings_repo,
         workspaces_repo,
         outbox_repo,
+        org_issue_types_repo,
     })
 }
 
@@ -178,5 +184,6 @@ pub(crate) fn build_sync_service(
         svc.bindings_repo.clone(),
         svc.workspaces_repo.clone(),
         provider,
+        svc.org_issue_types_repo.clone(),
     ))
 }
