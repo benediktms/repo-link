@@ -784,6 +784,23 @@ impl OutboxDrainer {
             return Ok(());
         };
         let project = self.projects.get(project_id).await?;
+        // Cross-project guard: `project_node_id` is the board this in-flight
+        // AddItem/CreateDraftIssue targeted, but `project` is the workspace's
+        // *current* project. If the workspace moved projects while the entry was
+        // queued, the two differ — and combining the old board's node id with
+        // the new project's field/option ids yields an invalid payload that
+        // Backend-errors, retries, and dead-letters. Skip: the move re-attaches
+        // on the new board with its own follow-up. (Pre-existing for Status;
+        // #225 widened the blast radius to the priority projection.)
+        if project.id.as_str() != project_node_id {
+            tracing::debug!(
+                task_id = %task_id,
+                stale_project = project_node_id,
+                current_project = %project.id,
+                "workspace moved projects since attach; skipping stale status/priority follow-up"
+            );
+            return Ok(());
+        }
         // No Status field → nothing to project onto (parallels the no-option
         // early return below).
         if let Some(status_field_id) = project.status_field_id()
@@ -1038,6 +1055,56 @@ mod tests {
             }
             other => panic!("expected SetSingleSelectOption, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_item_write_back_skips_follow_up_when_workspace_moved_projects() {
+        // The workspace's current project is B, but an in-flight AddItem targets
+        // an OLD board A (the workspace moved projects while it was queued). The
+        // follow-up must NOT project B's field/option ids onto board A (invalid
+        // payload → Backend error → dead-letter); it skips entirely.
+        let h = harness(test_backoff(5)).await;
+
+        let project = project_with_status_and_priority(); // board B (current)
+        h.projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        h.workspaces.save(&ws).await.unwrap();
+
+        let mut task = Task::new_draft(ws.id, None, "moved".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "9".into(),
+            node_id: Some("I_9".into()),
+        })
+        .unwrap();
+        h.tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        h.remote_projects.set_add_item_returns("PVTI_new");
+
+        // AddItem targets the OLD board A, distinct from the workspace's current
+        // project B.
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddItem {
+                project_node_id: "PVT_old_board_A".into(),
+                issue_node_id: "I_9".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let calls = h.remote_projects.calls();
+        let projections = calls
+            .iter()
+            .filter(|c| matches!(c, ProjectCall::SetSingleSelectOption { .. }))
+            .count();
+        assert_eq!(
+            projections, 0,
+            "workspace moved projects — no status/priority follow-up must be projected: {calls:?}"
+        );
     }
 
     #[tokio::test]
