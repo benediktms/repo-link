@@ -7,15 +7,15 @@ use std::sync::Arc;
 use application_sync::enqueue;
 use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::{OutboxEntry, OutboxMutation, resolve_filing_repo};
-use domain_task::{Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
+use domain_task::{IssueType, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
 use dto_shared::{
     AddTaskRelationCmd, CreateTaskCmd, ImportMirrorCmd, ListTasksQuery, RemoveTaskRelationCmd,
     TaskDto, UpdateTaskCmd,
 };
 use ports::{
-    PortError, ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository,
-    TaskSnapshotRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, PortError, ProjectRepository, RepoBindingRepository, TaskFilter,
+    TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
 };
 
 use crate::dto::{assemble_task_display_id, parse_enum, task_to_dto};
@@ -53,6 +53,11 @@ pub struct TaskService {
     /// can compute the project Status option to enqueue.
     workspaces: Arc<dyn WorkspaceRepository>,
     projects: Arc<dyn ProjectRepository>,
+    /// Org-level native issue-type registry (RFC 0006 D5/D8), consulted by
+    /// [`Self::plan_issue_type_mutation`] to resolve a task's local
+    /// `IssueType` name to the `issue_type_id` GitHub's `updateIssue` wants
+    /// (#228).
+    org_issue_types: Arc<dyn OrgIssueTypeRepository>,
 }
 
 impl TaskService {
@@ -62,6 +67,7 @@ impl TaskService {
         bindings: Arc<dyn RepoBindingRepository>,
         workspaces: Arc<dyn WorkspaceRepository>,
         projects: Arc<dyn ProjectRepository>,
+        org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     ) -> Self {
         Self {
             repo,
@@ -69,6 +75,7 @@ impl TaskService {
             bindings,
             workspaces,
             projects,
+            org_issue_types,
         }
     }
 
@@ -369,6 +376,12 @@ impl TaskService {
         let was_orphan_draft = enqueue::is_draft_backed(&t) && t.repo_id.is_none();
         let sync_before = t.sync;
         let priority_before = t.priority;
+        // `issue_type_before` mirrors `priority_before` (RFC 0006 §0 A1 /
+        // #228): `set_issue_type` doesn't dirty the issue mirror either, but a
+        // real change still owes an outbound `SetIssueType` GraphQL
+        // projection — planned on its own branch below, never through
+        // `plan_update_mutations`.
+        let issue_type_before = t.issue_type.clone();
 
         if let Some(title) = cmd.title {
             t.set_title(title)?;
@@ -385,6 +398,11 @@ impl TaskService {
         if let Some(repo_id) = cmd.repo_id {
             let parsed = repo_id.parse::<RepoId>()?;
             t.set_repo_id(Some(parsed))?;
+        }
+        // Outer `None` = leave unchanged; `Some(None)` = clear; `Some(Some(name))`
+        // = set, parsed infallibly via `IssueType::from` (RFC 0006 D7).
+        if let Some(new_type) = cmd.issue_type {
+            t.set_issue_type(new_type.map(IssueType::from));
         }
 
         // RFC 0002 D3: re-run the D2 filing-repo chain at draft-conversion
@@ -449,6 +467,19 @@ impl TaskService {
             entries.push(OutboxEntry::new(t.id, mutation));
         }
 
+        // RFC 0006 §0 A1 — issue type's OWN branch, sibling of the priority
+        // branch above and for the same reason: `SetIssueType` is an off-axis
+        // GraphQL `updateIssue` projection, never part of the issue-mirror
+        // PATCH, so it must never ride `plan_update_mutations` (which would
+        // fold it into `UpdateRemote` and emit a spurious no-op for a
+        // type-only edit). A no-op / unchanged type plans nothing here.
+        if t.issue_type != issue_type_before
+            && enqueue::is_mirror(&t)
+            && let Some(mutation) = self.plan_issue_type_mutation(&t).await?
+        {
+            entries.push(OutboxEntry::new(t.id, mutation));
+        }
+
         self.repo
             .save_with_outbox(&t, SnapshotSource::LocalEdit, &entries)
             .await?;
@@ -509,6 +540,77 @@ impl TaskService {
                 Ok(None)
             }
         }
+    }
+
+    /// Plan the `SetIssueType` GraphQL projection an issue-type edit owes
+    /// (RFC 0006 §0 A1 / #228). Sibling of [`Self::plan_priority_mutation`] —
+    /// same shape, a different rail (the issue's native "Type" field via
+    /// `updateIssue`, not a project-item single-select). Returns `None`
+    /// (enqueuing nothing) when:
+    /// - the task's FILING repo owner can't be resolved (no filing repo
+    ///   chain input yet) — silent, mirrors an unresolved project;
+    /// - the owner's native issue-type registry is empty/unavailable (a
+    ///   user-owned owner or an org with the feature disabled, RFC 0006 D8)
+    ///   — warns (naming the owner + task), since this is a real
+    ///   misconfiguration the user may want to know about;
+    /// - the task's local type has no case-insensitive name match in the
+    ///   registry (`TypeUnmapped`) — warns;
+    /// - the task has no GraphQL issue node id yet — debug (deferred, not
+    ///   lost: nothing enqueues a follow-up here today because, unlike the
+    ///   project-item attach, there is no later write-back that revisits this;
+    ///   the next edit that changes the type will replan it).
+    async fn plan_issue_type_mutation(&self, task: &Task) -> Result<Option<OutboxMutation>> {
+        let Some(owner) = self.filing_repo_owner_login(task).await? else {
+            tracing::debug!(
+                task_id = %task.id,
+                "issue type changed but no filing repo is resolved yet; will project once known"
+            );
+            return Ok(None);
+        };
+        let registry = self.org_issue_types.get(&owner).await?;
+        if !registry.is_available() {
+            tracing::warn!(
+                task_id = %task.id,
+                owner = %owner,
+                "issue type changed but native issue types are unavailable for this owner \
+                 (user-owned account or org feature disabled)"
+            );
+            return Ok(None);
+        }
+        match enqueue::set_issue_type_mutation(&registry, task) {
+            enqueue::IssueTypeResolution::Mutation(mutation) => Ok(Some(mutation)),
+            enqueue::IssueTypeResolution::Unmapped => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    owner = %owner,
+                    issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "issue type changed but has no match in the org's native issue-type registry; not projected (TypeUnmapped)"
+                );
+                Ok(None)
+            }
+            enqueue::IssueTypeResolution::NoNode => {
+                tracing::debug!(
+                    task_id = %task.id,
+                    "issue type changed but the task has no issue node id yet; will project once known"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Resolve the login of the owner that the task's backing issue is (or
+    /// will be) FILED under — the org whose native issue-type registry
+    /// governs `plan_issue_type_mutation`'s resolution (RFC 0006 §0 A1).
+    /// Reuses `filing_canonical_for`'s D2 chain (recorded `filing_repo_id` →
+    /// workspace default → logical `repo_id`, RFC 0002) and parses the
+    /// `github.com/<owner>/<repo>` canonical it returns. `None` when the
+    /// chain has no inputs yet (board-draft orphan) or the canonical isn't a
+    /// GitHub URL of that shape.
+    async fn filing_repo_owner_login(&self, task: &Task) -> Result<Option<String>> {
+        let Some(canonical) = self.filing_canonical_for(task).await? else {
+            return Ok(None);
+        };
+        Ok(parse_github_owner(&canonical))
     }
 
     /// Plan the outbound mutations an *edit* owes. Distinct from
@@ -1301,6 +1403,27 @@ impl TaskService {
     }
 }
 
+/// Parse the owner login out of a `github.com/<owner>/<repo>` canonical URL
+/// (the shape `filing_canonical_for` returns). `None` for any other shape
+/// (a non-GitHub canonical, or a malformed one) — mirrors
+/// `infra_github::rest::split_owner_repo`'s parse without adding an
+/// application → infra dependency (clean layering; `application-task` stays
+/// infra-free).
+fn parse_github_owner(canonical: &str) -> Option<String> {
+    let rest = canonical.strip_prefix("github.com/")?;
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    // A well-formed canonical also has a non-empty repo segment and nothing
+    // after it; a malformed shape (missing repo, or extra segments) is not a
+    // resolvable owner.
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    let _ = repo;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
 /// Wrap each planned [`OutboxMutation`] in a fresh `Pending` [`OutboxEntry`]
 /// for `task_id`, preserving the plan's order (the outbox is per-task FIFO, so
 /// order is load-bearing — e.g. `UpdateDraftIssue` must precede
@@ -1348,8 +1471,9 @@ mod tests {
     use super::*;
     use ports::TaskSnapshotRepository;
     use testing_fixtures::{
-        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRepoBindingRepository,
-        InMemoryTaskRepository, InMemoryTaskSnapshotRepository, InMemoryWorkspaceRepository,
+        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryProjectRepository,
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryTaskSnapshotRepository,
+        InMemoryWorkspaceRepository,
     };
 
     fn svc() -> TaskService {
@@ -1375,6 +1499,7 @@ mod tests {
             bindings.clone() as Arc<dyn RepoBindingRepository>,
             workspaces,
             projects,
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         (svc, bindings)
     }
@@ -1393,7 +1518,14 @@ mod tests {
             Arc::new(InMemoryRepoBindingRepository::new());
         let workspaces: Arc<dyn WorkspaceRepository> = Arc::new(InMemoryWorkspaceRepository::new());
         let projects: Arc<dyn ProjectRepository> = Arc::new(InMemoryProjectRepository::new());
-        let svc = TaskService::new(repo, snaps, bindings, workspaces, projects);
+        let svc = TaskService::new(
+            repo,
+            snaps,
+            bindings,
+            workspaces,
+            projects,
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+        );
         (svc, outbox)
     }
 
@@ -1455,6 +1587,7 @@ mod tests {
                 priority: Some("p0".into()),
                 assignees: Some(vec!["alice".into()]),
                 repo_id: None,
+                issue_type: None,
             })
             .await
             .unwrap();
@@ -2024,6 +2157,7 @@ mod tests {
             bindings,
             Arc::new(InMemoryWorkspaceRepository::new()),
             Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         let dto = svc
             .create(CreateTaskCmd {
@@ -2091,6 +2225,7 @@ mod tests {
             bindings,
             Arc::new(InMemoryWorkspaceRepository::new()),
             Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
         let dto = svc
             .create(CreateTaskCmd {
@@ -2145,6 +2280,7 @@ mod tests {
             bindings_repo.clone(),
             Arc::new(InMemoryWorkspaceRepository::new()),
             Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
 
         let workspace_id = WorkspaceId::new();
@@ -2201,6 +2337,7 @@ mod tests {
             bindings_repo,
             Arc::new(InMemoryWorkspaceRepository::new()),
             Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
 
         let workspace_id = WorkspaceId::new();
@@ -2240,6 +2377,7 @@ mod tests {
             bindings_repo.clone(),
             Arc::new(InMemoryWorkspaceRepository::new()),
             Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
 
         let workspace_id = WorkspaceId::new();
@@ -2313,6 +2451,7 @@ mod tests {
         workspaces: Arc<InMemoryWorkspaceRepository>,
         projects: Arc<InMemoryProjectRepository>,
         bindings: Arc<InMemoryRepoBindingRepository>,
+        org_issue_types: Arc<InMemoryOrgIssueTypeRepository>,
     }
 
     fn rich_svc() -> RichSvc {
@@ -2323,12 +2462,14 @@ mod tests {
         let bindings = Arc::new(InMemoryRepoBindingRepository::new());
         let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
         let projects = Arc::new(InMemoryProjectRepository::new());
+        let org_issue_types = Arc::new(InMemoryOrgIssueTypeRepository::new());
         let svc = TaskService::new(
             repo.clone(),
             snaps,
             bindings.clone(),
             workspaces.clone(),
             projects.clone(),
+            org_issue_types.clone(),
         );
         RichSvc {
             svc,
@@ -2337,6 +2478,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            org_issue_types,
         }
     }
 
@@ -2525,6 +2667,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_atomic");
         projects.save(&project).await.unwrap();
@@ -2591,6 +2734,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -2641,6 +2785,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -2682,6 +2827,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -2787,6 +2933,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_block");
         projects.save(&project).await.unwrap();
@@ -2892,6 +3039,7 @@ mod tests {
             priority: Some("p0".into()),
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -2992,6 +3140,7 @@ mod tests {
             priority: Some("p1".into()),
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3054,6 +3203,7 @@ mod tests {
             priority: Some("p2".into()),
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3122,6 +3272,7 @@ mod tests {
             priority: Some("p2".into()),
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3129,6 +3280,232 @@ mod tests {
         assert!(
             outbox.all().is_empty(),
             "priority unmapped on the board — warn, don't enqueue"
+        );
+    }
+
+    // --- issue type mutation matrix (RFC 0006 §0 A1 / #228) -----------------
+
+    fn bug_registry(owner: &str) -> domain_project::OrgIssueTypeRegistry {
+        domain_project::OrgIssueTypeRegistry::new(
+            owner,
+            vec![domain_project::OrgIssueType {
+                issue_type_id: "IT_bug".into(),
+                name: "Bug".into(),
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn issue_type_change_on_attached_mirror_enqueues_only_set_issue_type() {
+        // RFC 0006 §0 A1 / #228: a type edit on a Synced issue-backed mirror
+        // enqueues exactly one SetIssueType, NO UpdateRemote, and the
+        // issue-axis sync_state stays Synced — type is an off-axis GraphQL
+        // projection, entirely separate from the issue mirror (mirrors
+        // `priority_edit_on_board_attached_mirror_enqueues_only_set_project_priority`).
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            org_issue_types,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_type_nid"), Some("PVTI_type")).await;
+        t.repo_id = Some(instance.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("bug".into())),
+        })
+        .await
+        .unwrap();
+
+        let all = outbox.all();
+        assert_eq!(
+            all.len(),
+            1,
+            "exactly one outbox entry — the type projection: {all:?}"
+        );
+        match &all[0].mutation {
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            } => {
+                assert_eq!(issue_node_id, "I_type_nid");
+                assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.sync,
+            SyncState::Synced,
+            "a type change must never flip the issue-axis sync_state"
+        );
+        assert!(
+            reloaded.diff_against_baseline().is_empty(),
+            "issue_type must never appear in the issue-mirror diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_type_edit_with_unavailable_registry_warns_and_enqueues_nothing() {
+        // No registry saved for the owner — `InMemoryOrgIssueTypeRepository::get`
+        // returns an empty (unavailable) registry, mirroring the D8 no-error
+        // contract. Must warn, not enqueue.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+
+        let mut t =
+            save_issue_mirror(&repo, ws.id, Some("I_unavail_nid"), Some("PVTI_unavail")).await;
+        t.repo_id = Some(instance.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("bug".into())),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "native issue types unavailable for this owner — warn, don't enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_type_edit_unmapped_warns_and_enqueues_nothing() {
+        // The registry has entries, but none match the edited name — TypeUnmapped.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            org_issue_types,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+
+        let mut t =
+            save_issue_mirror(&repo, ws.id, Some("I_unmapped_nid"), Some("PVTI_unmapped")).await;
+        t.repo_id = Some(instance.id);
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("Epic".into())),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "no registry match for \"Epic\" — warn, don't enqueue (TypeUnmapped)"
+        );
+    }
+
+    #[tokio::test]
+    async fn issue_type_noop_reset_enqueues_nothing() {
+        // Re-setting the SAME type is a domain no-op (`Task::set_issue_type`
+        // short-circuits on equality) — `issue_type_before == t.issue_type`
+        // after the edit, so the service must plan nothing.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            org_issue_types,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+
+        let mut t = save_issue_mirror(&repo, ws.id, Some("I_noop_nid"), Some("PVTI_noop")).await;
+        t.repo_id = Some(instance.id);
+        t.set_issue_type(Some(domain_task::IssueType::Bug));
+        repo.save(&t, SnapshotSource::Promote).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("bug".into())),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "re-setting the same issue type is a no-op — nothing to enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_only_task_issue_type_edit_enqueues_nothing() {
+        let RichSvc { svc, outbox, .. } = rich_svc();
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "local".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: None,
+            })
+            .await
+            .unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: dto.id.clone(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("bug".into())),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "LocalOnly tasks enqueue nothing regardless of issue_type edits"
         );
     }
 
@@ -3506,6 +3883,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3566,6 +3944,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3645,6 +4024,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3753,6 +4133,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3773,6 +4154,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .expect("second edit must not error on an already-recorded filing repo");
@@ -3844,6 +4226,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3927,6 +4310,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -3993,6 +4377,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();
@@ -4019,6 +4404,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_lazy");
         projects.save(&project).await.unwrap();
@@ -4062,6 +4448,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_d2_issue");
         projects.save(&project).await.unwrap();
@@ -4119,6 +4506,7 @@ mod tests {
             workspaces,
             projects: _,
             bindings,
+            ..
         } = rich_svc();
 
         // No project on the workspace, so the only enqueued mutation is the
@@ -4244,6 +4632,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_d2_ws_default");
         projects.save(&project).await.unwrap();
@@ -4324,6 +4713,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_d2_attached");
         projects.save(&project).await.unwrap();
@@ -4456,6 +4846,7 @@ mod tests {
             workspaces,
             projects,
             bindings,
+            ..
         } = rich_svc();
         let project = test_project("PVT_kwHO_d2_repeat");
         projects.save(&project).await.unwrap();
@@ -4524,6 +4915,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            issue_type: None,
         })
         .await
         .unwrap();

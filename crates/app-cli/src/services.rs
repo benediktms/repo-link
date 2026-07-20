@@ -78,6 +78,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             bindings_repo.clone(),
             workspaces_repo.clone(),
             projects_repo.clone(),
+            org_issue_types_repo.clone(),
         ),
         query: QueryService::new(
             workspaces_repo.clone(),

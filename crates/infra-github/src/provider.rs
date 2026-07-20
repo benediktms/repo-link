@@ -284,4 +284,14 @@ impl RemoteProjectProvider for GithubAdapter {
     async fn fetch_org_issue_types(&self, owner_login: &str) -> PortResult<Vec<RemoteIssueType>> {
         self.graphql.fetch_org_issue_types(owner_login).await
     }
+
+    async fn set_issue_type(
+        &self,
+        issue_node_id: &str,
+        issue_type_id: Option<&str>,
+    ) -> PortResult<()> {
+        self.graphql
+            .set_issue_type(issue_node_id, issue_type_id)
+            .await
+    }
 }

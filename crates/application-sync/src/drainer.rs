@@ -620,6 +620,30 @@ impl OutboxDrainer {
                     Err(e) => Ok(ApplyDisposition::Retry(e.into())),
                 }
             }
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            } => {
+                // GraphQL `updateIssue(input: { id, issueTypeId })` — the
+                // native issue-level "Type" field (RFC 0006 §0 A1 / #228).
+                // Deliberately off the issue-mirror axis (NOT `MIRRORED_FIELDS`
+                // / `MirrorPatch`), so this arm never touches `sync_state` and
+                // never writes back to the task: the outbox entry itself is
+                // the durable retry unit. There is also NO read-back
+                // comparison — `GraphqlClient::set_issue_type` doesn't fetch
+                // the applied value back — so unlike `SetProjectStatus` there
+                // is no `Conflict` disposition available here at all, an
+                // asymmetry deliberately shared with `SetProjectPriority`: any
+                // `Ok` is Stamped, any transient provider error retries.
+                match self
+                    .remote_projects
+                    .set_issue_type(issue_node_id, issue_type_id.as_deref())
+                    .await
+                {
+                    Ok(()) => Ok(ApplyDisposition::Stamped),
+                    Err(e) => Ok(ApplyDisposition::Retry(e.into())),
+                }
+            }
             // Relation-sync arms (#95/#96). These address the GitHub-native
             // primitives directly via REST; the adapter resolves the *related*
             // issue's integer db id at apply time (the entry carries only the
@@ -2872,6 +2896,134 @@ mod tests {
                 item_node_id: "PVTI_y".into(),
                 priority_field_id: "PVTSSF_prio".into(),
                 option_id: "p0".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let dead = h.outbox.list_dead_lettered().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].status, OutboxStatus::Failed);
+    }
+
+    // --- SetIssueType (RFC 0006 §0 A1 / #228) --------------------------------
+
+    /// `SetIssueType` calls `set_issue_type` with the issue node id and the
+    /// resolved `issue_type_id`, and any `Ok` stamps — no read-back comparison
+    /// exists for this arm at all (unlike `SetProjectPriority`, which reads
+    /// back and just chooses not to Conflict on a mismatch).
+    #[tokio::test]
+    async fn set_issue_type_calls_provider_with_node_id_and_stamps() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetIssueType {
+                issue_node_id: "I_9".into(),
+                issue_type_id: Some("IT_bug".into()),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+
+        let calls = h.remote_projects.calls();
+        let call = calls
+            .iter()
+            .find(|c| matches!(c, ProjectCall::SetIssueType { .. }))
+            .expect("one SetIssueType call recorded");
+        match call {
+            ProjectCall::SetIssueType {
+                issue_node_id,
+                issue_type_id,
+            } => {
+                assert_eq!(issue_node_id, "I_9");
+                assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+        assert_ne!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict,
+            "SetIssueType must never flip the issue-axis sync_state — there is no read-back at all"
+        );
+    }
+
+    /// `issue_type_id: None` (a clear) drains through to the provider as
+    /// `None` — the clearing shape must not get lost between the outbox row
+    /// and the port call.
+    #[tokio::test]
+    async fn set_issue_type_clear_drains_issue_type_id_none() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetIssueType {
+                issue_node_id: "I_9".into(),
+                issue_type_id: None,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+
+        let calls = h.remote_projects.calls();
+        match calls
+            .iter()
+            .find(|c| matches!(c, ProjectCall::SetIssueType { .. }))
+            .expect("one SetIssueType call recorded")
+        {
+            ProjectCall::SetIssueType { issue_type_id, .. } => {
+                assert_eq!(
+                    issue_type_id, &None,
+                    "a clear must drain as None, not a stringified sentinel"
+                );
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_issue_type_err_under_cap_reschedules() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        h.remote_projects.fail_next(1);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetIssueType {
+                issue_node_id: "I_9".into(),
+                issue_type_id: Some("IT_bug".into()),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let all = h.outbox.all();
+        assert_eq!(all[0].status, OutboxStatus::Pending, "back to pending");
+        assert_eq!(all[0].attempts, 1, "attempts bumped");
+    }
+
+    #[tokio::test]
+    async fn set_issue_type_err_at_cap_dead_letters() {
+        let h = harness(test_backoff(1)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        h.remote_projects.fail_next(1);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetIssueType {
+                issue_node_id: "I_9".into(),
+                issue_type_id: Some("IT_bug".into()),
             },
         );
         h.outbox.enqueue(&entry).await.unwrap();

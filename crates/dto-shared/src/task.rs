@@ -127,6 +127,16 @@ pub struct UpdateTaskCmd {
     /// service rejects reassigning a synced task. There is no way to *clear*
     /// the repo via update (matches the assignees gap).
     pub repo_id: Option<String>,
+    /// Set-or-clear the task's local extensible issue type (RFC 0006 D7 /
+    /// #228). Outer `None` = leave unchanged; `Some(None)` = clear;
+    /// `Some(Some(name))` = set, parsed infallibly and case-insensitively via
+    /// `IssueType::from` (unknown → a verbatim custom type). If the task is a
+    /// mirror, a real change is projected onto the GitHub issue's native Type
+    /// field — an off-axis GraphQL `updateIssue` projection (RFC 0006 §0 A1),
+    /// never the issue-mirror PATCH. `rl task edit`'s `--type`/`--clear-type`
+    /// are the CLI surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<Option<String>>,
 }
 
 /// Materialise a remote issue as a local mirror task (`sync import`). The
