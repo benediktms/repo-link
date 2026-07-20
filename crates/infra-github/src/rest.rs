@@ -52,6 +52,17 @@ impl RestClient {
         Ok(map_issue(issue))
     }
 
+    pub(crate) async fn resolve_repo_node_id(&self, canonical_repo: &str) -> PortResult<String> {
+        let (owner, repo) = split_owner_repo(canonical_repo)?;
+        self.http
+            .repos(owner, repo)
+            .get()
+            .await
+            .map_err(map_err)?
+            .node_id
+            .ok_or_else(|| PortError::Backend(format!("{canonical_repo} returned no node id")))
+    }
+
     pub(crate) async fn update_issue(
         &self,
         cmd: RemoteTaskUpdate<'_>,

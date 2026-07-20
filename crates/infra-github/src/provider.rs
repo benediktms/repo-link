@@ -251,10 +251,17 @@ impl RemoteProjectProvider for GithubAdapter {
     async fn convert_draft_to_issue(
         &self,
         item_node_id: &str,
-        repo_node_id: &str,
+        repo_ref: &str,
     ) -> PortResult<(String, u64)> {
+        // New entries carry the filing canonical; tolerate node IDs from old
+        // persisted entries while they drain.
+        let repo_node_id = if repo_ref.starts_with("github.com/") {
+            self.rest.resolve_repo_node_id(repo_ref).await?
+        } else {
+            repo_ref.to_owned()
+        };
         self.graphql
-            .convert_draft_to_issue(item_node_id, repo_node_id)
+            .convert_draft_to_issue(item_node_id, &repo_node_id)
             .await
     }
 
