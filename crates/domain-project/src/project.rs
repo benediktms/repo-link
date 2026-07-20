@@ -177,6 +177,13 @@ impl Project {
             .find(|f| f.kind == ProjectFieldKind::Priority)
     }
 
+    /// The Priority field's `PVTSSF_…` node id, if the project has a Priority
+    /// field. Mirrors [`Self::status_field_id`]; `None` means Priority sync is
+    /// unavailable for this board (RFC 0006 D3 opt-in).
+    pub fn priority_field_id(&self) -> Option<&str> {
+        self.priority_field().map(|f| f.field_id.as_str())
+    }
+
     /// The Priority field's option catalog (empty slice when there is no
     /// Priority field).
     pub fn priority_options(&self) -> &[FieldOption] {
@@ -710,6 +717,26 @@ mod tests {
         // P2/P3 were not mapped here → None (opt-in, no fabricated fallback).
         assert_eq!(p.resolved_priority_option_id_for(Priority::P2), None);
         assert_eq!(p.priority_options().len(), 2);
+        assert_eq!(p.priority_field_id(), Some("PVTSSF_prio"));
+    }
+
+    #[test]
+    fn priority_field_id_is_none_without_a_priority_field() {
+        // A board with only a Status field (the common case, D3 opt-in) has
+        // no Priority field id to project onto.
+        let p = Project::from_fields(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            vec![status_field("PVTSSF_s", vec![opt("o1", "Backlog", 0)])],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(p.priority_field_id(), None);
     }
 
     #[test]

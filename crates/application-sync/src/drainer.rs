@@ -561,7 +561,12 @@ impl OutboxDrainer {
             } => {
                 let applied = match self
                     .remote_projects
-                    .set_status(project_node_id, item_node_id, status_field_id, option_id)
+                    .set_single_select_option(
+                        project_node_id,
+                        item_node_id,
+                        status_field_id,
+                        option_id,
+                    )
                     .await
                 {
                     Ok(a) => a,
@@ -576,6 +581,43 @@ impl OutboxDrainer {
                     Ok(ApplyDisposition::Conflict(
                         ConflictKind::ProjectStatusMismatch,
                     ))
+                }
+            }
+            OutboxMutation::SetProjectPriority {
+                project_node_id,
+                item_node_id,
+                priority_field_id,
+                option_id,
+            } => {
+                // Same wire mutation as `SetProjectStatus` (a field-agnostic
+                // `updateProjectV2ItemFieldValue`), but a DIFFERENT read-back
+                // disposition (RFC 0006 D4): a mismatch here does NOT flip the
+                // task to `SyncState::Conflict`. Priority is an outbound-only
+                // *projection* onto the board (like Status, RFC 0006 D4 / RFC
+                // 0004 D7) — but unlike Status it does not gate the issue-axis
+                // sync state at all, so a disagreeing board value must never
+                // contaminate `sync_state`. Ok → Stamped regardless of the
+                // read-back *value* (we never compare applied vs sent, so a
+                // mismatch can't Conflict); only a transient provider error
+                // retries. Note a *wholly-missing* read-back value is surfaced
+                // by the adapter as a transient `Backend` error (not `Ok`), so
+                // it retries here exactly as it does for `SetProjectStatus` —
+                // that is a shared adapter behaviour, not a priority-specific
+                // rule. This asymmetry with `SetProjectStatus` (no Conflict on a
+                // value mismatch) is deliberate — see the `SetProjectPriority`
+                // outbox variant doc.
+                match self
+                    .remote_projects
+                    .set_single_select_option(
+                        project_node_id,
+                        item_node_id,
+                        priority_field_id,
+                        option_id,
+                    )
+                    .await
+                {
+                    Ok(_applied) => Ok(ApplyDisposition::Stamped),
+                    Err(e) => Ok(ApplyDisposition::Retry(e.into())),
                 }
             }
             // Relation-sync arms (#95/#96). These address the GitHub-native
@@ -718,11 +760,18 @@ impl OutboxDrainer {
         Ok(project.id.as_str() == project_node_id)
     }
 
-    /// Enqueue the `SetProjectStatus` that follows an `AddItem` /
-    /// `CreateDraftIssue` once we know the item id. Resolves the project from
-    /// the task's workspace and maps the current lifecycle status to an option
-    /// (Blocked-with-no-matching-option falls back to the Open option, per RFC
-    /// §3). No-op when the workspace has no project or no option resolves.
+    /// Enqueue the `SetProjectStatus` (and, when the board has one, a sibling
+    /// `SetProjectPriority`) that follow an `AddItem` / `CreateDraftIssue` once
+    /// we know the item id. Resolves the project from the task's workspace and
+    /// maps the current lifecycle status to an option (Blocked-with-no-matching
+    /// option falls back to the Open option, per RFC §3). No-op on either
+    /// projection when the workspace has no project or no option resolves.
+    ///
+    /// Folding the Priority follow-up in here (RFC 0006 D4) mirrors Status:
+    /// a task's first-board-filing should carry BOTH its lifecycle column and
+    /// its priority column onto the new card in one go, same as an
+    /// already-attached task's lifecycle/priority edits each enqueue their own
+    /// projection independently.
     async fn enqueue_status_follow_up(
         &self,
         task_id: domain_core::TaskId,
@@ -735,24 +784,49 @@ impl OutboxDrainer {
             return Ok(());
         };
         let project = self.projects.get(project_id).await?;
+        // Cross-project guard: `project_node_id` is the board this in-flight
+        // AddItem/CreateDraftIssue targeted, but `project` is the workspace's
+        // *current* project. If the workspace moved projects while the entry was
+        // queued, the two differ — and combining the old board's node id with
+        // the new project's field/option ids yields an invalid payload that
+        // Backend-errors, retries, and dead-letters. Skip: the move re-attaches
+        // on the new board with its own follow-up. (Pre-existing for Status;
+        // #225 widened the blast radius to the priority projection.)
+        if project.id.as_str() != project_node_id {
+            tracing::debug!(
+                task_id = %task_id,
+                stale_project = project_node_id,
+                current_project = %project.id,
+                "workspace moved projects since attach; skipping stale status/priority follow-up"
+            );
+            return Ok(());
+        }
         // No Status field → nothing to project onto (parallels the no-option
         // early return below).
-        let Some(status_field_id) = project.status_field_id() else {
-            return Ok(());
-        };
-        let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open()) else {
-            return Ok(());
-        };
-        let entry = OutboxEntry::new(
-            task_id,
-            OutboxMutation::SetProjectStatus {
-                project_node_id: project_node_id.to_string(),
-                item_node_id: item_id.to_string(),
-                status_field_id: status_field_id.to_string(),
-                option_id: option_id.to_string(),
-            },
-        );
-        self.outbox.enqueue(&entry).await?;
+        if let Some(status_field_id) = project.status_field_id()
+            && let Some(option_id) = crate::board_option_for_lifecycle(&project, task.is_open())
+        {
+            let entry = OutboxEntry::new(
+                task_id,
+                OutboxMutation::SetProjectStatus {
+                    project_node_id: project_node_id.to_string(),
+                    item_node_id: item_id.to_string(),
+                    status_field_id: status_field_id.to_string(),
+                    option_id: option_id.to_string(),
+                },
+            );
+            self.outbox.enqueue(&entry).await?;
+        }
+        // Priority follow-up (RFC 0006 D4): opt-in per project, so a board
+        // with no Priority field or no mapping for this task's priority
+        // simply enqueues nothing here — no warning, since this is a
+        // best-effort convenience on first attach, not a user-initiated
+        // priority edit (that path's `PriorityFieldMissing` warning lives in
+        // `application-task::TaskService`).
+        if let Some(mutation) = crate::enqueue::set_project_priority_mutation(&project, &task) {
+            let entry = OutboxEntry::new(task_id, mutation);
+            self.outbox.enqueue(&entry).await?;
+        }
         Ok(())
     }
 }
@@ -878,6 +952,159 @@ mod tests {
             Timestamp::now(),
         )
         .unwrap()
+    }
+
+    /// Sibling of [`project_with_options`] with a Priority field + one
+    /// mapping added, for the `enqueue_status_follow_up` priority-follow-up
+    /// test (RFC 0006 D4 / #225).
+    fn project_with_status_and_priority() -> Project {
+        Project::from_fields(
+            ProjectId::parse("PVT_kwHO_drainer_prio").unwrap(),
+            "acme".into(),
+            3,
+            "Board".into(),
+            vec![
+                domain_project::ProjectField {
+                    field_id: "PVTSSF_field".into(),
+                    name: "Status".into(),
+                    kind: domain_project::ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o_backlog".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                domain_project::ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: domain_project::ProjectFieldKind::Priority,
+                    options: vec![FieldOption {
+                        option_id: "p3".into(),
+                        name: "P3".into(),
+                        ordinal: 0,
+                    }],
+                },
+            ],
+            vec![StatusMapping {
+                is_open: true,
+                option_id: "o_backlog".into(),
+            }],
+            vec![domain_project::PriorityMapping {
+                priority: domain_task::Priority::P3,
+                option_id: "p3".into(),
+            }],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn add_item_write_back_also_enqueues_priority_follow_up() {
+        // RFC 0006 D4 / #225: first-board-filing should carry BOTH the
+        // lifecycle column (SetProjectStatus) AND the priority column
+        // (SetProjectPriority) onto the new card in one go.
+        let h = harness(test_backoff(5)).await;
+
+        let project = project_with_status_and_priority();
+        h.projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        h.workspaces.save(&ws).await.unwrap();
+
+        let mut task = Task::new_draft(ws.id, None, "attach me".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "9".into(),
+            node_id: Some("I_9".into()),
+        })
+        .unwrap();
+        // Default Priority is P3 (see `domain_task::Task::new_draft`), which is
+        // mapped on this board — no explicit `set_priority` call needed.
+        h.tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        h.remote_projects.set_add_item_returns("PVTI_new");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddItem {
+                project_node_id: project.id.as_str().to_string(),
+                issue_node_id: "I_9".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let calls = h.remote_projects.calls();
+        let priority_calls: Vec<&ProjectCall> = calls
+            .iter()
+            .filter(
+                |c| matches!(c, ProjectCall::SetSingleSelectOption { field_id, .. } if field_id == "PVTSSF_prio"),
+            )
+            .collect();
+        assert_eq!(
+            priority_calls.len(),
+            1,
+            "the first attach must also enqueue+drain a SetProjectPriority: {calls:?}"
+        );
+        match priority_calls[0] {
+            ProjectCall::SetSingleSelectOption { option_id, .. } => {
+                assert_eq!(option_id, "p3");
+            }
+            other => panic!("expected SetSingleSelectOption, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_item_write_back_skips_follow_up_when_workspace_moved_projects() {
+        // The workspace's current project is B, but an in-flight AddItem targets
+        // an OLD board A (the workspace moved projects while it was queued). The
+        // follow-up must NOT project B's field/option ids onto board A (invalid
+        // payload → Backend error → dead-letter); it skips entirely.
+        let h = harness(test_backoff(5)).await;
+
+        let project = project_with_status_and_priority(); // board B (current)
+        h.projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        h.workspaces.save(&ws).await.unwrap();
+
+        let mut task = Task::new_draft(ws.id, None, "moved".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        task.promote_to_remote(RemoteRef {
+            provider: "github".into(),
+            remote_id: "9".into(),
+            node_id: Some("I_9".into()),
+        })
+        .unwrap();
+        h.tasks.save(&task, SnapshotSource::Promote).await.unwrap();
+
+        h.remote_projects.set_add_item_returns("PVTI_new");
+
+        // AddItem targets the OLD board A, distinct from the workspace's current
+        // project B.
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::AddItem {
+                project_node_id: "PVT_old_board_A".into(),
+                issue_node_id: "I_9".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let calls = h.remote_projects.calls();
+        let projections = calls
+            .iter()
+            .filter(|c| matches!(c, ProjectCall::SetSingleSelectOption { .. }))
+            .count();
+        assert_eq!(
+            projections, 0,
+            "workspace moved projects — no status/priority follow-up must be projected: {calls:?}"
+        );
     }
 
     #[tokio::test]
@@ -1389,7 +1616,7 @@ mod tests {
         );
         assert!(calls.iter().any(|c| matches!(
             c,
-            ProjectCall::SetStatus { option_id, .. } if option_id == "o_backlog"
+            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id == "o_backlog"
         )));
     }
 
@@ -1453,7 +1680,7 @@ mod tests {
         assert!(
             !calls
                 .iter()
-                .any(|c| matches!(c, ProjectCall::SetStatus { .. })),
+                .any(|c| matches!(c, ProjectCall::SetSingleSelectOption { .. })),
             "no SetProjectStatus follow-up after a detached AddItem"
         );
         assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
@@ -2064,7 +2291,7 @@ mod tests {
         );
         assert!(calls.iter().any(|c| matches!(
             c,
-            ProjectCall::SetStatus { option_id, .. } if option_id == "o_backlog"
+            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id == "o_backlog"
         )));
     }
 
@@ -2470,7 +2697,8 @@ mod tests {
         let ws = WorkspaceId::new();
         let task = seed_issue_task(&h, ws, "1").await;
 
-        h.remote_projects.set_set_status_returns("o_wrong");
+        h.remote_projects
+            .set_single_select_option_returns("o_wrong");
 
         let entry = OutboxEntry::new(
             task.id,
@@ -2517,6 +2745,142 @@ mod tests {
             h.tasks.get(task.id).await.unwrap().sync,
             SyncState::Conflict
         );
+    }
+
+    // --- SetProjectPriority (RFC 0006 D4 / #225) -----------------------------
+
+    /// `SetProjectPriority` drives `set_single_select_option` with the
+    /// PRIORITY field id — distinct from Status's field id — and a matching
+    /// option resolves to `Stamped`.
+    #[tokio::test]
+    async fn set_project_priority_drives_priority_field_id_and_stamps() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectPriority {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                priority_field_id: "PVTSSF_prio".into(),
+                option_id: "p0".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+
+        let calls = h.remote_projects.calls();
+        let call = calls
+            .iter()
+            .find(|c| matches!(c, ProjectCall::SetSingleSelectOption { .. }))
+            .expect("one SetSingleSelectOption call recorded");
+        match call {
+            ProjectCall::SetSingleSelectOption {
+                field_id,
+                option_id,
+                ..
+            } => {
+                assert_eq!(
+                    field_id, "PVTSSF_prio",
+                    "the priority projection must target the Priority field id, not Status"
+                );
+                assert_eq!(option_id, "p0");
+            }
+            other => panic!("expected SetSingleSelectOption, got {other:?}"),
+        }
+    }
+
+    /// The core asymmetry with `SetProjectStatus` (RFC 0006 D4): a read-back
+    /// mismatch on Priority must NOT flip the task to `Conflict` — it still
+    /// stamps. A board disagreement on the Priority projection must never
+    /// contaminate the issue-axis sync state.
+    #[tokio::test]
+    async fn set_project_priority_read_back_mismatch_does_not_conflict() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+
+        // Force the fixture to echo a DIFFERENT option than requested — the
+        // same knob `SetProjectStatus`'s conflict test uses, but here it must
+        // NOT produce a conflict.
+        h.remote_projects
+            .set_single_select_option_returns("p_wrong");
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectPriority {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                priority_field_id: "PVTSSF_prio".into(),
+                option_id: "p0".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(
+            h.drainer.drain_once().await.unwrap(),
+            1,
+            "a priority read-back mismatch still stamps — no Conflict path"
+        );
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+        assert_ne!(
+            h.tasks.get(task.id).await.unwrap().sync,
+            SyncState::Conflict,
+            "SetProjectPriority must never flip the issue-axis sync_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_project_priority_err_under_cap_reschedules() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        h.remote_projects.fail_next(1);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectPriority {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                priority_field_id: "PVTSSF_prio".into(),
+                option_id: "p0".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let all = h.outbox.all();
+        assert_eq!(all[0].status, OutboxStatus::Pending, "back to pending");
+        assert_eq!(all[0].attempts, 1, "attempts bumped");
+    }
+
+    #[tokio::test]
+    async fn set_project_priority_err_at_cap_dead_letters() {
+        let h = harness(test_backoff(1)).await;
+        let ws = WorkspaceId::new();
+        let task = seed_issue_task(&h, ws, "1").await;
+        h.remote_projects.fail_next(1);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectPriority {
+                project_node_id: "PVT_x".into(),
+                item_node_id: "PVTI_y".into(),
+                priority_field_id: "PVTSSF_prio".into(),
+                option_id: "p0".into(),
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        h.drainer.drain_once().await.unwrap();
+
+        let dead = h.outbox.list_dead_lettered().await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].status, OutboxStatus::Failed);
     }
 
     /// The relation-sync arms have no response body — a transient error is the

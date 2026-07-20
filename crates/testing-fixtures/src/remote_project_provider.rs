@@ -33,10 +33,14 @@ pub enum ProjectCall {
         item_node_id: String,
         repo_node_id: String,
     },
-    SetStatus {
+    /// One `set_single_select_option` invocation (RFC 0006 D4). Field-agnostic
+    /// on the wire — `field_id` is whichever single-select was targeted
+    /// (Status or Priority); tests distinguish by comparing `field_id`
+    /// against the project's known Status/Priority field ids.
+    SetSingleSelectOption {
         project_node_id: String,
         item_node_id: String,
-        status_field_id: String,
+        field_id: String,
         option_id: String,
     },
     /// One `poll_project_items` invocation. The poller's tests assert the
@@ -58,10 +62,11 @@ pub struct InMemoryRemoteProjectProvider {
     create_draft_returns: Mutex<Option<String>>,
     /// Issue node id + REST `number` `convert_draft_to_issue` returns.
     convert_returns: Mutex<Option<(String, u64)>>,
-    /// Applied `option_id` `set_status` reads back. `None` (default) echoes the
-    /// sent option id (the success case GitHub returns); set it to a DIFFERENT
-    /// id to drive the drainer's status-conflict tripwire.
-    set_status_returns: Mutex<Option<String>>,
+    /// Applied `option_id` `set_single_select_option` reads back. `None`
+    /// (default) echoes the sent option id (the success case GitHub
+    /// returns); set it to a DIFFERENT id to drive the drainer's
+    /// status-conflict tripwire.
+    set_single_select_option_returns: Mutex<Option<String>>,
     /// Fail the next N mutation calls with a transient backend error before
     /// any succeed. Each failing call decrements the counter. Lets a test
     /// drive "Err under cap → reschedule" and "Err at cap → dead-letter".
@@ -102,11 +107,13 @@ impl InMemoryRemoteProjectProvider {
         *self.convert_returns.lock().unwrap() = Some((id.to_string(), number));
     }
 
-    /// Override the `option_id` `set_status` reads back, simulating a remote
-    /// that applied a DIFFERENT option than requested. Drives the drainer's
-    /// `SetProjectStatus` → `Conflict` tripwire.
-    pub fn set_set_status_returns(&self, option_id: &str) {
-        *self.set_status_returns.lock().unwrap() = Some(option_id.to_string());
+    /// Override the `option_id` `set_single_select_option` reads back,
+    /// simulating a remote that applied a DIFFERENT option than requested.
+    /// Drives the drainer's `SetProjectStatus` → `Conflict` tripwire (Priority
+    /// deliberately has no such tripwire — see the drainer's
+    /// `SetProjectPriority` arm).
+    pub fn set_single_select_option_returns(&self, option_id: &str) {
+        *self.set_single_select_option_returns.lock().unwrap() = Some(option_id.to_string());
     }
 
     /// Make the next `n` mutation calls fail with a transient error.
@@ -239,26 +246,32 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
             .unwrap_or_else(|| ("I_converted".to_string(), 1)))
     }
 
-    async fn set_status(
+    async fn set_single_select_option(
         &self,
         project_node_id: &str,
         item_node_id: &str,
-        status_field_id: &str,
+        field_id: &str,
         option_id: &str,
     ) -> PortResult<String> {
         if self.should_fail() {
-            return Err(PortError::Backend("stub: set_status transient".into()));
+            return Err(PortError::Backend(
+                "stub: set_single_select_option transient".into(),
+            ));
         }
-        self.calls.lock().unwrap().push(ProjectCall::SetStatus {
-            project_node_id: project_node_id.to_string(),
-            item_node_id: item_node_id.to_string(),
-            status_field_id: status_field_id.to_string(),
-            option_id: option_id.to_string(),
-        });
+        self.calls
+            .lock()
+            .unwrap()
+            .push(ProjectCall::SetSingleSelectOption {
+                project_node_id: project_node_id.to_string(),
+                item_node_id: item_node_id.to_string(),
+                field_id: field_id.to_string(),
+                option_id: option_id.to_string(),
+            });
         // Default: echo the requested option (the remote applied it). A test
-        // can override via `set_set_status_returns` to force a mismatch.
+        // can override via `set_single_select_option_returns` to force a
+        // mismatch.
         Ok(self
-            .set_status_returns
+            .set_single_select_option_returns
             .lock()
             .unwrap()
             .clone()

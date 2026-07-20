@@ -1690,7 +1690,7 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(
+        async fn set_single_select_option(
             &self,
             _: &str,
             _: &str,
@@ -1740,7 +1740,7 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(
+        async fn set_single_select_option(
             &self,
             _: &str,
             _: &str,
@@ -1788,7 +1788,7 @@ mod tests {
         async fn convert_draft_to_issue(&self, _: &str, _: &str) -> PortResult<(String, u64)> {
             Ok(("I_x".into(), 1))
         }
-        async fn set_status(
+        async fn set_single_select_option(
             &self,
             _: &str,
             _: &str,

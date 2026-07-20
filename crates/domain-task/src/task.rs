@@ -562,8 +562,15 @@ impl Task {
         taken
     }
 
-    /// Priority is **local-only metadata**: GitHub doesn't model it, so a
-    /// priority change does NOT flip sync state.
+    /// Set the local `Priority`. Unlike a title/body/assignee edit, this does
+    /// NOT flip `sync_state` — priority is projected outbound onto the
+    /// project-item board rail (RFC 0006 D4), never the issue mirror. It is
+    /// deliberately absent from `MIRRORED_FIELDS` / `MirrorPatch` /
+    /// `diff_against_baseline`, so a priority change must never dirty the
+    /// issue axis. `application_task::TaskService::update` is responsible for
+    /// planning the `SetProjectPriority` board projection on its own branch
+    /// when this changes a board-attached mirror's priority — that decision
+    /// lives outside the domain, which only tracks the local value here.
     pub fn set_priority(&mut self, priority: Priority) {
         if self.priority != priority {
             self.priority = priority;
@@ -1805,14 +1812,23 @@ mod tests {
     }
 
     #[test]
-    fn priority_is_local_only_and_does_not_dirty() {
+    fn priority_change_does_not_dirty_the_issue_mirror() {
+        // RFC 0006 D4: priority flips from "local-only, never synced" to a
+        // synced OUTBOUND PROJECTION — but onto the project-item board rail,
+        // never the issue mirror. A priority change on a Synced task must
+        // still leave the issue axis (`sync_state` + `diff_against_baseline`)
+        // untouched, mirroring `set_issue_type_is_local_only_and_does_not_dirty`.
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
         t.set_priority(Priority::P0);
-        // Priority isn't a remote field — no spurious DirtyLocal flip.
+        // Priority isn't a mirrored issue field — no spurious DirtyLocal flip.
         assert_eq!(t.sync, SyncState::Synced);
+        assert!(
+            t.diff_against_baseline().is_empty(),
+            "priority is not a mirrored field — the issue-mirror diff must stay empty"
+        );
     }
 
     #[test]

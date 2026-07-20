@@ -144,6 +144,33 @@ pub fn set_project_status_mutation(project: &Project, task: &Task) -> Option<Out
     })
 }
 
+/// Build the `SetProjectPriority` mutation for a task already attached to a
+/// project item, resolving the board option from the task's local `Priority`
+/// via the project's ordinal-derived mapping (RFC 0006 D3/D4). Sibling of
+/// [`set_project_status_mutation`] — same `updateProjectV2ItemFieldValue`
+/// wire mutation, a DIFFERENT field id — but deliberately planned on its own
+/// (see [`crate::OutboxDrainer`]'s `SetProjectPriority` arm and
+/// `application-task::TaskService::update`'s dedicated priority branch): it
+/// must never ride `plan_mutations`, which would fold it into the issue axis.
+///
+/// `None` when: the task isn't attached to a project item yet (no board card
+/// to carry the value), the project has no Priority field (D3 is opt-in — the
+/// caller surfaces `PriorityFieldMissing`), or the project has no mapping for
+/// this task's `Priority` (an unmapped/unlinked board).
+pub fn set_project_priority_mutation(project: &Project, task: &Task) -> Option<OutboxMutation> {
+    let item_node_id = task.project_item_id.clone()?;
+    let priority_field_id = project.priority_field_id()?.to_string();
+    let option_id = project
+        .resolved_priority_option_id_for(task.priority)?
+        .to_string();
+    Some(OutboxMutation::SetProjectPriority {
+        project_node_id: project.id.as_str().to_string(),
+        item_node_id,
+        priority_field_id,
+        option_id,
+    })
+}
+
 /// Enqueue a single mutation for `task_id`.
 pub async fn enqueue(
     outbox: &Arc<dyn OutboxRepository>,
@@ -279,8 +306,10 @@ pub fn plan_mutations(
 mod tests {
     use super::*;
     use domain_core::{ProjectId, WorkspaceId};
-    use domain_project::{FieldOption, Project, StatusMapping};
-    use domain_task::{RemoteRef, SyncState, Task};
+    use domain_project::{
+        FieldOption, PriorityMapping, Project, ProjectField, ProjectFieldKind, StatusMapping,
+    };
+    use domain_task::{Priority, RemoteRef, SyncState, Task};
 
     fn make_project(id: &str) -> Project {
         Project::new(
@@ -475,6 +504,120 @@ mod tests {
             !kinds.contains(&"add_item"),
             "without a project AddItem must not be emitted: {kinds:?}"
         );
+    }
+
+    // --- set_project_priority_mutation (RFC 0006 D4 / #225) -----------------
+
+    /// A project with both a Status field (required for `Project::from_fields`
+    /// to validate) and a Priority field carrying two ordinal-derived
+    /// mappings, mirroring `derive_priority_mappings`'s 4-option-board case
+    /// truncated to what the test needs.
+    fn project_with_status_and_priority(id: &str) -> Project {
+        Project::from_fields(
+            ProjectId::parse(id).unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_status".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o1".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: ProjectFieldKind::Priority,
+                    options: vec![
+                        FieldOption {
+                            option_id: "p0".into(),
+                            name: "P0".into(),
+                            ordinal: 0,
+                        },
+                        FieldOption {
+                            option_id: "p1".into(),
+                            name: "P1".into(),
+                            ordinal: 1,
+                        },
+                    ],
+                },
+            ],
+            vec![StatusMapping {
+                is_open: true,
+                option_id: "o1".into(),
+            }],
+            vec![
+                PriorityMapping {
+                    priority: Priority::P0,
+                    option_id: "p0".into(),
+                },
+                PriorityMapping {
+                    priority: Priority::P1,
+                    option_id: "p1".into(),
+                },
+            ],
+            false,
+            domain_core::Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    /// An issue-backed mirror already attached to a project item, with a
+    /// caller-chosen `Priority`.
+    fn make_attached_mirror(item_node_id: &str, priority: Priority) -> Task {
+        let mut t = make_issue_backed_mirror("I_prio_nid");
+        t.project_item_id = Some(item_node_id.to_string());
+        t.set_priority(priority);
+        t
+    }
+
+    #[test]
+    fn set_project_priority_mutation_resolves_priority_field_and_option() {
+        let project = project_with_status_and_priority("PVT_kwHO_enq_prio_ok");
+        let t = make_attached_mirror("PVTI_attached", Priority::P1);
+
+        let m = set_project_priority_mutation(&project, &t).expect("priority resolves");
+        match m {
+            OutboxMutation::SetProjectPriority {
+                project_node_id,
+                item_node_id,
+                priority_field_id,
+                option_id,
+            } => {
+                assert_eq!(project_node_id, project.id.as_str());
+                assert_eq!(item_node_id, "PVTI_attached");
+                assert_eq!(priority_field_id, "PVTSSF_prio");
+                assert_eq!(option_id, "p1");
+            }
+            other => panic!("expected SetProjectPriority, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_project_priority_mutation_none_without_project_item_id() {
+        // Not yet attached to a board item — nothing to project the priority
+        // onto yet.
+        let project = project_with_status_and_priority("PVT_kwHO_enq_prio_noitem");
+        let mut t = make_issue_backed_mirror("I_prio_noitem");
+        t.set_priority(Priority::P0);
+        assert!(t.project_item_id.is_none());
+
+        assert_eq!(set_project_priority_mutation(&project, &t), None);
+    }
+
+    #[test]
+    fn set_project_priority_mutation_none_without_priority_field() {
+        // The board has a Status field only — Priority sync is opt-in
+        // (RFC 0006 D3) and absent here, so no mutation resolves.
+        let project = make_project("PVT_kwHO_enq_prio_nofield");
+        let t = make_attached_mirror("PVTI_attached_nofield", Priority::P2);
+
+        assert_eq!(set_project_priority_mutation(&project, &t), None);
     }
 
     // --- local-only tasks are always silent ---------------------------------

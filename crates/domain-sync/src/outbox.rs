@@ -69,6 +69,20 @@ pub enum OutboxMutation {
         status_field_id: String,
         option_id: String,
     },
+    /// GraphQL `updateProjectV2ItemFieldValue` against the single-select
+    /// Priority field (RFC 0006 D4). Sibling of [`Self::SetProjectStatus`] —
+    /// same mutation, different field — kept as its OWN variant rather than
+    /// overloading `SetProjectStatus` so the two projections stay
+    /// independently addressable (a distinct outbox kind, a distinct drainer
+    /// arm with no read-back `Conflict`, see the drainer doc). Priority rides
+    /// the project-ITEM rail, never the issue PATCH path — it must stay out of
+    /// `MIRRORED_FIELDS` / `MirrorPatch`.
+    SetProjectPriority {
+        project_node_id: String,
+        item_node_id: String,
+        priority_field_id: String,
+        option_id: String,
+    },
     /// REST `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link an existing
     /// issue as a sub-issue of another (the GitHub-native projection of a
     /// `parent_of` / `child_of` relation). `parent_*` addresses the URL; GitHub
@@ -126,6 +140,7 @@ impl OutboxMutation {
             Self::UpdateDraftIssue { .. } => "update_draft_issue",
             Self::ConvertDraftToIssue { .. } => "convert_draft_to_issue",
             Self::SetProjectStatus { .. } => "set_project_status",
+            Self::SetProjectPriority { .. } => "set_project_priority",
             Self::AddSubIssue { .. } => "add_sub_issue",
             Self::RemoveSubIssue { .. } => "remove_sub_issue",
             Self::AddBlockedBy { .. } => "add_blocked_by",
@@ -252,6 +267,23 @@ mod tests {
             let json = serde_json::to_value(&m).unwrap();
             assert_eq!(json["kind"], tag);
         }
+    }
+
+    #[test]
+    fn set_project_priority_kind_matches_serde_tag() {
+        // Same lockstep guard as `outbox_mutation_kind_matches_serde_tag`, for
+        // the new priority-projection variant (RFC 0006 D4 / #225): a serde
+        // rename here without a `kind()` arm update would silently desync the
+        // SQLite discriminator column from the payload.
+        let m = OutboxMutation::SetProjectPriority {
+            project_node_id: "PVT_x".into(),
+            item_node_id: "PVTI_y".into(),
+            priority_field_id: "PVTSSF_prio".into(),
+            option_id: "opt_p0".into(),
+        };
+        assert_eq!(m.kind(), "set_project_priority");
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["kind"], "set_project_priority");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! GitHub GraphQL adapter internals — the Projects v2 surface.
 //!
-//! Everything REST can't reach lives here: a project's Status field schema,
-//! draft issues, project membership, and the single-select status writes.
+//! Everything REST can't reach lives here: a project's field schema, draft
+//! issues, project membership, and the field-agnostic single-select writes
+//! (Status, Priority, RFC 0006 D4).
 //! GitHub exposes Projects v2 *only* over GraphQL (the REST `projects` API
 //! is the sunset v1), so this module talks to `octocrab.graphql()` with
 //! hand-written query strings + bespoke response structs.
@@ -147,7 +148,7 @@ mutation($input: ConvertProjectV2DraftIssueItemToIssueInput!) {
   }
 }"#;
 
-const SET_STATUS: &str = r#"
+const SET_SINGLE_SELECT_OPTION: &str = r#"
 mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   updateProjectV2ItemFieldValue(input: $input) {
     projectV2Item {
@@ -380,40 +381,45 @@ impl GraphqlClient {
         Ok((node_id, number))
     }
 
-    pub(crate) async fn set_status(
+    /// Set an item's single-select field to `option_id` (RFC 0006 D4). Field
+    /// agnostic on the wire — `field_id` selects which single-select (Status,
+    /// Priority, or any future one) the write targets; callers pin the
+    /// meaning by which field id they pass. Used for both the board Status
+    /// projection and the Priority projection.
+    pub(crate) async fn set_single_select_option(
         &self,
         project_node_id: &str,
         item_node_id: &str,
-        status_field_id: &str,
+        field_id: &str,
         option_id: &str,
     ) -> PortResult<String> {
-        let data: SetStatusData = self
+        let data: SetSingleSelectOptionData = self
             .run(
-                SET_STATUS,
+                SET_SINGLE_SELECT_OPTION,
                 json!({ "input": {
                     "projectId": project_node_id,
                     "itemId": item_node_id,
-                    "fieldId": status_field_id,
+                    "fieldId": field_id,
                     "value": { "singleSelectOptionId": option_id },
                 } }),
             )
             .await?;
-        // Read back the applied option from the project's chosen Status field
-        // (matched by id, mirroring `map_poll_item`). The caller (drainer)
-        // compares it against the sent `option_id` to detect a conflict. A
-        // mutation that succeeds but returns no single-select value for the
-        // field is ambiguous — surface it as a backend error so the drainer
-        // retries rather than dead-lettering on a false conflict.
+        // Read back the applied option from the targeted field (matched by
+        // id, mirroring `map_poll_item`). The caller (drainer) compares it
+        // against the sent `option_id` to detect a conflict. A mutation that
+        // succeeds but returns no single-select value for the field is
+        // ambiguous — surface it as a backend error so the drainer retries
+        // rather than dead-lettering on a false conflict.
         data.update_project_v2_item_field_value
             .project_v2_item
             .field_values
             .nodes
             .into_iter()
-            .find(|v| v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(status_field_id))
+            .find(|v| v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(field_id))
             .and_then(|v| v.option_id)
             .ok_or_else(|| {
                 PortError::Backend(format!(
-                    "set_status on item {item_node_id} returned no single-select value for field {status_field_id}"
+                    "set_single_select_option on item {item_node_id} returned no single-select value for field {field_id}"
                 ))
             })
     }
@@ -716,17 +722,17 @@ struct ConvertIssueContent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetStatusData {
+struct SetSingleSelectOptionData {
     update_project_v2_item_field_value: ProjectV2ItemWrap,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectV2ItemWrap {
-    project_v2_item: SetStatusItem,
+    project_v2_item: SetSingleSelectOptionItem,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SetStatusItem {
+struct SetSingleSelectOptionItem {
     #[allow(dead_code)]
     id: String,
     #[serde(default)]

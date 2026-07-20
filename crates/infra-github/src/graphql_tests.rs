@@ -417,7 +417,7 @@ async fn set_status_sends_single_select_option_id() {
     // the adapter must read back the applied single-select value (matched by
     // field id), not echo the sent option.
     let applied = provider(&server)
-        .set_status("PVT_x", "PVTI_y", "PVTSSF_z", "47fc9ee4")
+        .set_single_select_option("PVT_x", "PVTI_y", "PVTSSF_z", "47fc9ee4")
         .await
         .unwrap();
     assert_eq!(applied, "47fc9ee4");

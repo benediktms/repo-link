@@ -258,15 +258,15 @@ impl RemoteProjectProvider for GithubAdapter {
             .await
     }
 
-    async fn set_status(
+    async fn set_single_select_option(
         &self,
         project_node_id: &str,
         item_node_id: &str,
-        status_field_id: &str,
+        field_id: &str,
         option_id: &str,
     ) -> PortResult<String> {
         self.graphql
-            .set_status(project_node_id, item_node_id, status_field_id, option_id)
+            .set_single_select_option(project_node_id, item_node_id, field_id, option_id)
             .await
     }
 

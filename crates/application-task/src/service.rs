@@ -359,11 +359,16 @@ impl TaskService {
         let mut t = self.resolve_task(&cmd.task_id).await?;
         // Snapshot the sync state *before* the edits so we can tell whether
         // anything remote-observable changed (the domain flips Synced →
-        // DirtyLocal on a real title/body/assignee change; priority is local
-        // metadata and never dirties). An orphan-draft gaining a repo is the
-        // ConvertDraftToIssue trigger, so capture that precondition too.
+        // DirtyLocal on a real title/body/assignee change). An orphan-draft
+        // gaining a repo is the ConvertDraftToIssue trigger, so capture that
+        // precondition too. `priority_before` is its own axis (RFC 0006 D4):
+        // priority no longer dirties the issue mirror, but a real change
+        // still owes an outbound `SetProjectPriority` board projection —
+        // planned on a dedicated branch below, never through
+        // `plan_update_mutations` (which would fold it into the issue axis).
         let was_orphan_draft = enqueue::is_draft_backed(&t) && t.repo_id.is_none();
         let sync_before = t.sync;
+        let priority_before = t.priority;
 
         if let Some(title) = cmd.title {
             t.set_title(title)?;
@@ -424,16 +429,86 @@ impl TaskService {
 
         // Plan the outbound mutations the edit owes BEFORE writing, then commit
         // the task + its outbox entries in one atomic write (#54). For a
-        // LocalOnly task / priority-only / no-op edit the plan is empty and
+        // LocalOnly task / no-op issue-mirror edit the plan is empty and
         // `save_with_outbox` behaves exactly like `save`.
         let mutations = self
             .plan_update_mutations(&mut t, sync_before, resolved_filing.is_some())
             .await?;
-        let entries = into_entries(t.id, mutations);
+        let mut entries = into_entries(t.id, mutations);
+
+        // RFC 0006 D4 — priority's OWN branch, deliberately separate from
+        // `plan_update_mutations`/`plan_mirror_mutations`: it is a
+        // project-ITEM projection, not part of the issue mirror, so it must
+        // never ride `plan_mutations` (which would emit a no-op `UpdateRemote`
+        // for a priority-only edit and conflate the two axes). A no-op /
+        // unchanged priority plans nothing here, same as the issue side.
+        if t.priority != priority_before
+            && enqueue::is_mirror(&t)
+            && let Some(mutation) = self.plan_priority_mutation(&t).await?
+        {
+            entries.push(OutboxEntry::new(t.id, mutation));
+        }
+
         self.repo
             .save_with_outbox(&t, SnapshotSource::LocalEdit, &entries)
             .await?;
         self.task_dto(&t).await
+    }
+
+    /// Plan the `SetProjectPriority` board projection a priority edit owes
+    /// (RFC 0006 D4). Priority rides the project-ITEM rail — resolved
+    /// independently of the issue-mirror mutation plan above. Returns `None`
+    /// (enqueuing nothing) when:
+    /// - the task's workspace has no project (nothing to project onto,
+    ///   silent — mirrors the Status rail's projectless no-op);
+    /// - the task isn't yet attached to a project item (no card exists yet to
+    ///   carry the value, silent);
+    /// - the project has no Priority field — this is the `PriorityFieldMissing`
+    ///   case (RFC 0006 D10): opt-in per project, so this warns (naming the
+    ///   project + task) rather than erroring, and enqueues nothing;
+    /// - the project has no mapping for this task's `Priority` (an
+    ///   unmapped/stale board) — silent, mirroring an unmapped Status bucket.
+    async fn plan_priority_mutation(&self, task: &Task) -> Result<Option<OutboxMutation>> {
+        let Some(project) =
+            enqueue::resolve_project(&self.workspaces, &self.projects, task).await?
+        else {
+            return Ok(None);
+        };
+        if project.priority_field_id().is_none() {
+            tracing::warn!(
+                project_id = %project.id,
+                task_id = %task.id,
+                "priority changed but the project has no Priority field to project onto (PriorityFieldMissing)"
+            );
+            return Ok(None);
+        }
+        match enqueue::set_project_priority_mutation(&project, task) {
+            Some(mutation) => Ok(Some(mutation)),
+            // Not yet on the board: the projection is deferred, not lost — the
+            // first-attach follow-up (`enqueue_status_follow_up`) enqueues it
+            // when the card is created. Expected transient state, so debug.
+            None if task.project_item_id.is_none() => {
+                tracing::debug!(
+                    project_id = %project.id,
+                    task_id = %task.id,
+                    "priority changed but the task has no board item yet; will project on first attach"
+                );
+                Ok(None)
+            }
+            // Priority field present, but this priority has no board-option
+            // mapping (a zero-option field, or a partial/hand-edited mapping).
+            // Unlike Status there is no natural fallback option, so surface it
+            // rather than silently leaving the board column stale.
+            None => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    task_id = %task.id,
+                    priority = ?task.priority,
+                    "priority changed but has no board-option mapping; not projected (PriorityUnmapped)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Plan the outbound mutations an *edit* owes. Distinct from
@@ -2785,6 +2860,9 @@ mod tests {
 
     #[tokio::test]
     async fn priority_only_edit_enqueues_nothing() {
+        // A priority edit never dirties the issue mirror (no UpdateRemote) —
+        // AND, on a projectless workspace, there's no board to project it onto
+        // either (no SetProjectPriority). RFC 0006 D4 / #225.
         let RichSvc {
             svc,
             repo,
@@ -2820,7 +2898,237 @@ mod tests {
 
         assert!(
             outbox.all().is_empty(),
-            "priority is local metadata — no remote-observable change, no enqueue"
+            "priority is local metadata on the issue axis, and this workspace \
+             is projectless — no board to project onto, so no enqueue at all"
+        );
+    }
+
+    /// A project with both a Status field (required by `Project::from_fields`)
+    /// and a Priority field carrying an ordinal-derived mapping for every
+    /// `Priority` variant, so any local priority resolves.
+    fn test_project_with_priority(id: &str) -> Project {
+        use domain_project::{PriorityMapping, ProjectField, ProjectFieldKind};
+        Project::from_fields(
+            domain_core::ProjectId::parse(id).unwrap(),
+            "acme".into(),
+            3,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_status".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o_open".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: ProjectFieldKind::Priority,
+                    options: vec![
+                        FieldOption {
+                            option_id: "p0".into(),
+                            name: "P0".into(),
+                            ordinal: 0,
+                        },
+                        FieldOption {
+                            option_id: "p1".into(),
+                            name: "P1".into(),
+                            ordinal: 1,
+                        },
+                    ],
+                },
+            ],
+            vec![StatusMapping {
+                is_open: true,
+                option_id: "o_open".into(),
+            }],
+            vec![
+                PriorityMapping {
+                    priority: domain_task::Priority::P0,
+                    option_id: "p0".into(),
+                },
+                PriorityMapping {
+                    priority: domain_task::Priority::P1,
+                    option_id: "p1".into(),
+                },
+            ],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn priority_edit_on_board_attached_mirror_enqueues_only_set_project_priority() {
+        // RFC 0006 D4 / #225: a priority edit on a board-attached mirror
+        // enqueues exactly one SetProjectPriority, NO UpdateRemote, and the
+        // issue-axis sync_state stays Synced — priority is a project-item
+        // projection, entirely separate from the issue mirror.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project_with_priority("PVT_kwHO_svc_prio");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let t = save_issue_mirror(&repo, ws.id, Some("I_nid"), Some("PVTI_attached")).await;
+        assert_eq!(t.sync, SyncState::Synced);
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: Some("p1".into()),
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        let all = outbox.all();
+        assert_eq!(
+            all.len(),
+            1,
+            "exactly one outbox entry — the priority projection: {all:?}"
+        );
+        match &all[0].mutation {
+            OutboxMutation::SetProjectPriority {
+                priority_field_id,
+                option_id,
+                ..
+            } => {
+                assert_eq!(priority_field_id, "PVTSSF_prio");
+                assert_eq!(option_id, "p1");
+            }
+            other => panic!("expected SetProjectPriority, got {other:?}"),
+        }
+
+        let reloaded = repo.get(t.id).await.unwrap();
+        assert_eq!(
+            reloaded.sync,
+            SyncState::Synced,
+            "a priority change must never flip the issue-axis sync_state"
+        );
+        assert!(
+            reloaded.diff_against_baseline().is_empty(),
+            "priority must never appear in the issue-mirror diff"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_edit_with_no_priority_field_warns_and_enqueues_nothing() {
+        // RFC 0006 D10 `PriorityFieldMissing`: the board has a Status field
+        // but no Priority field (opt-in, D3) — a priority edit warns (not an
+        // error) and enqueues nothing.
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project("PVT_kwHO_svc_prio_missing");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let t = save_issue_mirror(&repo, ws.id, Some("I_nid2"), Some("PVTI_attached2")).await;
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: Some("p2".into()),
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "no Priority field on the board — warn, don't enqueue"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_edit_with_unmapped_priority_warns_and_enqueues_nothing() {
+        // The board HAS a Priority field but the task's priority has no
+        // board-option mapping (here: a zero-option Priority field, so every
+        // priority is unmapped). Unlike Status there is no fallback option, so
+        // this must warn and enqueue nothing — never silently drop the change.
+        use domain_project::{ProjectField, ProjectFieldKind};
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = Project::from_fields(
+            domain_core::ProjectId::parse("PVT_kwHO_svc_prio_unmapped").unwrap(),
+            "acme".into(),
+            3,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_status".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o_open".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: ProjectFieldKind::Priority,
+                    options: vec![], // zero options → no mapping for any priority
+                },
+            ],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let t = save_issue_mirror(&repo, ws.id, Some("I_nid3"), Some("PVTI_attached3")).await;
+
+        svc.update(UpdateTaskCmd {
+            task_id: t.id.to_string(),
+            title: None,
+            body: None,
+            priority: Some("p2".into()),
+            assignees: None,
+            repo_id: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            outbox.all().is_empty(),
+            "priority unmapped on the board — warn, don't enqueue"
         );
     }
 
