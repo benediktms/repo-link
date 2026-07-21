@@ -56,12 +56,11 @@ daemon-restart:
     {{rl}} daemon stop  || true
     {{rl}} daemon start
 
-# daemon-logs — `status` includes `log_path` in its JSON so the file
-# location stays in one source of truth (no second hardcode here).
+# logs — convenience alias for the first-class CLI command.
 
 # Tail the daemon log file.
-daemon-logs:
-    tail -F "$({{rl}} daemon status | jq -r '.log_path')"
+logs:
+    {{rl}} daemon logs --follow
 
 # dev — foreground debug daemon for iteration: faster tick, pretty logs,
 # prune enabled so the grace counter exercises locally.

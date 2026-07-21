@@ -2210,6 +2210,125 @@ fn daemon_status_flags_wedged_when_stale() {
 }
 
 #[test]
+fn daemon_logs_prints_raw_tail_with_default_and_explicit_line_counts() {
+    let env = daemon_env();
+    let contents = format!(
+        "{}\n{}",
+        "large-prefix".repeat(1024),
+        (1..=21).map(|n| format!("line-{n}\n")).collect::<String>()
+    );
+    std::fs::write(env.db_dir.path().join("daemon.2026-07-21.log"), &contents).unwrap();
+
+    let default = daemon_bin(&env, "fake")
+        .args(["daemon", "logs"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(default).unwrap(),
+        (2..=21).map(|n| format!("line-{n}\n")).collect::<String>()
+    );
+
+    let explicit = daemon_bin(&env, "fake")
+        .args(["daemon", "logs", "--lines", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(explicit, b"line-20\nline-21\n");
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_logs_follow_handles_rotation_truncation_and_ctrl_c() {
+    use assert_cmd::cargo::CommandCargoExt;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    struct ChildGuard {
+        child: std::process::Child,
+        running: bool,
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if self.running {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    let env = daemon_env();
+    let old_log = env.db_dir.path().join("daemon.2026-07-20.log");
+    let new_log = env.db_dir.path().join("daemon.2026-07-21.log");
+    std::fs::write(&old_log, "old-start\n").unwrap();
+
+    let mut command = std::process::Command::cargo_bin("rl").unwrap();
+    command
+        .env("HOME", env.home.path())
+        .env("REPO_LINK_DB", env.db_dir.path().join("repo-link.db"))
+        .env("REPO_LINK_LAUNCHER", "fake")
+        .env("REPO_LINK_LAUNCHER_LOG", &env.launcher_log)
+        .env("REPO_LINK_RLD_PATH", &env.rld_path)
+        .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
+        .args(["daemon", "logs", "--follow", "--lines", "1"])
+        .stdout(Stdio::piped());
+    let mut child = ChildGuard {
+        child: command.spawn().unwrap(),
+        running: true,
+    };
+    let stdout = child.child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next_line = || rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    assert_eq!(next_line(), "old-start");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&old_log)
+        .unwrap()
+        .write_all(b"old-final\n")
+        .unwrap();
+    std::fs::write(&new_log, "new-start\n").unwrap();
+    assert_eq!(next_line(), "old-final");
+    assert_eq!(next_line(), "new-start");
+
+    std::fs::write(&new_log, "x\n").unwrap();
+    assert_eq!(next_line(), "x");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&new_log)
+        .unwrap()
+        .write_all(b"after-truncate\n")
+        .unwrap();
+    assert_eq!(next_line(), "after-truncate");
+
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-INT", &child.child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = child.child.wait().unwrap();
+    child.running = false;
+    assert!(status.success());
+    reader.join().unwrap();
+}
+
+#[test]
 fn daemon_uninstall_is_idempotent() {
     let env = daemon_env();
 
