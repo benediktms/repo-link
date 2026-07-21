@@ -1,15 +1,18 @@
-//! `rl daemon` — install / uninstall / status / start / stop the platform
-//! unit that keeps `rld` running across reboots. One source of truth per
+//! `rl daemon` — manage the platform unit that keeps `rld` running across
+//! reboots, inspect its status, and read its logs. One source of truth per
 //! platform lives in [`macos`] / [`linux`]; the dispatcher in [`dispatch`]
 //! picks via `cfg!(target_os = "macos")`. Both modules compile on every
 //! platform so a Linux CI run still type-checks the macOS path.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use infra_config::RepoLinkConfig;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::fs::{File, Metadata};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 mod launcher;
 mod linux;
@@ -30,6 +33,15 @@ pub enum DaemonCmd {
     Start,
     /// Toggle the persistent unit off (idempotent).
     Stop,
+    /// Print recent daemon log lines, optionally following new output.
+    Logs {
+        /// Keep streaming new lines until interrupted.
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of existing lines to print.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        lines: usize,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -138,9 +150,158 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
             };
             serde_json::to_string_pretty(&out)?
         }
+        DaemonCmd::Logs { follow, lines } => return print_logs(cfg, follow, lines).await,
     };
     println!("{outcome_json}");
     Ok(())
+}
+
+struct LogFile {
+    path: PathBuf,
+    file: File,
+    offset: u64,
+}
+
+impl LogFile {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        Ok(Self {
+            file: File::open(&path)?,
+            path,
+            offset: 0,
+        })
+    }
+
+    fn print_tail(&mut self, lines: usize) -> std::io::Result<()> {
+        const CHUNK: usize = 8 * 1024;
+
+        let end = self.file.seek(SeekFrom::End(0))?;
+        self.offset = end;
+        if lines == 0 || end == 0 {
+            return Ok(());
+        }
+
+        let mut buffer = [0; CHUNK];
+        let mut position = end;
+        let mut remaining = lines;
+        let mut start = 0;
+        'scan: while position > 0 {
+            let len = position.min(CHUNK as u64) as usize;
+            position -= len as u64;
+            self.file.seek(SeekFrom::Start(position))?;
+            self.file.read_exact(&mut buffer[..len])?;
+
+            for index in (0..len).rev() {
+                let absolute = position + index as u64;
+                if buffer[index] == b'\n' && absolute + 1 != end {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        start = absolute + 1;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+
+        self.file.seek(SeekFrom::Start(start))?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        std::io::copy(&mut (&mut self.file).take(end - start), &mut out)?;
+        out.flush()
+    }
+
+    fn print_appended(&mut self) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(self.offset))?;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        let written = std::io::copy(&mut self.file, &mut out)?;
+        self.offset += written;
+        if written > 0 {
+            out.flush()?;
+        }
+        Ok(())
+    }
+}
+
+async fn print_logs(cfg: &RepoLinkConfig, follow: bool, lines: usize) -> Result<()> {
+    let path = daemon_status_log_path(cfg)?;
+    let mut log = match LogFile::open(path.clone()) {
+        Ok(mut log) => {
+            log.print_tail(lines)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            Some(log)
+        }
+        Err(e) if follow && e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to open {}", path.display()));
+        }
+    };
+
+    if !follow {
+        return Ok(());
+    }
+
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    loop {
+        tokio::select! {
+            signal = &mut ctrl_c => {
+                signal.context("failed to listen for ctrl-c")?;
+                return Ok(());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+        }
+
+        let path = daemon_status_log_path(cfg)?;
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+
+        let replace = match log.as_ref() {
+            Some(current) => {
+                current.path != path || !same_file(&current.file.metadata()?, &metadata)
+            }
+            None => true,
+        };
+        if replace {
+            let mut next = match LogFile::open(path.clone()) {
+                Ok(next) => next,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to open {}", path.display()));
+                }
+            };
+            next.print_appended()
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            log = Some(next);
+            continue;
+        }
+
+        let current = log.as_mut().expect("checked above");
+        if metadata.len() < current.offset {
+            current.offset = 0;
+        }
+        current
+            .print_appended()
+            .with_context(|| format!("failed to read {}", path.display()))?;
+    }
+}
+
+#[cfg(unix)]
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    match (left.created(), right.created()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => true,
+    }
 }
 
 /// Surface a clear error when `rl daemon` is invoked on something that
@@ -205,7 +366,7 @@ fn daemon_status_log_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
 /// `daemon.YYYY-MM-DD.log` and return the lexicographically-largest
 /// one — which, since ISO-8601 dates sort the same as time, is the
 /// newest. Returns `None` if no matching segments exist.
-fn newest_log_segment(dir: &std::path::Path) -> Option<PathBuf> {
+fn newest_log_segment(dir: &Path) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut latest: Option<(String, PathBuf)> = None;
     for entry in entries.flatten() {
@@ -234,7 +395,7 @@ fn newest_log_segment(dir: &std::path::Path) -> Option<PathBuf> {
     latest.map(|(_, path)| path)
 }
 
-fn db_parent(cfg: &RepoLinkConfig) -> Result<&std::path::Path> {
+fn db_parent(cfg: &RepoLinkConfig) -> Result<&Path> {
     cfg.database_path.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "database path has no parent directory: {}",
@@ -246,7 +407,7 @@ fn db_parent(cfg: &RepoLinkConfig) -> Result<&std::path::Path> {
 /// Read `last_tick.json` if it exists. Missing file is normal (the daemon
 /// hasn't ticked yet, or status is being run on a brand-new install) and
 /// returns `Ok(None)`; only deserialization errors propagate.
-pub(super) fn read_last_tick(path: &std::path::Path) -> Result<Option<LastTickDto>> {
+pub(super) fn read_last_tick(path: &Path) -> Result<Option<LastTickDto>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

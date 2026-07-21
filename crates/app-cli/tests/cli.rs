@@ -2210,6 +2210,38 @@ fn daemon_status_flags_wedged_when_stale() {
 }
 
 #[test]
+fn daemon_logs_prints_raw_tail_with_default_and_explicit_line_counts() {
+    let env = daemon_env();
+    let contents = format!(
+        "{}\n{}",
+        "large-prefix".repeat(1024),
+        (1..=21).map(|n| format!("line-{n}\n")).collect::<String>()
+    );
+    std::fs::write(env.db_dir.path().join("daemon.2026-07-21.log"), &contents).unwrap();
+
+    let default = daemon_bin(&env, "fake")
+        .args(["daemon", "logs"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(default).unwrap(),
+        (2..=21).map(|n| format!("line-{n}\n")).collect::<String>()
+    );
+
+    let explicit = daemon_bin(&env, "fake")
+        .args(["daemon", "logs", "--lines", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(explicit, b"line-20\nline-21\n");
+}
+
+#[test]
 fn daemon_uninstall_is_idempotent() {
     let env = daemon_env();
 
