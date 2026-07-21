@@ -1055,6 +1055,7 @@ impl TaskService {
 
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
         let mut task = self.resolve_task(id).await?;
+        let priority_before = task.priority;
         // Capture the live filing repo up front for the no-mismatch invariant
         // (RFC 0002 #118/#120): rollback must NOT retarget it, so this value
         // must survive the rollback unchanged (asserted below).
@@ -1108,7 +1109,16 @@ impl TaskService {
             "rollback must not retarget the filing repo of a remote-backed task"
         );
         task.reconcile_dirty_against_baseline();
-        self.repo.save(&task, SnapshotSource::Rollback).await?;
+        let mut entries = Vec::new();
+        if task.priority != priority_before
+            && enqueue::is_mirror(&task)
+            && let Some(mutation) = self.plan_priority_mutation(&task).await?
+        {
+            entries.push(OutboxEntry::new(task.id, mutation));
+        }
+        self.repo
+            .save_with_outbox(&task, SnapshotSource::Rollback, &entries)
+            .await?;
         self.task_dto(&task).await
     }
 
@@ -3156,6 +3166,46 @@ mod tests {
             reloaded.diff_against_baseline().is_empty(),
             "priority must never appear in the issue-mirror diff"
         );
+    }
+
+    #[tokio::test]
+    async fn rollback_priority_on_board_attached_mirror_enqueues_projection() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            projects,
+            ..
+        } = rich_svc();
+        let project = test_project_with_priority("PVT_kwHO_rollback_prio");
+        projects.save(&project).await.unwrap();
+        let mut ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        ws.project_id = Some(project.id.clone());
+        workspaces.save(&ws).await.unwrap();
+
+        let mut task =
+            save_issue_mirror(&repo, ws.id, Some("I_rollback"), Some("PVTI_rollback")).await;
+        task.set_priority(Priority::P0);
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        task.set_priority(Priority::P1);
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.rollback(&task.id.to_string(), 2).await.unwrap();
+
+        let reloaded = repo.get(task.id).await.unwrap();
+        assert_eq!(reloaded.priority, Priority::P0);
+        assert_eq!(reloaded.sync, SyncState::Synced);
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].mutation,
+            OutboxMutation::SetProjectPriority {
+                priority_field_id,
+                option_id,
+                ..
+            } if priority_field_id == "PVTSSF_prio" && option_id == "p0"
+        ));
     }
 
     #[tokio::test]

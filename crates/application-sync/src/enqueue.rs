@@ -9,10 +9,8 @@
 //! These helpers are intentionally *decision* functions plus a thin enqueue
 //! wrapper: they decide which mutation (if any) a mirror task owes and append
 //! it to the outbox. They never touch the remote — the [`crate::OutboxDrainer`]
-//! does that. Nothing is enqueued for `LocalOnly` tasks, priority-only edits,
-//! relation ops, rollbacks, or no-op edits (the caller is responsible for not
-//! invoking these on those paths; the mirror guards below add a second line of
-//! defence).
+//! does that. Callers decide which path invokes which helper; the mirror guards
+//! below add a second line of defence.
 
 use std::sync::Arc;
 
