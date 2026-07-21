@@ -4,7 +4,7 @@
 //! `rl project link` fetches a project's schema from GitHub over GraphQL and
 //! seeds it via [`ProjectService::link_from_snapshot`], which auto-derives the
 //! local-status → option mapping (RFC 0001 §3). The remaining operations
-//! (`get` / `list` / `map_status` / `unlink`) are local reads/edits of the
+//! (`get` / `list` / `map_status` / `map_priority` / `unlink`) are local reads/edits of the
 //! mirrored project. [`ProjectService::link`] is a lower-level programmatic
 //! seam taking a hand-entered schema; it is not wired to the CLI.
 

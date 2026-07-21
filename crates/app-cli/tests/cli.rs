@@ -3516,7 +3516,7 @@ fn task_claim_is_idempotent_when_already_claimed() {
 // ---------- RFC 0001 Stage 4 — `rl project` + workspace ↔ project ----------
 
 /// Helper: link a stock project addressed as `acme/7` (node id
-/// `PVT_demo_abc`) with two Status options — Backlog and Done.
+/// `PVT_demo_abc`) with Status and Priority fields.
 ///
 /// `rl project link` fetches the schema over GraphQL (Stage 5), so we stand
 /// up a wiremock server returning that schema and point the CLI at it via
@@ -3547,6 +3547,13 @@ fn link_demo_project(dir: &TempDir) -> String {
                           "id": "PVTSSF_x", "name": "Status", "options": [
                             { "id": "o1", "name": "Backlog" },
                             { "id": "o2", "name": "Done" }
+                        ] },
+                        { "__typename": "ProjectV2SingleSelectField",
+                          "id": "PVTSSF_priority", "name": "Priority", "options": [
+                            { "id": "po0", "name": "Urgent" },
+                            { "id": "po1", "name": "High" },
+                            { "id": "po2", "name": "Medium" },
+                            { "id": "po3", "name": "Low" }
                         ] }
                     ] }
                 } } }
@@ -3680,6 +3687,9 @@ fn project_link_show_and_list_roundtrip() {
     assert_eq!(shown["status_options"].as_array().unwrap().len(), 2);
     // Auto-derivation seeds two mappings by name: Backlog→open, Done→done.
     assert_eq!(shown["status_mappings"].as_array().unwrap().len(), 2);
+    assert_eq!(shown["priority_field_id"], "PVTSSF_priority");
+    assert_eq!(shown["priority_options"].as_array().unwrap().len(), 4);
+    assert_eq!(shown["priority_mappings"].as_array().unwrap().len(), 4);
 
     // `default_for` should also surface inline on the matching option row
     // so a single render covers both the catalog and the mapping.
@@ -3770,6 +3780,64 @@ fn project_map_rejects_option_outside_catalog() {
     assert!(
         stderr.contains("ghost"),
         "error should name the offending option_id: {stderr}"
+    );
+}
+
+#[test]
+fn project_map_priority_overwrites_persists_and_rejects_unowned_option() {
+    let dir = TempDir::new().unwrap();
+    link_demo_project(&dir);
+
+    let mapped = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "project",
+            "map-priority",
+            "acme/7",
+            "--priority",
+            "p0",
+            "--option-id",
+            "po1",
+        ],
+    );
+    let mappings = mapped["priority_mappings"].as_array().unwrap();
+    let p0 = mappings.iter().find(|m| m["priority"] == "p0").unwrap();
+    assert_eq!(p0["option_id"], "po1");
+    assert_eq!(
+        mappings.len(),
+        4,
+        "overwrite must not append a duplicate row"
+    );
+
+    // A fresh process reads the override back from SQLite.
+    let shown = run_json(&mut bin("repo-link", &dir), &["project", "show", "acme/7"]);
+    let persisted = shown["priority_mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["priority"] == "p0")
+        .unwrap();
+    assert_eq!(persisted["option_id"], "po1");
+
+    // o1 is real, but it belongs to Status rather than Priority.
+    let output = bin("repo-link", &dir)
+        .args([
+            "project",
+            "map-priority",
+            "acme/7",
+            "--priority",
+            "p0",
+            "--option-id",
+            "o1",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("o1"),
+        "error should name the unowned option: {stderr}"
     );
 }
 

@@ -1,7 +1,9 @@
 //! Mapping from the [`Project`] aggregate to its transport [`ProjectDto`].
 
 use domain_project::Project;
-use dto_shared::{ProjectDto, StatusMappingDto, StatusOptionDto};
+use dto_shared::{
+    PriorityMappingDto, PriorityOptionDto, ProjectDto, StatusMappingDto, StatusOptionDto,
+};
 
 use crate::status::status_to_str;
 
@@ -24,6 +26,16 @@ pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
         })
         .collect();
     options.sort_by_key(|o| o.ordinal);
+    let mut priority_options: Vec<PriorityOptionDto> = p
+        .priority_options()
+        .iter()
+        .map(|o| PriorityOptionDto {
+            option_id: o.option_id.clone(),
+            name: o.name.clone(),
+            ordinal: o.ordinal,
+        })
+        .collect();
+    priority_options.sort_by_key(|o| o.ordinal);
     ProjectDto {
         id: p.id.as_str().to_string(),
         owner_login: p.owner_login.clone(),
@@ -36,6 +48,22 @@ pub(crate) fn project_to_dto(p: &Project) -> ProjectDto {
             .iter()
             .map(|m| StatusMappingDto {
                 status: status_to_str(m.is_open).to_string(),
+                option_id: m.option_id.clone(),
+            })
+            .collect(),
+        priority_field_id: p.priority_field_id().map(str::to_string),
+        priority_options,
+        priority_mappings: p
+            .priority_mappings
+            .iter()
+            .map(|m| PriorityMappingDto {
+                priority: match m.priority {
+                    domain_task::Priority::P0 => "p0",
+                    domain_task::Priority::P1 => "p1",
+                    domain_task::Priority::P2 => "p2",
+                    domain_task::Priority::P3 => "p3",
+                }
+                .to_string(),
                 option_id: m.option_id.clone(),
             })
             .collect(),

@@ -213,6 +213,19 @@ impl Project {
         Ok(())
     }
 
+    /// Replace the local-priority mapping wholesale, rejecting options not
+    /// owned by this project's Priority field.
+    pub fn set_priority_mappings(
+        &mut self,
+        mappings: Vec<PriorityMapping>,
+        now: Timestamp,
+    ) -> Result<()> {
+        Self::validate_priority_mappings(&mappings, self.priority_options())?;
+        self.priority_mappings = mappings;
+        self.updated_at = now;
+        Ok(())
+    }
+
     /// Refresh the Status field's option catalog from the remote (e.g. a
     /// periodic poll caught a field change). Swaps the options in place and
     /// drops mapping rows that point at options that no longer exist — those

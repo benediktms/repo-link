@@ -18,6 +18,8 @@ pub enum ServiceError {
     AmbiguousSpec(String, usize),
     #[error("unknown task status '{0}'")]
     UnknownStatus(String),
+    #[error("unknown priority '{0}'; expected p0, p1, p2, or p3")]
+    UnknownPriority(String),
     #[error("option_id '{0}' is not part of project '{1}'")]
     UnknownOption(String, String),
     #[error("project '{0}' has no single-select field to use as Status")]

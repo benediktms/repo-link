@@ -747,6 +747,16 @@ pub(crate) enum ProjectCmd {
         #[arg(long = "option-id")]
         option_id: String,
     },
+    /// Set a local Priority → project Priority option mapping.
+    MapPriority {
+        spec: String,
+        /// Local priority (`p0` / `p1` / `p2` / `p3`).
+        #[arg(long)]
+        priority: String,
+        /// Option ID on the project's Priority field.
+        #[arg(long = "option-id")]
+        option_id: String,
+    },
     /// Unlink a project locally. Workspaces attached to it have their
     /// `project_id` reset to NULL via the storage cascade.
     Unlink { spec: String },
