@@ -23,6 +23,19 @@ pub struct StatusMappingDto {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorityOptionDto {
+    pub option_id: String,
+    pub name: String,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriorityMappingDto {
+    pub priority: String,
+    pub option_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectDto {
     /// `PVT_…` — the GitHub node ID. No separate local UUID.
     pub id: String,
@@ -32,6 +45,9 @@ pub struct ProjectDto {
     pub status_field_id: String,
     pub status_options: Vec<StatusOptionDto>,
     pub status_mappings: Vec<StatusMappingDto>,
+    pub priority_field_id: Option<String>,
+    pub priority_options: Vec<PriorityOptionDto>,
+    pub priority_mappings: Vec<PriorityMappingDto>,
     pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -60,6 +76,15 @@ pub struct MapStatusCmd {
     pub project_spec: String,
     /// Local lifecycle bucket as a snake-case string (`"open"` / `"closed"`).
     pub status: String,
+    pub option_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MapPriorityCmd {
+    /// Project node id (`PVT_…`) or `owner/number` spec.
+    pub project_spec: String,
+    /// Local priority as a lowercase string (`"p0"` through `"p3"`).
+    pub priority: String,
     pub option_id: String,
 }
 

@@ -7,10 +7,11 @@ use std::collections::HashSet;
 
 use domain_core::{ProjectId, Timestamp};
 use domain_project::{
-    FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping, assign_field_kinds,
-    derive_priority_mappings, derive_status_mappings,
+    FieldOption, PriorityMapping, Project, ProjectField, ProjectFieldKind, StatusMapping,
+    assign_field_kinds, derive_priority_mappings, derive_status_mappings,
 };
-use dto_shared::{LinkProjectCmd, MapStatusCmd, ProjectDto};
+use domain_task::Priority;
+use dto_shared::{LinkProjectCmd, MapPriorityCmd, MapStatusCmd, ProjectDto};
 use ports::{PortError, ProjectRepository, RemoteProjectSnapshot};
 
 use crate::dto::project_to_dto;
@@ -249,6 +250,41 @@ impl ProjectService {
             });
         }
         project.set_mappings(mappings, Timestamp::now())?;
+        self.repo.save(&project).await?;
+        Ok(project_to_dto(&project))
+    }
+
+    /// Replace the mapping for one local priority, leaving the other three
+    /// buckets untouched.
+    pub async fn map_priority(&self, cmd: MapPriorityCmd) -> Result<ProjectDto> {
+        let mut project = resolve_project(&self.repo, &cmd.project_spec).await?;
+        let priority = match cmd.priority.as_str() {
+            "p0" => Priority::P0,
+            "p1" => Priority::P1,
+            "p2" => Priority::P2,
+            "p3" => Priority::P3,
+            _ => return Err(ServiceError::UnknownPriority(cmd.priority)),
+        };
+        if !project
+            .priority_options()
+            .iter()
+            .any(|o| o.option_id == cmd.option_id)
+        {
+            return Err(ServiceError::UnknownOption(
+                cmd.option_id,
+                project.id.as_str().to_string(),
+            ));
+        }
+        let mut mappings = project.priority_mappings.clone();
+        if let Some(existing) = mappings.iter_mut().find(|m| m.priority == priority) {
+            existing.option_id = cmd.option_id;
+        } else {
+            mappings.push(PriorityMapping {
+                priority,
+                option_id: cmd.option_id,
+            });
+        }
+        project.set_priority_mappings(mappings, Timestamp::now())?;
         self.repo.save(&project).await?;
         Ok(project_to_dto(&project))
     }
@@ -517,8 +553,7 @@ mod tests {
     #[tokio::test]
     async fn link_from_snapshot_retains_non_status_fields() {
         // The Priority field in the snapshot must be persisted alongside the
-        // Status field, classified `Priority` — genuine round trip (it isn't
-        // surfaced on the Status-centric DTO, so assert on the aggregate).
+        // Status field, classified `Priority` — genuine round trip.
         let repo = Arc::new(InMemoryProjectRepository::new());
         let svc = ProjectService::new(repo.clone());
         svc.link_from_snapshot(snapshot()).await.unwrap();

@@ -11,8 +11,8 @@ mod task;
 mod workspace;
 
 pub use project::{
-    LinkProjectCmd, MapStatusCmd, ProjectDto, SetWorkspaceProjectCmd, StatusMappingDto,
-    StatusOptionDto,
+    LinkProjectCmd, MapPriorityCmd, MapStatusCmd, PriorityMappingDto, PriorityOptionDto,
+    ProjectDto, SetWorkspaceProjectCmd, StatusMappingDto, StatusOptionDto,
 };
 pub use repo::{
     AttachRepoCmd, FilingRepoRefDto, FindRepoMatchDto, FindRepoResponseDto, HereMatchDto,

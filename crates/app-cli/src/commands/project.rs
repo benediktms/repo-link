@@ -3,7 +3,7 @@
 //! local-only reads/edits of the mirrored project.
 
 use anyhow::{Result, anyhow};
-use dto_shared::MapStatusCmd;
+use dto_shared::{MapPriorityCmd, MapStatusCmd};
 use infra_config::RepoLinkConfig;
 use ports::RemoteProjectProvider;
 
@@ -86,6 +86,22 @@ pub(crate) async fn project_dispatch(
                 .map_status(MapStatusCmd {
                     project_spec: spec,
                     status: local,
+                    option_id,
+                })
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+            println!("{}", serde_json::to_string_pretty(&dto)?);
+        }
+        ProjectCmd::MapPriority {
+            spec,
+            priority,
+            option_id,
+        } => {
+            let dto = svc
+                .projects
+                .map_priority(MapPriorityCmd {
+                    project_spec: spec,
+                    priority,
                     option_id,
                 })
                 .await
