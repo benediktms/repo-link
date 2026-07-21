@@ -262,11 +262,22 @@ async fn print_logs(cfg: &RepoLinkConfig, follow: bool, lines: usize) -> Result<
 
         let replace = match log.as_ref() {
             Some(current) => {
-                current.path != path || !same_file(&current.file.metadata()?, &metadata)
+                current.path != path
+                    || !same_file(
+                        &current.file.metadata().with_context(|| {
+                            format!("failed to inspect {}", current.path.display())
+                        })?,
+                        &metadata,
+                    )
             }
             None => true,
         };
         if replace {
+            if let Some(current) = log.as_mut() {
+                current
+                    .print_appended()
+                    .with_context(|| format!("failed to read {}", current.path.display()))?;
+            }
             let mut next = match LogFile::open(path.clone()) {
                 Ok(next) => next,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
