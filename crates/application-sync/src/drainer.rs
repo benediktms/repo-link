@@ -3502,6 +3502,50 @@ mod tests {
         assert_eq!(dead[0].status, OutboxStatus::Failed);
     }
 
+    #[tokio::test]
+    async fn pending_issue_type_does_not_recreate_same_dead_letter() {
+        let h = harness(test_backoff(1)).await;
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        let (workspace_id, repo_id, filing_repo_id) = seed_type_binding(&h).await;
+        let mut remote = RemoteRef::new("github", "11");
+        remote.node_id = Some("I_failed".into());
+        let mut task = Task::import_mirror(
+            workspace_id,
+            Some(repo_id),
+            remote,
+            "dead letter".into(),
+            String::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.force_set_filing_repo_id(Some(filing_repo_id));
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+        h.remote_projects.fail_next(1);
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(h.outbox.all().len(), 1);
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Failed);
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert_eq!(
+            h.outbox.all().len(),
+            1,
+            "the same failed payload must not restart its attempt counter"
+        );
+
+        h.tasks
+            .cache_remote_node_id(task.id, "I_replaced".into())
+            .await
+            .unwrap();
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(h.outbox.all().len(), 2);
+        assert!(!h.tasks.get(task.id).await.unwrap().issue_type_pending);
+    }
+
     /// The relation-sync arms have no response body — a transient error is the
     /// only non-success outcome and must Retry (reschedule), not dead-letter.
     #[tokio::test]

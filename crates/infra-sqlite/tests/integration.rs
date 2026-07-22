@@ -2507,22 +2507,22 @@ async fn outbox_with_task(
 }
 
 #[tokio::test]
-async fn set_issue_type_enqueue_deduplicates_non_terminal_entry() {
+async fn set_issue_type_enqueue_deduplicates_active_and_same_failed_payload() {
     use domain_sync::{OutboxEntry, OutboxMutation};
     use ports::OutboxRepository;
 
     let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
     let (outbox, task_id) = outbox_with_task(&db, &ts).await;
-    let mutation = || OutboxMutation::SetIssueType {
-        issue_node_id: "I_type".into(),
+    let mutation = |node: &str| OutboxMutation::SetIssueType {
+        issue_node_id: node.into(),
         issue_type_id: Some("IT_bug".into()),
         local_issue_type: Some("bug".into()),
         local_issue_type_recorded: true,
     };
-    let first = OutboxEntry::new(task_id, mutation());
+    let first = OutboxEntry::new(task_id, mutation("I_type"));
     outbox.enqueue(&first).await.unwrap();
     outbox
-        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .enqueue(&OutboxEntry::new(task_id, mutation("I_type")))
         .await
         .unwrap();
     assert_eq!(outbox.list_pending(task_id).await.unwrap().len(), 1);
@@ -2533,7 +2533,7 @@ async fn set_issue_type_enqueue_deduplicates_non_terminal_entry() {
         .unwrap()
         .unwrap();
     outbox
-        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .enqueue(&OutboxEntry::new(task_id, mutation("I_type")))
         .await
         .unwrap();
     assert_eq!(
@@ -2544,13 +2544,41 @@ async fn set_issue_type_enqueue_deduplicates_non_terminal_entry() {
 
     outbox.mark_succeeded(claimed.id).await.unwrap();
     outbox
-        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .enqueue(&OutboxEntry::new(task_id, mutation("I_type")))
         .await
         .unwrap();
     assert_eq!(
         outbox.list_pending(task_id).await.unwrap().len(),
         1,
         "terminal entries do not suppress a later desired projection"
+    );
+
+    let retry = outbox
+        .claim_next_eligible(domain_core::Timestamp::now())
+        .await
+        .unwrap()
+        .unwrap();
+    outbox
+        .mark_failed(retry.id, "permanent failure")
+        .await
+        .unwrap();
+    outbox
+        .enqueue(&OutboxEntry::new(task_id, mutation("I_type")))
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox.list_pending(task_id).await.unwrap().len(),
+        0,
+        "the same failed payload must remain dead-lettered"
+    );
+    outbox
+        .enqueue(&OutboxEntry::new(task_id, mutation("I_new_node")))
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox.list_pending(task_id).await.unwrap().len(),
+        1,
+        "a changed prerequisite produces a different payload and may retry"
     );
 }
 

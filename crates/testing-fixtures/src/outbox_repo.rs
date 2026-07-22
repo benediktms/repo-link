@@ -49,10 +49,11 @@ pub(crate) fn push_deduped(guard: &mut Vec<OutboxEntry>, entry: &OutboxEntry) ->
         && guard.iter().any(|existing| {
             existing.task_id == entry.task_id
                 && existing.mutation.kind() == "set_issue_type"
-                && matches!(
+                && (matches!(
                     existing.status,
                     OutboxStatus::Pending | OutboxStatus::Inflight
-                )
+                ) || (existing.status == OutboxStatus::Failed
+                    && existing.mutation == entry.mutation))
         });
     if duplicate_type {
         return false;

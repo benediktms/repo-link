@@ -32,6 +32,7 @@ pub(crate) async fn insert_outbox_in_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     entry: &OutboxEntry,
 ) -> PortResult<()> {
+    let payload_json = json_to_string(&entry.mutation)?;
     sqlx::query(
         r#"
         INSERT INTO outbox_entries
@@ -42,14 +43,17 @@ pub(crate) async fn insert_outbox_in_tx(
                 SELECT 1 FROM outbox_entries
                  WHERE task_id = ?
                    AND mutation_kind = 'set_issue_type'
-                   AND status IN ('pending', 'inflight')
+                   AND (
+                       status IN ('pending', 'inflight')
+                       OR (status = 'failed' AND payload_json = ?)
+                   )
             )
         "#,
     )
     .bind(entry.id.to_string())
     .bind(entry.task_id.to_string())
     .bind(entry.mutation.kind())
-    .bind(json_to_string(&entry.mutation)?)
+    .bind(&payload_json)
     .bind(enum_to_str(&entry.status)?)
     .bind(i64::from(entry.attempts))
     .bind(entry.last_error.as_deref())
@@ -58,6 +62,7 @@ pub(crate) async fn insert_outbox_in_tx(
     .bind(entry.updated_at.into_inner())
     .bind(entry.mutation.kind())
     .bind(entry.task_id.to_string())
+    .bind(&payload_json)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
