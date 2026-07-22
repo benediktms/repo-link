@@ -3,7 +3,7 @@
 use domain_core::{RepoId, TaskId, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::enums::{Lifecycle, Priority, SyncState};
+use crate::enums::{IssueType, Lifecycle, Priority, SyncState};
 use crate::relation::RemoteRef;
 
 /// Why a snapshot was captured. Only events that confirm remote alignment
@@ -79,6 +79,12 @@ pub struct TaskSnapshot {
     pub lifecycle: Lifecycle,
     pub sync_state: SyncState,
     pub priority: Priority,
+    /// Local issue type at capture time. History / rollback only: this field
+    /// is deliberately excluded from `MIRRORED_FIELDS` and `MirrorPatch`.
+    pub issue_type: Option<IssueType>,
+    /// Whether `issue_type` was recorded by the writer. Distinguishes an
+    /// intentional `None` from a legacy snapshot that predates the column.
+    pub issue_type_recorded: bool,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
     /// The task's binding at the time of the snapshot. Captured so that
@@ -156,6 +162,8 @@ mod tests {
             lifecycle: Lifecycle::Open,
             sync_state,
             priority: Priority::P3,
+            issue_type: None,
+            issue_type_recorded: true,
             assignees: vec![],
             remote: None,
             repo_id: None,

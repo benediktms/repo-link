@@ -619,14 +619,14 @@ async fn write_task_in_tx(
 
     // Append the snapshot row after the task upsert so the FK constraint
     // (task_snapshots.task_id → tasks.id) is satisfied.
-    // `repo_id_recorded` is always 1 here (fresh snapshots record the binding;
-    // see `Task::snapshot_view`). `filing_repo_id` (RFC 0002 #118) is captured
-    // for history/audit; it has no `_recorded` companion because rollback never
-    // restores it.
+    // The two `_recorded` flags are always 1 here: fresh snapshots distinguish
+    // intentional NULL values from legacy rows that predate their columns.
+    // `filing_repo_id` (RFC 0002 #118) is captured for history/audit; it has no
+    // companion flag because rollback never restores it.
     sqlx::query(
         r#"
-        INSERT INTO task_snapshots (task_id, version, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+        INSERT INTO task_snapshots (task_id, version, title, body, status, lifecycle, sync_state, priority, issue_type, issue_type_recorded, assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 1, ?, ?, ?)
         "#,
     )
     .bind(t.id.to_string())
@@ -639,6 +639,7 @@ async fn write_task_in_tx(
     .bind(enum_to_str(&t.lifecycle)?)
     .bind(enum_to_str(&t.sync)?)
     .bind(enum_to_str(&t.priority)?)
+    .bind(t.issue_type.as_ref().map(enum_to_str).transpose()?)
     .bind(json_to_string(&t.assignees)?)
     .bind(t.remote.as_ref().map(|r| r.provider.clone()))
     .bind(t.remote.as_ref().map(|r| r.remote_id.clone()))
@@ -854,8 +855,8 @@ async fn load_latest_baseline(
     let row = sqlx::query(
         r#"
         SELECT version, title, body, lifecycle, sync_state, priority,
-               assignees_json, remote_provider, remote_id, repo_id, repo_id_recorded,
-               filing_repo_id, source, captured_at
+               issue_type, issue_type_recorded, assignees_json, remote_provider,
+               remote_id, repo_id, repo_id_recorded, filing_repo_id, source, captured_at
         FROM task_snapshots
         WHERE task_id = ?
           -- Mirror of `domain_task::TaskSnapshot::is_baseline` — keep in sync.
@@ -887,6 +888,8 @@ async fn load_latest_baseline(
     let lifecycle: String = row.try_get("lifecycle").map_err(map_sqlx_err)?;
     let sync_state: String = row.try_get("sync_state").map_err(map_sqlx_err)?;
     let priority: String = row.try_get("priority").map_err(map_sqlx_err)?;
+    let issue_type_raw: Option<String> = row.try_get("issue_type").map_err(map_sqlx_err)?;
+    let issue_type_recorded_raw: i64 = row.try_get("issue_type_recorded").map_err(map_sqlx_err)?;
     let assignees_json: String = row.try_get("assignees_json").map_err(map_sqlx_err)?;
     let remote_provider: Option<String> = row.try_get("remote_provider").map_err(map_sqlx_err)?;
     let remote_id: Option<String> = row.try_get("remote_id").map_err(map_sqlx_err)?;
@@ -921,6 +924,10 @@ async fn load_latest_baseline(
         lifecycle: enum_from_str::<Lifecycle>("task lifecycle", &lifecycle)?,
         sync_state: enum_from_str::<SyncState>("task sync_state", &sync_state)?,
         priority: enum_from_str::<Priority>("priority", &priority)?,
+        issue_type: issue_type_raw
+            .map(|value| enum_from_str::<IssueType>("issue type", &value))
+            .transpose()?,
+        issue_type_recorded: issue_type_recorded_raw != 0,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         repo_id,

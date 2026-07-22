@@ -1072,6 +1072,9 @@ impl TaskService {
         task.lifecycle = snapshot.lifecycle;
         task.sync = snapshot.sync_state;
         task.priority = snapshot.priority;
+        if snapshot.issue_type_recorded {
+            task.issue_type = snapshot.issue_type;
+        }
         task.assignees = snapshot.assignees;
         task.remote = snapshot.remote;
         // Restore the binding pointer too — `rl task link` / `--relink`
@@ -4955,6 +4958,84 @@ mod tests {
         // Rollback to version 1 — title should revert.
         let rolled_back = svc.rollback(&original.id, 1).await.unwrap();
         assert_eq!(rolled_back.title, "original title");
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_recorded_issue_type_and_preserves_legacy_value() {
+        let RichSvc { svc, repo, .. } = rich_svc();
+        let original = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws_id(),
+                repo_id: None,
+                title: "issue type history".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: None,
+            })
+            .await
+            .unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: original.id.clone(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("bug".into())),
+        })
+        .await
+        .unwrap();
+        svc.update(UpdateTaskCmd {
+            task_id: original.id.clone(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(None),
+        })
+        .await
+        .unwrap();
+
+        let restored_set = svc.rollback(&original.id, 2).await.unwrap();
+        assert_eq!(restored_set.issue_type.as_deref(), Some("bug"));
+        let restored_clear = svc.rollback(&original.id, 1).await.unwrap();
+        assert_eq!(restored_clear.issue_type, None);
+
+        svc.update(UpdateTaskCmd {
+            task_id: original.id.clone(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(Some("feature".into())),
+        })
+        .await
+        .unwrap();
+
+        let task_id = svc
+            .resolve_id(&original.id)
+            .await
+            .unwrap()
+            .parse::<TaskId>()
+            .unwrap();
+        {
+            let snapshots = repo.snapshots_handle();
+            let mut snapshots = snapshots.lock().unwrap();
+            let legacy = snapshots
+                .get_mut(&task_id)
+                .unwrap()
+                .iter_mut()
+                .find(|snapshot| snapshot.version == 1)
+                .unwrap();
+            legacy.issue_type = None;
+            legacy.issue_type_recorded = false;
+        }
+
+        let preserved = svc.rollback(&original.id, 1).await.unwrap();
+        assert_eq!(preserved.issue_type.as_deref(), Some("feature"));
     }
 
     /// `repoint_filing_repo` re-points the recorded `filing_repo_id` and

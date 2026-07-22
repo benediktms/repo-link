@@ -2050,6 +2050,43 @@ async fn snapshot_filing_repo_id_roundtrips() {
     );
 }
 
+#[tokio::test]
+async fn snapshot_issue_type_roundtrips_and_hydrates_baseline() {
+    use infra_sqlite::SqliteTaskSnapshotRepository;
+    use ports::TaskSnapshotRepository;
+
+    let (_dir, db, ws, _rb, ts) = setup_with_db().await;
+    let workspace = Workspace::new(WorkspaceName::new("snap-type").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+
+    let mut task = Task::new_draft(workspace.id, None, "snap type".into()).unwrap();
+    task.set_issue_type(Some(IssueType::Custom("Epic".into())));
+    task.stage_for_sync().unwrap();
+    task.promote_to_remote(RemoteRef::new("github", "9"))
+        .unwrap();
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    task.set_issue_type(None);
+    ts.save(&task, SnapshotSource::Promote).await.unwrap();
+
+    let snaps = SqliteTaskSnapshotRepository::new(db);
+    let listed = snaps.list(task.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].issue_type, Some(IssueType::Custom("Epic".into())));
+    assert!(listed[0].issue_type_recorded);
+    assert_eq!(listed[1].issue_type, None);
+    assert!(listed[1].issue_type_recorded);
+
+    let got = snaps.get(task.id, listed[0].version).await.unwrap();
+    assert_eq!(got.issue_type, Some(IssueType::Custom("Epic".into())));
+    assert!(got.issue_type_recorded);
+
+    let baseline = ts.get(task.id).await.unwrap().synced_baseline.unwrap();
+    assert_eq!(baseline.version, listed[1].version);
+    assert_eq!(baseline.issue_type, None);
+    assert!(baseline.issue_type_recorded);
+}
+
 /// RFC 0002 #118: the second read path — baseline hydration via
 /// `load_latest_baseline` (exercised by `SqliteTaskRepository::get`) — must
 /// also carry the filing repo.
@@ -2160,12 +2197,10 @@ async fn load_latest_baseline_admits_link_only_when_synced() {
     assert_eq!(baseline.sync_state, SyncState::Synced);
 }
 
-/// RFC 0002 #118: snapshot rows pre-dating the `filing_repo_id` column (or with
-/// an empty value) must read back as `None` gracefully — the same tolerance the
-/// `repo_id` non-empty/parse path established. We simulate a pre-column row by
-/// inserting one with a NULL `filing_repo_id` directly.
+/// Snapshot rows predating additive nullable fields must read back gracefully.
+/// We simulate one by omitting issue type and inserting a NULL filing repo.
 #[tokio::test]
-async fn pre_column_snapshot_filing_reads_null() {
+async fn pre_column_snapshot_fields_read_as_unrecorded_or_null() {
     use infra_sqlite::SqliteTaskSnapshotRepository;
     use ports::TaskSnapshotRepository;
 
@@ -2197,6 +2232,8 @@ async fn pre_column_snapshot_filing_reads_null() {
         got.filing_repo_id, None,
         "a NULL/pre-column filing_repo_id must read back as None"
     );
+    assert_eq!(got.issue_type, None);
+    assert!(!got.issue_type_recorded);
 }
 
 /// The same column must persist through `save_with_outbox`, which shares the

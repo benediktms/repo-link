@@ -90,6 +90,8 @@ impl InMemoryTaskRepository {
             lifecycle: task.lifecycle,
             sync_state: task.sync,
             priority: task.priority,
+            issue_type: task.issue_type.clone(),
+            issue_type_recorded: true,
             assignees: task.assignees.clone(),
             remote: task.remote.clone(),
             repo_id: task.repo_id,
