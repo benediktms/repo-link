@@ -231,6 +231,8 @@ impl Task {
             lifecycle: self.lifecycle,
             sync_state: self.sync,
             priority: self.priority,
+            issue_type: self.issue_type.clone(),
+            issue_type_recorded: true,
             assignees: self.assignees.clone(),
             remote: self.remote.clone(),
             repo_id: self.repo_id,
@@ -584,11 +586,9 @@ impl Task {
     /// [`Task::reconcile_dirty_against_baseline`] (it must never flip sync
     /// state). Setting the same value is an idempotent no-op.
     ///
-    /// Note the parity with `priority` is not yet total: unlike `priority`,
-    /// `issue_type` is **not** captured in `snapshot_view`/`TaskSnapshot`, so a
-    /// `rollback` does not restore it. That fidelity is deferred to #228 along
-    /// with the sync rail; today `issue_type` is only settable in-process, so
-    /// the gap is not user-reachable.
+    /// `issue_type` is captured in [`TaskSnapshot`] for local history and
+    /// rollback, but remains excluded from `MIRRORED_FIELDS` / `MirrorPatch`;
+    /// the separate outbound projection is owned by the application layer.
     ///
     /// [`set_priority`]: Task::set_priority
     pub fn set_issue_type(&mut self, issue_type: Option<IssueType>) {
@@ -1850,6 +1850,9 @@ mod tests {
             t.diff_against_baseline().is_empty(),
             "issue_type is not a mirrored field — the diff must stay empty"
         );
+        let snapshot = t.snapshot_view(SnapshotSource::LocalEdit);
+        assert_eq!(snapshot.issue_type, Some(IssueType::Bug));
+        assert!(snapshot.issue_type_recorded);
     }
 
     #[test]
