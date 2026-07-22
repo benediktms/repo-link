@@ -39,13 +39,18 @@ pub struct Task {
     pub priority: Priority,
     /// Extensible issue type (RFC 0006 D7): `Task` / `Bug` / `Feature` or a
     /// `Custom(String)` for org-specific kinds. `None` = unset. Like
-    /// `priority` at this stage this is **local-only metadata** — GitHub's
-    /// issue-type rail and org-registry validation are a follow-up
-    /// (#228 / RFC §6 Q3), so changing it does NOT flip sync state and it is
+    /// `priority`, this is local metadata projected separately onto GitHub's
+    /// native Type rail, so changing it does NOT flip sync state and it is
     /// deliberately NOT a [`MirrorField`]. `#[serde(default)]` keeps any
     /// pre-existing serialized `Task` JSON deserializable.
     #[serde(default)]
     pub issue_type: Option<IssueType>,
+    /// Durable intent to project [`issue_type`](Self::issue_type) onto the
+    /// remote issue's native Type field. This is operational state on a
+    /// separate axis from issue-mirror dirty detection: it survives missing
+    /// node ids and unavailable registries, but never changes `sync`.
+    #[serde(default)]
+    pub issue_type_pending: bool,
     pub assignees: Vec<String>,
     pub remote: Option<RemoteRef>,
     pub relations: Vec<TaskRelation>,
@@ -127,6 +132,7 @@ impl Task {
             priority: Priority::P3,
             // Local-only metadata (RFC 0006 D7); unset on a fresh draft.
             issue_type: None,
+            issue_type_pending: false,
             assignees: Vec::new(),
             remote: None,
             relations: Vec::new(),
@@ -188,6 +194,7 @@ impl Task {
             // Local-only metadata (RFC 0006 D7); the remote issue-type rail is
             // #228, so a cold import records no issue type yet.
             issue_type: None,
+            issue_type_pending: false,
             assignees,
             remote: Some(remote),
             relations: Vec::new(),
@@ -581,8 +588,8 @@ impl Task {
     }
 
     /// Set the extensible issue type (RFC 0006 D7). Like [`set_priority`],
-    /// this is **local-only metadata** at this stage — the remote issue-type
-    /// rail is #228 — so a change touches `updated_at` but must NOT call
+    /// this is metadata on a separate projection axis, so a change touches
+    /// `updated_at` and records durable intent but must NOT call
     /// [`Task::reconcile_dirty_against_baseline`] (it must never flip sync
     /// state). Setting the same value is an idempotent no-op.
     ///
@@ -594,6 +601,7 @@ impl Task {
     pub fn set_issue_type(&mut self, issue_type: Option<IssueType>) {
         if self.issue_type != issue_type {
             self.issue_type = issue_type;
+            self.issue_type_pending = true;
             self.touch();
         }
     }
@@ -1817,7 +1825,7 @@ mod tests {
         // synced OUTBOUND PROJECTION — but onto the project-item board rail,
         // never the issue mirror. A priority change on a Synced task must
         // still leave the issue axis (`sync_state` + `diff_against_baseline`)
-        // untouched, mirroring `set_issue_type_is_local_only_and_does_not_dirty`.
+        // untouched, mirroring `set_issue_type_is_off_axis_and_does_not_dirty`.
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
@@ -1834,17 +1842,20 @@ mod tests {
     #[test]
     fn issue_type_defaults_to_none_on_a_fresh_draft() {
         assert_eq!(draft().issue_type, None);
+        assert!(!draft().issue_type_pending);
     }
 
     #[test]
-    fn set_issue_type_is_local_only_and_does_not_dirty() {
+    fn set_issue_type_is_off_axis_and_does_not_dirty() {
         // Regression guard mirroring `priority_is_local_only_and_does_not_dirty`
         // (RFC 0006 D7): setting the issue type on a Synced task must NOT flip
-        // sync state nor produce a mirror diff — the issue-type rail is #228.
+        // sync state nor produce a mirror diff; it records separate projection
+        // intent instead.
         let mut t = synced();
         assert_eq!(t.sync, SyncState::Synced);
         t.set_issue_type(Some(IssueType::Bug));
         assert_eq!(t.issue_type, Some(IssueType::Bug));
+        assert!(t.issue_type_pending);
         assert_eq!(t.sync, SyncState::Synced);
         assert!(
             t.diff_against_baseline().is_empty(),

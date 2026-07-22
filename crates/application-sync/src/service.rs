@@ -2160,6 +2160,7 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             } => {
                 // FakeProvider::create_remote's fixed node id (RFC 0001 §9 /
                 // §D1 — the node id the REST create response carries).

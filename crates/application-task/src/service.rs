@@ -555,10 +555,8 @@ impl TaskService {
     ///   misconfiguration the user may want to know about;
     /// - the task's local type has no case-insensitive name match in the
     ///   registry (`TypeUnmapped`) — warns;
-    /// - the task has no GraphQL issue node id yet — debug (deferred, not
-    ///   lost: nothing enqueues a follow-up here today because, unlike the
-    ///   project-item attach, there is no later write-back that revisits this;
-    ///   the next edit that changes the type will replan it).
+    /// - the task has no GraphQL issue node id yet — debug; the task's durable
+    ///   pending flag keeps the intent for the drainer's later sweep.
     async fn plan_issue_type_mutation(&self, task: &Task) -> Result<Option<OutboxMutation>> {
         let owner = self.filing_repo_owner_login(task).await?;
         match enqueue::resolve_issue_type_projection(&self.org_issue_types, owner.as_deref(), task)
@@ -1056,6 +1054,7 @@ impl TaskService {
     pub async fn rollback(&self, id: &str, to_version: u64) -> Result<TaskDto> {
         let mut task = self.resolve_task(id).await?;
         let priority_before = task.priority;
+        let issue_type_before = task.issue_type.clone();
         // Capture the live filing repo up front for the no-mismatch invariant
         // (RFC 0002 #118/#120): rollback must NOT retarget it, so this value
         // must survive the rollback unchanged (asserted below).
@@ -1073,7 +1072,7 @@ impl TaskService {
         task.sync = snapshot.sync_state;
         task.priority = snapshot.priority;
         if snapshot.issue_type_recorded {
-            task.issue_type = snapshot.issue_type;
+            task.set_issue_type(snapshot.issue_type);
         }
         task.assignees = snapshot.assignees;
         task.remote = snapshot.remote;
@@ -1116,6 +1115,12 @@ impl TaskService {
         if task.priority != priority_before
             && enqueue::is_mirror(&task)
             && let Some(mutation) = self.plan_priority_mutation(&task).await?
+        {
+            entries.push(OutboxEntry::new(task.id, mutation));
+        }
+        if task.issue_type != issue_type_before
+            && enqueue::is_mirror(&task)
+            && let Some(mutation) = self.plan_issue_type_mutation(&task).await?
         {
             entries.push(OutboxEntry::new(task.id, mutation));
         }
@@ -3377,6 +3382,7 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             } => {
                 assert_eq!(issue_node_id, "I_type_nid");
                 assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
@@ -3394,6 +3400,92 @@ mod tests {
             reloaded.diff_against_baseline().is_empty(),
             "issue_type must never appear in the issue-mirror diff"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_type_clear_with_empty_registry_enqueues_direct_clear() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+        let mut task =
+            save_issue_mirror(&repo, ws.id, Some("I_clear_type"), Some("PVTI_clear_type")).await;
+        task.repo_id = Some(instance.id);
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: task.id.to_string(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            issue_type: Some(None),
+        })
+        .await
+        .unwrap();
+
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].mutation,
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id: None,
+                local_issue_type: None,
+                local_issue_type_recorded: true,
+            } if issue_node_id == "I_clear_type"
+        ));
+    }
+
+    #[tokio::test]
+    async fn rollback_issue_type_on_mirror_enqueues_projection() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            org_issue_types,
+            ..
+        } = rich_svc();
+        let (ws, instance) = ws_with_binding(&workspaces, &bindings).await;
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+        let mut task = save_issue_mirror(
+            &repo,
+            ws.id,
+            Some("I_rollback_type"),
+            Some("PVTI_rollback_type"),
+        )
+        .await;
+        task.repo_id = Some(instance.id);
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        task.set_issue_type(Some(domain_task::IssueType::Feature));
+        repo.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.rollback(&task.id.to_string(), 2).await.unwrap();
+
+        assert_eq!(
+            repo.get(task.id).await.unwrap().issue_type,
+            Some(domain_task::IssueType::Bug)
+        );
+        let entries = outbox.all();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0].mutation,
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id: Some(issue_type_id),
+                ..
+            } if issue_node_id == "I_rollback_type" && issue_type_id == "IT_bug"
+        ));
     }
 
     #[tokio::test]
@@ -3432,6 +3524,10 @@ mod tests {
             outbox.all().is_empty(),
             "native issue types unavailable for this owner — warn, don't enqueue"
         );
+        assert!(
+            repo.get(t.id).await.unwrap().issue_type_pending,
+            "unavailable registry must preserve durable projection intent"
+        );
     }
 
     #[tokio::test]
@@ -3469,6 +3565,10 @@ mod tests {
         assert!(
             outbox.all().is_empty(),
             "no registry match for \"Epic\" — warn, don't enqueue (TypeUnmapped)"
+        );
+        assert!(
+            repo.get(t.id).await.unwrap().issue_type_pending,
+            "unmapped Type must preserve durable projection intent"
         );
     }
 

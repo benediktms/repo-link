@@ -647,6 +647,7 @@ async fn task_issue_type_roundtrip() {
         ts.get(custom.id).await.unwrap().issue_type,
         Some(IssueType::Custom("Epic".into()))
     );
+    assert!(ts.get(custom.id).await.unwrap().issue_type_pending);
 
     // Well-known variant survives.
     let mut bug = Task::new_draft(w.id, None, "bug".into()).unwrap();
@@ -676,6 +677,15 @@ async fn task_issue_type_roundtrip() {
     custom.set_issue_type(None);
     ts.save(&custom, SnapshotSource::LocalEdit).await.unwrap();
     assert_eq!(ts.get(custom.id).await.unwrap().issue_type, None);
+    assert!(ts.get(custom.id).await.unwrap().issue_type_pending);
+    assert!(ts.clear_issue_type_pending(custom.id, None).await.unwrap());
+    assert!(!ts.get(custom.id).await.unwrap().issue_type_pending);
+    assert!(
+        !ts.clear_issue_type_pending(bug.id, Some(IssueType::Feature))
+            .await
+            .unwrap(),
+        "a stale success must not clear intent for a different desired type"
+    );
 }
 
 #[tokio::test]
@@ -2494,6 +2504,54 @@ async fn outbox_with_task(
         infra_sqlite::SqliteOutboxRepository::new(db.clone()),
         task.id,
     )
+}
+
+#[tokio::test]
+async fn set_issue_type_enqueue_deduplicates_non_terminal_entry() {
+    use domain_sync::{OutboxEntry, OutboxMutation};
+    use ports::OutboxRepository;
+
+    let (_dir, db, _ws, _rb, ts) = setup_with_db().await;
+    let (outbox, task_id) = outbox_with_task(&db, &ts).await;
+    let mutation = || OutboxMutation::SetIssueType {
+        issue_node_id: "I_type".into(),
+        issue_type_id: Some("IT_bug".into()),
+        local_issue_type: Some("bug".into()),
+        local_issue_type_recorded: true,
+    };
+    let first = OutboxEntry::new(task_id, mutation());
+    outbox.enqueue(&first).await.unwrap();
+    outbox
+        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .await
+        .unwrap();
+    assert_eq!(outbox.list_pending(task_id).await.unwrap().len(), 1);
+
+    let claimed = outbox
+        .claim_next_eligible(domain_core::Timestamp::now())
+        .await
+        .unwrap()
+        .unwrap();
+    outbox
+        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox.list_pending(task_id).await.unwrap().len(),
+        0,
+        "an inflight Type projection also suppresses a duplicate"
+    );
+
+    outbox.mark_succeeded(claimed.id).await.unwrap();
+    outbox
+        .enqueue(&OutboxEntry::new(task_id, mutation()))
+        .await
+        .unwrap();
+    assert_eq!(
+        outbox.list_pending(task_id).await.unwrap().len(),
+        1,
+        "terminal entries do not suppress a later desired projection"
+    );
 }
 
 #[tokio::test]

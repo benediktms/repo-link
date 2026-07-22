@@ -83,12 +83,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use domain_core::Timestamp;
-use domain_sync::{ConflictKind, OutboxEntry, OutboxMutation};
+use domain_core::{RepoOriginId, Timestamp};
+use domain_sync::{ConflictKind, OutboxEntry, OutboxMutation, resolve_filing_repo};
 use domain_task::{RemoteRef, SnapshotSource, SyncState};
 use ports::{
     OrgIssueTypeRepository, OutboxRepository, ProjectRepository, RemoteProjectProvider,
-    RemoteTaskProvider, SyncedSource, TaskRepository, WorkspaceRepository,
+    RemoteTaskProvider, RepoBindingRepository, SyncedSource, TaskFilter, TaskRepository,
+    WorkspaceRepository,
 };
 use tracing::{debug, info, warn};
 
@@ -187,6 +188,7 @@ impl Default for BackoffSchedule {
 pub struct OutboxDrainer {
     outbox: Arc<dyn OutboxRepository>,
     tasks: Arc<dyn TaskRepository>,
+    bindings: Arc<dyn RepoBindingRepository>,
     workspaces: Arc<dyn WorkspaceRepository>,
     projects: Arc<dyn ProjectRepository>,
     remote_tasks: Arc<dyn RemoteTaskProvider>,
@@ -202,9 +204,11 @@ pub struct OutboxDrainer {
 }
 
 impl OutboxDrainer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         outbox: Arc<dyn OutboxRepository>,
         tasks: Arc<dyn TaskRepository>,
+        bindings: Arc<dyn RepoBindingRepository>,
         workspaces: Arc<dyn WorkspaceRepository>,
         projects: Arc<dyn ProjectRepository>,
         remote_tasks: Arc<dyn RemoteTaskProvider>,
@@ -214,6 +218,7 @@ impl OutboxDrainer {
         Self {
             outbox,
             tasks,
+            bindings,
             workspaces,
             projects,
             remote_tasks,
@@ -235,6 +240,7 @@ impl OutboxDrainer {
     /// cap are dead-lettered. A claim that returns the same task again can't
     /// happen mid-pass because the head stays `inflight` until resolved here.
     pub async fn drain_once(&self) -> Result<usize> {
+        self.enqueue_pending_issue_types().await?;
         let mut succeeded = 0usize;
         loop {
             let now = Timestamp::now();
@@ -313,6 +319,74 @@ impl OutboxDrainer {
             }
         }
         Ok(succeeded)
+    }
+
+    /// Re-evaluate durable native-Type intent without putting an unresolved
+    /// placeholder into the per-task FIFO. Once prerequisites exist, enqueue
+    /// the ordinary concrete mutation; repository-level dedupe makes repeated
+    /// daemon sweeps harmless.
+    async fn enqueue_pending_issue_types(&self) -> Result<()> {
+        let pending = self
+            .tasks
+            .list(TaskFilter {
+                issue_type_pending: true,
+                ..TaskFilter::default()
+            })
+            .await?;
+        for task in pending {
+            if !crate::enqueue::is_mirror(&task) {
+                continue;
+            }
+            let owner = if task.issue_type.is_some() {
+                self.filing_owner_login(&task).await?
+            } else {
+                None
+            };
+            if let crate::enqueue::IssueTypeProjection::Mutation(mutation) =
+                crate::enqueue::resolve_issue_type_projection(
+                    &self.org_issue_types,
+                    owner.as_deref(),
+                    &task,
+                )
+                .await?
+            {
+                self.outbox
+                    .enqueue(&OutboxEntry::new(task.id, mutation))
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn filing_owner_login(&self, task: &domain_task::Task) -> Result<Option<String>> {
+        let workspace_default = match self.workspaces.get(task.workspace_id).await {
+            Ok(workspace) => workspace
+                .filing_repo_id
+                .map(|id| RepoOriginId::from_uuid(id.as_uuid())),
+            Err(ports::PortError::NotFound(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let recorded = task
+            .filing_repo_id
+            .map(|id| RepoOriginId::from_uuid(id.as_uuid()));
+        let logical = if let Some(repo_id) = task.repo_id {
+            match self.bindings.get(repo_id).await {
+                Ok(binding) => Some(binding.instance.origin_id),
+                Err(ports::PortError::NotFound(_)) => None,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            None
+        };
+        let Some(origin_id) = resolve_filing_repo(recorded, workspace_default, logical) else {
+            return Ok(None);
+        };
+        let canonical = match self.bindings.get_origin(origin_id).await {
+            Ok(origin) => origin.canonical_url,
+            Err(ports::PortError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(crate::enqueue::parse_github_owner(&canonical))
     }
 
     /// Route one entry to the right provider, apply its write-backs, and
@@ -643,13 +717,16 @@ impl OutboxDrainer {
             OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                local_issue_type,
+                local_issue_type_recorded,
             } => {
                 // GraphQL `updateIssue(input: { id, issueTypeId })` — the
                 // native issue-level "Type" field (RFC 0006 §0 A1 / #228).
                 // Deliberately off the issue-mirror axis (NOT `MIRRORED_FIELDS`
-                // / `MirrorPatch`), so this arm never touches `sync_state` and
-                // never writes back to the task: the outbox entry itself is
-                // the durable retry unit. There is also NO read-back
+                // / `MirrorPatch`), so this arm never touches `sync_state`.
+                // Success compare-and-clears the separate durable intent flag
+                // only if the task still wants this exact local value. There
+                // is also NO read-back
                 // comparison — `GraphqlClient::set_issue_type` doesn't fetch
                 // the applied value back — so unlike `SetProjectStatus` there
                 // is no `Conflict` disposition available here at all, an
@@ -660,7 +737,17 @@ impl OutboxDrainer {
                     .set_issue_type(issue_node_id, issue_type_id.as_deref())
                     .await
                 {
-                    Ok(()) => Ok(ApplyDisposition::Stamped),
+                    Ok(()) => {
+                        if *local_issue_type_recorded {
+                            self.tasks
+                                .clear_issue_type_pending(
+                                    entry.task_id,
+                                    local_issue_type.clone().map(domain_task::IssueType::from),
+                                )
+                                .await?;
+                        }
+                        Ok(ApplyDisposition::Stamped)
+                    }
                     Err(e) => Ok(ApplyDisposition::Retry(e.into())),
                 }
             }
@@ -969,13 +1056,14 @@ mod tests {
     };
     use testing_fixtures::{
         InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryProjectRepository,
-        InMemoryRemoteProjectProvider, InMemoryRemoteTaskProvider, InMemoryTaskRepository,
-        InMemoryWorkspaceRepository, ProjectCall,
+        InMemoryRemoteProjectProvider, InMemoryRemoteTaskProvider, InMemoryRepoBindingRepository,
+        InMemoryTaskRepository, InMemoryWorkspaceRepository, ProjectCall,
     };
 
     struct Harness {
         outbox: Arc<InMemoryOutboxRepository>,
         tasks: Arc<InMemoryTaskRepository>,
+        bindings: Arc<InMemoryRepoBindingRepository>,
         workspaces: Arc<InMemoryWorkspaceRepository>,
         projects: Arc<InMemoryProjectRepository>,
         remote_tasks: Arc<InMemoryRemoteTaskProvider>,
@@ -989,6 +1077,7 @@ mod tests {
     async fn harness(backoff: BackoffSchedule) -> Harness {
         let outbox = Arc::new(InMemoryOutboxRepository::new());
         let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
         let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
         let projects = Arc::new(InMemoryProjectRepository::new());
         let remote_tasks = Arc::new(InMemoryRemoteTaskProvider::new());
@@ -997,6 +1086,7 @@ mod tests {
 
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
         let tasks_dyn: Arc<dyn TaskRepository> = tasks.clone();
+        let bindings_dyn: Arc<dyn RepoBindingRepository> = bindings.clone();
         let ws_dyn: Arc<dyn WorkspaceRepository> = workspaces.clone();
         let proj_dyn: Arc<dyn ProjectRepository> = projects.clone();
         let rt_dyn: Arc<dyn ports::RemoteTaskProvider> = remote_tasks.clone();
@@ -1004,13 +1094,21 @@ mod tests {
         let oit_dyn: Arc<dyn OrgIssueTypeRepository> = org_issue_types.clone();
 
         let drainer = OutboxDrainer::new(
-            outbox_dyn, tasks_dyn, ws_dyn, proj_dyn, rt_dyn, rp_dyn, oit_dyn,
+            outbox_dyn,
+            tasks_dyn,
+            bindings_dyn,
+            ws_dyn,
+            proj_dyn,
+            rt_dyn,
+            rp_dyn,
+            oit_dyn,
         )
         .with_backoff(backoff);
 
         Harness {
             outbox,
             tasks,
+            bindings,
             workspaces,
             projects,
             remote_tasks,
@@ -1880,6 +1978,101 @@ mod tests {
         )
     }
 
+    async fn seed_type_binding(
+        h: &Harness,
+    ) -> (WorkspaceId, domain_core::RepoId, domain_core::RepoId) {
+        let workspace = Workspace::new(WorkspaceName::new("types").unwrap(), None, false);
+        h.workspaces.save(&workspace).await.unwrap();
+        let origin =
+            domain_repo::RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into())
+                .unwrap();
+        let instance = domain_repo::RepoInstance::new(
+            workspace.id,
+            origin.id,
+            origin.canonical_url.clone(),
+            None,
+        )
+        .unwrap();
+        h.bindings.save_origin(&origin).await.unwrap();
+        h.bindings.save_instance(&instance).await.unwrap();
+        (
+            workspace.id,
+            instance.id,
+            domain_core::RepoId::from_uuid(origin.id.as_uuid()),
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_issue_type_projects_after_remote_node_arrives() {
+        let h = harness(test_backoff(5)).await;
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        let (workspace_id, repo_id, filing_repo_id) = seed_type_binding(&h).await;
+        let mut task = Task::import_mirror(
+            workspace_id,
+            Some(repo_id),
+            RemoteRef::new("github", "9"),
+            "legacy mirror".into(),
+            String::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.force_set_filing_repo_id(Some(filing_repo_id));
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert!(h.tasks.get(task.id).await.unwrap().issue_type_pending);
+
+        h.tasks
+            .cache_remote_node_id(task.id, "I_late".into())
+            .await
+            .unwrap();
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert!(!h.tasks.get(task.id).await.unwrap().issue_type_pending);
+        assert!(h.remote_projects.calls().iter().any(|call| matches!(
+            call,
+            ProjectCall::SetIssueType {
+                issue_node_id,
+                issue_type_id: Some(issue_type_id),
+            } if issue_node_id == "I_late" && issue_type_id == "IT_bug"
+        )));
+    }
+
+    #[tokio::test]
+    async fn pending_issue_type_projects_after_registry_becomes_resolvable() {
+        let h = harness(test_backoff(5)).await;
+        let (workspace_id, repo_id, filing_repo_id) = seed_type_binding(&h).await;
+        let mut remote = RemoteRef::new("github", "10");
+        remote.node_id = Some("I_registry_late".into());
+        let mut task = Task::import_mirror(
+            workspace_id,
+            Some(repo_id),
+            remote,
+            "registry later".into(),
+            String::new(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.force_set_filing_repo_id(Some(filing_repo_id));
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 0);
+        assert!(h.tasks.get(task.id).await.unwrap().issue_type_pending);
+
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert!(!h.tasks.get(task.id).await.unwrap().issue_type_pending);
+    }
+
     #[tokio::test]
     async fn convert_draft_to_issue_with_local_issue_type_enqueues_set_issue_type() {
         let h = harness(test_backoff(5)).await;
@@ -1934,6 +2127,7 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             } => {
                 assert_eq!(issue_node_id, "I_converted_type");
                 assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
@@ -3159,6 +3353,8 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id: "I_9".into(),
                 issue_type_id: Some("IT_bug".into()),
+                local_issue_type: Some("bug".into()),
+                local_issue_type_recorded: true,
             },
         );
         h.outbox.enqueue(&entry).await.unwrap();
@@ -3188,6 +3384,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_set_issue_type_success_keeps_newer_intent_pending() {
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let mut task = seed_issue_task(&h, ws, "1").await;
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetIssueType {
+                issue_node_id: "I_9".into(),
+                issue_type_id: Some("IT_bug".into()),
+                local_issue_type: Some("bug".into()),
+                local_issue_type_recorded: true,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+        task.set_issue_type(Some(domain_task::IssueType::Feature));
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert!(h.tasks.get(task.id).await.unwrap().issue_type_pending);
+    }
+
     /// `issue_type_id: None` (a clear) drains through to the provider as
     /// `None` — the clearing shape must not get lost between the outbox row
     /// and the port call.
@@ -3202,6 +3428,8 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id: "I_9".into(),
                 issue_type_id: None,
+                local_issue_type: None,
+                local_issue_type_recorded: true,
             },
         );
         h.outbox.enqueue(&entry).await.unwrap();
@@ -3236,6 +3464,8 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id: "I_9".into(),
                 issue_type_id: Some("IT_bug".into()),
+                local_issue_type: Some("bug".into()),
+                local_issue_type_recorded: true,
             },
         );
         h.outbox.enqueue(&entry).await.unwrap();
@@ -3259,6 +3489,8 @@ mod tests {
             OutboxMutation::SetIssueType {
                 issue_node_id: "I_9".into(),
                 issue_type_id: Some("IT_bug".into()),
+                local_issue_type: Some("bug".into()),
+                local_issue_type_recorded: true,
             },
         );
         h.outbox.enqueue(&entry).await.unwrap();

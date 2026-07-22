@@ -32,7 +32,7 @@ impl SqliteTaskRepository {
 // per the #110 every-live-column contract) but `row_to_task` no longer reads it —
 // the lifecycle axis is read from `lifecycle` (RFC 0004 D1). `synced_at` is the
 // RFC 0004 D3 write-through cache column.
-pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at, issue_type";
+pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at, issue_type, issue_type_pending";
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
@@ -190,6 +190,9 @@ impl TaskRepository for SqliteTaskRepository {
         }
         if filter.has_project_item_id {
             qb.push(" AND tasks.project_item_id IS NOT NULL");
+        }
+        if filter.issue_type_pending {
+            qb.push(" AND tasks.issue_type_pending = 1");
         }
         if let Some(ts) = filter.synced_at_lt {
             // Stale-scan: never-observed (NULL) or older than the threshold.
@@ -495,6 +498,23 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn clear_issue_type_pending(
+        &self,
+        task_id: TaskId,
+        expected: Option<IssueType>,
+    ) -> PortResult<bool> {
+        let result = sqlx::query(
+            "UPDATE tasks SET issue_type_pending = 0 \
+             WHERE id = ? AND issue_type_pending = 1 AND issue_type IS ?",
+        )
+        .bind(task_id.to_string())
+        .bind(expected.as_ref().map(enum_to_str).transpose()?)
+        .execute(&self.db.writes)
+        .await
+        .map_err(map_sqlx_err)?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn cache_synced_at(
         &self,
         task_id: TaskId,
@@ -549,8 +569,8 @@ async fn write_task_in_tx(
 
     sqlx::query(
         r#"
-        INSERT INTO tasks (id, workspace_id, repo_instance_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at, issue_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO tasks (id, workspace_id, repo_instance_id, filing_repo_id, title, body, status, lifecycle, sync_state, priority, assignees_json, remote_provider, remote_id, remote_node_id, project_item_id, project_status_option_id, synced_at, hash, created_at, updated_at, issue_type, issue_type_pending)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             workspace_id = excluded.workspace_id,
             repo_instance_id = excluded.repo_instance_id,
@@ -566,6 +586,14 @@ async fn write_task_in_tx(
             -- it is the silent-never-persists-on-update bug class (unlike
             -- `synced_at`, whose exclusion below is deliberate).
             issue_type = excluded.issue_type,
+            -- Projection intent is a write-through operational flag. Preserve
+            -- its current value on unrelated whole-row saves; a real local
+            -- Type change always creates fresh intent, and only the targeted
+            -- compare-and-clear path may clear it.
+            issue_type_pending = CASE
+                WHEN excluded.issue_type IS NOT tasks.issue_type THEN 1
+                ELSE tasks.issue_type_pending
+            END,
             assignees_json = excluded.assignees_json,
             remote_provider = excluded.remote_provider,
             remote_id = excluded.remote_id,
@@ -613,6 +641,7 @@ async fn write_task_in_tx(
     // or verbatim custom), or NULL when unset. `enum_to_str` reuses the enum's
     // string Serialize; `transpose()` maps `Option<Result<_>>` → `Result<Option<_>>`.
     .bind(t.issue_type.as_ref().map(enum_to_str).transpose()?)
+    .bind(t.issue_type_pending)
     .execute(&mut **tx)
     .await
     .map_err(map_sqlx_err)?;
@@ -744,6 +773,10 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
     let synced_at: Option<DateTime<Utc>> = row.try_get("synced_at").map_err(map_sqlx_err)?;
     // RFC 0006 D7 / #227: local extensible issue type. NULL = unset.
     let issue_type: Option<String> = row.try_get("issue_type").map_err(map_sqlx_err)?;
+    let issue_type_pending: bool = row
+        .try_get::<i64, _>("issue_type_pending")
+        .map_err(map_sqlx_err)?
+        != 0;
 
     let repo_id = repo_id_str
         .as_deref()
@@ -783,6 +816,7 @@ fn row_to_task(row: &sqlx::sqlite::SqliteRow) -> PortResult<Task> {
             .as_deref()
             .map(|s| enum_from_str::<IssueType>("issue_type", s))
             .transpose()?,
+        issue_type_pending,
         assignees: json_from_string::<Vec<String>>("assignees", &assignees_json)?,
         remote,
         relations: Vec::new(),
