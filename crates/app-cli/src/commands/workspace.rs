@@ -95,6 +95,16 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                      --standalone <name>, --sub-issue <name>, or --none"
                 ));
             }
+            // A blank name would be stored verbatim and later stamped as an
+            // unresolvable `Custom("")` type — reject it at the boundary rather
+            // than persist garbage (a name is matched against the org registry).
+            for (flag, value) in [("--standalone", &standalone), ("--sub-issue", &sub_issue)] {
+                if value.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                    return Err(anyhow!(
+                        "{flag} requires a non-empty issue-type name (use --none to clear)"
+                    ));
+                }
+            }
             let workspace = resolve_workspace(svc, workspace).await?;
             let dto = svc
                 .workspaces

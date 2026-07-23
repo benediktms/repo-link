@@ -4155,6 +4155,22 @@ fn workspace_set_default_type_merges_and_clears() {
         cleared.get("default_sub_issue_type").is_none()
             || cleared["default_sub_issue_type"].is_null()
     );
+
+    // A blank name is rejected at the boundary (not stored as Custom("")).
+    let stderr = String::from_utf8(
+        bin("repo-link", &dir)
+            .args(["workspace", "set-default-type", &ws_id, "--standalone", ""])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stderr.contains("non-empty issue-type name"),
+        "blank --standalone must be rejected: {stderr}"
+    );
 }
 
 #[test]

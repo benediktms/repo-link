@@ -196,6 +196,7 @@ impl SyncService {
         // now, so it becomes an ordinary value the block below (and every later
         // re-save) projects unchanged. Runs only here at first filing, so it can
         // never override an already-recorded type or a deliberate clear.
+        let mut stamped_default = false;
         if task.issue_type.is_none()
             && let Some(derived) = enqueue::derive_default_issue_type(
                 &task,
@@ -203,8 +204,14 @@ impl SyncService {
                 workspace.default_sub_issue_type.as_deref(),
             )
         {
-            task.set_issue_type(Some(derived));
+            // Stamp the default (via the no-pending setter, keeping the in-flight
+            // domain object honest). The persistence layer's #228 CASE re-arms
+            // `issue_type_pending` on any Type change regardless, so the stuck-
+            // pending fix is applied AFTER the save below, gated on `!type_projected`.
+            task.set_issue_type_default(derived);
+            stamped_default = true;
         }
+        let mut type_projected = false;
         if task.issue_type.is_some() {
             // Reuse the `workspace` already fetched above (RFC 0002 filing
             // chain) instead of `resolve_project`, which would re-fetch it.
@@ -219,12 +226,28 @@ impl SyncService {
             .await?
             {
                 entries.push(OutboxEntry::new(task.id, mutation));
+                type_projected = true;
             }
         }
 
         self.tasks
             .save_with_outbox(&task, SnapshotSource::Promote, &entries)
             .await?;
+
+        // #239 finding #1: a stamped DEFAULT that could not project (type-less
+        // board — native registry unavailable AND no custom Type field, so no
+        // outbox entry was enqueued) must not stay `issue_type_pending`: the
+        // save's #228 CASE armed it because the Type value changed, but a
+        // best-effort default has no durable retry intent, so the daemon sweep
+        // must not re-derive + re-warn about it forever. Clear it now (compare-
+        // and-clear guarded on the value we just stamped). Explicit types and
+        // projected defaults are untouched — they keep #228's retry backstop
+        // (a projected default's entry clears pending on drain success).
+        if stamped_default && !type_projected {
+            self.tasks
+                .clear_issue_type_pending(task.id, task.issue_type.clone())
+                .await?;
+        }
         Ok(summary(&task, prev, SyncDecision::PushLocal))
     }
 
@@ -2171,9 +2194,15 @@ mod tests {
         let (svc, tasks, task) = promote_setup_with_defaults(Some("Story"), Some("Task")).await;
         svc.promote(&task.id.to_string()).await.unwrap();
         // Free-standing task → standalone default stamped as the local type.
-        assert_eq!(
-            tasks.get(task.id).await.unwrap().issue_type,
-            Some(IssueType::from("Story"))
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(saved.issue_type, Some(IssueType::from("Story")));
+        // #239 finding #1: this setup has no org registry and no custom Type
+        // field, so the default can't project. The stamp must NOT arm the
+        // durable projection intent — otherwise the daemon sweep would re-derive
+        // and re-warn about an unprojectable default on every tick forever.
+        assert!(
+            !saved.issue_type_pending,
+            "a default stamped on a type-less board must not arm issue_type_pending"
         );
     }
 
@@ -2311,6 +2340,72 @@ mod tests {
                 // §D1 — the node id the REST create response carries).
                 assert_eq!(issue_node_id, "I_kwDOfake100");
                 assert_eq!(issue_type_id, &Some("IT_bug".to_string()));
+            }
+            other => panic!("expected SetIssueType, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn promote_projects_the_stamped_default_type_end_to_end() {
+        // #239 + #228 end-to-end: a task with NO explicit type, on a workspace
+        // whose standalone default name IS present in the org registry, must
+        // both STAMP the default locally AND project it — exactly one
+        // SetIssueType with the resolved id — proving the default-fill flows all
+        // the way through resolve_type_projection to the outbox, not just the
+        // local stamp (the four `promote_stamps_*` tests use an empty registry
+        // and only assert the stamp).
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+        let org_issue_types = Arc::new(InMemoryOrgIssueTypeRepository::new());
+        org_issue_types.save(&bug_registry("o")).await.unwrap();
+
+        let mut workspace = Workspace::new(WorkspaceName::new("def-proj-ws").unwrap(), None, true);
+        workspace.set_default_issue_types(Some("Bug".into()), None);
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
+        let task = Task::new_draft(workspace_id, Some(repo_id), "no explicit type".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
+            provider.clone(),
+            org_issue_types.clone(),
+        );
+
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Local stamp landed.
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().issue_type,
+            Some(IssueType::Bug)
+        );
+        // ...and it projected: exactly one SetIssueType carrying the resolved id.
+        let type_entries: Vec<_> = outbox
+            .all()
+            .into_iter()
+            .filter(|e| matches!(e.mutation, OutboxMutation::SetIssueType { .. }))
+            .collect();
+        assert_eq!(
+            type_entries.len(),
+            1,
+            "the stamped default must project a SetIssueType: {:?}",
+            outbox.all()
+        );
+        match &type_entries[0].mutation {
+            OutboxMutation::SetIssueType { issue_type_id, .. } => {
+                assert_eq!(issue_type_id, &Some("IT_bug".to_string()))
             }
             other => panic!("expected SetIssueType, got {other:?}"),
         }

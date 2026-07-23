@@ -606,6 +606,23 @@ impl Task {
         }
     }
 
+    /// Stamp a DERIVED DEFAULT issue type (RFC 0006 #239) WITHOUT arming the
+    /// durable projection intent. Unlike [`Self::set_issue_type`], this does
+    /// **not** set `issue_type_pending`: a default is a best-effort first-filing
+    /// fill, not the user's durable intent. The caller (`SyncService::promote`)
+    /// still projects it inline when the board/org can carry it (the outbox
+    /// entry, once enqueued, has its own retry) — but on a type-less board
+    /// (user-owned, no custom Type field) there is nothing to project, and
+    /// arming `pending` would make the daemon sweep re-derive and re-warn about
+    /// an unprojectable default on every tick forever. The task still carries
+    /// the effective type locally; only the retry backstop is withheld.
+    pub fn set_issue_type_default(&mut self, issue_type: IssueType) {
+        if self.issue_type.as_ref() != Some(&issue_type) {
+            self.issue_type = Some(issue_type);
+            self.touch();
+        }
+    }
+
     /// Cache the task's remote GitHub Projects v2 status option id (written
     /// by the Stage-7 poller from a polled item, RFC 0001 Stage 8). This is a
     /// **separate drift axis**, not a lifecycle/sync transition: it mirrors
