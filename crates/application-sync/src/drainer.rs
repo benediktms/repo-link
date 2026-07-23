@@ -337,22 +337,35 @@ impl OutboxDrainer {
             if !crate::enqueue::is_mirror(&task) {
                 continue;
             }
-            let owner = if task.issue_type.is_some() {
-                self.filing_owner_login(&task).await?
-            } else {
-                None
-            };
-            if let crate::enqueue::IssueTypeProjection::Mutation(mutation) =
-                crate::enqueue::resolve_issue_type_projection(
+            let projection = async {
+                let owner = if task.issue_type.is_some() {
+                    self.filing_owner_login(&task).await?
+                } else {
+                    None
+                };
+                let projection = crate::enqueue::resolve_issue_type_projection(
                     &self.org_issue_types,
                     owner.as_deref(),
                     &task,
                 )
-                .await?
-            {
-                self.outbox
-                    .enqueue(&OutboxEntry::new(task.id, mutation))
-                    .await?;
+                .await?;
+                Ok::<_, SyncError>(projection)
+            }
+            .await;
+            match projection {
+                Ok(crate::enqueue::IssueTypeProjection::Mutation(mutation)) => {
+                    self.outbox
+                        .enqueue(&OutboxEntry::new(task.id, mutation))
+                        .await?;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(
+                        task_id = %task.id,
+                        error = %error,
+                        "failed to resolve pending issue type projection; retrying next drain"
+                    );
+                }
             }
         }
         Ok(())
@@ -2000,6 +2013,48 @@ mod tests {
             instance.id,
             domain_core::RepoId::from_uuid(origin.id.as_uuid()),
         )
+    }
+
+    #[tokio::test]
+    async fn pending_issue_type_backend_error_skips_only_that_task() {
+        let h = harness(test_backoff(5)).await;
+        h.org_issue_types
+            .save(&drainer_bug_registry("o"))
+            .await
+            .unwrap();
+        h.org_issue_types.fail_next(1);
+        let (workspace_id, repo_id, filing_repo_id) = seed_type_binding(&h).await;
+        for (remote_id, node_id) in [("12", "I_first"), ("13", "I_second")] {
+            let mut remote = RemoteRef::new("github", remote_id);
+            remote.node_id = Some(node_id.into());
+            let mut task = Task::import_mirror(
+                workspace_id,
+                Some(repo_id),
+                remote,
+                remote_id.into(),
+                String::new(),
+                vec![],
+                false,
+            )
+            .unwrap();
+            task.force_set_filing_repo_id(Some(filing_repo_id));
+            task.set_issue_type(Some(domain_task::IssueType::Bug));
+            h.tasks.save(&task, SnapshotSource::Pull).await.unwrap();
+        }
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(
+            h.tasks
+                .list(TaskFilter {
+                    issue_type_pending: true,
+                    ..TaskFilter::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the failed task stays pending while the next task drains"
+        );
     }
 
     #[tokio::test]

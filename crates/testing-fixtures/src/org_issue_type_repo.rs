@@ -8,16 +8,21 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use domain_project::OrgIssueTypeRegistry;
-use ports::{OrgIssueTypeRepository, PortResult};
+use ports::{OrgIssueTypeRepository, PortError, PortResult};
 
 #[derive(Default)]
 pub struct InMemoryOrgIssueTypeRepository {
     by_owner: Mutex<HashMap<String, OrgIssueTypeRegistry>>,
+    fail_next: Mutex<u32>,
 }
 
 impl InMemoryOrgIssueTypeRepository {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn fail_next(&self, n: u32) {
+        *self.fail_next.lock().unwrap() = n;
     }
 }
 
@@ -32,6 +37,12 @@ impl OrgIssueTypeRepository for InMemoryOrgIssueTypeRepository {
     }
 
     async fn get(&self, owner_login: &str) -> PortResult<OrgIssueTypeRegistry> {
+        let mut fail_next = self.fail_next.lock().unwrap();
+        if *fail_next > 0 {
+            *fail_next -= 1;
+            return Err(PortError::Backend("stub: registry transient".into()));
+        }
+        drop(fail_next);
         // Absent owner → empty registry (is_available() == false), never
         // NotFound — mirrors the SQLite repo's D8 contract.
         let mut registry = self
