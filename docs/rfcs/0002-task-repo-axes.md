@@ -46,7 +46,7 @@ Two distinct facts, one field.
 
 Keep `Task.repo_id` as the **logical repo** (worktrees, prefix, where the agent works). Introduce a separate **filing repo** axis: where the backing GitHub issue is created. This is the split flagged when RFC 0001 was scoped but not implemented.
 
-### D2 — The filing repo is a workspace default, recorded per task on promote
+### D2 — The filing repo is a workspace default, recorded per task (override at create, fallback at promote)
 
 > **Status:** step 1 (the per-task `--filing-repo` override) is **wired** (#122). `rl task create --filing-repo <handle>` resolves the binding to its origin and records it as the draft's `filing_repo_id`; `SyncService::promote` reads that recorded override first in the chain below. Step 2 (workspace filing default) already shipped (#121). Steps 3–4 are unchanged from RFC 0001.
 
@@ -62,7 +62,7 @@ Two edge cases the chain must make explicit:
 - **Orphan task + workspace filing default.** When `repo_id IS NULL` (orphan) but a workspace filing default is set, step 2 resolves: a **real GitHub issue is created in the filing repo** and added to the board — the filing repo substitutes for the missing logical repo as the issue's home (the same substitution D3 relies on for `convertProjectV2DraftIssueItemToIssue`). The orphan does **not** stay a board draft.
 - **NULL fall-through.** Step 3 applies only when `repo_id IS NOT NULL`; a NULL `repo_id` is a *failing* resolution that falls through to step 4, not an empty-but-passing one. Board draft (step 4) is therefore reached only when steps 1–3 all miss.
 
-The **resolved** filing repo is recorded on the task at promote time (stable, like `project_item_id`) so that later changes to the workspace default never silently move an already-filed issue. Once recorded, it is authoritative: sync/update logic consults `tasks.filing_repo_id` first and never re-resolves from the workspace default (the full migration/lookup rules are in §3).
+**When the filing repo is recorded** depends on which link resolves it. The **explicit per-task override** (step 1) is recorded at **create** time — `rl task create --filing-repo` writes `tasks.filing_repo_id` immediately (#122), so it is already pinned before promote. The **fallback** links (steps 2–3, workspace default / logical repo) have no value to record until first-filing, so promote resolves and records them then. Either way the recorded value is stable (like `project_item_id`): later changes to the workspace default never silently move an already-filed — or already-overridden — issue. Once recorded, it is authoritative: sync/update logic (and promote itself) consults `tasks.filing_repo_id` **first** and never re-resolves from the workspace default (the full migration/lookup rules are in §3).
 
 This keeps RFC 0001 behaviour intact: with no workspace default and no override, the filing repo resolves to `repo_id` exactly as today. The new axis only diverges when a workspace opts into a dedicated issues repo. The split is therefore **additive**, not an inversion of `repo_id`'s meaning.
 
