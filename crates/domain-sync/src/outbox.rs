@@ -84,6 +84,36 @@ pub enum OutboxMutation {
         priority_field_id: String,
         option_id: String,
     },
+    /// GraphQL `updateProjectV2ItemFieldValue` (set) or
+    /// `clearProjectV2ItemFieldValue` (clear) against a board's CUSTOM
+    /// "Type"/"Types" single-select field (RFC 0006 #238). The dogfoodable
+    /// alternative to [`Self::SetIssueType`] for user-owned boards, which have
+    /// no native issue types: the local `IssueType` is projected onto the board
+    /// option whose name matches (case-insensitively). `option_id` is `None` to
+    /// clear the field value (via `clearProjectV2ItemFieldValue`), `Some(id)` to
+    /// set it.
+    ///
+    /// Sibling of [`Self::SetProjectPriority`] — same project-ITEM rail, its own
+    /// variant + drainer arm with no read-back `Conflict`. It carries the
+    /// `local_issue_type` compare-and-clear fields of [`Self::SetIssueType`]
+    /// because the two rails share the task's single durable projection intent
+    /// (`Task::issue_type_pending`): whichever rail applies clears it on success
+    /// (RFC 0006 #238 decision 2 — never both rails for one task). Exactly one
+    /// of `SetProjectType` / `SetIssueType` is ever enqueued for a given edit,
+    /// chosen by `resolve_type_projection`.
+    SetProjectType {
+        project_node_id: String,
+        item_node_id: String,
+        type_field_id: String,
+        option_id: Option<String>,
+        /// Canonical local value this mutation represents; compare-and-clears
+        /// the durable projection intent on success (see [`Self::SetIssueType`]).
+        #[serde(default)]
+        local_issue_type: Option<String>,
+        /// Distinguishes a newly-authored clear from a legacy serialized entry.
+        #[serde(default)]
+        local_issue_type_recorded: bool,
+    },
     /// GraphQL `updateIssue(input: { id, issueTypeId })` — set (or clear) the
     /// issue's native "Type" field (RFC 0006 §0 A1 / #228). `issue_type_id`
     /// is `None` to clear, `Some(id)` to set (an `OrgIssueType::issue_type_id`
@@ -171,6 +201,7 @@ impl OutboxMutation {
             Self::ConvertDraftToIssue { .. } => "convert_draft_to_issue",
             Self::SetProjectStatus { .. } => "set_project_status",
             Self::SetProjectPriority { .. } => "set_project_priority",
+            Self::SetProjectType { .. } => "set_project_type",
             Self::SetIssueType { .. } => "set_issue_type",
             Self::AddSubIssue { .. } => "add_sub_issue",
             Self::RemoveSubIssue { .. } => "remove_sub_issue",
@@ -315,6 +346,40 @@ mod tests {
         assert_eq!(m.kind(), "set_project_priority");
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["kind"], "set_project_priority");
+    }
+
+    #[test]
+    fn set_project_type_kind_matches_serde_tag() {
+        // Lockstep guard for the custom Type-projection variant (RFC 0006
+        // #238). Cover both set and clear (`option_id: None`) shapes — both
+        // serialize under the same `kind`.
+        let set = OutboxMutation::SetProjectType {
+            project_node_id: "PVT_x".into(),
+            item_node_id: "PVTI_y".into(),
+            type_field_id: "PVTSSF_type".into(),
+            option_id: Some("opt_bug".into()),
+            local_issue_type: Some("bug".into()),
+            local_issue_type_recorded: true,
+        };
+        assert_eq!(set.kind(), "set_project_type");
+        assert_eq!(
+            serde_json::to_value(&set).unwrap()["kind"],
+            "set_project_type"
+        );
+
+        let clear = OutboxMutation::SetProjectType {
+            project_node_id: "PVT_x".into(),
+            item_node_id: "PVTI_y".into(),
+            type_field_id: "PVTSSF_type".into(),
+            option_id: None,
+            local_issue_type: None,
+            local_issue_type_recorded: true,
+        };
+        assert_eq!(clear.kind(), "set_project_type");
+        assert_eq!(
+            serde_json::to_value(&clear).unwrap()["kind"],
+            "set_project_type"
+        );
     }
 
     #[test]

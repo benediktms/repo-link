@@ -542,60 +542,22 @@ impl TaskService {
         }
     }
 
-    /// Plan the `SetIssueType` GraphQL projection an issue-type edit owes
-    /// (RFC 0006 §0 A1 / #228). Sibling of [`Self::plan_priority_mutation`] —
-    /// same shape, a different rail (the issue's native "Type" field via
-    /// `updateIssue`, not a project-item single-select). Returns `None`
-    /// (enqueuing nothing) when:
-    /// - the task's FILING repo owner can't be resolved (no filing repo
-    ///   chain input yet) — silent, mirrors an unresolved project;
-    /// - the owner's native issue-type registry is empty/unavailable (a
-    ///   user-owned owner or an org with the feature disabled, RFC 0006 D8)
-    ///   — warns (naming the owner + task), since this is a real
-    ///   misconfiguration the user may want to know about;
-    /// - the task's local type has no case-insensitive name match in the
-    ///   registry (`TypeUnmapped`) — warns;
-    /// - the task has no GraphQL issue node id yet — debug; the task's durable
-    ///   pending flag keeps the intent for the drainer's later sweep.
+    /// Plan the single Type projection an edit/rollback owes, choosing the rail
+    /// (custom project-item "Type"/"Types" field vs native org issue type) via
+    /// the shared [`enqueue::resolve_type_projection`] (RFC 0006 #238). A board
+    /// with an unambiguous custom Type field takes the custom rail; otherwise
+    /// the native rail. Exactly one rail per task (decision 2), and the resolver
+    /// owns all advisory logging.
     async fn plan_issue_type_mutation(&self, task: &Task) -> Result<Option<OutboxMutation>> {
+        let project = enqueue::resolve_project(&self.workspaces, &self.projects, task).await?;
         let owner = self.filing_repo_owner_login(task).await?;
-        match enqueue::resolve_issue_type_projection(&self.org_issue_types, owner.as_deref(), task)
-            .await?
-        {
-            enqueue::IssueTypeProjection::Mutation(mutation) => Ok(Some(mutation)),
-            enqueue::IssueTypeProjection::NoOwner => {
-                tracing::debug!(
-                    task_id = %task.id,
-                    "issue type changed but no filing repo is resolved yet; will project once known"
-                );
-                Ok(None)
-            }
-            enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    owner = %owner,
-                    "issue type changed but native issue types are unavailable for this owner \
-                     (user-owned account or org feature disabled)"
-                );
-                Ok(None)
-            }
-            enqueue::IssueTypeProjection::Unmapped { owner } => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    owner = %owner,
-                    issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
-                    "issue type changed but has no match in the org's native issue-type registry; not projected (TypeUnmapped)"
-                );
-                Ok(None)
-            }
-            enqueue::IssueTypeProjection::NoNode => {
-                tracing::debug!(
-                    task_id = %task.id,
-                    "issue type changed but the task has no issue node id yet; will project once known"
-                );
-                Ok(None)
-            }
-        }
+        Ok(enqueue::resolve_type_projection(
+            project.as_ref(),
+            &self.org_issue_types,
+            owner.as_deref(),
+            task,
+        )
+        .await?)
     }
 
     /// Resolve the login of the owner that the task's backing issue is (or

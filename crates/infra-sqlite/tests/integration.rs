@@ -1467,6 +1467,85 @@ async fn project_roundtrip_preserves_priority_mappings() {
 }
 
 #[tokio::test]
+async fn project_roundtrip_preserves_type_field() {
+    // RFC 0006 #238: a custom Type single-select (kind='type', admitted by the
+    // widened CHECK in 20260723000002) must persist + load, and the domain
+    // resolver must read an option back by case-insensitive name. There is no
+    // Type mapping table — resolution is by option name, so only the field +
+    // options need to survive.
+    use domain_core::{ProjectId, Timestamp};
+    use domain_project::{FieldOption, Project, ProjectField, ProjectFieldKind, StatusMapping};
+    use domain_task::IssueType;
+    use infra_sqlite::SqliteProjectRepository;
+    use ports::ProjectRepository;
+
+    let (_dir, db, _ws, _rb, _ts) = setup_with_db().await;
+    let projects = SqliteProjectRepository::new(db);
+    let id = ProjectId::parse("PVT_kwHO_type").unwrap();
+
+    let status = ProjectField {
+        field_id: "PVTSSF_status".into(),
+        name: "Status".into(),
+        kind: ProjectFieldKind::Status,
+        options: vec![FieldOption {
+            option_id: "s_open".into(),
+            name: "Backlog".into(),
+            ordinal: 0,
+        }],
+    };
+    let ty = ProjectField {
+        field_id: "PVTSSF_type".into(),
+        name: "Type".into(),
+        kind: ProjectFieldKind::Type,
+        options: vec![
+            FieldOption {
+                option_id: "t_bug".into(),
+                name: "Bug".into(),
+                ordinal: 0,
+            },
+            FieldOption {
+                option_id: "t_feat".into(),
+                name: "Feature".into(),
+                ordinal: 1,
+            },
+        ],
+    };
+
+    let saved = Project::from_fields(
+        id.clone(),
+        "acme".into(),
+        12,
+        "Type Board".into(),
+        vec![status, ty],
+        vec![StatusMapping {
+            is_open: true,
+            option_id: "s_open".into(),
+        }],
+        vec![],
+        false,
+        Timestamp::now(),
+    )
+    .unwrap();
+
+    projects.save(&saved).await.unwrap();
+    let loaded = projects.get(id.clone()).await.unwrap();
+
+    assert_eq!(loaded.type_field_id(), Some("PVTSSF_type"));
+    assert_eq!(loaded.type_options().len(), 2);
+    assert!(!loaded.has_ambiguous_type_field());
+    // Local Display "bug" resolves to board option "Bug" by case-insensitive
+    // name across the round trip.
+    assert_eq!(
+        loaded.resolved_type_option_id_for(&IssueType::Bug),
+        Some("t_bug")
+    );
+    assert_eq!(
+        loaded.resolved_type_option_id_for(&IssueType::Custom("FEATURE".into())),
+        Some("t_feat")
+    );
+}
+
+#[tokio::test]
 async fn project_roundtrip_preserves_many_to_one_mapping() {
     // Regression for #80: the Stage 3 scalar `default_for` column could hold
     // at most one TaskStatus per option, so saving a Project where two

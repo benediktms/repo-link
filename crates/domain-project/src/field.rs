@@ -29,13 +29,16 @@ pub struct FieldOption {
 }
 
 /// How repo-link treats a retained single-select field, decided by name at
-/// link time (RFC 0006 D9). Only `Status` drives lifecycle today; `Priority`
-/// and `Other` are retained (persisted + loaded) so the data is a genuine round
-/// trip, but no mapping logic consumes them yet — priority mapping is #224.
+/// link time (RFC 0006 D9). `Status` drives lifecycle; `Priority` drives the
+/// ordinal priority projection (#225); `Type` drives the custom issue-type
+/// projection on user-owned boards (#238), resolved by case-insensitive option
+/// name. `Other` is retained (persisted + loaded) so the data round-trips but
+/// no mapping logic consumes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectFieldKind {
     Status,
     Priority,
+    Type,
     Other,
 }
 
@@ -45,6 +48,7 @@ impl ProjectFieldKind {
         match self {
             ProjectFieldKind::Status => "status",
             ProjectFieldKind::Priority => "priority",
+            ProjectFieldKind::Type => "type",
             ProjectFieldKind::Other => "other",
         }
     }
@@ -55,6 +59,7 @@ impl ProjectFieldKind {
         match s {
             "status" => Ok(ProjectFieldKind::Status),
             "priority" => Ok(ProjectFieldKind::Priority),
+            "type" => Ok(ProjectFieldKind::Type),
             "other" => Ok(ProjectFieldKind::Other),
             other => Err(DomainError::validation(format!(
                 "unknown project field kind '{other}'"
@@ -94,6 +99,13 @@ impl ProjectField {
 ///   field (the historical fallback for a board whose lifecycle field is named
 ///   something else). At most one field is ever tagged `Status`.
 /// - **Priority** — a (non-Status) field named `"Priority"`.
+/// - **Type** — a (non-Status) field named `"Type"` or `"Types"`,
+///   case-insensitively (RFC 0006 #238). Unlike Status/Priority this may tag
+///   MORE than one field (a board with both a "Type" and a "Types" single-select
+///   is legal); ambiguity is resolved lazily at projection time — `Project`
+///   surfaces the custom Type field only when exactly one is tagged (see
+///   [`crate::Project::type_field`]) rather than rejecting the board at
+///   construction, so lifecycle/priority still work.
 /// - **Other** — everything else.
 ///
 /// An empty input yields an empty set with no Status field (the caller — e.g.
@@ -113,6 +125,10 @@ pub fn assign_field_kinds(mut fields: Vec<ProjectField>) -> Vec<ProjectField> {
             ProjectFieldKind::Status
         } else if field.name == "Priority" {
             ProjectFieldKind::Priority
+        } else if field.name.eq_ignore_ascii_case("type")
+            || field.name.eq_ignore_ascii_case("types")
+        {
+            ProjectFieldKind::Type
         } else {
             ProjectFieldKind::Other
         };
@@ -154,15 +170,38 @@ mod tests {
     }
 
     #[test]
-    fn tags_priority_and_leaves_the_rest_other() {
+    fn tags_priority_type_and_leaves_the_rest_other() {
         let fields = assign_field_kinds(vec![
             field("f_stat", "Status"),
             field("f_prio", "Priority"),
             field("f_type", "Type"),
+            field("f_notes", "Notes"),
         ]);
         assert_eq!(fields[0].kind, ProjectFieldKind::Status);
         assert_eq!(fields[1].kind, ProjectFieldKind::Priority);
-        assert_eq!(fields[2].kind, ProjectFieldKind::Other);
+        assert_eq!(fields[2].kind, ProjectFieldKind::Type);
+        assert_eq!(fields[3].kind, ProjectFieldKind::Other);
+    }
+
+    #[test]
+    fn tags_type_and_types_case_insensitively() {
+        // RFC 0006 #238 decision 1: "Type" or "Types", case-insensitive. A
+        // board legitimately carrying both variants tags BOTH — the ambiguity
+        // is resolved at projection time, not here.
+        let fields = assign_field_kinds(vec![
+            field("f_stat", "Status"),
+            field("f_type", "type"),
+            field("f_types", "TYPES"),
+        ]);
+        assert_eq!(fields[1].kind, ProjectFieldKind::Type);
+        assert_eq!(fields[2].kind, ProjectFieldKind::Type);
+        assert_eq!(
+            fields
+                .iter()
+                .filter(|f| f.kind == ProjectFieldKind::Type)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -177,6 +216,7 @@ mod tests {
         for kind in [
             ProjectFieldKind::Status,
             ProjectFieldKind::Priority,
+            ProjectFieldKind::Type,
             ProjectFieldKind::Other,
         ] {
             assert_eq!(

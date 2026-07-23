@@ -32,6 +32,10 @@ pub(crate) struct Services {
     /// Raw workspace repo — `build_sync_service` needs it for the RFC 0002 D2
     /// step-2 lookup (workspace default filing repo) at promote.
     pub(crate) workspaces_repo: Arc<dyn ports::WorkspaceRepository>,
+    /// Raw project repo — `build_sync_service` needs it so `SyncService::promote`
+    /// can resolve the task's board and choose the custom-Type vs native rail
+    /// (RFC 0006 #238).
+    pub(crate) projects_repo: Arc<dyn ports::ProjectRepository>,
     /// Backs `rl sync outbox` so dead-lettered entries are visible.
     pub(crate) outbox_repo: Arc<dyn ports::OutboxRepository>,
     /// Raw org issue-type registry repo — `build_sync_service` needs it so
@@ -91,11 +95,12 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
             tasks_repo.clone(),
             projects_repo.clone(),
         ),
-        projects: ProjectService::new(projects_repo),
+        projects: ProjectService::new(projects_repo.clone()),
         org_issue_types: OrgIssueTypeService::new(org_issue_types_repo.clone()),
         tasks_repo,
         bindings_repo,
         workspaces_repo,
+        projects_repo,
         outbox_repo,
         org_issue_types_repo,
     })
@@ -183,6 +188,7 @@ pub(crate) fn build_sync_service(
         svc.tasks_repo.clone(),
         svc.bindings_repo.clone(),
         svc.workspaces_repo.clone(),
+        svc.projects_repo.clone(),
         provider,
         svc.org_issue_types_repo.clone(),
     ))

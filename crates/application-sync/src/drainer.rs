@@ -337,28 +337,38 @@ impl OutboxDrainer {
             if !crate::enqueue::is_mirror(&task) {
                 continue;
             }
-            let projection = async {
+            // Route through the SHARED rail decision (RFC 0006 #238): the sweep
+            // must prefer the custom Type rail exactly as edit/rollback do, or a
+            // custom-Type board would get a native `SetIssueType` here in
+            // addition to its custom projection — the double-projection decision
+            // 2 forbids. `resolve_type_projection` owns the advisory logging and
+            // returns the single mutation to enqueue (or `None`).
+            let planned = async {
+                let project = self.resolve_project_tolerant(&task).await?;
+                // Owner only matters for the native fallback and only when a
+                // non-clear value must resolve against the org registry.
                 let owner = if task.issue_type.is_some() {
                     self.filing_owner_login(&task).await?
                 } else {
                     None
                 };
-                let projection = crate::enqueue::resolve_issue_type_projection(
+                let mutation = crate::enqueue::resolve_type_projection(
+                    project.as_ref(),
                     &self.org_issue_types,
                     owner.as_deref(),
                     &task,
                 )
                 .await?;
-                Ok::<_, SyncError>(projection)
+                Ok::<_, SyncError>(mutation)
             }
             .await;
-            match projection {
-                Ok(crate::enqueue::IssueTypeProjection::Mutation(mutation)) => {
+            match planned {
+                Ok(Some(mutation)) => {
                     self.outbox
                         .enqueue(&OutboxEntry::new(task.id, mutation))
                         .await?;
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(error) => {
                     warn!(
                         task_id = %task.id,
@@ -400,6 +410,31 @@ impl OutboxDrainer {
             Err(error) => return Err(error.into()),
         };
         Ok(crate::enqueue::parse_github_owner(&canonical))
+    }
+
+    /// Resolve a task's board (RFC 0006 #238 rail decision) tolerantly: a
+    /// missing workspace or project (`NotFound`) yields `None` rather than
+    /// erroring, so a best-effort projection hook never turns a not-yet-loaded
+    /// board into a failed convert/drain. Mirrors [`Self::filing_owner_login`]'s
+    /// `NotFound` tolerance. A resolved board with no `project_id` is also
+    /// `None` (projectless workspace).
+    async fn resolve_project_tolerant(
+        &self,
+        task: &domain_task::Task,
+    ) -> Result<Option<domain_project::Project>> {
+        let workspace = match self.workspaces.get(task.workspace_id).await {
+            Ok(w) => w,
+            Err(ports::PortError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(project_id) = workspace.project_id.clone() else {
+            return Ok(None);
+        };
+        match self.projects.get(project_id).await {
+            Ok(p) => Ok(Some(p)),
+            Err(ports::PortError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Route one entry to the right provider, apply its write-backs, and
@@ -672,11 +707,24 @@ impl OutboxDrainer {
                         project_node_id,
                         item_node_id,
                         status_field_id,
-                        option_id,
+                        Some(option_id),
                     )
                     .await
                 {
-                    Ok(a) => a,
+                    // Status always SETs (never clears), so a well-behaved
+                    // adapter reads back `Some(applied)`. A `None` here would be
+                    // a set that returned no value — treat it like the adapter's
+                    // missing-read-back error and retry rather than falsely
+                    // Stamp or Conflict.
+                    Ok(Some(a)) => a,
+                    Ok(None) => {
+                        return Ok(ApplyDisposition::Retry(
+                            ports::PortError::Backend(
+                                "set_project_status read back no applied option".into(),
+                            )
+                            .into(),
+                        ));
+                    }
                     Err(e) => return Ok(ApplyDisposition::Retry(e.into())),
                 };
                 // Read-back disposition (D5): the remote echoes the applied
@@ -719,11 +767,56 @@ impl OutboxDrainer {
                         project_node_id,
                         item_node_id,
                         priority_field_id,
-                        option_id,
+                        Some(option_id),
                     )
                     .await
                 {
                     Ok(_applied) => Ok(ApplyDisposition::Stamped),
+                    Err(e) => Ok(ApplyDisposition::Retry(e.into())),
+                }
+            }
+            OutboxMutation::SetProjectType {
+                project_node_id,
+                item_node_id,
+                type_field_id,
+                option_id,
+                local_issue_type,
+                local_issue_type_recorded,
+            } => {
+                // Custom "Type"/"Types" board projection (RFC 0006 #238) — the
+                // project-item sibling of `SetIssueType`, chosen by
+                // `resolve_type_projection` when the board has an unambiguous
+                // custom Type field. Same field-agnostic
+                // `updateProjectV2ItemFieldValue`/`clearProjectV2ItemFieldValue`
+                // wire call as Status/Priority (`option_id: None` clears,
+                // decision 3), and the same no-read-back-`Conflict` disposition
+                // as `SetProjectPriority`/`SetIssueType`: it is an outbound-only
+                // projection off the issue axis, so a board disagreement must
+                // never flip `sync_state`. On success it compare-and-clears the
+                // SHARED durable projection intent (`issue_type_pending`) — the
+                // same flag the native rail clears — so whichever rail applies
+                // retires the intent (decision 2, never both).
+                match self
+                    .remote_projects
+                    .set_single_select_option(
+                        project_node_id,
+                        item_node_id,
+                        type_field_id,
+                        option_id.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(_applied) => {
+                        if *local_issue_type_recorded {
+                            self.tasks
+                                .clear_issue_type_pending(
+                                    entry.task_id,
+                                    local_issue_type.clone().map(domain_task::IssueType::from),
+                                )
+                                .await?;
+                        }
+                        Ok(ApplyDisposition::Stamped)
+                    }
                     Err(e) => Ok(ApplyDisposition::Retry(e.into())),
                 }
             }
@@ -971,6 +1064,19 @@ impl OutboxDrainer {
             let entry = OutboxEntry::new(task_id, mutation);
             self.outbox.enqueue(&entry).await?;
         }
+        // Custom Type follow-up (RFC 0006 #238): the project-item sibling of the
+        // priority follow-up. Only fires when the board has an unambiguous
+        // custom Type field AND the local type maps to an option by name;
+        // best-effort on first attach, so an absent/ambiguous field or unmapped
+        // value simply enqueues nothing (the user-initiated edit path in
+        // `TaskService` owns the advisory warnings). The native issue-type rail
+        // is NOT touched here — a board with a custom Type field takes the
+        // custom rail (decision 2), and native first-issue projection has its
+        // own hooks (`promote` / `enqueue_issue_type_follow_up`).
+        if let Some(mutation) = crate::enqueue::set_project_type_mutation(&project, &task) {
+            let entry = OutboxEntry::new(task_id, mutation);
+            self.outbox.enqueue(&entry).await?;
+        }
         Ok(())
     }
 
@@ -1009,48 +1115,25 @@ impl OutboxDrainer {
         if task.issue_type.is_none() {
             return Ok(());
         }
+        // Route through the SHARED rail decision (RFC 0006 #238): if the
+        // workspace's board carries an unambiguous custom Type field the
+        // just-converted issue's type projects onto THAT (decision 2), else the
+        // native rail. `resolve_type_projection` owns all advisory logging, so
+        // this hook stays a one-liner and can never turn a successful convert
+        // into a failure.
+        let project = self.resolve_project_tolerant(&task).await?;
         let owner = crate::enqueue::parse_github_owner(filing_canonical);
-        match crate::enqueue::resolve_issue_type_projection(
+        if let Some(mutation) = crate::enqueue::resolve_type_projection(
+            project.as_ref(),
             &self.org_issue_types,
             owner.as_deref(),
             &task,
         )
         .await?
         {
-            crate::enqueue::IssueTypeProjection::Mutation(mutation) => {
-                let entry = OutboxEntry::new(task_id, mutation);
-                self.outbox.enqueue(&entry).await?;
-            }
-            crate::enqueue::IssueTypeProjection::NoOwner => {
-                debug!(
-                    task_id = %task_id,
-                    "converted draft to issue but no filing owner resolved; issue type not projected"
-                );
-            }
-            crate::enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
-                warn!(
-                    task_id = %task_id,
-                    owner = %owner,
-                    "converted draft to issue but native issue types are unavailable for this \
-                     owner (user-owned account or org feature disabled)"
-                );
-            }
-            crate::enqueue::IssueTypeProjection::Unmapped { owner } => {
-                warn!(
-                    task_id = %task_id,
-                    owner = %owner,
-                    issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
-                    "converted draft to issue but its issue type has no match in the org's \
-                     native issue-type registry; not projected (TypeUnmapped)"
-                );
-            }
-            crate::enqueue::IssueTypeProjection::NoNode => {
-                debug!(
-                    task_id = %task_id,
-                    "converted draft to issue but the task has no issue node id yet; will \
-                     project once known"
-                );
-            }
+            self.outbox
+                .enqueue(&OutboxEntry::new(task_id, mutation))
+                .await?;
         }
         Ok(())
     }
@@ -1293,7 +1376,7 @@ mod tests {
         );
         match priority_calls[0] {
             ProjectCall::SetSingleSelectOption { option_id, .. } => {
-                assert_eq!(option_id, "p3");
+                assert_eq!(option_id.as_deref(), Some("p3"));
             }
             other => panic!("expected SetSingleSelectOption, got {other:?}"),
         }
@@ -1858,7 +1941,7 @@ mod tests {
         );
         assert!(calls.iter().any(|c| matches!(
             c,
-            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id == "o_backlog"
+            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id.as_deref() == Some("o_backlog")
         )));
     }
 
@@ -2799,7 +2882,7 @@ mod tests {
         );
         assert!(calls.iter().any(|c| matches!(
             c,
-            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id == "o_backlog"
+            ProjectCall::SetSingleSelectOption { option_id, .. } if option_id.as_deref() == Some("o_backlog")
         )));
     }
 
@@ -3295,7 +3378,7 @@ mod tests {
                     field_id, "PVTSSF_prio",
                     "the priority projection must target the Priority field id, not Status"
                 );
-                assert_eq!(option_id, "p0");
+                assert_eq!(option_id.as_deref(), Some("p0"));
             }
             other => panic!("expected SetSingleSelectOption, got {other:?}"),
         }
@@ -3436,6 +3519,61 @@ mod tests {
             h.tasks.get(task.id).await.unwrap().sync,
             SyncState::Conflict,
             "SetIssueType must never flip the issue-axis sync_state — there is no read-back at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_project_type_projects_onto_field_and_clears_pending() {
+        // RFC 0006 #238: SetProjectType drains through the field-agnostic
+        // single-select call onto the custom Type field id, never flips
+        // sync_state (no read-back Conflict), and compare-and-clears the shared
+        // durable projection intent on success.
+        let h = harness(test_backoff(5)).await;
+        let ws = WorkspaceId::new();
+        let mut task = seed_issue_task(&h, ws, "1").await;
+        task.set_issue_type(Some(domain_task::IssueType::Bug));
+        h.tasks
+            .save(&task, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+        assert!(h.tasks.get(task.id).await.unwrap().issue_type_pending);
+
+        let entry = OutboxEntry::new(
+            task.id,
+            OutboxMutation::SetProjectType {
+                project_node_id: "PVT_b".into(),
+                item_node_id: "PVTI_c".into(),
+                type_field_id: "PVTSSF_type".into(),
+                option_id: Some("t_bug".into()),
+                local_issue_type: Some("bug".into()),
+                local_issue_type_recorded: true,
+            },
+        );
+        h.outbox.enqueue(&entry).await.unwrap();
+
+        assert_eq!(h.drainer.drain_once().await.unwrap(), 1);
+        assert_eq!(h.outbox.all()[0].status, OutboxStatus::Succeeded);
+
+        let calls = h.remote_projects.calls();
+        let call = calls
+            .iter()
+            .find(|c| matches!(c, ProjectCall::SetSingleSelectOption { field_id, .. } if field_id == "PVTSSF_type"))
+            .expect("one SetSingleSelectOption call on the Type field");
+        match call {
+            ProjectCall::SetSingleSelectOption { option_id, .. } => {
+                assert_eq!(option_id.as_deref(), Some("t_bug"));
+            }
+            other => panic!("expected SetSingleSelectOption, got {other:?}"),
+        }
+        let after = h.tasks.get(task.id).await.unwrap();
+        assert!(
+            !after.issue_type_pending,
+            "a successful custom Type projection must clear the shared pending intent"
+        );
+        assert_ne!(
+            after.sync,
+            SyncState::Conflict,
+            "SetProjectType must never flip sync_state — no read-back Conflict"
         );
     }
 

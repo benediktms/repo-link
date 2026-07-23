@@ -38,11 +38,11 @@ pub(crate) async fn insert_outbox_in_tx(
         INSERT INTO outbox_entries
             (id, task_id, mutation_kind, payload_json, status, attempts, last_error, next_attempt_at, enqueued_at, updated_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE ? != 'set_issue_type'
+         WHERE ? NOT IN ('set_issue_type', 'set_project_type')
             OR NOT EXISTS (
                 SELECT 1 FROM outbox_entries
                  WHERE task_id = ?
-                   AND mutation_kind = 'set_issue_type'
+                   AND mutation_kind = ?
                    AND (
                        status IN ('pending', 'inflight')
                        OR (status = 'failed' AND payload_json = ?)
@@ -62,6 +62,7 @@ pub(crate) async fn insert_outbox_in_tx(
     .bind(entry.updated_at.into_inner())
     .bind(entry.mutation.kind())
     .bind(entry.task_id.to_string())
+    .bind(entry.mutation.kind())
     .bind(&payload_json)
     .execute(&mut **tx)
     .await

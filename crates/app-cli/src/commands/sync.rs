@@ -65,6 +65,7 @@ pub(crate) async fn sync_dispatch(
         svc.tasks_repo.clone(),
         svc.bindings_repo.clone(),
         svc.workspaces_repo.clone(),
+        svc.projects_repo.clone(),
         provider,
         svc.org_issue_types_repo.clone(),
     );

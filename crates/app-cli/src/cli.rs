@@ -474,11 +474,12 @@ pub(crate) enum TaskCmd {
         /// Set the task's local extensible issue type (RFC 0006 D7): a
         /// well-known name (`task` / `bug` / `feature`, case-insensitive) or
         /// any other string, kept verbatim as a custom type. If the task is a
-        /// mirror, a real change is projected onto the GitHub issue's native
-        /// Type field by name against the org's issue-type registry (#228);
-        /// an unmapped name or an org with the feature unavailable degrades
-        /// to a logged advisory, not an error. Mutually exclusive with
-        /// `--clear-type`.
+        /// mirror, a real change is projected onto GitHub: if its board has a
+        /// custom "Type"/"Types" single-select the value lands there by option
+        /// name (#238, works on user-owned boards); otherwise onto the issue's
+        /// native Type field via the org's issue-type registry (#228). An
+        /// unmapped name or an unavailable field degrades to a logged advisory,
+        /// not an error. Mutually exclusive with `--clear-type`.
         #[arg(long = "type", conflicts_with = "clear_type")]
         issue_type: Option<String>,
         /// Clear the task's local issue type. Mutually exclusive with

@@ -130,25 +130,31 @@ pub trait RemoteProjectProvider: Send + Sync {
         repo_ref: &str,
     ) -> PortResult<(String, u64)>;
 
-    /// Set an item's single-select field to `option_id` (RFC 0006 D4 — the
-    /// generalized form of the old Status-only `set_status`). Field-agnostic
-    /// on the wire: `field_id` names whichever single-select is being written
-    /// — the board Status field or the Priority field share this one method.
-    /// Works on both draft items and issue-backed items. Returns the
-    /// **applied** `option_id` read back from the mutation response — the
-    /// drainer compares it against the sent `option_id` to detect a conflict
-    /// (RFC 0004 D5 for Status; Priority deliberately does NOT flip the task
-    /// to `Conflict` on a mismatch, see the drainer's `SetProjectPriority`
-    /// arm). An otherwise-successful mutation whose response omits the
-    /// single-select value is an error (the caller treats it as
-    /// transient/retry), not a silent confirmation.
+    /// Set — or clear — an item's single-select field (RFC 0006 D4 — the
+    /// generalized form of the old Status-only `set_status`, extended to
+    /// support clearing for #238). Field-agnostic on the wire: `field_id` names
+    /// whichever single-select is being written — the board Status, Priority,
+    /// and custom Type fields share this one method. Works on both draft items
+    /// and issue-backed items.
+    ///
+    /// `option_id`:
+    /// - `Some(id)` → `updateProjectV2ItemFieldValue`. Returns `Ok(Some(applied))`
+    ///   — the `option_id` read back from the response; the drainer compares it
+    ///   against the sent value to detect a conflict (RFC 0004 D5 for Status;
+    ///   Priority and custom Type deliberately do NOT flip the task to
+    ///   `Conflict` on a mismatch, see the drainer arms). An otherwise-successful
+    ///   set whose response omits the single-select value is an error (the caller
+    ///   treats it as transient/retry), not a silent confirmation.
+    /// - `None` → `clearProjectV2ItemFieldValue` (the custom-Type clear path,
+    ///   #238 decision 3). There is no option to read back, so a successful
+    ///   clear returns `Ok(None)`.
     async fn set_single_select_option(
         &self,
         project_node_id: &str,
         item_node_id: &str,
         field_id: &str,
-        option_id: &str,
-    ) -> PortResult<String>;
+        option_id: Option<&str>,
+    ) -> PortResult<Option<String>>;
 
     /// Poll a project for items matching `query`, a Projects-v2 filter (#208).
     /// `ProjectV2.items(query:)` has no `updated:` qualifier, so there is no

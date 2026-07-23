@@ -171,6 +171,119 @@ pub fn set_project_priority_mutation(project: &Project, task: &Task) -> Option<O
     })
 }
 
+/// Build the `SetProjectType` mutation a task's local issue type owes onto a
+/// board's CUSTOM "Type"/"Types" single-select (RFC 0006 #238) — the project-
+/// item sibling of [`set_project_priority_mutation`]. Resolves the option by
+/// **case-insensitive name** (decision 4), or `None` (clear) when the task has
+/// no local type. `None` (no mutation) when:
+/// - the task isn't attached to a board item yet (defer to first attach);
+/// - the board has no unambiguous custom Type field
+///   ([`Project::type_field_id`] is `None` — zero fields OR ambiguous, decision
+///   1); or
+/// - the local type has no option whose name matches (unmapped, decision 4).
+///
+/// The two unmappable cases collapse to `None` here; [`resolve_type_projection`]
+/// distinguishes them for logging. Used directly by the drainer's first-attach
+/// follow-up (where the item id is freshly known), mirroring
+/// `set_project_priority_mutation`.
+pub fn set_project_type_mutation(project: &Project, task: &Task) -> Option<OutboxMutation> {
+    let item_node_id = task.project_item_id.clone()?;
+    let type_field_id = project.type_field_id()?.to_string();
+    let option_id = match &task.issue_type {
+        None => None,
+        Some(it) => Some(project.resolved_type_option_id_for(it)?.to_string()),
+    };
+    Some(OutboxMutation::SetProjectType {
+        project_node_id: project.id.as_str().to_string(),
+        item_node_id,
+        type_field_id,
+        option_id,
+        local_issue_type: task.issue_type.as_ref().map(|it| it.to_string()),
+        local_issue_type_recorded: true,
+    })
+}
+
+/// Resolve which Type rail a task's issue-type projection should take and
+/// return the single [`OutboxMutation`] to enqueue, or `None` when nothing is
+/// owed right now (RFC 0006 #238). This is the ONE decision point every
+/// issue-type-projection trigger routes through — edit, rollback, the durable
+/// pending sweep, first-issue promote, and orphan-draft convert — so a task
+/// takes **exactly one** rail (decision 2, never both):
+///
+/// - **Custom rail** (preferred, decision 2): when the task's project has an
+///   unambiguous custom "Type"/"Types" single-select, project onto it via
+///   [`OutboxMutation::SetProjectType`] (dogfoodable on user-owned boards,
+///   which have no native issue types). A board with MORE than one Type/Types
+///   field is ambiguous (decision 1) — warn and fall through to native rather
+///   than choosing arbitrarily.
+/// - **Native rail** (fallback): otherwise, the native org issue-type
+///   projection ([`resolve_issue_type_projection`] → `SetIssueType`).
+///
+/// All advisory cases are surfaced as plain `tracing::warn!` (misconfiguration)
+/// / `tracing::debug!` (expected-transient) per RFC 0006 §0 A3 — this resolver
+/// owns that logging so its five callers stay one-liners.
+pub async fn resolve_type_projection(
+    project: Option<&Project>,
+    org_issue_types: &Arc<dyn OrgIssueTypeRepository>,
+    filing_owner_login: Option<&str>,
+    task: &Task,
+) -> PortResult<Option<OutboxMutation>> {
+    if let Some(project) = project {
+        if project.has_ambiguous_type_field() {
+            tracing::warn!(
+                project_id = %project.id,
+                task_id = %task.id,
+                "board has multiple 'Type'/'Types' single-select fields; skipping the custom Type projection and using the native issue-type rail (RFC 0006 #238 decision 1)"
+            );
+            // fall through to the native rail
+        } else if project.type_field_id().is_some() {
+            // Custom rail available (decision 2) — do NOT fall back to native,
+            // even when the value is unmapped or the item isn't attached yet.
+            return Ok(match set_project_type_mutation(project, task) {
+                Some(mutation) => Some(mutation),
+                None if task.project_item_id.is_none() => {
+                    tracing::debug!(
+                        project_id = %project.id,
+                        task_id = %task.id,
+                        "custom Type projection deferred until the task is attached to a board item"
+                    );
+                    None
+                }
+                None => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        task_id = %task.id,
+                        "local issue type has no matching option on the board's custom Type field; skipping (RFC 0006 #238 decision 4, TypeUnmapped)"
+                    );
+                    None
+                }
+            });
+        }
+    }
+
+    // Native fallback (no project, no Type field, or ambiguous).
+    let native = resolve_issue_type_projection(org_issue_types, filing_owner_login, task).await?;
+    Ok(match native {
+        IssueTypeProjection::Mutation(mutation) => Some(mutation),
+        IssueTypeProjection::NoNode => {
+            tracing::debug!(task_id = %task.id, "native issue-type projection deferred: no issue node id yet");
+            None
+        }
+        IssueTypeProjection::NoOwner => {
+            tracing::debug!(task_id = %task.id, "native issue-type projection deferred: filing owner unresolved");
+            None
+        }
+        IssueTypeProjection::Unmapped { owner } => {
+            tracing::warn!(task_id = %task.id, owner = %owner, "native issue type unmapped in the org registry; skipping (TypeUnmapped)");
+            None
+        }
+        IssueTypeProjection::RegistryUnavailable { owner } => {
+            tracing::warn!(task_id = %task.id, owner = %owner, "native issue-type registry unavailable (user-owned repo or feature disabled); skipping (TypeUnavailable)");
+            None
+        }
+    })
+}
+
 /// Outcome of resolving a task's local `IssueType` against the org registry
 /// (RFC 0006 §0 A1 / #228). A plain `Option<OutboxMutation>` can't distinguish
 /// the silent "defer" case (no issue node id yet — the task will project once
@@ -1023,5 +1136,196 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome, IssueTypeProjection::NoNode);
+    }
+
+    // --- custom Type rail + resolve_type_projection (RFC 0006 #238) ---------
+
+    /// A project with a Status field (required) + a custom "Type" single-select
+    /// carrying `Bug`/`Feature` options.
+    fn project_with_status_and_type(id: &str) -> Project {
+        Project::from_fields(
+            ProjectId::parse(id).unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_status".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![FieldOption {
+                        option_id: "o1".into(),
+                        name: "Backlog".into(),
+                        ordinal: 0,
+                    }],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_type".into(),
+                    name: "Type".into(),
+                    kind: ProjectFieldKind::Type,
+                    options: vec![
+                        FieldOption {
+                            option_id: "t_bug".into(),
+                            name: "Bug".into(),
+                            ordinal: 0,
+                        },
+                        FieldOption {
+                            option_id: "t_feat".into(),
+                            name: "Feature".into(),
+                            ordinal: 1,
+                        },
+                    ],
+                },
+            ],
+            vec![StatusMapping {
+                is_open: true,
+                option_id: "o1".into(),
+            }],
+            vec![],
+            false,
+            domain_core::Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    fn attached_mirror_with_type(item: &str, issue_type: Option<IssueType>) -> Task {
+        let mut t = make_issue_backed_mirror("I_type_rail");
+        t.project_item_id = Some(item.to_string());
+        t.set_issue_type(issue_type);
+        t
+    }
+
+    #[test]
+    fn set_project_type_mutation_resolves_option_by_name() {
+        let project = project_with_status_and_type("PVT_type_ok");
+        let t = attached_mirror_with_type("PVTI_x", Some(IssueType::Bug));
+        match set_project_type_mutation(&project, &t) {
+            Some(OutboxMutation::SetProjectType {
+                type_field_id,
+                option_id,
+                local_issue_type,
+                ..
+            }) => {
+                assert_eq!(type_field_id, "PVTSSF_type");
+                assert_eq!(option_id, Some("t_bug".to_string()));
+                assert_eq!(local_issue_type, Some("bug".to_string()));
+            }
+            other => panic!("expected SetProjectType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_project_type_mutation_clear_sends_none_option() {
+        let project = project_with_status_and_type("PVT_type_clear");
+        let t = attached_mirror_with_type("PVTI_x", None);
+        match set_project_type_mutation(&project, &t) {
+            Some(OutboxMutation::SetProjectType { option_id, .. }) => {
+                assert_eq!(option_id, None);
+            }
+            other => panic!("expected clearing SetProjectType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_project_type_mutation_none_when_unmapped_or_unattached() {
+        let project = project_with_status_and_type("PVT_type_none");
+        // Unmapped local type (no option named "task").
+        let unmapped = attached_mirror_with_type("PVTI_x", Some(IssueType::Task));
+        assert_eq!(set_project_type_mutation(&project, &unmapped), None);
+        // Not attached to a board item yet.
+        let mut unattached = make_issue_backed_mirror("I_unattached");
+        unattached.set_issue_type(Some(IssueType::Bug));
+        assert_eq!(set_project_type_mutation(&project, &unattached), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_type_projection_prefers_custom_over_native() {
+        // Board has BOTH a custom Type field AND the org has native issue types
+        // for the same value — decision 2 says the custom rail wins and native
+        // is NOT also enqueued.
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let project = project_with_status_and_type("PVT_prefer");
+        let t = attached_mirror_with_type("PVTI_x", Some(IssueType::Bug));
+
+        let m = resolve_type_projection(Some(&project), &org, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert!(
+            matches!(m, Some(OutboxMutation::SetProjectType { .. })),
+            "custom rail must win over native: {m:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_type_projection_custom_unmapped_does_not_fall_back_to_native() {
+        // Custom Type field present but the local value maps to no option — the
+        // custom rail IS available, so we skip (None), NOT fall through to a
+        // native SetIssueType (decision 2 / 4).
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        // Registry DOES contain a match, to prove native isn't consulted.
+        repo.save(&OrgIssueTypeRegistry::new(
+            "acme",
+            vec![ty("IT_task", "Task")],
+        ))
+        .await
+        .unwrap();
+        let org: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let project = project_with_status_and_type("PVT_unmapped");
+        let t = attached_mirror_with_type("PVTI_x", Some(IssueType::Task));
+
+        let m = resolve_type_projection(Some(&project), &org, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert_eq!(
+            m, None,
+            "unmapped custom value must not fall back to native"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_type_projection_ambiguous_falls_back_to_native() {
+        // Two Type/Types fields → ambiguous → native rail.
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        let mut project = project_with_status_and_type("PVT_ambig");
+        // Add a second Type-kind field to force ambiguity.
+        project.fields.push(ProjectField {
+            field_id: "PVTSSF_types".into(),
+            name: "Types".into(),
+            kind: ProjectFieldKind::Type,
+            options: vec![FieldOption {
+                option_id: "x".into(),
+                name: "X".into(),
+                ordinal: 0,
+            }],
+        });
+        assert!(project.has_ambiguous_type_field());
+        let t = attached_mirror_with_type("PVTI_x", Some(IssueType::Bug));
+
+        let m = resolve_type_projection(Some(&project), &org, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert!(
+            matches!(m, Some(OutboxMutation::SetIssueType { .. })),
+            "ambiguous custom fields must fall back to the native rail: {m:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_type_projection_no_type_field_uses_native() {
+        let repo = testing_fixtures::InMemoryOrgIssueTypeRepository::new();
+        repo.save(&registry_with_bug_and_epic()).await.unwrap();
+        let org: Arc<dyn OrgIssueTypeRepository> = Arc::new(repo);
+        // A Status-only board (no Type field).
+        let project = make_project("PVT_native_only");
+        let t = attached_mirror_with_type("PVTI_x", Some(IssueType::Bug));
+
+        let m = resolve_type_projection(Some(&project), &org, Some("acme"), &t)
+            .await
+            .unwrap();
+        assert!(matches!(m, Some(OutboxMutation::SetIssueType { .. })));
     }
 }
