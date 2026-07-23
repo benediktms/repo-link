@@ -1354,6 +1354,84 @@ fn attach_no_link(dir: &TempDir, workspace: &str, url: &str, canonical: &str) ->
         .to_string()
 }
 
+#[test]
+fn repo_list_without_workspace_returns_all_active_bindings() {
+    let dir = TempDir::new().unwrap();
+    let workspace = |name: &str| {
+        run_json(
+            &mut bin("repo-link", &dir),
+            &["workspace", "create", name, "--local-only"],
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let ws_a = workspace("a");
+    let ws_b = workspace("b");
+    let ws_archived = workspace("archived");
+
+    attach_no_link(
+        &dir,
+        &ws_a,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    attach_no_link(
+        &dir,
+        &ws_b,
+        "git@github.com:o/shared.git",
+        "github.com/o/shared",
+    );
+    attach_no_link(
+        &dir,
+        &ws_archived,
+        "git@github.com:o/old.git",
+        "github.com/o/old",
+    );
+    run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "archive", &ws_archived],
+    );
+
+    let listed = run_json(&mut bin("repo-link", &dir), &["repo", "list"]);
+    let rows = listed.as_array().expect("global repo list array");
+    assert_eq!(rows.len(), 2);
+    let mut workspace_ids = rows
+        .iter()
+        .map(|row| row["workspace_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    workspace_ids.sort_unstable();
+    let mut expected_workspace_ids = [ws_a.as_str(), ws_b.as_str()];
+    expected_workspace_ids.sort_unstable();
+    assert_eq!(workspace_ids, expected_workspace_ids);
+    assert!(
+        rows.iter()
+            .all(|row| row["canonical_url"] == "github.com/o/shared")
+    );
+
+    let filtered = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "list", "--workspace", &ws_a],
+    );
+    let rows = filtered.as_array().expect("filtered repo list array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["workspace_id"], ws_a);
+    assert_eq!(rows[0]["canonical_url"], "github.com/o/shared");
+}
+
+#[test]
+fn repo_list_help_documents_unbound_global_scope() {
+    let output = bin("repo-link", &TempDir::new().unwrap())
+        .args(["repo", "list", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(stdout.contains("across all active workspaces"), "{stdout}");
+    assert!(stdout.contains("optionally scope the results"), "{stdout}");
+}
+
 /// Resolve a repo handle (UUID / name / alias) to its shared ORIGIN id
 /// (RFC 0005). The filing axis stores origin ids, so filing-default
 /// assertions compare against this — not the per-workspace instance id
@@ -1894,6 +1972,8 @@ fn agents_docs_creates_file_with_markers() {
     assert!(text.contains("## When to use `rl`"));
     assert!(text.contains("### Choosing work"));
     assert!(text.contains("### Working with a tracked task"));
+    assert!(text.contains("rl repo find <query>"));
+    assert!(text.contains("rl repo list"));
     assert!(text.contains("Do not invoke `rl` merely because"));
     assert!(!text.contains("Before doing anything else in a session"));
     // Per-repo info block. The tempdir is not a git repo, so we expect

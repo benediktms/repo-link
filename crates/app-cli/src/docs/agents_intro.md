@@ -13,15 +13,17 @@ Do not invoke `rl` merely because the checkout is bound to a workspace.
 
 All commands emit JSON on stdout. Use `jq` to extract or reshape fields, and present results to a human as a markdown table rather than raw JSON. Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference.
 
-### Workspace context
+### Workspace and repository context
 
-When an `rl` workflow needs workspace context, run:
+When an `rl` workflow needs workspace or repository context, use:
 
 ```bash
-rl here
+rl here                    # resolve the current checkout
+rl repo find <query>       # search bindings by name, alias, or URL
+rl repo list               # list all active-workspace bindings; add --workspace to scope
 ```
 
-It returns every workspace this checkout belongs to, the current repo binding, filing repo, and sibling repos. Use the returned `workspace.id` as `--workspace <id>`. An empty `matches` array means the checkout is unbound.
+`rl here` returns every workspace the checkout belongs to, its repo binding, filing repo, and sibling repos. Use the returned `workspace.id` as `--workspace <id>`. An empty `matches` array means the checkout is unbound. `rl repo list` works outside a bound checkout; its optional `--workspace <id>` flag scopes the global result to one workspace.
 
 ### Choosing work
 

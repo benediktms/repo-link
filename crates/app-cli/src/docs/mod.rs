@@ -230,6 +230,8 @@ mod tests {
         assert!(block.contains("## When to use `rl`"));
         assert!(block.contains("### Choosing work"));
         assert!(block.contains("### Working with a tracked task"));
+        assert!(block.contains("rl repo find <query>"));
+        assert!(block.contains("rl repo list"));
         assert!(block.contains("Do not invoke `rl` merely because"));
         assert!(!block.contains("Before doing anything else in a session"));
         assert!(block.contains("## This repo"));

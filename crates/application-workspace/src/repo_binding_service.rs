@@ -387,6 +387,17 @@ impl RepoBindingService {
             .collect())
     }
 
+    /// List every binding in active workspaces.
+    pub async fn list_all(&self) -> Result<Vec<RepoBindingDto>> {
+        let mut out = Vec::new();
+        for workspace in self.workspaces.list(false).await? {
+            for view in self.bindings.list_by_workspace(workspace.id).await? {
+                out.push(binding_to_dto(&view.instance, &view.origin));
+            }
+        }
+        Ok(out)
+    }
+
     /// Return every (workspace, binding) pair whose binding's
     /// `canonical_url` is an exact match. Archived workspaces are excluded
     /// unless `include_archived` is set (the `rl repo locate -a` opt-in);

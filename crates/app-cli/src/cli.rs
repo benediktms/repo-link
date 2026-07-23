@@ -98,12 +98,12 @@ pub(crate) enum Cmd {
     Daemon(daemon::DaemonCmd),
     /// Resolve the current directory's full working context in one shot.
     ///
-    /// Run this at the start of every session (and any time you need to
-    /// recover context mid-session) instead of grepping AGENTS.md or
-    /// guessing workspace ids. No arguments — always evaluates the cwd's
-    /// git origin, and archived workspaces are always excluded. Returns
-    /// every workspace membership for this checkout, each with its repo
-    /// binding, project + filing repo, and the sibling repo roster.
+    /// Use this when an `rl` workflow needs the current checkout's workspace
+    /// context instead of grepping AGENTS.md or guessing workspace ids. No
+    /// arguments — always evaluates the cwd's git origin, and archived
+    /// workspaces are excluded. Returns every workspace membership for this
+    /// checkout, each with its repo binding, project + filing repo, and the
+    /// sibling repo roster.
     Here,
 }
 
@@ -243,9 +243,13 @@ pub(crate) enum RepoCmd {
     /// UUID / prefix / name / alias. Ambiguous matches exit 2 with a
     /// candidate list.
     Detach { id: String },
+    /// List repository bindings across all active workspaces. Can run outside
+    /// a bound checkout; use `--workspace` to optionally scope the results to
+    /// one workspace.
     List {
-        #[command(flatten)]
-        ws: WorkspaceArg,
+        /// Optionally scope the results to one workspace UUID.
+        #[arg(short = 'w', long)]
+        workspace: Option<String>,
     },
     /// Show a binding. Accepts a UUID, an exact `name`, or an exact alias.
     /// Returns a JSON error with candidate IDs if a non-UUID handle matches
