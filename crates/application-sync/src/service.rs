@@ -184,7 +184,9 @@ impl SyncService {
         // resolver owns all advisory logging; promote stays best-effort (never
         // a hard failure — a promote must succeed regardless).
         if task.issue_type.is_some() {
-            let project = enqueue::resolve_project(&self.workspaces, &self.projects, &task).await?;
+            // Reuse the `workspace` already fetched above (RFC 0002 filing
+            // chain) instead of `resolve_project`, which would re-fetch it.
+            let project = enqueue::project_for_workspace(&self.projects, &workspace).await?;
             let owner = enqueue::parse_github_owner(&filing_canonical);
             if let Some(mutation) = enqueue::resolve_type_projection(
                 project.as_ref(),
