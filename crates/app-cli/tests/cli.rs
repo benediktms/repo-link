@@ -1890,11 +1890,12 @@ fn agents_docs_creates_file_with_markers() {
     assert!(text.starts_with("# AGENTS\n"));
     assert!(text.contains("<!-- rl:doc:start -->"));
     assert!(text.contains("<!-- rl:doc:end -->"));
-    // Workflow guidance sections — the curated replacement for the
-    // previous auto-generated command reference.
-    assert!(text.contains("### Finding work"));
-    assert!(text.contains("### Before you start: check drift"));
-    assert!(text.contains("### Before you stop: sync your work"));
+    // Workflow guidance is opt-in rather than an unconditional session hook.
+    assert!(text.contains("## When to use `rl`"));
+    assert!(text.contains("### Choosing work"));
+    assert!(text.contains("### Working with a tracked task"));
+    assert!(text.contains("Do not invoke `rl` merely because"));
+    assert!(!text.contains("Before doing anything else in a session"));
     // Per-repo info block. The tempdir is not a git repo, so we expect
     // the `unbound` notice.
     assert!(text.contains("## This repo"));
