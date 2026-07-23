@@ -380,6 +380,13 @@ impl RepoBindingService {
 
     pub async fn list(&self, workspace_id: &str) -> Result<Vec<RepoBindingDto>> {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
+        let workspace = self.workspaces.get(workspace_id).await?;
+        if matches!(
+            workspace.status,
+            WorkspaceStatus::Archived | WorkspaceStatus::Deleted
+        ) {
+            return Ok(Vec::new());
+        }
         let rows = self.bindings.list_by_workspace(workspace_id).await?;
         Ok(rows
             .iter()

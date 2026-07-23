@@ -1417,6 +1417,12 @@ fn repo_list_without_workspace_returns_all_active_bindings() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["workspace_id"], ws_a);
     assert_eq!(rows[0]["canonical_url"], "github.com/o/shared");
+
+    let archived = run_json(
+        &mut bin("repo-link", &dir),
+        &["repo", "list", "--workspace", &ws_archived],
+    );
+    assert_eq!(archived, json!([]));
 }
 
 #[test]
