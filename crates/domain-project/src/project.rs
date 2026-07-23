@@ -4,7 +4,7 @@ use crate::field::{FieldOption, ProjectField, ProjectFieldKind};
 use crate::priority::PriorityMapping;
 use crate::status::StatusMapping;
 use domain_core::{DomainError, ProjectId, Result, Timestamp};
-use domain_task::Priority;
+use domain_task::{IssueType, Priority};
 use serde::{Deserialize, Serialize};
 
 /// Mirror of a GitHub Projects v2 board.
@@ -201,6 +201,67 @@ impl Project {
             .iter()
             .find(|m| m.priority == priority)
             .map(|m| m.option_id.as_str())
+    }
+
+    /// The project's custom `Type`-kind field, if EXACTLY one is present
+    /// (RFC 0006 #238). Returns `None` for zero (no custom Type field — the
+    /// native issue-type rail applies) AND for two-or-more (ambiguous: a board
+    /// with both a "Type" and a "Types" single-select). Ambiguity is
+    /// deliberately not a construction error (unlike >1 Priority) — the board
+    /// still links and drives Status/Priority; the custom Type projection is
+    /// simply skipped in favour of the native rail. Callers distinguish the
+    /// two `None` cases via [`Self::has_ambiguous_type_field`] to warn on
+    /// ambiguity.
+    pub fn type_field(&self) -> Option<&ProjectField> {
+        let mut it = self
+            .fields
+            .iter()
+            .filter(|f| f.kind == ProjectFieldKind::Type);
+        match (it.next(), it.next()) {
+            (Some(f), None) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Whether the board carries MORE than one custom Type/Types single-select
+    /// (RFC 0006 #238 decision 1). When true, [`Self::type_field`] is `None`
+    /// and the caller warns + skips the custom projection rather than choosing
+    /// a field arbitrarily.
+    pub fn has_ambiguous_type_field(&self) -> bool {
+        self.fields
+            .iter()
+            .filter(|f| f.kind == ProjectFieldKind::Type)
+            .count()
+            > 1
+    }
+
+    /// The unambiguous custom Type field's `PVTSSF_…` node id, if any.
+    pub fn type_field_id(&self) -> Option<&str> {
+        self.type_field().map(|f| f.field_id.as_str())
+    }
+
+    /// The unambiguous custom Type field's option catalog (empty slice when
+    /// there is no unambiguous Type field).
+    pub fn type_options(&self) -> &[FieldOption] {
+        self.type_field()
+            .map(|f| f.options.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Resolve a local [`IssueType`] to a custom Type-field board option by
+    /// **case-insensitive name** (RFC 0006 #238 decision 4) — never by ordinal
+    /// (that is Priority's rule, D3). The local `Display` is lowercase
+    /// (`"bug"`); board options carry their own display casing (`"Bug"`), so
+    /// the match ignores case in both directions, mirroring the native
+    /// registry match in `set_issue_type_mutation`. `None` when there is no
+    /// unambiguous Type field or no option's name matches.
+    pub fn resolved_type_option_id_for(&self, issue_type: &IssueType) -> Option<&str> {
+        let name = issue_type.to_string();
+        self.type_field()?
+            .options
+            .iter()
+            .find(|o| o.name.eq_ignore_ascii_case(&name))
+            .map(|o| o.option_id.as_str())
     }
 
     /// Replace the mapping wholesale. Same option-ownership invariant as
@@ -804,6 +865,100 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ---------- custom Type field (RFC 0006 #238) --------------------------
+
+    fn type_field(field_id: &str, name: &str, options: Vec<FieldOption>) -> ProjectField {
+        ProjectField {
+            field_id: field_id.into(),
+            name: name.into(),
+            kind: ProjectFieldKind::Type,
+            options,
+        }
+    }
+
+    #[test]
+    fn resolves_type_option_by_case_insensitive_name() {
+        let p = Project::from_fields(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            vec![
+                status_field("PVTSSF_s", vec![opt("o1", "Backlog", 0)]),
+                type_field(
+                    "PVTSSF_type",
+                    "Type",
+                    vec![opt("t_bug", "Bug", 0), opt("t_feat", "Feature", 1)],
+                ),
+            ],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(p.type_field_id(), Some("PVTSSF_type"));
+        // Local Display is lowercase ("bug"); board option is "Bug" — match
+        // ignores case (decision 4, by name not ordinal).
+        assert_eq!(
+            p.resolved_type_option_id_for(&IssueType::Bug),
+            Some("t_bug")
+        );
+        assert_eq!(
+            p.resolved_type_option_id_for(&IssueType::Custom("feature".into())),
+            Some("t_feat")
+        );
+        // A local type with no matching option name → None (unmapped, not
+        // fabricated).
+        assert_eq!(p.resolved_type_option_id_for(&IssueType::Task), None);
+        assert!(!p.has_ambiguous_type_field());
+    }
+
+    #[test]
+    fn ambiguous_type_field_is_none_and_flagged() {
+        // Both a "Type" and a "Types" single-select → ambiguous. type_field()
+        // is None (skip custom projection), but the board still constructs
+        // (no hard error, unlike >1 Priority).
+        let p = Project::from_fields(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            vec![
+                status_field("PVTSSF_s", vec![opt("o1", "Backlog", 0)]),
+                type_field("PVTSSF_type", "Type", vec![opt("t_bug", "Bug", 0)]),
+                type_field("PVTSSF_types", "Types", vec![opt("t_x", "X", 0)]),
+            ],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert!(p.has_ambiguous_type_field());
+        assert_eq!(p.type_field(), None);
+        assert_eq!(p.type_field_id(), None);
+        assert_eq!(p.resolved_type_option_id_for(&IssueType::Bug), None);
+    }
+
+    #[test]
+    fn no_type_field_is_none_and_not_ambiguous() {
+        let p = Project::from_fields(
+            pid(),
+            "acme".into(),
+            7,
+            "Repo Link".into(),
+            vec![status_field("PVTSSF_s", vec![opt("o1", "Backlog", 0)])],
+            vec![],
+            vec![],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert!(!p.has_ambiguous_type_field());
+        assert_eq!(p.type_field_id(), None);
     }
 
     #[test]

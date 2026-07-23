@@ -427,10 +427,37 @@ async fn set_status_sends_single_select_option_id() {
     // the adapter must read back the applied single-select value (matched by
     // field id), not echo the sent option.
     let applied = provider(&server)
-        .set_single_select_option("PVT_x", "PVTI_y", "PVTSSF_z", "47fc9ee4")
+        .set_single_select_option("PVT_x", "PVTI_y", "PVTSSF_z", Some("47fc9ee4"))
         .await
         .unwrap();
-    assert_eq!(applied, "47fc9ee4");
+    assert_eq!(applied, Some("47fc9ee4".to_string()));
+}
+
+#[tokio::test]
+async fn clear_single_select_option_uses_clear_mutation_and_returns_none() {
+    // RFC 0006 #238: `option_id: None` must route to
+    // `clearProjectV2ItemFieldValue` (NOT `updateProjectV2ItemFieldValue`),
+    // sending no `value`, and return `Ok(None)` (no option to read back).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("clearProjectV2ItemFieldValue"))
+        .and(body_partial_json(serde_json::json!({
+            "variables": { "input": {
+                "projectId": "PVT_x", "itemId": "PVTI_y", "fieldId": "PVTSSF_z"
+            } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "clearProjectV2ItemFieldValue": { "projectV2Item": { "id": "PVTI_y" } } }
+        })))
+        .mount(&server)
+        .await;
+
+    let applied = provider(&server)
+        .set_single_select_option("PVT_x", "PVTI_y", "PVTSSF_z", None)
+        .await
+        .unwrap();
+    assert_eq!(applied, None);
 }
 
 /// One project item with a single-select value on the status field.

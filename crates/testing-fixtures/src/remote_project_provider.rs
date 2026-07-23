@@ -41,7 +41,9 @@ pub enum ProjectCall {
         project_node_id: String,
         item_node_id: String,
         field_id: String,
-        option_id: String,
+        /// `None` records a clear (`clearProjectV2ItemFieldValue`) — the
+        /// custom-Type clear path (#238); `Some` records a set.
+        option_id: Option<String>,
     },
     /// One `poll_project_items` invocation. The poller's tests assert the
     /// project node id, status field id, and query the daemon passes through
@@ -259,8 +261,8 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
         project_node_id: &str,
         item_node_id: &str,
         field_id: &str,
-        option_id: &str,
-    ) -> PortResult<String> {
+        option_id: Option<&str>,
+    ) -> PortResult<Option<String>> {
         if self.should_fail() {
             return Err(PortError::Backend(
                 "stub: set_single_select_option transient".into(),
@@ -273,17 +275,23 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
                 project_node_id: project_node_id.to_string(),
                 item_node_id: item_node_id.to_string(),
                 field_id: field_id.to_string(),
-                option_id: option_id.to_string(),
+                option_id: option_id.map(str::to_string),
             });
+        // A clear (`None`) has no option to read back — return `Ok(None)`,
+        // mirroring the adapter's `clearProjectV2ItemFieldValue` path.
+        let Some(option_id) = option_id else {
+            return Ok(None);
+        };
         // Default: echo the requested option (the remote applied it). A test
         // can override via `set_single_select_option_returns` to force a
         // mismatch.
-        Ok(self
-            .set_single_select_option_returns
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| option_id.to_string()))
+        Ok(Some(
+            self.set_single_select_option_returns
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| option_id.to_string()),
+        ))
     }
 
     async fn poll_project_items(

@@ -179,6 +179,17 @@ mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   }
 }"#;
 
+// RFC 0006 #238 — clear a single-select field value on a project item (the
+// custom-Type clear path). `updateProjectV2ItemFieldValue` cannot express an
+// empty single-select, so clearing needs this dedicated mutation. No option to
+// read back — the caller returns `Ok(None)` on success.
+const CLEAR_SINGLE_SELECT_OPTION: &str = r#"
+mutation($input: ClearProjectV2ItemFieldValueInput!) {
+  clearProjectV2ItemFieldValue(input: $input) {
+    projectV2Item { id }
+  }
+}"#;
+
 const POLL_ITEMS: &str = r#"
 query($projectId: ID!, $query: String, $first: Int!, $after: String) {
   node(id: $projectId) {
@@ -404,8 +415,23 @@ impl GraphqlClient {
         project_node_id: &str,
         item_node_id: &str,
         field_id: &str,
-        option_id: &str,
-    ) -> PortResult<String> {
+        option_id: Option<&str>,
+    ) -> PortResult<Option<String>> {
+        // Clear path (#238): a `None` option maps to the dedicated
+        // `clearProjectV2ItemFieldValue` mutation. No value to read back.
+        let Some(option_id) = option_id else {
+            let _: ClearSingleSelectOptionData = self
+                .run(
+                    CLEAR_SINGLE_SELECT_OPTION,
+                    json!({ "input": {
+                        "projectId": project_node_id,
+                        "itemId": item_node_id,
+                        "fieldId": field_id,
+                    } }),
+                )
+                .await?;
+            return Ok(None);
+        };
         let data: SetSingleSelectOptionData = self
             .run(
                 SET_SINGLE_SELECT_OPTION,
@@ -430,6 +456,7 @@ impl GraphqlClient {
             .into_iter()
             .find(|v| v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(field_id))
             .and_then(|v| v.option_id)
+            .map(Some)
             .ok_or_else(|| {
                 PortError::Backend(format!(
                     "set_single_select_option on item {item_node_id} returned no single-select value for field {field_id}"
@@ -764,6 +791,21 @@ struct ConvertIssueContent {
 #[serde(rename_all = "camelCase")]
 struct SetSingleSelectOptionData {
     update_project_v2_item_field_value: ProjectV2ItemWrap,
+}
+// Clear response (#238): typed (not `serde_json::Value`) so a wrong shape is a
+// deserialize failure, mirroring `SetIssueTypeData`. The value is unused — a
+// successful clear returns `Ok(None)`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearSingleSelectOptionData {
+    #[allow(dead_code)]
+    clear_project_v2_item_field_value: ClearProjectV2ItemWrap,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearProjectV2ItemWrap {
+    #[allow(dead_code)]
+    project_v2_item: OptionalIdNode,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

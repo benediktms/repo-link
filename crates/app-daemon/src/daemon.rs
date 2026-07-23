@@ -1699,9 +1699,9 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            option_id: &str,
-        ) -> PortResult<String> {
-            Ok(option_id.to_string())
+            option_id: Option<&str>,
+        ) -> PortResult<Option<String>> {
+            Ok(option_id.map(str::to_string))
         }
         async fn poll_project_items(
             &self,
@@ -1749,9 +1749,9 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            option_id: &str,
-        ) -> PortResult<String> {
-            Ok(option_id.to_string())
+            option_id: Option<&str>,
+        ) -> PortResult<Option<String>> {
+            Ok(option_id.map(str::to_string))
         }
         async fn poll_project_items(
             &self,
@@ -1797,9 +1797,9 @@ mod tests {
             _: &str,
             _: &str,
             _: &str,
-            option_id: &str,
-        ) -> PortResult<String> {
-            Ok(option_id.to_string())
+            option_id: Option<&str>,
+        ) -> PortResult<Option<String>> {
+            Ok(option_id.map(str::to_string))
         }
         async fn poll_project_items(
             &self,

@@ -15,8 +15,8 @@ use dto_shared::{
     SyncSummaryDto,
 };
 use ports::{
-    OrgIssueTypeRepository, PortError, RemoteTaskCreate, RemoteTaskProvider, RepoBindingRepository,
-    SyncedSource, TaskRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, PortError, ProjectRepository, RemoteTaskCreate, RemoteTaskProvider,
+    RepoBindingRepository, SyncedSource, TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -44,6 +44,11 @@ pub struct SyncService {
     // Needed to read the workspace default filing repo (`filing_repo_id`) for
     // step 2 of the RFC 0002 D2 chain when resolving where to file at promote.
     workspaces: Arc<dyn WorkspaceRepository>,
+    /// Needed at `promote` to resolve the task's board and decide the Type rail:
+    /// a board with an unambiguous custom "Type"/"Types" field takes the custom
+    /// project-item rail (RFC 0006 #238), so promote must NOT enqueue the native
+    /// projection for it (decision 2, never both) — it defers to first-attach.
+    projects: Arc<dyn ProjectRepository>,
     provider: Arc<dyn RemoteTaskProvider>,
     /// Org-level native issue-type registry (RFC 0006 D5/D8), consulted at
     /// `promote` to project a task's local `IssueType` — set before the task
@@ -59,6 +64,7 @@ impl SyncService {
         tasks: Arc<dyn TaskRepository>,
         bindings: Arc<dyn RepoBindingRepository>,
         workspaces: Arc<dyn WorkspaceRepository>,
+        projects: Arc<dyn ProjectRepository>,
         provider: Arc<dyn RemoteTaskProvider>,
         org_issue_types: Arc<dyn OrgIssueTypeRepository>,
     ) -> Self {
@@ -66,6 +72,7 @@ impl SyncService {
             tasks,
             bindings,
             workspaces,
+            projects,
             provider,
             org_issue_types,
             policy: SyncPolicy::ManualMerge,
@@ -168,52 +175,26 @@ impl SyncService {
         // advisory `debug`/`warn` on an unresolved owner or an
         // unavailable/unmapped registry, never a hard failure — promote must
         // succeed regardless. No local type at all → nothing to do here.
+        // Route through the SHARED rail decision (RFC 0006 #238): a board with
+        // an unambiguous custom Type field takes the custom project-item rail,
+        // which at promote has no board item yet and therefore defers to
+        // first-attach (`resolve_type_projection` → `None`) — so promote must
+        // NOT also enqueue the native projection for it (decision 2, never
+        // both). A native-type board still projects immediately here. The
+        // resolver owns all advisory logging; promote stays best-effort (never
+        // a hard failure — a promote must succeed regardless).
         if task.issue_type.is_some() {
+            let project = enqueue::resolve_project(&self.workspaces, &self.projects, &task).await?;
             let owner = enqueue::parse_github_owner(&filing_canonical);
-            match enqueue::resolve_issue_type_projection(
+            if let Some(mutation) = enqueue::resolve_type_projection(
+                project.as_ref(),
                 &self.org_issue_types,
                 owner.as_deref(),
                 &task,
             )
             .await?
             {
-                enqueue::IssueTypeProjection::Mutation(mutation) => {
-                    entries.push(OutboxEntry::new(task.id, mutation));
-                }
-                enqueue::IssueTypeProjection::NoOwner => {
-                    tracing::debug!(
-                        task_id = %task.id,
-                        "promoted with a local issue type set but no filing owner resolved; \
-                         will project once known"
-                    );
-                }
-                enqueue::IssueTypeProjection::RegistryUnavailable { owner } => {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        owner = %owner,
-                        "promoted with a local issue type set but native issue types are \
-                         unavailable for this owner (user-owned account or org feature disabled)"
-                    );
-                }
-                enqueue::IssueTypeProjection::Unmapped { owner } => {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        owner = %owner,
-                        issue_type = %task.issue_type.as_ref().map(ToString::to_string).unwrap_or_default(),
-                        "promoted with a local issue type set but it has no match in the org's \
-                         native issue-type registry; not projected (TypeUnmapped)"
-                    );
-                }
-                enqueue::IssueTypeProjection::NoNode => {
-                    // Shouldn't happen right after `promote_to_remote` unless
-                    // the provider returned no node id at all — defer rather
-                    // than assume, symmetric with the edit-time trigger.
-                    tracing::debug!(
-                        task_id = %task.id,
-                        "promoted but the task has no issue node id yet; will project the \
-                         issue type once known"
-                    );
-                }
+                entries.push(OutboxEntry::new(task.id, mutation));
             }
         }
 
@@ -1264,8 +1245,8 @@ mod tests {
     };
     use std::sync::Mutex;
     use testing_fixtures::{
-        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryRepoBindingRepository,
-        InMemoryTaskRepository, InMemoryWorkspaceRepository,
+        InMemoryOrgIssueTypeRepository, InMemoryOutboxRepository, InMemoryProjectRepository,
+        InMemoryRepoBindingRepository, InMemoryTaskRepository, InMemoryWorkspaceRepository,
     };
 
     /// Asserts the post-mutation task's inbound mirror set matches its
@@ -1546,6 +1527,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
@@ -1608,6 +1590,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
@@ -2117,6 +2100,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             org_issue_types.clone(),
         );
@@ -2266,6 +2250,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
@@ -2354,6 +2339,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
@@ -2452,6 +2438,7 @@ mod tests {
             tasks,
             bindings,
             workspaces,
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );
@@ -3438,6 +3425,7 @@ mod tests {
             tasks.clone(),
             bindings.clone(),
             workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
         );

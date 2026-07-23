@@ -270,8 +270,8 @@ impl RemoteProjectProvider for GithubAdapter {
         project_node_id: &str,
         item_node_id: &str,
         field_id: &str,
-        option_id: &str,
-    ) -> PortResult<String> {
+        option_id: Option<&str>,
+    ) -> PortResult<Option<String>> {
         self.graphql
             .set_single_select_option(project_node_id, item_node_id, field_id, option_id)
             .await

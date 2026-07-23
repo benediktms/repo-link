@@ -29,6 +29,16 @@ D10 proposed new `SyncNoticeDto` variants. **Dropped.** The advisory cases (`Pri
 
 `IssueType::from` is infallible (unknown → `Custom`, never rejected). The **relation-aware default policy** — a sub-issue (`child_of`) defaults to the org's sub-issue type (e.g. Task/Subtask), a free-standing issue to the standalone default (e.g. Story), always overridable — was **not** in this RFC's scope (D7 only modelled the enum + explicit set). It is split to a follow-up task (`rpl-qa5`, blocked on #228). Its defaults are org-specific, dynamic names and must be **validated against the live `org_issue_types` registry** (A1's cache), not hardcoded; config location (workspace setting vs mapping) is that task's open question.
 
+### A6 — Custom "Type"/"Types" project field IS now supported (supersedes the §3 non-goal), preferred over native issue Type (#238)
+
+§3 listed the custom **"Types"** Projects v2 single-select as a non-goal ("if ever wanted it rides the Priority rail unchanged"). #238 implements it — and it does **not** ride the Priority rail unchanged, because Priority maps by *ordinal* (D3) whereas a custom Type field maps by **case-insensitive option name** (an open, unordered vocabulary, exactly as native Type resolves by name in A1). The decisions:
+
+- **Two rails, one per task, custom preferred.** A board with an **unambiguous** custom single-select named `Type` or `Types` (case-insensitive) takes a dedicated project-item `OutboxMutation::SetProjectType`; otherwise the native `SetIssueType` rail (A1) is the fallback. Never both for one task — the choice is centralized in `application-sync::enqueue::resolve_type_projection`, which **every** issue-type-projection trigger routes through (edit, rollback, the `issue_type_pending` sweep, `promote`, orphan-draft convert, and the first-attach follow-up). This is why the custom rail is dogfoodable on repo-link's own **user-owned** test board #3, which has no native issue types (D8).
+- **Ambiguity is not a hard error.** More than one `Type`/`Types` single-select → warn and skip the custom projection (native fallback), rather than choosing arbitrarily or failing the board link (contrast the >1-Priority hard error, which is safe because Priority is auto-classified from the literal name "Priority"). `Project::type_field` returns `Some` only when exactly one is classified; `has_ambiguous_type_field` drives the warn.
+- **Clear support.** The project-item single-select rail gained a clear path: the generalized `RemoteProjectProvider::set_single_select_option` now takes `Option<&str>` (`None` → GraphQL `clearProjectV2ItemFieldValue`), so an explicit `--clear-type` removes the custom field value. When the custom rail is unavailable the clear falls to native Type.
+- **Persistence.** A new `ProjectFieldKind::Type` is persisted (additive migration `20260723000002` widens the `project_fields.kind` CHECK to include `'type'` via a stash/rebuild, since SQLite can't relax a CHECK in place). There is **no** Type mapping table — resolution is by option name against the retained `project_field_options` catalog, so no `project_type_mappings` analog to `project_priority_mappings` exists.
+- **Shared durable intent.** `SetProjectType` carries the same `local_issue_type` / `local_issue_type_recorded` compare-and-clear fields as `SetIssueType` and clears the SAME `issue_type_pending` flag on success, so whichever rail applies retires the intent and the daemon sweep is rail-agnostic. The outbox dedupe (`insert_outbox_in_tx` + `idx_outbox_set_issue_type_dedupe`) was generalized to cover both `set_issue_type` and `set_project_type`.
+
 ### A5 — Delivery
 
 Sliced into six tasks under epic #222: #223 (generalized field model, D2/D9), #224 (priority mapping, D3), #225 (priority projection, D4/A2), #226 (org issue-type registry, D5), #227 (local `IssueType` enum, D7), #228 (type-on-issue mechanism, A1). #223/#224/#225/#226/#227 are merged; #228 is in progress; defaulting (`rpl-qa5`) is a follow-up. Recommended order held: Priority track before Type.
@@ -45,7 +55,7 @@ These two fields look similar in the GitHub UI but come from **two different API
 | Type (`Task`) | GitHub **native issue type** | per **organization** | REST `PATCH /issues/{n}` `"type": "<name>"` (or GraphQL `updateIssue(issueTypeId:)`) |
 | "Types" (empty, under Fields) | a *separate* Projects v2 single-select custom field | per project | `updateProjectV2ItemFieldValue` |
 
-Note the third row: the sidebar also shows an empty custom **"Types"** project field, distinct from the native **"Type: Task"** at the top. This RFC targets the **native issue type**; the custom "Types" field is a non-goal (§3) that would, if ever wanted, ride the Priority rail unchanged.
+Note the third row: the sidebar also shows an empty custom **"Types"** project field, distinct from the native **"Type: Task"** at the top. This RFC originally targeted only the **native issue type** and listed the custom field as a non-goal; **§0 A6 (#238) supersedes that** — the custom "Type"/"Types" field is now supported and *preferred* over native Type, resolving by option name (not the Priority ordinal rail).
 
 ### What exists today
 
@@ -178,7 +188,7 @@ Two constraints inherited from the existing abstraction:
 
 ## 3. Non-goals
 
-- The empty custom **"Types"** Projects v2 field (distinct from native issue type). If ever wanted it rides the Priority rail (D3/D4) unchanged; out of scope here.
+- ~~The empty custom **"Types"** Projects v2 field (distinct from native issue type). If ever wanted it rides the Priority rail (D3/D4) unchanged; out of scope here.~~ **Superseded — see §0 A6 (#238):** the custom "Type"/"Types" field IS now supported, resolves by case-insensitive option NAME (not the Priority ordinal rail), and is preferred over the native issue-type rail.
 - Other sidebar fields: **Effort**, **Due date**, **Labels** (RFC 0003 §D8 defers labels), **Milestone**.
 - **Inbound pull** of priority or type back onto the local task — both are outbound-only projections initially, like Status (RFC 0003 §D7 / RFC 0004).
 - A per-field **conflict model** for priority/type (parallels RFC 0003's dormant `AssigneeMismatch`).
@@ -241,7 +251,7 @@ Two constraints inherited from the existing abstraction:
 | Status | project item | single-select | project | opaque `option_id` | `project_status_mappings` (project_id, is_open) → option_id | project-item |
 | **Priority** | project item | single-select | project | opaque `option_id` | `project_priority_mappings` (project_id, priority) → option_id | project-item |
 | **Type** | issue | native issue type | **org** | type **name** / id | `org_issue_types` (owner_login, local_type) → name (+id) | issue (RFC 0003) |
-| "Types" (custom) | project item | single-select | project | opaque `option_id` | — (non-goal) | project-item |
+| "Type"/"Types" (custom) | project item | single-select | project | opaque `option_id` (resolved by option **name**, #238) | — (no mapping table; name match over `project_field_options`) | project-item (`SetProjectType`, §0 A6) |
 
 ## Appendix B — current vs target field model
 
