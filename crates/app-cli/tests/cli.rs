@@ -1978,6 +1978,7 @@ fn agents_docs_creates_file_with_markers() {
     assert!(text.contains("## When to use `rl`"));
     assert!(text.contains("### Choosing work"));
     assert!(text.contains("### Working with a tracked task"));
+    assert!(text.contains("rl here"));
     assert!(text.contains("rl repo find <query>"));
     assert!(text.contains("rl repo list"));
     assert!(text.contains("Do not invoke `rl` merely because"));

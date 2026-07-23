@@ -11,7 +11,7 @@ Use `rl` only when the request concerns tracked work:
 
 Do not invoke `rl` merely because the checkout is bound to a workspace.
 
-All commands emit JSON on stdout. Use `jq` to extract or reshape fields, and present results to a human as a markdown table rather than raw JSON. Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference.
+Data-producing commands emit JSON on stdout; help and diagnostics may be human-readable. Use `jq` to extract or reshape fields, and present results to a human as a markdown table rather than raw JSON. Run `rl <subcommand> --help` (or `rl <subcommand> <verb> --help`) for the authoritative flag reference.
 
 ### Workspace and repository context
 
