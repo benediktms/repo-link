@@ -197,6 +197,37 @@ pub(crate) enum WorkspaceCmd {
         #[arg(long)]
         none: bool,
     },
+    /// Set (or clear) the workspace's default native issue-type NAMES
+    /// (RFC 0006 #239 / §0 A4). When a task is first filed (`rl sync promote`)
+    /// carrying no explicit `--type`, the effective type is derived from these:
+    /// a sub-issue (a task with a `child_of` relation) uses `--sub-issue`, a
+    /// free-standing task uses `--standalone`. Names are org-specific and
+    /// resolved case-insensitively against the filing owner's issue-type
+    /// registry at promote (an absent name degrades to a logged advisory, not
+    /// an error). The default only ever *fills* a never-set type at first
+    /// filing — it never overrides an explicit type or a later re-save.
+    ///
+    /// Merge semantics: an omitted flag leaves that default unchanged (setting
+    /// one never wipes the other); `--none` clears both. Workspace-scoped
+    /// because native Type works with no board.
+    ///
+    /// `<workspace>` is optional: when omitted, it is derived from the current
+    /// directory's repo, same as `--workspace` elsewhere.
+    SetDefaultType {
+        workspace: Option<String>,
+        /// Default type name for free-standing (non-sub-issue) tasks
+        /// (e.g. `Story`). Mutually exclusive with `--none`.
+        #[arg(long, conflicts_with = "none")]
+        standalone: Option<String>,
+        /// Default type name for sub-issue (`child_of`) tasks (e.g. `Task`).
+        /// Mutually exclusive with `--none`.
+        #[arg(long = "sub-issue", conflicts_with = "none")]
+        sub_issue: Option<String>,
+        /// Clear both workspace default issue types. Mutually exclusive with
+        /// `--standalone` / `--sub-issue`.
+        #[arg(long)]
+        none: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

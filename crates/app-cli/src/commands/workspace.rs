@@ -83,6 +83,30 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                 .await?;
             render::workspace(&dto);
         }
+        WorkspaceCmd::SetDefaultType {
+            workspace,
+            standalone,
+            sub_issue,
+            none,
+        } => {
+            if !none && standalone.is_none() && sub_issue.is_none() {
+                return Err(anyhow!(
+                    "rl workspace set-default-type requires at least one of \
+                     --standalone <name>, --sub-issue <name>, or --none"
+                ));
+            }
+            let workspace = resolve_workspace(svc, workspace).await?;
+            let dto = svc
+                .workspaces
+                .set_default_issue_types(
+                    &workspace,
+                    standalone.as_deref(),
+                    sub_issue.as_deref(),
+                    none,
+                )
+                .await?;
+            render::workspace(&dto);
+        }
         WorkspaceCmd::List { include_archived } => {
             let rows = svc
                 .workspaces

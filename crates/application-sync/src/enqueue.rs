@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use domain_project::{OrgIssueTypeRegistry, Project};
 use domain_sync::{OutboxEntry, OutboxMutation};
-use domain_task::{RelationKind, Task};
+use domain_task::{IssueType, RelationKind, Task};
 use domain_workspace::Workspace;
 use ports::{
     OrgIssueTypeRepository, OutboxRepository, PortResult, ProjectRepository, WorkspaceRepository,
@@ -201,6 +201,41 @@ pub fn set_project_type_mutation(project: &Project, task: &Task) -> Option<Outbo
         local_issue_type: task.issue_type.as_ref().map(|it| it.to_string()),
         local_issue_type_recorded: true,
     })
+}
+
+/// Derive the effective default native issue type for a task being first-filed
+/// with no explicit type (RFC 0006 #239 / §0 A4). A `child_of` (sub-issue) task
+/// uses `sub_issue_default`; a free-standing task uses `standalone_default`.
+/// `None` when the relevant default isn't configured — the task then files with
+/// no type, as before.
+///
+/// Returns the configured NAME wrapped as an [`IssueType`] (well-known or
+/// `Custom`); it is NOT validated here — the caller stamps it via
+/// `Task::set_issue_type` and the existing projection path resolves it
+/// case-insensitively against the filing owner's live `org_issue_types`
+/// registry (an unconfigured/absent name degrades to a logged advisory there,
+/// never hardcoded). Pure; the caller supplies the workspace's two defaults.
+///
+/// This is a **first-filing fill only** — callers gate it on
+/// `task.issue_type.is_none()` at `promote`. Once stamped it is an ordinary
+/// explicit value: re-saves project it unchanged and an explicit clear sticks
+/// (the default is never re-derived for an already-filed task, so it can't
+/// override an existing type — #239 decision).
+pub fn derive_default_issue_type(
+    task: &Task,
+    standalone_default: Option<&str>,
+    sub_issue_default: Option<&str>,
+) -> Option<IssueType> {
+    let is_sub_issue = task
+        .relations
+        .iter()
+        .any(|r| r.kind == RelationKind::ChildOf);
+    let name = if is_sub_issue {
+        sub_issue_default
+    } else {
+        standalone_default
+    }?;
+    Some(IssueType::from(name))
 }
 
 /// Resolve which Type rail a task's issue-type projection should take and
@@ -1312,6 +1347,45 @@ mod tests {
             matches!(m, Some(OutboxMutation::SetIssueType { .. })),
             "ambiguous custom fields must fall back to the native rail: {m:?}"
         );
+    }
+
+    // --- derive_default_issue_type (RFC 0006 #239) --------------------------
+
+    #[test]
+    fn derive_default_issue_type_standalone_vs_sub_issue() {
+        use domain_core::TaskId;
+        use domain_task::RelationKind;
+
+        // Free-standing task → standalone default.
+        let free = make_issue_backed_mirror("I_free");
+        assert_eq!(
+            derive_default_issue_type(&free, Some("Story"), Some("Task")),
+            Some(IssueType::from("Story"))
+        );
+
+        // A `child_of` edge makes it a sub-issue → sub-issue default.
+        let mut child = make_issue_backed_mirror("I_child");
+        child.add_relation(RelationKind::ChildOf, TaskId::new());
+        assert_eq!(
+            derive_default_issue_type(&child, Some("Story"), Some("Task")),
+            Some(IssueType::Task) // "Task" is a well-known variant
+        );
+    }
+
+    #[test]
+    fn derive_default_issue_type_none_when_relevant_default_unset() {
+        use domain_core::TaskId;
+        use domain_task::RelationKind;
+
+        // Free-standing but no standalone default configured → None.
+        let free = make_issue_backed_mirror("I_free2");
+        assert_eq!(derive_default_issue_type(&free, None, Some("Task")), None);
+
+        // Sub-issue but no sub-issue default configured → None (does NOT fall
+        // back to the standalone default).
+        let mut child = make_issue_backed_mirror("I_child2");
+        child.add_relation(RelationKind::ChildOf, TaskId::new());
+        assert_eq!(derive_default_issue_type(&child, Some("Story"), None), None);
     }
 
     #[tokio::test]

@@ -189,6 +189,22 @@ impl SyncService {
         // both). A native-type board still projects immediately here. The
         // resolver owns all advisory logging; promote stays best-effort (never
         // a hard failure — a promote must succeed regardless).
+        //
+        // Default issue type (RFC 0006 #239 / §0 A4): first-filing fill. If the
+        // task carries no explicit type, derive one from the workspace defaults
+        // — sub-issue vs standalone by its `child_of` relations — and STAMP it
+        // now, so it becomes an ordinary value the block below (and every later
+        // re-save) projects unchanged. Runs only here at first filing, so it can
+        // never override an already-recorded type or a deliberate clear.
+        if task.issue_type.is_none()
+            && let Some(derived) = enqueue::derive_default_issue_type(
+                &task,
+                workspace.default_issue_type.as_deref(),
+                workspace.default_sub_issue_type.as_deref(),
+            )
+        {
+            task.set_issue_type(Some(derived));
+        }
         if task.issue_type.is_some() {
             // Reuse the `workspace` already fetched above (RFC 0002 filing
             // chain) instead of `resolve_project`, which would re-fetch it.
@@ -2108,6 +2124,97 @@ mod tests {
             saved.filing_repo_id,
             Some(domain_core::RepoId::from_uuid(filing_origin.id.as_uuid()))
         );
+    }
+
+    // --- default issue type at first filing (RFC 0006 #239) -----------------
+
+    /// A `SyncService` over a workspace with the given default type names + one
+    /// bound repo, plus a fresh LocalOnly task ready to promote. Returns the
+    /// task repo so a test can read back the stamped `issue_type`.
+    async fn promote_setup_with_defaults(
+        standalone: Option<&str>,
+        sub_issue: Option<&str>,
+    ) -> (SyncService, Arc<InMemoryTaskRepository>, Task) {
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+        let mut workspace = Workspace::new(WorkspaceName::new("def-ws").unwrap(), None, true);
+        workspace.set_default_issue_types(
+            standalone.map(str::to_string),
+            sub_issue.map(str::to_string),
+        );
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
+        let task = Task::new_draft(workspace_id, Some(repo_id), "t".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
+            provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+        );
+        (svc, tasks, task)
+    }
+
+    #[tokio::test]
+    async fn promote_stamps_standalone_default_when_type_unset() {
+        let (svc, tasks, task) = promote_setup_with_defaults(Some("Story"), Some("Task")).await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        // Free-standing task → standalone default stamped as the local type.
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().issue_type,
+            Some(IssueType::from("Story"))
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_stamps_sub_issue_default_for_child_task() {
+        let (svc, tasks, mut task) = promote_setup_with_defaults(Some("Story"), Some("Task")).await;
+        // Make it a sub-issue before promote. The parent must exist as a real
+        // task — promote's relation backfill (#151) loads every neighbor.
+        let parent = Task::new_draft(task.workspace_id, None, "parent".into()).unwrap();
+        tasks
+            .save(&parent, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+        task.add_relation(RelationKind::ChildOf, parent.id);
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().issue_type,
+            Some(IssueType::Task)
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_never_overrides_an_explicit_type() {
+        let (svc, tasks, mut task) = promote_setup_with_defaults(Some("Story"), Some("Task")).await;
+        // An explicit type set before promote must survive — the default only
+        // fills a never-set type (#239 decision).
+        task.set_issue_type(Some(IssueType::Bug));
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().issue_type,
+            Some(IssueType::Bug)
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_leaves_type_unset_when_no_default_configured() {
+        let (svc, tasks, task) = promote_setup_with_defaults(None, None).await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        assert_eq!(tasks.get(task.id).await.unwrap().issue_type, None);
     }
 
     // --- first-issue native-type projection (RFC 0006 §0 A1 / #228 follow-up) --

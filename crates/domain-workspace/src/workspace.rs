@@ -27,6 +27,21 @@ pub struct Workspace {
     /// filing axis which is never surfaced on the task boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filing_repo_id: Option<RepoId>,
+    /// Workspace default native issue-type NAMES (RFC 0006 #239 / §0 A4).
+    /// When a task is first filed (`sync promote`) with no explicit type, the
+    /// effective type is derived from these: a `child_of` (sub-issue) task uses
+    /// [`Self::default_sub_issue_type`], a free-standing task uses
+    /// [`Self::default_issue_type`]. Stored as the configured NAME (e.g.
+    /// `"Story"` / `"Task"`), org-specific — resolved case-insensitively against
+    /// the filing owner's live `org_issue_types` registry at projection time, so
+    /// nothing is hardcoded and a name absent there degrades to a logged
+    /// advisory. `None` = no default (the task files with no type, as today).
+    /// Set via `rl workspace set-default-type`; workspace-scoped (project-
+    /// independent) because native Type works with no board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_issue_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sub_issue_type: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -42,6 +57,8 @@ impl Workspace {
             local_only,
             project_id: None,
             filing_repo_id: None,
+            default_issue_type: None,
+            default_sub_issue_type: None,
             created_at: now,
             updated_at: now,
         }
@@ -111,6 +128,22 @@ impl Workspace {
     /// Bumps `updated_at` so the mutation is observable.
     pub fn set_filing_repo_id(&mut self, repo_id: Option<RepoId>) {
         self.filing_repo_id = repo_id;
+        self.touch();
+    }
+
+    /// Set the workspace default native issue-type names (RFC 0006 #239).
+    /// Forward-looking like [`Self::set_filing_repo_id`]: reassigning is
+    /// permitted and affects only tasks first-filed AFTER the change —
+    /// already-recorded `tasks.issue_type` values are never retargeted (the
+    /// default is a first-filing fill, never a re-projection). Each argument is
+    /// independent (`None` clears that default). Bumps `updated_at`.
+    pub fn set_default_issue_types(
+        &mut self,
+        standalone: Option<String>,
+        sub_issue: Option<String>,
+    ) {
+        self.default_issue_type = standalone;
+        self.default_sub_issue_type = sub_issue;
         self.touch();
     }
 

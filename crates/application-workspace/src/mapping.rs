@@ -36,6 +36,8 @@ pub fn workspace_to_dto(w: &Workspace) -> WorkspaceDto {
         local_only: w.local_only,
         project_id: w.project_id.as_ref().map(|p| p.as_str().to_string()),
         filing_repo_id: w.filing_repo_id.map(|r| r.to_string()),
+        default_issue_type: w.default_issue_type.clone(),
+        default_sub_issue_type: w.default_sub_issue_type.clone(),
         created_at: w.created_at.into(),
         updated_at: w.updated_at.into(),
     }

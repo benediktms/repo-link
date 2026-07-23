@@ -21,6 +21,14 @@ pub struct WorkspaceDto {
     /// workspaces serialise unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filing_repo_id: Option<String>,
+    /// Workspace default native issue-type names (RFC 0006 #239): the type a
+    /// task is first-filed with when it carries no explicit type — standalone
+    /// vs `child_of` sub-issue. Configured names (org-specific); omitted from
+    /// JSON when unset so existing workspaces serialise unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_issue_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sub_issue_type: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

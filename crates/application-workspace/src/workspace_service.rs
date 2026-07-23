@@ -323,6 +323,40 @@ impl WorkspaceService {
         Ok(workspace_to_dto(&w))
     }
 
+    /// Set the workspace default native issue-type names (RFC 0006 #239). Like
+    /// [`Self::set_filing_repo`], a plain load-flip-save on a bare
+    /// `WorkspaceService` — the defaults are a first-filing fill applied at
+    /// `promote`, never an eager backfill. The names are stored verbatim and
+    /// validated against the filing-org registry only at projection time.
+    ///
+    /// **Merge** semantics (non-destructive): a `Some` argument overrides that
+    /// default; an omitted (`None`) argument leaves the stored value untouched,
+    /// so setting one default never silently wipes the other. `clear_all` wins
+    /// over both and clears the pair (the `--none` sugar).
+    pub async fn set_default_issue_types(
+        &self,
+        workspace_id: &str,
+        standalone: Option<&str>,
+        sub_issue: Option<&str>,
+        clear_all: bool,
+    ) -> Result<WorkspaceDto> {
+        let id: WorkspaceId = workspace_id.parse()?;
+        let mut w = self.repo.get(id).await?;
+        if clear_all {
+            w.set_default_issue_types(None, None);
+        } else {
+            let standalone = standalone
+                .map(str::to_string)
+                .or_else(|| w.default_issue_type.clone());
+            let sub_issue = sub_issue
+                .map(str::to_string)
+                .or_else(|| w.default_sub_issue_type.clone());
+            w.set_default_issue_types(standalone, sub_issue);
+        }
+        self.repo.save(&w).await?;
+        Ok(workspace_to_dto(&w))
+    }
+
     /// Resolve a `<project-spec>` to a `ProjectId`. Centralised here so the
     /// CLI and service share one form. `owner/number` falls through to a
     /// `list_all` scan because projects have no `UNIQUE(owner, number)` —
