@@ -97,11 +97,12 @@ pub(crate) async fn repo_dispatch(
             svc.bindings.detach(&resolved).await?;
             println!("{}", serde_json::json!({ "detached": resolved }));
         }
-        RepoCmd::List {
-            ws: WorkspaceArg { workspace },
-        } => {
-            let workspace = resolve_workspace(svc, workspace).await?;
-            render::repos(&svc.bindings.list(&workspace).await?)
+        RepoCmd::List { workspace } => {
+            let rows = match workspace {
+                Some(workspace) => svc.bindings.list(&workspace).await?,
+                None => svc.bindings.list_all().await?,
+            };
+            render::repos(&rows);
         }
         RepoCmd::Show { id } => match svc.bindings.show(&id).await {
             Ok(dto) => render::repo(&dto),

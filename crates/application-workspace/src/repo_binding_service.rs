@@ -380,11 +380,29 @@ impl RepoBindingService {
 
     pub async fn list(&self, workspace_id: &str) -> Result<Vec<RepoBindingDto>> {
         let workspace_id: WorkspaceId = workspace_id.parse()?;
+        let workspace = self.workspaces.get(workspace_id).await?;
+        if matches!(
+            workspace.status,
+            WorkspaceStatus::Archived | WorkspaceStatus::Deleted
+        ) {
+            return Ok(Vec::new());
+        }
         let rows = self.bindings.list_by_workspace(workspace_id).await?;
         Ok(rows
             .iter()
             .map(|v| binding_to_dto(&v.instance, &v.origin))
             .collect())
+    }
+
+    /// List every binding in active workspaces.
+    pub async fn list_all(&self) -> Result<Vec<RepoBindingDto>> {
+        let mut out = Vec::new();
+        for workspace in self.workspaces.list(false).await? {
+            for view in self.bindings.list_by_workspace(workspace.id).await? {
+                out.push(binding_to_dto(&view.instance, &view.origin));
+            }
+        }
+        Ok(out)
     }
 
     /// Return every (workspace, binding) pair whose binding's

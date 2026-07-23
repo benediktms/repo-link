@@ -57,9 +57,7 @@ pub fn render_block(repo_info: &str) -> String {
 
 /// Render the "## This repo" section. When `bound` is `false`, emit an
 /// `unbound` notice that points the agent at `rl repo attach`. Otherwise
-/// emit a static pointer at `rl here` — the workspace/binding/roster data
-/// itself is live-queried, not embedded here, so it can't go stale between
-/// `rl agents docs` runs.
+/// explain where to get live workspace/binding/roster data when it is needed.
 pub fn render_repo_info(bound: bool, canonical_url: Option<&str>) -> String {
     let mut out = String::from("## This repo\n\n");
     if !bound {
@@ -69,9 +67,9 @@ pub fn render_repo_info(bound: bool, canonical_url: Option<&str>) -> String {
         ));
     } else {
         out.push_str(
-            "This checkout is bound to an `rl` workspace. Don't look for workspace IDs or a \
-             repo roster in this file — run `rl here` at the start of every session, and any \
-             time you need to recover context mid-session.\n\n\
+            "This checkout is bound to an `rl` workspace. When an `rl` workflow needs \
+             workspace context, run `rl here` rather than looking for workspace IDs or a \
+             repo roster in this file.\n\n\
              `rl here` returns this checkout's repo binding (instance id, origin id, name, \
              prefix, aliases), every workspace it belongs to (use each workspace's `id` as \
              `--workspace <id>`), each workspace's attached project and default filing repo, \
@@ -213,10 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn render_repo_info_bound_points_at_rl_here() {
+    fn render_repo_info_bound_points_at_rl_here_when_needed() {
         let out = render_repo_info(true, Some("github.com/foo/bar"));
         assert!(out.starts_with("## This repo\n\n"));
         assert!(out.contains("rl here"));
+        assert!(out.contains("When an `rl` workflow needs workspace context"));
+        assert!(!out.contains("at the start of every session"));
         assert!(!out.contains("workspace_id"));
         assert!(!out.contains("```json"));
         assert!(!out.contains("status: unbound"));
@@ -227,9 +227,13 @@ mod tests {
         let repo = render_repo_info(false, None);
         let block = render_block(&repo);
         assert!(block.contains("`rl` (repo-link) is a local-first workspace"));
-        assert!(block.contains("### Finding work"));
-        assert!(block.contains("### Before you start: check drift"));
-        assert!(block.contains("### Before you stop: sync your work"));
+        assert!(block.contains("## When to use `rl`"));
+        assert!(block.contains("### Choosing work"));
+        assert!(block.contains("### Working with a tracked task"));
+        assert!(block.contains("rl repo find <query>"));
+        assert!(block.contains("rl repo list"));
+        assert!(block.contains("Do not invoke `rl` merely because"));
+        assert!(!block.contains("Before doing anything else in a session"));
         assert!(block.contains("## This repo"));
         assert!(block.contains("status: unbound"));
         assert!(!block.contains("## Command reference"));
