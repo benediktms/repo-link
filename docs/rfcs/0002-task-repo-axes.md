@@ -48,9 +48,11 @@ Keep `Task.repo_id` as the **logical repo** (worktrees, prefix, where the agent 
 
 ### D2 — The filing repo is a workspace default, recorded per task on promote
 
+> **Status:** step 1 (the per-task `--filing-repo` override) is **wired** (#122). `rl task create --filing-repo <handle>` resolves the binding to its origin and records it as the draft's `filing_repo_id`; `SyncService::promote` reads that recorded override first in the chain below. Step 2 (workspace filing default) already shipped (#121). Steps 3–4 are unchanged from RFC 0001.
+
 The team's consensus is workspace/project-wide ("file in `team-eng`"), so the filing repo's natural home is a **workspace-level default**, not a per-task decision. Resolution precedence at create/promote:
 
-1. explicit per-task override (the `--filing-repo` flag), else
+1. explicit per-task override (the `--filing-repo` flag, recorded at create), else
 2. the workspace's filing-repo default, else
 3. the logical `repo_id` **if it is non-NULL** (**today's behaviour** — issue lands in the logical repo), else
 4. (`repo_id IS NULL`, no override, no workspace default) → board draft (RFC 0001 path 1, unchanged).
@@ -111,7 +113,7 @@ Both columns share the name `filing_repo_id`: same concept (where the issue is f
 
 ## 6. Out of scope / open questions
 
-- **Per-task override UX** — exact shape of `--filing-repo` and whether it accepts the same handle forms (prefix/name/alias/UUID) as `--repo`.
+- ~~**Per-task override UX** — exact shape of `--filing-repo` and whether it accepts the same handle forms (prefix/name/alias/UUID) as `--repo`.~~ **Resolved (#122):** `--filing-repo` accepts the same handle forms as `--repo` (it resolves through the same `resolve_repo_handle` path), is consumed at `task create`, and is recorded on the draft for promote.
 - **Filing repo not checked out locally** — `team-eng` may have no worktree on disk. Filing needs only its `canonical_url`, not a checkout, so this is fine; confirm `repo attach` can register a binding without a worktree.
 - **Multiple filing repos per workspace** — out of scope; one default + per-task override covers the exceptions.
 - **Remote-identity scope** — now a firm decision; see **D6**.

@@ -108,21 +108,27 @@ impl SyncService {
 
         // RFC 0002 D2: promote is a first-filing transition, so resolve the
         // filing repo and record it on the task before creating the remote.
-        // The per-task override is carried on the draft, not resolved here
-        // (CLI lands in #122); step 2 reads the workspace default. With both
-        // absent the chain collapses to the logical `repo_id`, so the issue is
-        // filed exactly where it is today. `set_filing_repo_id(None)` is a
-        // no-op when nothing resolved (orphan with no default), preserving the
-        // existing "promote needs a repo" error via `filing_canonical_for`.
+        // The per-task override is the draft's recorded `filing_repo_id` — set
+        // at `task create --filing-repo` time (RFC 0002 D2 step 1, #122) — and
+        // takes precedence over the workspace default (step 2), which in turn
+        // beats the logical `repo_id`. With all absent the chain collapses to
+        // the logical repo, so the issue is filed exactly where it is today.
+        // `set_filing_repo_id` below is an idempotent no-op when the recorded
+        // override already equals the resolved value (the common case once an
+        // override was set at create).
         let workspace = self.workspaces.get(task.workspace_id).await?;
         // Convert RepoId (instance id space) to RepoOriginId for the chain.
-        // workspace.filing_repo_id already holds an origin id after the RFC 0005
-        // migration; task.repo_id is an instance id → map to origin via the binding.
+        // The task's `filing_repo_id` and `workspace.filing_repo_id` already
+        // hold origin ids (RFC 0005 §D4); `task.repo_id` is an instance id →
+        // map to origin via the binding in `logical_origin_for`.
+        let recorded_origin = task
+            .filing_repo_id
+            .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
         let ws_default_origin = workspace
             .filing_repo_id
             .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
         let logical_origin = self.logical_origin_for(&task).await?;
-        let filing_origin = resolve_filing_repo(None, ws_default_origin, logical_origin);
+        let filing_origin = resolve_filing_repo(recorded_origin, ws_default_origin, logical_origin);
         // Convert back to RepoId for set_filing_repo_id (domain field is Option<RepoId>)
         let filing = filing_origin.map(|o| RepoId::from_uuid(o.as_uuid()));
         task.set_filing_repo_id(filing)?;
@@ -2055,6 +2061,52 @@ mod tests {
         assert_eq!(
             provider.last_create_canonical.lock().unwrap().as_deref(),
             Some("github.com/o/r")
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_prefers_recorded_filing_override_over_logical() {
+        // RFC 0002 D2 step 1 (#122): a per-task filing override recorded on the
+        // draft (as `task create --filing-repo` does) beats the logical repo —
+        // promote files the issue at the override, not at `repo_id`.
+        let (svc, tasks, bindings, mut task, provider) = setup_with_bindings().await;
+        // A second binding in the same workspace: the filing override, distinct
+        // from the logical `github.com/o/r`.
+        let filing_origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save_origin(&filing_origin).await.unwrap();
+        let filing_instance = RepoInstance::new(
+            task.workspace_id,
+            filing_origin.id,
+            "github.com/o/filing".into(),
+            None,
+        )
+        .unwrap();
+        bindings.save_instance(&filing_instance).await.unwrap();
+        // Record the override in origin space, exactly as `TaskService::create`
+        // would after resolving `--filing-repo`.
+        task.set_filing_repo_id(Some(domain_core::RepoId::from_uuid(
+            filing_origin.id.as_uuid(),
+        )))
+        .unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        // Filed at the override, NOT the logical github.com/o/r.
+        assert_eq!(
+            provider.last_create_canonical.lock().unwrap().as_deref(),
+            Some("github.com/o/filing"),
+            "the recorded per-task override must win the D2 chain over the logical repo"
+        );
+        // The recorded override survives promote unchanged (idempotent re-set).
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(
+            saved.filing_repo_id,
+            Some(domain_core::RepoId::from_uuid(filing_origin.id.as_uuid()))
         );
     }
 

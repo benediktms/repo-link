@@ -260,8 +260,21 @@ impl TaskService {
         if let Some(p) = cmd.priority {
             t.set_priority(parse_enum::<Priority>("priority", &p)?);
         }
+        // Per-task filing-repo override (RFC 0002 D2 step 1, #122): the
+        // highest-precedence link in the filing chain, recorded on the draft
+        // NOW so `SyncService::promote` files the eventual issue there. The
+        // CLI resolves the handle to a binding (instance) id; convert it to its
+        // origin so the stored value is origin-space (RFC 0005 §D4), matching
+        // `import_mirror` and what `promote`'s chain expects. The initial set on
+        // a fresh draft is always allowed by `set_filing_repo_id`.
+        if let Some(handle_id) = cmd.filing_repo_override {
+            let rid: RepoId = handle_id.parse()?;
+            let origin_id = self.bindings.get(rid).await?.instance.origin_id;
+            t.set_filing_repo_id(Some(RepoId::from_uuid(origin_id.as_uuid())))?;
+        }
         // `Created`, not `LocalEdit` — v1 is a creation, not an edit. See
-        // `SnapshotSource::Created` for why this distinction matters.
+        // `SnapshotSource::Created` for why this distinction matters. The
+        // filing intent set above rides this first snapshot.
         self.save_with_minted_hash(&mut t, SnapshotSource::Created)
             .await?;
         self.task_dto(&t).await
@@ -1522,6 +1535,50 @@ mod tests {
         // And it's findable by its remote ref (idempotency backstop).
         let found = svc.show(&dto.id).await.unwrap();
         assert_eq!(found.remote.unwrap().remote_id, "123");
+    }
+
+    #[tokio::test]
+    async fn create_with_filing_repo_override_records_origin_space_filing_repo_id() {
+        // RFC 0002 D2 step 1 (#122): `create` resolves the override binding to
+        // its origin and records it as the new task's `filing_repo_id`
+        // (origin-space, RFC 0005 §D4) — pre-promote, on a LocalOnly draft.
+        use domain_core::RepoId;
+        use domain_repo::{RepoInstance, RepoOrigin};
+
+        let (svc, bindings) = svc_with_bindings();
+        let ws = WorkspaceId::new();
+        let origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        let instance =
+            RepoInstance::new(ws, origin.id, "github.com/o/filing".into(), None).unwrap();
+        let filing_binding_id = instance.id;
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+
+        let dto = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws.to_string(),
+                repo_id: None,
+                title: "t".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: Some(filing_binding_id.to_string()),
+            })
+            .await
+            .unwrap();
+
+        // The stored filing_repo_id is the binding's ORIGIN id (not the
+        // instance id), matching the space `promote`'s D2 chain reads.
+        let task = svc.resolve_task(&dto.id).await.unwrap();
+        assert_eq!(
+            task.filing_repo_id,
+            Some(RepoId::from_uuid(origin.id.as_uuid())),
+            "override must be recorded as the origin-space filing_repo_id"
+        );
+        assert_eq!(task.sync, domain_task::SyncState::LocalOnly);
     }
 
     #[tokio::test]

@@ -417,13 +417,9 @@ pub(crate) enum TaskCmd {
         /// When present, the resolved binding beats the workspace filing default
         /// and the logical repo in the D2 resolution chain.
         ///
-        /// Note: `rl task create` only mints a local draft — it does not
-        /// promote the task to a remote issue. The filing-repo override is
-        /// consumed at the first-filing transition (`rl sync promote`), which
-        /// is not yet wired to read a per-task pending override. Supplying this
-        /// flag on a non-promoting create is therefore rejected with a deferral
-        /// error; use `rl sync promote` to file the task and control the target
-        /// repo via the workspace filing default for now.
+        /// The override is recorded on the draft at create time and honoured at
+        /// the first-filing transition: `rl sync promote` files the eventual
+        /// GitHub issue in this repo, independent of the logical `--repo`.
         #[arg(long = "filing-repo")]
         filing_repo: Option<String>,
         #[arg(long)]
