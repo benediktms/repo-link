@@ -981,6 +981,7 @@ mod tests {
         let drainer = Arc::new(OutboxDrainer::new(
             outbox_dyn.clone(),
             task_repo.clone(),
+            bind_repo.clone(),
             ws_repo.clone(),
             proj_repo.clone(),
             remote_tasks,
@@ -1893,6 +1894,7 @@ mod tests {
         let drainer = Arc::new(OutboxDrainer::new(
             outbox_dyn.clone(),
             task_repo.clone(),
+            bind_repo.clone(),
             ws_repo.clone(),
             proj_repo.clone(),
             remote_tasks,

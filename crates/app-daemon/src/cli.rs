@@ -125,6 +125,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
             let drainer = Arc::new(OutboxDrainer::new(
                 outbox_repo.clone(),
                 tasks_repo.clone(),
+                bindings_repo.clone(),
                 workspaces_repo.clone(),
                 projects_repo.clone(),
                 remote_tasks,

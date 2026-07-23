@@ -74,6 +74,8 @@ pub struct TaskFilter {
     /// Keep only project-backed tasks (`project_item_id IS NOT NULL`). The
     /// poller correlates these against polled board items.
     pub has_project_item_id: bool,
+    /// Keep only tasks with durable native-Type projection intent.
+    pub issue_type_pending: bool,
     /// JOIN `workspaces` and keep only tasks in a *pollable* workspace: `active`
     /// AND project-attached (`project_id IS NOT NULL`). The poller gate (RFC
     /// 0004 D3). Excluding projectless workspaces matters: a task with a stale
@@ -297,6 +299,14 @@ pub trait TaskRepository: Send + Sync {
     /// `node_id` on a row that has no remote. A zero-row match (task absent OR
     /// remote-less) is therefore benign.
     async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()>;
+    /// Clear native-Type projection intent iff the task still wants
+    /// `expected`. The compare-and-clear prevents an older successful outbox
+    /// entry from erasing a newer local type edit.
+    async fn clear_issue_type_pending(
+        &self,
+        task_id: TaskId,
+        expected: Option<domain_task::IssueType>,
+    ) -> PortResult<bool>;
     /// Stamp ONLY the `synced_at` cache column for one task — the
     /// write-through "remote last observed" timestamp (RFC 0004 D3). A
     /// targeted single-column write in the same family as

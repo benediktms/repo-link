@@ -8,7 +8,7 @@ use domain_task::{SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot};
 use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 
 use crate::InMemoryOutboxRepository;
-use crate::outbox_repo::OutboxStore;
+use crate::outbox_repo::{OutboxStore, push_deduped};
 
 // ---------- Task repository -----------------------------------------------
 
@@ -102,7 +102,16 @@ impl InMemoryTaskRepository {
             source,
             captured_at: Timestamp::now(),
         });
-        self.inner.lock().unwrap().insert(task.id, task.clone());
+        let mut tasks = self.inner.lock().unwrap();
+        let mut stored = task.clone();
+        if let Some(existing) = tasks.get(&task.id) {
+            stored.issue_type_pending = if existing.issue_type != task.issue_type {
+                true
+            } else {
+                existing.issue_type_pending
+            };
+        }
+        tasks.insert(task.id, stored);
     }
 }
 
@@ -137,7 +146,9 @@ impl TaskRepository for InMemoryTaskRepository {
         );
         let mut guard = store.lock().unwrap();
         self.write_locked(task, source);
-        guard.extend(entries.iter().cloned());
+        for entry in entries {
+            push_deduped(&mut guard, entry);
+        }
         Ok(())
     }
 
@@ -164,7 +175,9 @@ impl TaskRepository for InMemoryTaskRepository {
         for (task, source) in tasks {
             self.write_locked(task, *source);
         }
-        guard.extend(entries.iter().cloned());
+        for entry in entries {
+            push_deduped(&mut guard, entry);
+        }
         Ok(())
     }
 
@@ -214,6 +227,7 @@ impl TaskRepository for InMemoryTaskRepository {
             })
             // `has_project_item_id`: keep only project-backed tasks.
             .filter(|t| !filter.has_project_item_id || t.project_item_id.is_some())
+            .filter(|t| !filter.issue_type_pending || t.issue_type_pending)
             // `synced_at_lt`: never-observed (None) or older than the threshold.
             .filter(|t| match filter.synced_at_lt {
                 Some(ts) => t.synced_at.is_none_or(|s| s < ts),
@@ -465,6 +479,22 @@ impl TaskRepository for InMemoryTaskRepository {
             remote.node_id = Some(node_id);
         }
         Ok(())
+    }
+
+    async fn clear_issue_type_pending(
+        &self,
+        task_id: TaskId,
+        expected: Option<domain_task::IssueType>,
+    ) -> PortResult<bool> {
+        let mut tasks = self.inner.lock().unwrap();
+        let Some(task) = tasks.get_mut(&task_id) else {
+            return Ok(false);
+        };
+        if task.issue_type_pending && task.issue_type == expected {
+            task.issue_type_pending = false;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn cache_synced_at(

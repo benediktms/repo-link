@@ -216,6 +216,8 @@ pub fn set_issue_type_mutation(
         None => IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
             issue_node_id,
             issue_type_id: None,
+            local_issue_type: None,
+            local_issue_type_recorded: true,
         }),
         Some(it) => {
             let name = it.to_string();
@@ -227,6 +229,8 @@ pub fn set_issue_type_mutation(
                 Some(t) => IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
                     issue_node_id,
                     issue_type_id: Some(t.issue_type_id.clone()),
+                    local_issue_type: Some(name),
+                    local_issue_type_recorded: true,
                 }),
                 None => IssueTypeResolution::Unmapped,
             }
@@ -305,6 +309,21 @@ pub async fn resolve_issue_type_projection(
     filing_owner_login: Option<&str>,
     task: &Task,
 ) -> PortResult<IssueTypeProjection> {
+    // Clearing Type needs only an issue node id. It must not be stranded by a
+    // missing filing owner or an unavailable/empty org registry.
+    if task.issue_type.is_none() {
+        let Some(issue_node_id) = task.remote.as_ref().and_then(|r| r.node_id.clone()) else {
+            return Ok(IssueTypeProjection::NoNode);
+        };
+        return Ok(IssueTypeProjection::Mutation(
+            OutboxMutation::SetIssueType {
+                issue_node_id,
+                issue_type_id: None,
+                local_issue_type: None,
+                local_issue_type_recorded: true,
+            },
+        ));
+    }
     let Some(owner) = filing_owner_login else {
         return Ok(IssueTypeProjection::NoOwner);
     };
@@ -810,6 +829,7 @@ mod tests {
             IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             }) => {
                 assert_eq!(issue_node_id, "I_type_nid");
                 assert_eq!(issue_type_id, Some("IT_bug".to_string()));
@@ -871,6 +891,7 @@ mod tests {
             IssueTypeResolution::Mutation(OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             }) => {
                 assert_eq!(issue_node_id, "I_clear_nid");
                 assert_eq!(issue_type_id, None);
@@ -962,6 +983,7 @@ mod tests {
             IssueTypeProjection::Mutation(OutboxMutation::SetIssueType {
                 issue_node_id,
                 issue_type_id,
+                ..
             }) => {
                 assert_eq!(issue_node_id, "I_proj_ok");
                 assert_eq!(issue_type_id, Some("IT_bug".to_string()));

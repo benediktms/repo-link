@@ -94,14 +94,24 @@ pub enum OutboxMutation {
     /// REST issue builder has no `issue_type` slot, so type can only be
     /// projected via this dedicated GraphQL mutation, exactly as
     /// `SetProjectPriority` sits off the project-item mirror. The outbox
-    /// entry itself is the durable retry unit — there is no baseline column
-    /// to re-confirm against (`Task::set_issue_type` does not call
-    /// `reconcile_dirty_against_baseline`), so the drainer's arm never flips
-    /// `sync_state` and never Conflicts on the read-back (there IS no
-    /// read-back — see `GraphqlClient::set_issue_type`).
+    /// concrete outbox entry is the network retry unit; unresolved intent is
+    /// retained separately on the task until a node id and registry mapping
+    /// exist. There is no mirror baseline to re-confirm against
+    /// (`Task::set_issue_type` does not call `reconcile_dirty_against_baseline`),
+    /// so the drainer never flips `sync_state` or Conflicts on a read-back
+    /// (there IS no read-back — see `GraphqlClient::set_issue_type`).
     SetIssueType {
         issue_node_id: String,
         issue_type_id: Option<String>,
+        /// Canonical local value this mutation represents. Used only to
+        /// compare-and-clear the task's durable projection intent after the
+        /// remote confirms success.
+        #[serde(default)]
+        local_issue_type: Option<String>,
+        /// Distinguishes a newly-authored clear (`local_issue_type = None`)
+        /// from a legacy serialized entry that predates the field.
+        #[serde(default)]
+        local_issue_type_recorded: bool,
     },
     /// REST `POST /repos/{o}/{r}/issues/{parent}/sub_issues` — link an existing
     /// issue as a sub-issue of another (the GitHub-native projection of a
@@ -318,6 +328,8 @@ mod tests {
         let set = OutboxMutation::SetIssueType {
             issue_node_id: "I_x".into(),
             issue_type_id: Some("IT_bug".into()),
+            local_issue_type: Some("bug".into()),
+            local_issue_type_recorded: true,
         };
         assert_eq!(set.kind(), "set_issue_type");
         let json = serde_json::to_value(&set).unwrap();
@@ -326,10 +338,30 @@ mod tests {
         let clear = OutboxMutation::SetIssueType {
             issue_node_id: "I_x".into(),
             issue_type_id: None,
+            local_issue_type: None,
+            local_issue_type_recorded: true,
         };
         assert_eq!(clear.kind(), "set_issue_type");
         let json = serde_json::to_value(&clear).unwrap();
         assert_eq!(json["kind"], "set_issue_type");
+    }
+
+    #[test]
+    fn legacy_set_issue_type_payload_does_not_claim_a_local_value() {
+        let mutation: OutboxMutation = serde_json::from_value(serde_json::json!({
+            "kind": "set_issue_type",
+            "issue_node_id": "I_x",
+            "issue_type_id": "IT_bug"
+        }))
+        .unwrap();
+        assert!(matches!(
+            mutation,
+            OutboxMutation::SetIssueType {
+                local_issue_type: None,
+                local_issue_type_recorded: false,
+                ..
+            }
+        ));
     }
 
     #[test]
