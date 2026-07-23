@@ -218,27 +218,13 @@ pub(crate) async fn task_dispatch(
             body,
             priority,
         } => {
-            // RFC 0002 D2 step 1 / #122 brief preference (a): `task create`
-            // only mints a LocalOnly draft — it does not promote and has no
-            // filing transition to consume the override. Silently accepting
-            // `--filing-repo` would create a flag that does nothing (a
-            // footgun). Instead, resolve the handle first (to validate it and
-            // surface ambiguity identically to `--repo`), then reject with an
-            // explicit deferral error directing the user to `rl sync promote`
-            // / a future workspace filing default.
-            if let Some(handle) = filing_repo {
-                let resolved = resolve_repo_handle_required(svc, &handle).await?;
-                return Err(anyhow!(
-                    "`--filing-repo` is not yet consumed by `task create` (RFC 0002 §4, #122): \
-                     `rl task create` only mints a local draft and does not promote the task to \
-                     a remote issue. The per-task filing-repo override will be honoured at the \
-                     first-filing transition; until that path is wired, control the filing target \
-                     via the workspace filing default. To file the task in a specific repo, \
-                     create it without `--filing-repo` and then run `rl sync promote`. \
-                     (Resolved binding: {})",
-                    resolved
-                ));
-            }
+            // RFC 0002 D2 step 1 / #122: the per-task filing-repo override is
+            // recorded on the draft now and honoured at the first-filing
+            // transition (`rl sync promote`). Resolve the handle to a binding id
+            // the same way `--repo` does (validates it + surfaces ambiguity
+            // identically); the service converts it to origin space and stores
+            // it as the task's `filing_repo_id`.
+            let filing_repo_override = resolve_repo_handle(svc, filing_repo).await?;
             let (workspace, repo_id) = resolve_task_create_scope(svc, workspace, repo).await?;
             let dto = svc
                 .tasks
@@ -248,7 +234,7 @@ pub(crate) async fn task_dispatch(
                     title,
                     body,
                     priority,
-                    filing_repo_override: None,
+                    filing_repo_override,
                 })
                 .await?;
             render::task(&dto);

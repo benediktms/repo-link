@@ -257,12 +257,12 @@ fn task_create_list_includes_state_filter() {
     assert_eq!(staged_list.as_array().unwrap().len(), 1);
 }
 
-/// RFC 0002 #122 (option a): `task create --filing-repo` resolves the handle
-/// (to validate it / surface ambiguity like `--repo`) then REJECTS with a
-/// deferral error — `task create` only mints a local draft and has no filing
-/// transition to consume the override. The flag must never be a silent no-op.
+/// RFC 0002 D2 step 1 (#122): `task create --filing-repo` now records the
+/// per-task override on the draft — distinct from the logical `--repo` — and
+/// `task show` surfaces it in the additive `filing_repo` block. No deferral
+/// error; the flag is consumed at create.
 #[test]
-fn task_create_filing_repo_override_is_deferred() {
+fn task_create_filing_repo_override_is_recorded() {
     let dir = TempDir::new().unwrap();
     let workspace = run_json(
         &mut bin("repo-link", &dir),
@@ -271,35 +271,50 @@ fn task_create_filing_repo_override_is_deferred() {
         .as_str()
         .unwrap()
         .to_string();
-    // A resolvable filing-repo handle (so we hit the deferral, not a not-found).
-    let repo_id = attach_no_link(&dir, &workspace, "git@github.com:o/r.git", "github.com/o/r");
+    let logical = attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/logical.git",
+        "github.com/o/logical",
+    );
+    let filing = attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/filing.git",
+        "github.com/o/filing",
+    );
 
-    let output = bin("repo-link", &dir)
-        .args([
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &[
             "task",
             "create",
             "--workspace",
             &workspace,
             "--title",
             "t",
+            "--repo",
+            &logical,
             "--filing-repo",
-            &repo_id,
-        ])
-        .assert()
-        .failure()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("not yet consumed by `task create`"),
-        "expected the --filing-repo deferral error, got: {stderr}"
+            &filing,
+        ],
     );
-    // The rejected create must not have persisted a task.
-    let listed = run_json(&mut bin("repo-link", &dir), &["task", "list"]);
+    let task_id = created["id"].as_str().unwrap().to_string();
+    // The logical axis is the `--repo` binding, unaffected by the override.
+    assert_eq!(created["repo_id"], logical);
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["task", "show", &task_id]);
     assert!(
-        listed.as_array().unwrap().is_empty(),
-        "a rejected create must not persist a task"
+        !shown["filing_repo"].is_null(),
+        "the per-task filing override must be recorded at create: {shown}"
     );
+    assert_eq!(
+        shown["filing_repo"]["canonical_url"], "github.com/o/filing",
+        "filing_repo must point at --filing-repo, not the logical --repo"
+    );
+    // D5: the internal filing_repo_id still never leaks onto the task surface.
+    assert!(!shown.as_object().unwrap().contains_key("filing_repo_id"));
+    assert_eq!(shown["repo_id"], logical);
 }
 
 /// RFC 0002 #122 / D5: `task show` overlays an additive `filing_repo` block
