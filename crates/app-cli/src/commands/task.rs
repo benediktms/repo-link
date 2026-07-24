@@ -186,6 +186,7 @@ async fn claim_one(
                 priority: None,
                 assignees: Some(next),
                 repo_id: None,
+                filing_repo_override: None,
                 issue_type: None,
             })
             .await
@@ -311,6 +312,7 @@ pub(crate) async fn task_dispatch(
             priority,
             assignees,
             repo,
+            filing_repo,
             issue_type,
             clear_type,
         } => {
@@ -323,11 +325,12 @@ pub(crate) async fn task_dispatch(
                 && priority.is_none()
                 && assignees.is_empty()
                 && repo.is_none()
+                && filing_repo.is_none()
                 && issue_type.is_none()
                 && !clear_type
             {
                 return Err(anyhow!(
-                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo, --type, --clear-type"
+                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo, --filing-repo, --type, --clear-type"
                 ));
             }
             // Collapse clap's accumulated Vec into the DTO's "None = no
@@ -352,6 +355,7 @@ pub(crate) async fn task_dispatch(
                     priority,
                     assignees: (!assignees.is_empty()).then_some(assignees),
                     repo_id: resolve_repo_handle(svc, repo).await?,
+                    filing_repo_override: resolve_repo_handle(svc, filing_repo).await?,
                     issue_type: issue_type_cmd,
                 })
                 .await?;

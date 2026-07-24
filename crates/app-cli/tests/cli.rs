@@ -317,6 +317,58 @@ fn task_create_filing_repo_override_is_recorded() {
     assert_eq!(shown["repo_id"], logical);
 }
 
+#[test]
+fn task_edit_filing_repo_records_override_as_a_local_edit() {
+    let dir = TempDir::new().unwrap();
+    let workspace = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let logical = attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/logical.git",
+        "github.com/o/logical",
+    );
+    attach_no_link(
+        &dir,
+        &workspace,
+        "git@github.com:o/filing.git",
+        "github.com/o/filing",
+    );
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--repo",
+            &logical,
+            "--title",
+            "t",
+        ],
+    );
+    let task_id = created["id"].as_str().unwrap();
+
+    let edited = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "edit", task_id, "--filing-repo", "filing"],
+    );
+    assert_eq!(edited["repo_id"], logical);
+
+    let shown = run_json(&mut bin("repo-link", &dir), &["task", "show", task_id]);
+    assert_eq!(shown["filing_repo"]["canonical_url"], "github.com/o/filing");
+    assert_eq!(shown["repo_id"], logical);
+
+    let snapshots = run_json(&mut bin("repo-link", &dir), &["task", "snapshots", task_id]);
+    assert_eq!(snapshots.as_array().unwrap().len(), 2);
+    assert_eq!(snapshots[1]["source"], "local_edit");
+}
+
 /// RFC 0002 #122 / D5: `task show` overlays an additive `filing_repo` block
 /// (null for an unpromoted task) WITHOUT leaking the internal `filing_repo_id`
 /// onto the task surface, and leaves the base TaskDto + list shapes unchanged.

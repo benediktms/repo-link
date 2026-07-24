@@ -229,11 +229,8 @@ mod tests {
 
     /// RFC 0002 D5 / #119: the create/update/import command DTOs are part of
     /// the consumer contract and must not carry the internal `filing_repo_id`
-    /// axis either. NOTE for the later CLI ticket: the per-task `--filing-repo`
-    /// override lands on [`CreateTaskCmd`] as its OWN distinct input field — it
-    /// is NEVER named `filing_repo_id`, so this guard stays valid; when that
-    /// ticket lands it should only revisit the CreateTaskCmd line below if it
-    /// chooses that key name (it must not).
+    /// axis either. The per-task `--filing-repo` input on create and edit uses
+    /// the distinct `filing_repo_override` key, so this guard stays valid.
     #[test]
     fn cmd_dtos_json_omit_filing_repo_id() {
         let create = CreateTaskCmd {
@@ -256,6 +253,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(RepoId::new().to_string()),
+            filing_repo_override: Some(RepoId::new().to_string()),
             issue_type: None,
         };
         let import = ImportMirrorCmd {
