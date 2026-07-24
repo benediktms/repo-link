@@ -80,6 +80,15 @@ pub struct ReadyTaskRow {
     pub sync_state: String,
     pub priority: String,
     pub assignees: Vec<String>,
+    /// Local issue type (RFC 0006, #236), e.g. `"bug"` / `"Story"`. `None` when
+    /// the task carries no type. Local-only — never a network read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
+    /// CURRENT cached board status display name (e.g. `"Ready"`) — the same
+    /// cached-status resolution `drift` uses (`project_status_option_id` →
+    /// `Project::option_name_for`). `None` when projectless or not yet polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_status: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +100,15 @@ pub struct AssignedTaskRow {
     pub priority: String,
     pub blocked: bool,
     pub remote_id: Option<String>,
+    /// Local issue type (RFC 0006, #236), e.g. `"bug"` / `"Story"`. `None` when
+    /// the task carries no type. Local-only — never a network read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
+    /// CURRENT cached board status display name (e.g. `"Ready"`) — the same
+    /// cached-status resolution `drift` uses (`project_status_option_id` →
+    /// `Project::option_name_for`). `None` when projectless or not yet polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_status: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +186,8 @@ mod tests {
                     sync_state: "local_only".into(),
                     priority: "p3".into(),
                     assignees: vec![],
+                    issue_type: None,
+                    project_status: None,
                 })
                 .unwrap(),
             ),
@@ -181,6 +201,8 @@ mod tests {
                     priority: "p3".into(),
                     blocked: false,
                     remote_id: None,
+                    issue_type: None,
+                    project_status: None,
                 })
                 .unwrap(),
             ),
