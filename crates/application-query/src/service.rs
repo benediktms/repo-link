@@ -244,6 +244,10 @@ impl QueryService {
 
         let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
 
+        // One workspace per query → resolve its project (if any) once and reuse
+        // the cached-status semantics for every row (#236); local-only, no reads.
+        let project = self.resolve_workspace_project(id).await?;
+
         let mut rows: Vec<AssignedTaskRow> = tasks
             .iter()
             .filter(|t| t.is_open())
@@ -265,6 +269,8 @@ impl QueryService {
                     priority: enum_str(&t.priority),
                     blocked,
                     remote_id: t.remote.as_ref().map(|r| r.remote_id.clone()),
+                    issue_type: t.issue_type.as_ref().map(enum_str),
+                    project_status: cached_project_status(project.as_ref(), t),
                 }
             })
             .collect();
@@ -297,6 +303,10 @@ impl QueryService {
 
         let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
 
+        // One workspace per query → resolve its project (if any) once and reuse
+        // the cached-status semantics for every row (#236); local-only, no reads.
+        let project = self.resolve_workspace_project(id).await?;
+
         // Ready = open, not (transitively) blocked, and not in conflict.
         let is_ready = |t: &domain_task::Task| t.is_open() && t.sync != SyncState::Conflict;
 
@@ -321,6 +331,8 @@ impl QueryService {
                 sync_state: enum_str(&t.sync),
                 priority: enum_str(&t.priority),
                 assignees: t.assignees.clone(),
+                issue_type: t.issue_type.as_ref().map(enum_str),
+                project_status: cached_project_status(project.as_ref(), t),
             })
             .collect())
     }
@@ -548,6 +560,17 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
 
 fn is_unsynced(sync: SyncState) -> bool {
     !matches!(sync, SyncState::Synced)
+}
+
+/// The task's CURRENT cached board status as a display name — the "actual"
+/// half of [`project_axis`], reused by the lean `ready`/`mine` views (#236).
+/// Resolves `task.project_status_option_id` against the workspace project's
+/// option catalog. `None` when projectless, unpolled, or the cached id is no
+/// longer in the catalog. Purely local: no network read.
+fn cached_project_status(project: Option<&Project>, task: &Task) -> Option<String> {
+    let project = project?;
+    let id = task.project_status_option_id.as_deref()?;
+    project.option_name_for(id).map(str::to_string)
 }
 
 /// Evaluate the project-status drift axis for one task (RFC 0001 Stage 8,
@@ -1075,6 +1098,80 @@ mod tests {
         assert_eq!(titles, vec!["open", "blocked"]);
         assert!(!rows[0].blocked);
         assert!(rows[1].blocked);
+    }
+
+    /// #236: the lean `ready`/`mine` rows surface the local `issue_type` and the
+    /// cached board `project_status` — resolved from local data only (the same
+    /// `project_status_option_id` → `option_name_for` path `drift` uses). One
+    /// task is typed with a cached board option; a second is untyped/unpolled,
+    /// so both fields stay `None` even though the workspace HAS a project.
+    #[tokio::test]
+    async fn ready_and_mine_surface_issue_type_and_cached_project_status() {
+        use domain_task::IssueType;
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, &ws, &ps).await;
+
+        let mut typed = Task::new_draft(wid, None, "typed + polled".into()).unwrap();
+        typed.assignees = vec!["benedikt".into()];
+        typed.issue_type = Some(IssueType::Bug);
+        typed.set_project_status_option_id(Some("o_backlog".into()));
+
+        let mut bare = Task::new_draft(wid, None, "untyped + unpolled".into()).unwrap();
+        bare.assignees = vec!["benedikt".into()];
+
+        for t in [&typed, &bare] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let ready = svc.ready_tasks(&wid.to_string()).await.unwrap();
+        let r_typed = ready.iter().find(|r| r.title == "typed + polled").unwrap();
+        assert_eq!(r_typed.issue_type.as_deref(), Some("bug"));
+        assert_eq!(r_typed.project_status.as_deref(), Some("Backlog"));
+        let r_bare = ready
+            .iter()
+            .find(|r| r.title == "untyped + unpolled")
+            .unwrap();
+        assert_eq!(r_bare.issue_type, None);
+        assert_eq!(r_bare.project_status, None);
+
+        let mine = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
+        let m_typed = mine.iter().find(|r| r.title == "typed + polled").unwrap();
+        assert_eq!(m_typed.issue_type.as_deref(), Some("bug"));
+        assert_eq!(m_typed.project_status.as_deref(), Some("Backlog"));
+        let m_bare = mine
+            .iter()
+            .find(|r| r.title == "untyped + unpolled")
+            .unwrap();
+        assert_eq!(m_bare.issue_type, None);
+        assert_eq!(m_bare.project_status, None);
+    }
+
+    /// #236 projectless case: a workspace with no board leaves `project_status`
+    /// `None` on both lean views even for a typed task (which still surfaces its
+    /// local `issue_type`) — the cached-status resolver is inert with no project.
+    #[tokio::test]
+    async fn ready_and_mine_leave_project_status_none_when_projectless() {
+        use domain_task::IssueType;
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let mut t = Task::new_draft(wid, None, "typed but projectless".into()).unwrap();
+        t.assignees = vec!["benedikt".into()];
+        t.issue_type = Some(IssueType::Feature);
+        ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let ready = svc.ready_tasks(&wid.to_string()).await.unwrap();
+        assert_eq!(ready[0].issue_type.as_deref(), Some("feature"));
+        assert_eq!(ready[0].project_status, None);
+
+        let mine = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
+        assert_eq!(mine[0].issue_type.as_deref(), Some("feature"));
+        assert_eq!(mine[0].project_status, None);
     }
 
     #[tokio::test]
