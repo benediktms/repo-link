@@ -4101,6 +4101,94 @@ fn workspace_set_filing_repo_none_clears_it() {
 }
 
 #[test]
+fn workspace_set_default_type_merges_and_clears() {
+    // RFC 0006 #239: set both defaults, then update one (merge — the other is
+    // left untouched), then clear both with --none.
+    let dir = TempDir::new().unwrap();
+    let ws_id = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let set = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "set-default-type",
+            &ws_id,
+            "--standalone",
+            "Story",
+            "--sub-issue",
+            "Task",
+        ],
+    );
+    assert_eq!(set["default_issue_type"], "Story");
+    assert_eq!(set["default_sub_issue_type"], "Task");
+
+    // Merge: updating only --standalone must leave --sub-issue intact.
+    let merged = run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "workspace",
+            "set-default-type",
+            &ws_id,
+            "--standalone",
+            "Epic",
+        ],
+    );
+    assert_eq!(merged["default_issue_type"], "Epic");
+    assert_eq!(
+        merged["default_sub_issue_type"], "Task",
+        "updating one default must not wipe the other (merge semantics)"
+    );
+
+    // Per-field clear: --clear-sub-issue removes ONLY the sub-issue default.
+    let one_cleared = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-default-type", &ws_id, "--clear-sub-issue"],
+    );
+    assert_eq!(
+        one_cleared["default_issue_type"], "Epic",
+        "--clear-sub-issue must leave the standalone default intact"
+    );
+    assert!(
+        one_cleared.get("default_sub_issue_type").is_none()
+            || one_cleared["default_sub_issue_type"].is_null(),
+        "--clear-sub-issue must clear only the sub-issue default: {one_cleared}"
+    );
+
+    // --none clears both.
+    let cleared = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-default-type", &ws_id, "--none"],
+    );
+    assert!(cleared.get("default_issue_type").is_none() || cleared["default_issue_type"].is_null());
+    assert!(
+        cleared.get("default_sub_issue_type").is_none()
+            || cleared["default_sub_issue_type"].is_null()
+    );
+
+    // A blank name is rejected at the boundary (not stored as Custom("")).
+    let stderr = String::from_utf8(
+        bin("repo-link", &dir)
+            .args(["workspace", "set-default-type", &ws_id, "--standalone", ""])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stderr.contains("non-empty issue-type name"),
+        "blank --standalone must be rejected: {stderr}"
+    );
+}
+
+#[test]
 fn workspace_set_filing_repo_reassignment_succeeds() {
     // Unlike set-project, reassigning from repo A to repo B is ALLOWED.
     let dir = TempDir::new().unwrap();

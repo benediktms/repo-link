@@ -20,16 +20,15 @@ impl SqliteWorkspaceRepository {
 
 // Must name every live column (schema-consistency contract, see #110).
 // `filing_repo_id` is the RFC 0002 workspace default filing repo (#116).
-pub(crate) const WORKSPACE_COLS: &str =
-    "id, name, description, status, local_only, created_at, updated_at, project_id, filing_repo_id";
+pub(crate) const WORKSPACE_COLS: &str = "id, name, description, status, local_only, created_at, updated_at, project_id, filing_repo_id, default_issue_type, default_sub_issue_type";
 
 #[async_trait]
 impl WorkspaceRepository for SqliteWorkspaceRepository {
     async fn save(&self, w: &Workspace) -> PortResult<()> {
         sqlx::query(
             r#"
-            INSERT INTO workspaces (id, name, description, status, local_only, project_id, filing_repo_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO workspaces (id, name, description, status, local_only, project_id, filing_repo_id, default_issue_type, default_sub_issue_type, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 description = excluded.description,
@@ -37,6 +36,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                 local_only = excluded.local_only,
                 project_id = excluded.project_id,
                 filing_repo_id = excluded.filing_repo_id,
+                default_issue_type = excluded.default_issue_type,
+                default_sub_issue_type = excluded.default_sub_issue_type,
                 updated_at = excluded.updated_at
             "#,
         )
@@ -47,6 +48,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         .bind(w.local_only as i64)
         .bind(w.project_id.as_ref().map(|p| p.as_str()))
         .bind(w.filing_repo_id.map(|r| r.to_string()))
+        .bind(w.default_issue_type.as_deref())
+        .bind(w.default_sub_issue_type.as_deref())
         .bind(w.created_at.into_inner())
         .bind(w.updated_at.into_inner())
         .execute(&self.db.writes)
@@ -126,6 +129,13 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         .map(|s| parse_uuid::<RepoId>("filing_repo_id", s))
         .transpose()?;
 
+    // RFC 0006 #239 workspace default issue-type names. NULL = no default.
+    let default_issue_type: Option<String> =
+        row.try_get("default_issue_type").map_err(map_sqlx_err)?;
+    let default_sub_issue_type: Option<String> = row
+        .try_get("default_sub_issue_type")
+        .map_err(map_sqlx_err)?;
+
     Ok(Workspace {
         id: parse_uuid::<WorkspaceId>("workspace_id", &id_str)?,
         name: WorkspaceName::new(&name_str)
@@ -135,6 +145,8 @@ fn row_to_workspace(row: &sqlx::sqlite::SqliteRow) -> PortResult<Workspace> {
         local_only: local_only != 0,
         project_id,
         filing_repo_id,
+        default_issue_type,
+        default_sub_issue_type,
         created_at: Timestamp::from_utc(created_at),
         updated_at: Timestamp::from_utc(updated_at),
     })

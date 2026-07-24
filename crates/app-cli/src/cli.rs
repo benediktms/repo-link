@@ -197,6 +197,43 @@ pub(crate) enum WorkspaceCmd {
         #[arg(long)]
         none: bool,
     },
+    /// Set (or clear) the workspace's default native issue-type NAMES
+    /// (RFC 0006 #239 / §0 A4). When a task is first filed (`rl sync promote`)
+    /// carrying no explicit `--type`, the effective type is derived from these:
+    /// a sub-issue (a task with a `child_of` relation) uses `--sub-issue`, a
+    /// free-standing task uses `--standalone`. Names are org-specific and
+    /// resolved case-insensitively against the filing owner's issue-type
+    /// registry at promote (an absent name degrades to a logged advisory, not
+    /// an error). The default only ever *fills* a never-set type at first
+    /// filing — it never overrides an explicit type or a later re-save.
+    ///
+    /// Merge semantics: an omitted flag leaves that default unchanged (setting
+    /// one never wipes the other); `--none` clears both. Workspace-scoped
+    /// because native Type works with no board.
+    ///
+    /// `<workspace>` is optional: when omitted, it is derived from the current
+    /// directory's repo, same as `--workspace` elsewhere.
+    SetDefaultType {
+        workspace: Option<String>,
+        /// Default type name for free-standing (non-sub-issue) tasks
+        /// (e.g. `Story`). Omitting it leaves the current value untouched.
+        #[arg(long, conflicts_with_all = ["none", "clear_standalone"])]
+        standalone: Option<String>,
+        /// Default type name for sub-issue (`child_of`) tasks (e.g. `Task`).
+        /// Omitting it leaves the current value untouched.
+        #[arg(long = "sub-issue", conflicts_with_all = ["none", "clear_sub_issue"])]
+        sub_issue: Option<String>,
+        /// Clear ONLY the standalone default (leaves the sub-issue default).
+        #[arg(long = "clear-standalone", conflicts_with_all = ["none", "standalone"])]
+        clear_standalone: bool,
+        /// Clear ONLY the sub-issue default (leaves the standalone default).
+        #[arg(long = "clear-sub-issue", conflicts_with_all = ["none", "sub_issue"])]
+        clear_sub_issue: bool,
+        /// Clear BOTH workspace default issue types. Mutually exclusive with the
+        /// set/clear flags above.
+        #[arg(long, conflicts_with_all = ["standalone", "sub_issue", "clear_standalone", "clear_sub_issue"])]
+        none: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

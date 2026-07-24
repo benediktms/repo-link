@@ -1966,6 +1966,34 @@ async fn workspace_filing_repo_id_roundtrips() {
 }
 
 #[tokio::test]
+async fn workspace_default_issue_types_roundtrip() {
+    // RFC 0006 #239: the workspace default issue-type NAMES survive the upsert
+    // (both set, and independently cleared).
+    let (_dir, ws, _rb, _ts) = setup().await;
+
+    let mut workspace = Workspace::new(WorkspaceName::new("def-ws").unwrap(), None, true);
+    ws.save(&workspace).await.unwrap();
+    // Insert path: no defaults.
+    let loaded = ws.get(workspace.id).await.unwrap();
+    assert_eq!(loaded.default_issue_type, None);
+    assert_eq!(loaded.default_sub_issue_type, None);
+
+    // Upsert path: both set.
+    workspace.set_default_issue_types(Some("Story".into()), Some("Task".into()));
+    ws.save(&workspace).await.unwrap();
+    let loaded = ws.get(workspace.id).await.unwrap();
+    assert_eq!(loaded.default_issue_type.as_deref(), Some("Story"));
+    assert_eq!(loaded.default_sub_issue_type.as_deref(), Some("Task"));
+
+    // Clearing one (replace-both at the domain level) round-trips as NULL.
+    workspace.set_default_issue_types(Some("Story".into()), None);
+    ws.save(&workspace).await.unwrap();
+    let loaded = ws.get(workspace.id).await.unwrap();
+    assert_eq!(loaded.default_issue_type.as_deref(), Some("Story"));
+    assert_eq!(loaded.default_sub_issue_type, None);
+}
+
+#[tokio::test]
 async fn task_remote_node_id_and_project_item_id_roundtrip() {
     let (_dir, ws, rb, ts) = setup().await;
 

@@ -83,6 +83,62 @@ pub(crate) async fn workspace_dispatch(cmd: WorkspaceCmd, svc: &Services) -> Res
                 .await?;
             render::workspace(&dto);
         }
+        WorkspaceCmd::SetDefaultType {
+            workspace,
+            standalone,
+            sub_issue,
+            clear_standalone,
+            clear_sub_issue,
+            none,
+        } => {
+            if !none
+                && standalone.is_none()
+                && sub_issue.is_none()
+                && !clear_standalone
+                && !clear_sub_issue
+            {
+                return Err(anyhow!(
+                    "rl workspace set-default-type requires at least one of \
+                     --standalone <name>, --sub-issue <name>, --clear-standalone, \
+                     --clear-sub-issue, or --none"
+                ));
+            }
+            // A blank name would be stored verbatim and later stamped as an
+            // unresolvable `Custom("")` type — reject it at the boundary rather
+            // than persist garbage (a name is matched against the org registry).
+            for (flag, value) in [("--standalone", &standalone), ("--sub-issue", &sub_issue)] {
+                if value.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                    return Err(anyhow!(
+                        "{flag} requires a non-empty issue-type name (use --clear-{} to clear)",
+                        flag.trim_start_matches("--")
+                    ));
+                }
+            }
+            let workspace = resolve_workspace(svc, workspace).await?;
+            // Map the flags to the service's per-field tri-state
+            // (`None` = leave, `Some(None)` = clear, `Some(Some)` = set).
+            // `--none` clears both; clap guarantees it's exclusive with the rest.
+            let (standalone_arg, sub_arg): (Option<Option<&str>>, Option<Option<&str>>) = if none {
+                (Some(None), Some(None))
+            } else {
+                let s = if clear_standalone {
+                    Some(None)
+                } else {
+                    standalone.as_deref().map(Some)
+                };
+                let su = if clear_sub_issue {
+                    Some(None)
+                } else {
+                    sub_issue.as_deref().map(Some)
+                };
+                (s, su)
+            };
+            let dto = svc
+                .workspaces
+                .set_default_issue_types(&workspace, standalone_arg, sub_arg)
+                .await?;
+            render::workspace(&dto);
+        }
         WorkspaceCmd::List { include_archived } => {
             let rows = svc
                 .workspaces

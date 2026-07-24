@@ -1113,6 +1113,10 @@ impl OutboxDrainer {
         // top-of-arm guard already observed.
         let task = self.tasks.get(task_id).await?;
         if task.issue_type.is_none() {
+            // ponytail: draft→issue convert does NOT apply the #239 workspace
+            // default issue type — only `SyncService::promote` (the repo-anchored
+            // first-filing) does. Add relation-aware defaulting here too if
+            // draft-anchored defaults are wanted (RFC 0006 §0 A4 deferred edge).
             return Ok(());
         }
         // Route through the SHARED rail decision (RFC 0006 #238): if the
