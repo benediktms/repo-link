@@ -25,17 +25,17 @@ Not a reuse of `SetProjectStatus`. Its drainer arm Stamps on any `Ok` (a value m
 
 D10 proposed new `SyncNoticeDto` variants. **Dropped.** The advisory cases (`PriorityClamped`/`PriorityFieldMissing`/`PriorityUnmapped`; type `Unavailable`/`Unmapped`/dropped) all occur on the async drainer or on off-axis projections that never return a `SyncSummaryDto`, so there is no synchronous surface to render a structured notice into. They are surfaced with plain `tracing::warn!` (misconfiguration) / `tracing::debug!` (expected-transient, e.g. not-yet-attached), consistent across #224/#225/#226/#228. Reintroduce a structured variant only if a synchronous CLI surface later needs it.
 
-### A4 — Parse is infallible; relation-aware defaulting is a separate follow-up (supersedes D7's "validated at set time / rejected", resolves §6 Q3)
+### A4 — Parse is infallible; relation-aware defaulting is applied at promote first-filing (implemented, #239; supersedes D7's "validated at set time / rejected", resolves §6 Q3)
 
-`IssueType::from` is infallible (unknown → `Custom`, never rejected). The **relation-aware default policy** — a sub-issue (`child_of`) defaults to the org's sub-issue type (e.g. Task/Subtask), a free-standing issue to the standalone default (e.g. Story), always overridable — was **not** in this RFC's original scope (D7 only modelled the enum + explicit set). It was split to follow-up `rpl-qa5` (#239).
+`IssueType::from` is infallible (unknown → `Custom`, never rejected). The **relation-aware default policy** — a sub-issue (`child_of`) defaults to the org's sub-issue type (e.g. Task/Subtask), a free-standing issue to the standalone default (e.g. Story), always overridable — was **not** in this RFC's original scope (D7 only modeled the enum + explicit set). It was split to `rpl-qa5` (#239) and is **now implemented** (details below).
 
 > **Resolved + implemented (#239):** the open questions closed as follows.
 > - **Config scope: workspace.** Two dedicated nullable columns on `workspaces` (`default_issue_type` / `default_sub_issue_type`) holding the configured NAMES, set via `rl workspace set-default-type` (merge semantics: an omitted flag leaves the other default untouched; `--none` clears both). Workspace-scoped (project-independent, since native Type needs no board) — matching the only config precedent, `workspace.filing_repo_id`, rather than inventing an org-config table. The names resolve **case-insensitively against the filing owner's live `org_issue_types` registry at projection time** through the existing #238 path — nothing hardcoded; a name absent there degrades to a logged advisory.
-> - **No three-state model.** `Task.issue_type: Option<IssueType>` is left unchanged. The default is a **first-filing fill**: at `SyncService::promote`, if `issue_type` is `None`, the effective default is derived (`child_of` → sub-issue default, else standalone) and **stamped** onto the task via the dedicated `Task::set_issue_type_default` (distinct from `set_issue_type`, which explicit edits use — the default setter intentionally does NOT arm `issue_type_pending`, so a default that can't project on a type-less board leaves no stuck retry intent). From then it is an ordinary explicit value — re-saves project it unchanged. Because the derive runs **only** at promote (never re-derived for an already-filed task), `None` never has to mean both "use default" and "cleared" at once, so no sidecar bool / `TypeIntent` enum was needed.
+> - **No three-state model.** `Task.issue_type: Option<IssueType>` is left unchanged. The default is a **first-filing fill**: at `SyncService::promote`, if `issue_type` is `None`, the effective default is derived (`child_of` → sub-issue default, else standalone) and **stamped** onto the task via the dedicated `Task::set_issue_type_default` (distinct from `set_issue_type`, which explicit edits use — the default setter intentionally does NOT arm `issue_type_pending`, so a default that can't project on a type-less board leaves no stuck retry intent). From then it is an ordinary explicit value — re-saves project it unchanged. Because the derive runs **only** at promote (never re-derived for an already-filed task), a two-state `Option<IssueType>` is *almost* sufficient: `None` means "use the default" at that single first-filing moment, so no sidecar bool / `TypeIntent` enum was built. The one window where `None` is ambiguous — a task explicitly typed then cleared *before its first promote* reads the same as never-set and gets the default — is an **accepted limitation** (see Known limitations below), not a modeled state.
 > - **No reprojection on relation change.** Defaults resolve once, at first filing; adding/removing a `child_of` edge later does not reproject — a re-save must never override an existing type (a user decision). Live reprojection (standalone→sub-issue auto-flip after the fact) is deferred.
 > - **Unprojectable defaults are not stamped.** If a derived default can neither project now (the filing org's native registry lacks the name) nor defer to a custom board Type field, `promote` reverts the tentative stamp so the task files with no type — no local/remote divergence, no armed `issue_type_pending`. A default only manifests locally where it can actually reach GitHub.
 >
-> Known limitations (accepted, not modelled):
+> Known limitations (accepted, not modeled):
 > - **Pre-promote clear is indistinguishable from never-set.** Because there is no three-state model, a task that is explicitly typed then cleared (`--type X` then `--clear-type`) *before its first* `promote` reads as `None` and is treated as never-set, so the workspace default fills it. Distinguishing "explicitly cleared before first filing" from "never set" would require the durable clear-intent bit we deliberately skipped; the case (set-then-clear before the very first promote) is niche and left as a known edge. After first filing, a clear sticks (the default is never re-derived for an already-filed task).
 > - **Convert path.** The orphan-draft→issue **convert** path (`OutboxDrainer`) does not apply the default — only the `promote` first-filing does (`ponytail:` marker at the convert hook).
 
@@ -51,7 +51,7 @@ D10 proposed new `SyncNoticeDto` variants. **Dropped.** The advisory cases (`Pri
 
 ### A5 — Delivery
 
-Sliced into six tasks under epic #222: #223 (generalized field model, D2/D9), #224 (priority mapping, D3), #225 (priority projection, D4/A2), #226 (org issue-type registry, D5), #227 (local `IssueType` enum, D7), #228 (type-on-issue mechanism, A1). #223/#224/#225/#226/#227 are merged; #228 is in progress; defaulting (`rpl-qa5`) is a follow-up. Recommended order held: Priority track before Type.
+Sliced into six tasks under epic #222: #223 (generalized field model, D2/D9), #224 (priority mapping, D3), #225 (priority projection, D4/A2), #226 (org issue-type registry, D5), #227 (local `IssueType` enum, D7), #228 (type-on-issue mechanism, A1). #223/#224/#225/#226/#227/#228 are merged; the custom-Type rail (#238) and relation-aware defaulting (`rpl-qa5`, #239) shipped as follow-ups. Recommended order held: Priority track before Type.
 
 ## 1. Context
 
@@ -153,7 +153,7 @@ board options (ordinal order)     P0  P1  P2  P3
 
 ### D7 — A local `IssueType` enum on `Task`: well-known variants + `Custom` passthrough
 
-> **Refined — see §0 A4.** Parse is infallible (unknown → `Custom`, not rejected); the relation-aware *defaulting* policy is split to follow-up `rpl-qa5`.
+> **Refined — see §0 A4.** Parse is infallible (unknown → `Custom`, not rejected); the relation-aware *defaulting* policy shipped separately in `rpl-qa5` (#239), applied at `promote` first-filing.
 
 Issue types are an open, org-configurable set — a *closed* enum would be too rigid, but a plain string gives no ergonomics for the common case. Model it as an **extensible enum** on the task:
 
