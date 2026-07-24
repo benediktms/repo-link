@@ -479,7 +479,8 @@ pub(crate) enum TaskCmd {
     /// Edit a task in place. Writes a new snapshot at `version = max + 1`
     /// with `source = local_edit`; preserves the task's identity (UUID and
     /// short prefix). At least one of `--title`, `--body`, `--priority`,
-    /// `--assignee`, `--repo`, `--type`, or `--clear-type` must be supplied.
+    /// `--assignee`, `--repo`, `--filing-repo`, `--type`, or `--clear-type`
+    /// must be supplied.
     Edit {
         id: String,
         #[arg(long)]
@@ -497,13 +498,15 @@ pub(crate) enum TaskCmd {
         assignees: Vec<String>,
         /// Reassign the task's logical repo binding (code/worktrees/prefix), by
         /// UUID / prefix / name / alias (same forms as `rl repo show`). Use
-        /// this to attach a repo to a task created without one — required
-        /// before `sync promote`, which needs a logical repo to know which
-        /// GitHub repo to open the issue in (the logical repo is also the
-        /// filing repo today, until RFC 0002). Only valid while the task is not
-        /// yet synced to a remote issue; reassigning a synced task is rejected.
+        /// this to attach a logical repo to a task created without one. The
+        /// filing repo is controlled separately by `--filing-repo`.
         #[arg(short = 'r', long)]
         repo: Option<String>,
+        /// Set an unset per-task filing repo. Accepts the same UUID / prefix /
+        /// name / alias handles as `--repo`. Changing or clearing a filing
+        /// repo after it has been recorded remains rejected.
+        #[arg(long = "filing-repo")]
+        filing_repo: Option<String>,
         /// Set the task's local extensible issue type (RFC 0006 D7): a
         /// well-known name (`task` / `bug` / `feature`, case-insensitive) or
         /// any other string, kept verbatim as a custom type. If the task is a

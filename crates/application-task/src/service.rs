@@ -395,6 +395,7 @@ impl TaskService {
         // projection — planned on its own branch below, never through
         // `plan_update_mutations`.
         let issue_type_before = t.issue_type.clone();
+        let filing_repo_before = t.filing_repo_id;
 
         if let Some(title) = cmd.title {
             t.set_title(title)?;
@@ -412,6 +413,12 @@ impl TaskService {
             let parsed = repo_id.parse::<RepoId>()?;
             t.set_repo_id(Some(parsed))?;
         }
+        if let Some(binding_id) = cmd.filing_repo_override {
+            let binding = self.bindings.get(binding_id.parse::<RepoId>()?).await?;
+            t.set_filing_repo_id(Some(RepoId::from_uuid(
+                binding.instance.origin_id.as_uuid(),
+            )))?;
+        }
         // Outer `None` = leave unchanged; `Some(None)` = clear; `Some(Some(name))`
         // = set, parsed infallibly via `IssueType::from` (RFC 0006 D7).
         if let Some(new_type) = cmd.issue_type {
@@ -425,15 +432,16 @@ impl TaskService {
         // repo resolves — this subsumes the old `attached_repo` case and adds
         // the workspace-default (step-2) case where `repo_id` stays NULL.
         // Resolution is computed once and feeds the gate, the recording, and
-        // the canonical. Per-task override stays None until #122.
+        // the canonical. An explicit edit-time filing repo is step 1.
         // Resolve + record the filing repo only on the GENUINE FIRST filing of
-        // an orphan draft — gate on `filing_repo_id.is_none()`. Once recorded it
-        // is authoritative and must never be re-resolved (the resolver's own
-        // contract). Without this guard, a workspace-default change between two
-        // edits of a not-yet-converted draft would make the second edit either
-        // error in `set_filing_repo_id` (cannot change a recorded filing repo)
-        // or enqueue a duplicate `ConvertDraftToIssue` (Greptile #137).
-        let resolved_filing = if was_orphan_draft && t.filing_repo_id.is_none() {
+        // an orphan draft — gate on the pre-edit `filing_repo_id` being unset.
+        // Once recorded it is authoritative and must never be re-resolved (the
+        // resolver's own contract). Without this guard, a workspace-default
+        // change between two edits of a not-yet-converted draft would make the
+        // second edit either error in `set_filing_repo_id` (cannot change a
+        // recorded filing repo) or enqueue a duplicate `ConvertDraftToIssue`
+        // (Greptile #137).
+        let resolved_filing = if was_orphan_draft && filing_repo_before.is_none() {
             let workspace = self.workspaces.get(t.workspace_id).await?;
             // RFC 0005: resolve_filing_repo operates in origin id space.
             // workspace.filing_repo_id and t.repo_id carry RepoId bytes but
@@ -446,7 +454,10 @@ impl TaskService {
             } else {
                 None
             };
-            resolve_filing_repo(None, ws_default, logical_origin)
+            let explicit = t
+                .filing_repo_id
+                .map(|r| RepoOriginId::from_uuid(r.as_uuid()));
+            resolve_filing_repo(explicit, ws_default, logical_origin)
                 .map(|o| RepoId::from_uuid(o.as_uuid()))
         } else {
             None
@@ -1582,6 +1593,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_sets_unset_filing_repo_without_changing_logical_repo() {
+        use domain_core::RepoId;
+        use domain_repo::{RepoInstance, RepoOrigin};
+
+        let (svc, bindings) = svc_with_bindings();
+        let ws = WorkspaceId::new();
+        let logical_origin = RepoOrigin::new(
+            "git@github.com:o/logical.git".into(),
+            "github.com/o/logical".into(),
+        )
+        .unwrap();
+        let logical =
+            RepoInstance::new(ws, logical_origin.id, "github.com/o/logical".into(), None).unwrap();
+        let filing_origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        let filing =
+            RepoInstance::new(ws, filing_origin.id, "github.com/o/filing".into(), None).unwrap();
+        let other_origin = RepoOrigin::new(
+            "git@github.com:o/other.git".into(),
+            "github.com/o/other".into(),
+        )
+        .unwrap();
+        let other =
+            RepoInstance::new(ws, other_origin.id, "github.com/o/other".into(), None).unwrap();
+        for origin in [&logical_origin, &filing_origin, &other_origin] {
+            bindings.save_origin(origin).await.unwrap();
+        }
+        for instance in [&logical, &filing, &other] {
+            bindings.save_instance(instance).await.unwrap();
+        }
+
+        let created = svc
+            .create(CreateTaskCmd {
+                workspace_id: ws.to_string(),
+                repo_id: Some(logical.id.to_string()),
+                title: "t".into(),
+                body: None,
+                priority: None,
+                filing_repo_override: None,
+            })
+            .await
+            .unwrap();
+
+        svc.update(UpdateTaskCmd {
+            task_id: created.id.clone(),
+            title: None,
+            body: None,
+            priority: None,
+            assignees: None,
+            repo_id: None,
+            filing_repo_override: Some(filing.id.to_string()),
+            issue_type: None,
+        })
+        .await
+        .unwrap();
+
+        let task = svc.resolve_task(&created.id).await.unwrap();
+        assert_eq!(
+            task.repo_id,
+            Some(RepoId::from_uuid(logical.id.as_uuid())),
+            "editing the filing repo must not change the logical repo"
+        );
+        assert_eq!(
+            task.filing_repo_id,
+            Some(RepoId::from_uuid(filing_origin.id.as_uuid())),
+            "the binding must be persisted in origin space"
+        );
+
+        let err = svc
+            .update(UpdateTaskCmd {
+                task_id: created.id,
+                title: None,
+                body: None,
+                priority: None,
+                assignees: None,
+                repo_id: None,
+                filing_repo_override: Some(other.id.to_string()),
+                issue_type: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot change or clear the filing repo"),
+            "recorded filing repo must stay immutable: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn create_show_and_update_task() {
         let svc = svc();
         let dto = svc
@@ -1607,6 +1710,7 @@ mod tests {
                 priority: Some("p0".into()),
                 assignees: Some(vec!["alice".into()]),
                 repo_id: None,
+                filing_repo_override: None,
                 issue_type: None,
             })
             .await
@@ -2754,6 +2858,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -2805,6 +2910,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -2847,6 +2953,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -3059,6 +3166,7 @@ mod tests {
             priority: Some("p0".into()),
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -3160,6 +3268,7 @@ mod tests {
             priority: Some("p1".into()),
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -3263,6 +3372,7 @@ mod tests {
             priority: Some("p2".into()),
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -3332,6 +3442,7 @@ mod tests {
             priority: Some("p2".into()),
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -3386,6 +3497,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("bug".into())),
         })
         .await
@@ -3445,6 +3557,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(None),
         })
         .await
@@ -3534,6 +3647,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("bug".into())),
         })
         .await
@@ -3576,6 +3690,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("Epic".into())),
         })
         .await
@@ -3620,6 +3735,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("bug".into())),
         })
         .await
@@ -3653,6 +3769,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("bug".into())),
         })
         .await
@@ -4038,6 +4155,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4099,6 +4217,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4179,6 +4298,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4211,6 +4331,81 @@ mod tests {
                     repo_node_id, "github.com/o/filing",
                     "repo_node_id must be the filing binding's canonical URL"
                 );
+            }
+            other => panic!("expected ConvertDraftToIssue, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_draft_converts_via_edit_filing_repo_once() {
+        let RichSvc {
+            svc,
+            repo,
+            outbox,
+            workspaces,
+            bindings,
+            ..
+        } = rich_svc();
+        let ws = Workspace::new(WorkspaceName::new("w").unwrap(), None, false);
+        workspaces.save(&ws).await.unwrap();
+        let origin = domain_repo::RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        let instance =
+            domain_repo::RepoInstance::new(ws.id, origin.id, "github.com/o/filing".into(), None)
+                .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+
+        let mut task = Task::import_mirror(
+            ws.id,
+            None,
+            RemoteRef::new("github", "0"),
+            "draft".into(),
+            "body".into(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        task.remote = None;
+        task.project_item_id = Some("PVTI_d".into());
+        repo.save(&task, SnapshotSource::Pull).await.unwrap();
+
+        for _ in 0..2 {
+            svc.update(UpdateTaskCmd {
+                task_id: task.id.to_string(),
+                title: None,
+                body: None,
+                priority: None,
+                assignees: None,
+                repo_id: None,
+                filing_repo_override: Some(instance.id.to_string()),
+                issue_type: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let reloaded = repo.get(task.id).await.unwrap();
+        assert!(reloaded.repo_id.is_none());
+        assert_eq!(
+            reloaded.filing_repo_id,
+            Some(RepoId::from_uuid(origin.id.as_uuid()))
+        );
+        let entries = outbox.all();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.mutation.kind() == "convert_draft_to_issue")
+                .count(),
+            1,
+            "an idempotent second edit must not enqueue another conversion"
+        );
+        match &entries[0].mutation {
+            OutboxMutation::ConvertDraftToIssue { repo_node_id, .. } => {
+                assert_eq!(repo_node_id, "github.com/o/filing");
             }
             other => panic!("expected ConvertDraftToIssue, got {other:?}"),
         }
@@ -4288,6 +4483,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4309,6 +4505,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4381,6 +4578,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: Some(instance.id.to_string()),
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4465,6 +4663,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -4532,6 +4731,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -5070,6 +5270,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: None,
         })
         .await
@@ -5101,6 +5302,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("bug".into())),
         })
         .await
@@ -5112,6 +5314,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(None),
         })
         .await
@@ -5129,6 +5332,7 @@ mod tests {
             priority: None,
             assignees: None,
             repo_id: None,
+            filing_repo_override: None,
             issue_type: Some(Some("feature".into())),
         })
         .await

@@ -118,12 +118,16 @@ pub struct UpdateTaskCmd {
     pub priority: Option<String>,
     pub assignees: Option<Vec<String>>,
     /// Reassign the task's **logical repo** binding (a repo UUID): where the
-    /// code/worktrees live and the prefix source — today also the filing repo
-    /// on promote (until RFC 0002). `None` leaves the current logical repo
-    /// untouched. Only valid while the task is not yet remote-backed — the
-    /// service rejects reassigning a synced task. There is no way to *clear*
-    /// the repo via update (matches the assignees gap).
+    /// code/worktrees live and the prefix source. `None` leaves it untouched;
+    /// the domain validates whether a remote-backed task may move. There is no
+    /// way to *clear* the logical repo via update.
     pub repo_id: Option<String>,
+    /// Set the task's filing repo when it has not been recorded yet. The
+    /// value is a resolved repo binding id; the application layer stores its
+    /// origin id. Named as an override rather than `filing_repo_id` so the
+    /// internal axis stays out of the shared DTO contract (RFC 0002 D5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filing_repo_override: Option<String>,
     /// Set-or-clear the task's local extensible issue type (RFC 0006 D7 /
     /// #228). Outer `None` = leave unchanged; `Some(None)` = clear;
     /// `Some(Some(name))` = set, parsed infallibly and case-insensitively via
