@@ -1,6 +1,6 @@
 # RFC 0007 — Local semantic search over task content
 
-Status: Draft (2026-07-21)
+Status: Draft (2026-07-21, revised 2026-07-24)
 Tracking epic: **#TBD**
 
 ## 1. Context
@@ -195,7 +195,8 @@ search_meta(
     schema_version,
     model_id,
     dimensions,
-    built_at
+    built_at,
+    corpus_fingerprint  -- D7 unchanged-corpus fast-path; single global value
 )
 
 embeddings(
@@ -244,6 +245,25 @@ service:
 5. removes unreferenced embeddings; and
 6. runs the query against the reconciled index.
 
+**Cold-sidecar guard.** A `search` against a sidecar that has never been built
+(no `search_meta` row, or the selected model is not installed) MUST NOT silently
+embed the entire corpus inline — for a cold index that is a multi-second-to-
+minute first-run cliff hidden behind an ordinary query. Instead `search` refuses
+with guidance to run `rl task search-index rebuild` (and, if the model is
+absent, `search-index prepare-model` — §D10). Only an already-initialised
+sidecar reconciles incrementally inline, where the delta is bounded by what
+changed since the last search.
+
+**Unchanged-corpus fast-path.** Steps 1–3 are `O(corpus in scope)` — they run
+even when nothing changed. To keep a warm repeat search cheap, the service first
+computes a corpus fingerprint for the scope (the count of in-scope tasks +
+comments and their `max(updated_at)`) and records it in `search_meta`. When the
+fingerprint matches the stored value, reconciliation (steps 1–5) is skipped
+entirely and the query runs directly against the existing index. The fingerprint
+is a heuristic, not a correctness boundary: it can miss a same-timestamp
+in-place edit, which the next fingerprint change or an explicit `rebuild`
+corrects — consistent with the sidecar being a cache, not an authority.
+
 Before step 4, reconciliation estimates the resulting sidecar size from the
 number of unique chunks, the active dimension, and a conservative SQLite
 overhead factor measured in Stage 0. It refuses the build before model
@@ -270,7 +290,10 @@ The selected model must:
 - have a license compatible with repo-link distribution;
 - support local CPU inference on macOS and Linux;
 - produce at most 384 dimensions, or support validated dimensionality
-  truncation to at most 384;
+  truncation to at most 384 — **v1 targets 384** (Q2 resolved: storage is
+  trivial at this corpus size, so dimensions are chosen for retrieval quality,
+  not footprint; drop to 256 only if the spike shows equal quality at lower
+  latency);
 - document any distinct query/document instruction prefixes;
 - expose its tokenizer or reliable input-limit accounting for D2/D3; and
 - demonstrate useful task retrieval on the evaluation set in §10.
@@ -326,9 +349,13 @@ rl task search <query> [--workspace <id>] [--repo <handle>]
                        [--status open|closed|all] [--limit <N>]
 ```
 
-`--workspace` and `--repo` use the existing cwd-aware resolvers. Search defaults
-to `--status all` and a bounded result count chosen at implementation time.
-`--limit 0` and an empty/whitespace-only query are rejected.
+`--workspace` and `--repo` use the existing cwd-aware resolvers. **Search spans
+all workspaces by default** (Q8 resolved: cross-workspace recall — "find that
+task I wrote months ago" — is a primary use case, mirroring D1's choice to keep
+closed tasks searchable); `--workspace`/`--repo` narrow the scope. Search
+defaults to `--status all` and **`--limit 10`** (Q5 resolved: matches the
+Recall@10 evaluation metric). `--limit 0` and an empty/whitespace-only query are
+rejected.
 
 Each JSON result contains:
 
@@ -336,6 +363,7 @@ Each JSON result contains:
 {
   "id": "rpl-abc",
   "task_id": "<uuid>",
+  "workspace_id": "<uuid>",
   "title": "...",
   "score": 0.82,
   "matched_source": {
@@ -346,25 +374,36 @@ Each JSON result contains:
 }
 ```
 
+`workspace_id` is included because a default search spans workspaces (Q8): a hit
+must say where it lives, or a cross-workspace result set is unreadable (the same
+"surface enough context" lesson as the lean query rows).
+
 `score` is a ranking signal, not a calibrated probability, and is comparable
 only within results produced by the same model/index version.
 
 Index maintenance is explicit and JSON-emitting:
 
 ```text
+rl task search-index prepare-model
 rl task search-index status
 rl task search-index rebuild
 rl task search-index clear
 ```
 
-`status` reports model ID, dimensions, task/chunk/unique-vector counts, raw
-vector bytes, sidecar file bytes, model-cache bytes when discoverable, and last
-build time. `rebuild` removes the old derived sidecar before rebuilding so it
-does not require temporary space for two complete indexes. `clear` removes only
-derived search state and never touches authoritative task data.
+`prepare-model` is the **only** command permitted to download the embedding
+model (Q3 resolved): it fetches the selected model into the local cache and
+reports its identity, dimensions, and on-disk size. `status` reports model ID,
+dimensions, task/chunk/unique-vector counts, raw vector bytes, sidecar file
+bytes, model-cache bytes when discoverable, and last build time. `rebuild`
+removes the old derived sidecar before rebuilding so it does not require
+temporary space for two complete indexes. `clear` removes only derived search
+state and never touches authoritative task data.
 
-Model installation UX remains an open question (§11); normal `task search`
-must not silently download a large model.
+Neither `task search` nor `rebuild` may silently download a large model: when
+the model is absent they refuse with guidance to run `prepare-model`. The model
+is fetched on explicit preparation and **never bundled into the `rl` binary**
+(bundling would bloat every install with an artifact most users of a task
+manager never invoke).
 
 ## 4. Crate map
 
@@ -510,9 +549,10 @@ local-first default and makes offline search impossible.
 - Evaluate a small set of eligible local models at no more than 384 dimensions.
 - Record model download size, runtime dependency size, indexing throughput,
   query latency, Recall@10/MRR, raw vector bytes, and actual sidecar bytes.
-- Choose the model, inference runtime, tokenizer limits, batch size, and default
-  result limit.
-- Resolve the installation UX and default storage budget open questions.
+- Choose the model, inference runtime, tokenizer limits, and batch size.
+- Resolve the numeric storage-budget threshold (§11 remaining Q3); the
+  installation UX, default `--limit`, dimensions, scope, and pending-comment
+  policy are already fixed in the §11 resolved set.
 
 No production schema or CLI contract ships before this evidence exists.
 
@@ -563,7 +603,14 @@ No production schema or CLI contract ships before this evidence exists.
 - Search filters by current workspace/repo/lifecycle state.
 - Task score is the maximum eligible chunk score with deterministic ties.
 - Search/index failure never mutates or blocks authoritative task operations.
-- `status`, `rebuild`, and `clear` report JSON and affect only the sidecar.
+- An unchanged corpus skips reconciliation via the D7 fingerprint fast-path; a
+  changed task or comment invalidates the fingerprint and forces reconcile.
+- A cold/uninitialised sidecar (no `search_meta`, or model absent) makes `search`
+  refuse with guidance to `rebuild`/`prepare-model` rather than embed inline.
+- A default (unscoped) search spans workspaces and each result carries its
+  `workspace_id`; `--workspace` narrows the returned set.
+- `status`, `rebuild`, `clear`, and `prepare-model` report JSON and affect only
+  the sidecar / model cache, never authoritative task data.
 
 ### Retrieval-quality evaluation
 
@@ -586,18 +633,33 @@ deterministic fake so builds remain offline and reproducible.
 
 ## 11. Open questions
 
+### Resolved (2026-07-24 revision)
+
+- **Q2 — dimensions.** v1 targets **384**; drop to 256 only if the spike shows
+  equal quality at lower latency (§D8).
+- **Q3 — model installation.** An explicit `rl task search-index prepare-model`
+  is the only command that downloads the model; `search`/`rebuild` refuse with
+  guidance when it is absent, and the model is never bundled into the binary
+  (§D10).
+- **Q5 — default `--limit`.** `10`, matching the Recall@10 evaluation metric
+  (§D10).
+- **Q7 — pending comments.** Included in the corpus immediately, not only after
+  remote mirroring — a local-first tool should find your own unsynced note
+  (§D1/§D3).
+- **Q8 — reconciliation/search scope.** All workspaces by default;
+  `--workspace`/`--repo` narrow it (§D10). Paired with the D7 unchanged-corpus
+  fast-path so the wider default stays cheap on warm repeats.
+- **Q6 — storage budget (direction).** The pre-inference preflight guard is
+  mandatory (§D7) and `status` surfaces raw-vector, sidecar, and model-cache
+  bytes (§D10); model-cache size dominates, not vectors. The specific numeric
+  warn/refuse threshold is still measured in Stage 0 (below).
+
+### Remaining (Stage 0 spike-gated)
+
 1. Which local model and Rust inference runtime meet D8 and the §10 evaluation?
-2. Should the selected model use 256 or 384 dimensions?
-3. What explicit command installs the model without making ordinary search
-   silently download a large artifact?
-4. What tokenizer-derived input limit and batch size fit supported machines?
-5. What default `--limit` gives useful recall without noisy output?
-6. What sidecar-size budget should warn or refuse before indexing, and how is
-   the estimate surfaced in JSON?
-7. Should pending local comments be included immediately (recommended) or only
-   after they are mirrored remotely?
-8. Should index reconciliation cover only the selected workspace or all
-   workspaces in the authoritative database?
+2. What tokenizer-derived input limit and batch size fit supported machines?
+3. What numeric sidecar-size budget should warn or refuse before indexing (the
+   Q6 threshold value, once real amplification is measured)?
 
 ## 12. References
 
