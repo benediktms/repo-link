@@ -329,30 +329,31 @@ impl WorkspaceService {
     /// `promote`, never an eager backfill. The names are stored verbatim and
     /// validated against the filing-org registry only at projection time.
     ///
-    /// **Merge** semantics (non-destructive): a `Some` argument overrides that
-    /// default; an omitted (`None`) argument leaves the stored value untouched,
-    /// so setting one default never silently wipes the other. `clear_all` wins
-    /// over both and clears the pair (the `--none` sugar).
+    /// **Tri-state merge** per field (non-destructive by default). Each argument
+    /// is `Option<Option<&str>>`:
+    /// - outer `None` → leave that default untouched (merge);
+    /// - `Some(Some(name))` → set it;
+    /// - `Some(None)` → clear just that one.
+    ///
+    /// So setting or clearing one default never touches the other; the CLI maps
+    /// `--none` to `(Some(None), Some(None))` to clear the pair.
     pub async fn set_default_issue_types(
         &self,
         workspace_id: &str,
-        standalone: Option<&str>,
-        sub_issue: Option<&str>,
-        clear_all: bool,
+        standalone: Option<Option<&str>>,
+        sub_issue: Option<Option<&str>>,
     ) -> Result<WorkspaceDto> {
         let id: WorkspaceId = workspace_id.parse()?;
         let mut w = self.repo.get(id).await?;
-        if clear_all {
-            w.set_default_issue_types(None, None);
-        } else {
-            let standalone = standalone
-                .map(str::to_string)
-                .or_else(|| w.default_issue_type.clone());
-            let sub_issue = sub_issue
-                .map(str::to_string)
-                .or_else(|| w.default_sub_issue_type.clone());
-            w.set_default_issue_types(standalone, sub_issue);
-        }
+        let standalone = match standalone {
+            Some(v) => v.map(str::to_string),
+            None => w.default_issue_type.clone(),
+        };
+        let sub_issue = match sub_issue {
+            Some(v) => v.map(str::to_string),
+            None => w.default_sub_issue_type.clone(),
+        };
+        w.set_default_issue_types(standalone, sub_issue);
         self.repo.save(&w).await?;
         Ok(workspace_to_dto(&w))
     }

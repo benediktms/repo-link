@@ -4145,6 +4145,21 @@ fn workspace_set_default_type_merges_and_clears() {
         "updating one default must not wipe the other (merge semantics)"
     );
 
+    // Per-field clear: --clear-sub-issue removes ONLY the sub-issue default.
+    let one_cleared = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "set-default-type", &ws_id, "--clear-sub-issue"],
+    );
+    assert_eq!(
+        one_cleared["default_issue_type"], "Epic",
+        "--clear-sub-issue must leave the standalone default intact"
+    );
+    assert!(
+        one_cleared.get("default_sub_issue_type").is_none()
+            || one_cleared["default_sub_issue_type"].is_null(),
+        "--clear-sub-issue must clear only the sub-issue default: {one_cleared}"
+    );
+
     // --none clears both.
     let cleared = run_json(
         &mut bin("repo-link", &dir),

@@ -216,16 +216,22 @@ pub(crate) enum WorkspaceCmd {
     SetDefaultType {
         workspace: Option<String>,
         /// Default type name for free-standing (non-sub-issue) tasks
-        /// (e.g. `Story`). Mutually exclusive with `--none`.
-        #[arg(long, conflicts_with = "none")]
+        /// (e.g. `Story`). Omitting it leaves the current value untouched.
+        #[arg(long, conflicts_with_all = ["none", "clear_standalone"])]
         standalone: Option<String>,
         /// Default type name for sub-issue (`child_of`) tasks (e.g. `Task`).
-        /// Mutually exclusive with `--none`.
-        #[arg(long = "sub-issue", conflicts_with = "none")]
+        /// Omitting it leaves the current value untouched.
+        #[arg(long = "sub-issue", conflicts_with_all = ["none", "clear_sub_issue"])]
         sub_issue: Option<String>,
-        /// Clear both workspace default issue types. Mutually exclusive with
-        /// `--standalone` / `--sub-issue`.
-        #[arg(long)]
+        /// Clear ONLY the standalone default (leaves the sub-issue default).
+        #[arg(long = "clear-standalone", conflicts_with_all = ["none", "standalone"])]
+        clear_standalone: bool,
+        /// Clear ONLY the sub-issue default (leaves the standalone default).
+        #[arg(long = "clear-sub-issue", conflicts_with_all = ["none", "sub_issue"])]
+        clear_sub_issue: bool,
+        /// Clear BOTH workspace default issue types. Mutually exclusive with the
+        /// set/clear flags above.
+        #[arg(long, conflicts_with_all = ["standalone", "sub_issue", "clear_standalone", "clear_sub_issue"])]
         none: bool,
     },
 }
