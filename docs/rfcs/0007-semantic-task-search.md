@@ -1,8 +1,7 @@
 # RFC 0007 — Local task search over current task content
 
-Status: Draft (2026-07-21, revised 2026-07-25: full-hash reconciliation with
-an in-place transactional sidecar)
-Tracking epic: **#TBD**
+Status: Draft (2026-07-21, revised 2026-07-25: full-hash reconciliation,
+in-place transactional sidecar, and measured Stage 0 storage budgets)
 
 ## 1. Context
 
@@ -68,14 +67,51 @@ formatted search text, and built FTS5. The complete index was 4.79 MiB after
 `VACUUM` — roughly a quarter of the authoritative database. Raw vectors alone
 were 1.68 MiB.
 
+### Stage 0 sidecar spike
+
+On 2026-07-25 a one-off harness exercised the exact D5 schema with 4 KiB pages,
+full auto-vacuum, WAL, external-content FTS5 triggers, and one 384-dimensional
+float32 vector per lexical chunk. The current corpus used D2's approximately
+900-byte boundary; synthetic rows used comparable 918-byte formatted chunks.
+Capacity measurements ran on SQLite 3.53.1. A separate build probe confirmed
+the schema, FTS5 `delete-all`/`integrity-check`, and DBSTAT on repo-link's
+bundled SQLite 3.46.0.
+
+| Corpus | Chunks | Sidecar | Largest WAL | Zero-change hash-diff p95 | Initial build |
+|---|---:|---:|---:|---:|---:|
+| Current | 1,658 | 5.39 MiB | 5.49 MiB | 0.82 ms | 77 ms |
+| Synthetic | 10,000 | 31.76 MiB | 32.02 MiB | 5.91 ms | 286 ms |
+| Synthetic | 100,000 | 317.71 MiB | 319.65 MiB | 90.71 ms | 3.76 s |
+
+Timings are local spike evidence, not CI acceptance promises; the byte
+measurements and enforced caps are the storage guarantees.
+
+The conservative Python harness measured 62.15 ms p95 for the complete current
+source-read, chunk, hash, and sidecar-diff path. A 100-row changed transaction
+took 9.41 ms at current scale and 8.84 ms at 100k. Full in-place rebuild,
+excluding model inference, took 170 ms, 788 ms, and 8.17 s respectively; its
+largest 100k WAL was 318.54 MiB.
+
+The concurrency probes confirmed that `BEGIN IMMEDIATE` serialized reconcilers
+before their authoritative snapshots, a later source edit won, a reused ROWID
+rejected a stale guarded vector insert, an already-owned profile rejected a
+second binary's claim, `SQLITE_FULL` rolled the transaction back to zero rows,
+and an exclusive lifecycle lock waited for an existing shared holder.
+
+One storage correction came directly from the spike: row-by-row FTS deletes
+left 22.9 MiB allocated after clearing the 100k corpus even though the freelist
+was empty. Adding FTS5 `delete-all` before the full auto-vacuum commit, followed
+by a truncating checkpoint, reduced every tested sidecar to 44 KiB with zero
+freelist pages. D5 makes that sequence mandatory.
+
 Two consequences drive the design:
 
 1. **Reading and hashing the whole corpus is milliseconds.** 0.91 MiB of
    current text can be re-read, re-chunked, and re-hashed on every search.
    Only embedding is expensive, and content addressing limits embedding to
    genuinely new text regardless of how change is detected. Incremental
-   change tracking is not justified before the Stage 0 measurement crosses
-   the D6 ceiling (§7).
+   change tracking is not justified while the measured path remains below the
+   D6 ceiling (§7).
 2. **The embedding model dominates disk**, not the index. Storage becomes a
    problem through retained model versions or unbounded chunking — not through
    current task volume.
@@ -238,10 +274,11 @@ because quote characters are removed before the CLI receives the value. The
 selected mode is reported in JSON.
 
 The lexical and semantic lanes collapse chunk results to the best rank per
-task and are combined with reciprocal-rank fusion (RRF), constant `k = 60`
-(the literature default; the fixture may revise it). RRF combines rank
-positions rather than pretending BM25 and cosine scores share a calibrated
-numeric scale. The literal lane participates by mode:
+task and are combined with reciprocal-rank fusion (RRF), initially `k = 60`
+(the literature default). Stage 2 fixture results may revise that tuning
+constant before it becomes final. RRF combines rank positions rather than
+pretending BM25 and cosine scores share a calibrated numeric scale. The
+literal lane participates by mode:
 
 - **exact mode:** tasks containing the complete query as a substring sort ahead
   of all other tasks, then by fused rank.
@@ -288,10 +325,10 @@ The default is `repo-link.db.task-search.db`; `rl --db /tmp/test.db` uses
 `/tmp/test.db.task-search.db`. Appending to the full filename avoids the
 stem-collision in the previous draft.
 
-The sidecar is created with `auto_vacuum=FULL` before any tables, WAL journaling,
-foreign keys enabled, and a `max_page_count` derived from the hard index budget.
-Unlike enabling auto-vacuum on the existing authoritative database, this needs
-no one-time rewrite and affects only disposable search storage.
+The sidecar is created with a 4 KiB page size and `auto_vacuum=FULL` before any
+tables, WAL journaling, foreign keys enabled, and `max_page_count = 131072`
+(512 MiB). Unlike enabling auto-vacuum on the existing authoritative database,
+this needs no one-time rewrite and affects only disposable search storage.
 
 The sidecar schema is:
 
@@ -339,30 +376,47 @@ Vector rows live separately, so embedding updates cannot desynchronize FTS.
 FTS5 and DBSTAT availability are compile-time facts in the current bundled
 SQLite build. An offline CI smoke test pins both capabilities.
 
-A stable sibling `<sidecar>.lock` file is never renamed or deleted. Every
-command that opens the sidecar holds a standard-library shared file lock for
-the connection lifetime, except `search-index clear`, which obtains the
-exclusive lock before opening it. Normal reconcile and rebuild operations use
-ordinary SQLite transactions and update the existing database in place; they
-never unlink, rename, or swap it. A failed transaction leaves the previous
-committed state intact.
+A stable sibling `<sidecar>.lock` file is never renamed or deleted. Search,
+status, and ordinary reconciliation hold a standard-library shared file lock
+for the sidecar connection lifetime. Explicit `rebuild` and `clear` obtain the
+exclusive lock before opening it. Normal reconciliation uses ordinary SQLite
+transactions and updates the existing database in place; it never unlinks,
+renames, or swaps it. A failed transaction leaves the previous committed state
+intact.
 
-`search-index clear` transactionally deletes all derived rows, commits the full
-auto-vacuum, and runs `PRAGMA wal_checkpoint(TRUNCATE)` before releasing its
-exclusive lock. If the sidecar cannot be opened as SQLite, the command instead
-confirms the failure while exclusively locked, removes the sidecar together
-with its `-wal`/`-shm`, and creates a fresh sidecar. Cooperating processes
-cannot retain an old database handle or mispair WAL state. Ordinary search
-never performs this destructive recovery.
+`search-index rebuild` replaces the derived schema and lexical rows in one
+transaction. A compatible FTS table receives `delete-all`; an incompatible
+derived schema is dropped and recreated before desired rows are inserted. The
+command commits and truncating-checkpoints the WAL while still exclusively
+locked. Guarded vector inference and batch writes follow without holding a
+SQLite write transaction during inference; the lifecycle lock remains
+exclusive until a final checkpoint.
+
+`search-index clear` transactionally deletes all derived rows, issues FTS5
+`delete-all`, commits the full auto-vacuum, and runs
+`PRAGMA wal_checkpoint(TRUNCATE)` before releasing its exclusive lock. If the
+sidecar cannot be opened as SQLite, the command instead confirms the failure
+while exclusively locked, removes the sidecar together with its `-wal`/`-shm`,
+and creates a fresh sidecar. Cooperating processes cannot retain an old
+database handle or mispair WAL state. Ordinary search never performs this
+destructive recovery.
 
 Before adding text, FTS entries, vectors, or model artifacts, the command
-preflights projected bytes and filesystem headroom. `max_page_count` is the
-native final backstop for the sidecar; an exceeded limit rolls back the derived
-write and never affects authoritative task operations. The model cache has a
-separate hard budget and refuses a new prepared profile until enough space is
-available or an explicitly selected old profile is removed. Numeric sidecar/WAL
-thresholds are selected and folded into this RFC before Stage 1 ships; the
-model-cache threshold is fixed before Stage 3.
+preflights projected bytes and filesystem headroom. The Stage 0 budgets are:
+
+- warn at a projected 384 MiB sidecar or WAL peak;
+- refuse a projected sidecar or WAL peak above 512 MiB;
+- warn when projected free space after the transaction is below 1 GiB; and
+- refuse when projected free space after the transaction is below 512 MiB.
+
+The 512 MiB `max_page_count` is the native final sidecar backstop. Stage 0
+verified that exceeding it rolls the transaction back without retained rows.
+The preflight includes final sidecar growth and transaction-peak WAL
+simultaneously, so a maximum-size operation requires up to 1 GiB for derived
+files plus the 512 MiB free-space reserve. These limits cover the sidecar only.
+The model cache has a separate hard budget, selected with the winning profile
+in Stage 2, and refuses preparation until enough space is available or an
+explicitly selected old profile is removed.
 
 Full auto-vacuum moves reclaimable pages to the end at clear's commit; the
 truncating checkpoint then materializes the smaller database and removes
@@ -413,10 +467,11 @@ to the wrong text. Vector dimensions and finite components are validated
 before storage. Exact semantic search streams vectors with a bounded top-k
 heap.
 
-The read/chunk/hash/diff target is under approximately 20 ms at current scale.
-Incremental authoritative change tracking remains a follow-up only if measured
-p95 reconciliation exceeds approximately 150 ms or 30 MiB of current source
-text. Until then, O(corpus) per search is the explicit, measured ceiling.
+The conservative Stage 0 harness measured 62.15 ms p95 for the complete
+current read/chunk/hash/diff path, below the 150 ms production ceiling.
+Incremental authoritative change tracking remains a follow-up only if
+production p95 reconciliation exceeds 150 ms. Until then, O(corpus) per search
+is the explicit, measured ceiling.
 
 ### D7 — Pin one complete local embedding profile with an in-binary trust root
 
@@ -634,14 +689,16 @@ rl task search-index clear
   model-cache bytes; configured warn/refuse budgets and filesystem headroom;
   schema/chunk/profile identity; and FTS5 integrity.
 - `rebuild` explicitly transitions schema, chunk format, and—when prepared—the
-  current binary's embedding profile. Lexical replacement is one in-place
-  sidecar transaction; guarded vector fill follows in batches and never holds a
-  write transaction during inference.
+  current binary's embedding profile. It holds the exclusive lifecycle lock,
+  replaces compatible contents with FTS `delete-all` or recreates incompatible
+  derived tables in one in-place sidecar transaction, checkpoints, fills
+  guarded vectors in batches without holding a write transaction during
+  inference, then checkpoints before unlocking.
 - `clear` holds the exclusive lifecycle lock, transactionally deletes sidecar
-  contents, and truncates the WAL after auto-vacuum. If SQLite cannot open the
-  sidecar, it recreates that disposable file under the same lock. Tasks,
-  comments, `repo-link.db`, and model artifacts are untouched. The next search
-  recreates literal+lexical state.
+  contents, issues FTS `delete-all`, and truncates the WAL after auto-vacuum.
+  If SQLite cannot open the sidecar, it recreates that disposable file under
+  the same lock. Tasks, comments, `repo-link.db`, and model artifacts are
+  untouched. The next search recreates literal+lexical state.
 
 Progress (reconcile counts, embedding batches) goes to stderr; JSON goes to
 stdout. `agents_intro.md` gains task search / search-index guidance and
@@ -686,13 +743,14 @@ app-cli
    preflight plus `max_page_count` refuses growth before disk pressure can
    affect authoritative task operations.
 
-At 384 float32 dimensions raw vectors cost ~1.5 KiB per chunk: ~1.7 MiB at
-the current ~1,150-chunk proxy, ~15 MiB at 10k chunks, and ~146 MiB at 100k
-before tokenizer-driven semantic splitting. The measured complete lexical +
-vector + FTS sidecar amplification was approximately 4.3 KiB per conservative
-chunk: roughly 42 MiB at 10k similar chunks and 420 MiB at 100k. These are
-planning estimates, not limits; D5 preflight, filesystem headroom, and
-`max_page_count` enforce the numeric budgets selected before Stage 1.
+With one 384-dimensional float32 vector per lexical chunk, Stage 0 measured
+approximately 3.33 KiB per synthetic chunk for text, indexes, FTS, and vector
+storage together: 31.76 MiB at 10k and 317.71 MiB at 100k. The current
+1,658-chunk corpus occupied 5.39 MiB. The 512 MiB cap therefore allows roughly
+161k comparable one-vector chunks—about 97 times the current count. Multiple
+tokenizer-derived semantic inputs consume that budget faster; D5 projects the
+actual segment count and refuses before either the sidecar or WAL crosses its
+cap.
 
 ## 6. Non-goals
 
@@ -896,19 +954,16 @@ search time, when the user has expressed interest in fresh results.
 
 ## 9. Staged implementation plan
 
-### Stage 0 — Reconciliation and storage spike
+### Stage 0 — Reconciliation and storage spike (completed 2026-07-25)
 
-- Build the exact D5 sidecar schema against current plus synthetic 10k/100k
-  chunk corpora.
-- Measure zero-change and changed full-hash reconciliation, sidecar/WAL peak,
-  `auto_vacuum=FULL` plus truncating-checkpoint clear-time reclamation, FTS
-  amplification, and `max_page_count` failure behavior.
-- Exercise serialized concurrent reconciles, a source edit during reconcile,
-  ROWID reuse during an embedding batch, mixed-version metadata, and exclusive
-  recovery of an unopenable sidecar while another process holds a shared
-  lifecycle lock.
-- Select and record numeric sidecar, WAL/headroom, and warn/refuse budgets
-  before PR1 begins.
+- Exercised the exact D5 sidecar at current, 10k, and 100k scales; §1 records
+  timings, component sizes, sidecar/WAL peaks, and clear/rebuild behavior.
+- Confirmed serialized snapshot ordering, stale-vector rejection, mixed-profile
+  compare-and-set behavior, lifecycle-lock exclusion, FTS/DBSTAT support in the
+  bundled SQLite, and rollback on `SQLITE_FULL`.
+- Fixed the discovered clear-time FTS retention with native `delete-all`, then
+  selected D5's 384 MiB warning, 512 MiB hard sidecar/WAL limits, and 1 GiB /
+  512 MiB free-space warning/refusal thresholds.
 
 ### Stage 1 — PR1: search without a model
 
@@ -992,8 +1047,11 @@ Reconciliation:
   inputs retryable.
 - Sidecar path derivation distinguishes `foo.db` from `foo.sqlite`.
 - Sidecar clear takes the exclusive lifecycle lock, shrinks the database and
-  WAL under full auto-vacuum plus a truncating checkpoint, and leaves
-  `repo-link.db` byte-for-byte and schema-for-schema unchanged.
+  WAL under FTS `delete-all`, full auto-vacuum, and a truncating checkpoint,
+  and leaves `repo-link.db` byte-for-byte and schema-for-schema unchanged.
+- Rebuild holds the exclusive lifecycle lock through ownership transition,
+  vector fill, and final checkpoint; concurrent search cannot observe mixed
+  schema/profile generations.
 - Unopenable-sidecar recovery waits for existing shared lifecycle locks, then
   recreates the sidecar and its WAL companions without exposing mixed
   generations to a concurrent command.
@@ -1086,10 +1144,12 @@ Normal CI downloads nothing and uses the deterministic fake.
 - **Freshness:** per-search hash-diff reconcile; no authoritative-table
   triggers or revisions; SQLite serializes in-place sidecar reconciles;
   incremental tracking is deferred behind a measured ceiling.
-- **Storage:** size-capped `repo-link.db.task-search.db` sidecar with full
-  auto-vacuum; no search schema or bytes in `repo-link.db`.
+- **Storage:** `repo-link.db.task-search.db` sidecar with full auto-vacuum;
+  384 MiB warnings, 512 MiB hard sidecar/WAL limits, and a 512 MiB minimum
+  post-transaction free-space reserve; no search schema or bytes in
+  `repo-link.db`.
 - **Retrieval:** literal (raw text) + FTS5/BM25 + exact cosine, query-mode
-  conditional ordering, explicit `--exact`, and RRF k=60 default.
+  conditional ordering, explicit `--exact`, and initial RRF k=60 tuning.
 - **Comment identity:** not a search dependency; content addressing absorbs
   surrogate churn; `remote_comment_id` recovered at render time.
 - **Runtime:** candle, committed. **Trust root:** in-binary digests.
@@ -1108,8 +1168,8 @@ Normal CI downloads nothing and uses the deterministic fake.
    with which instruction prefixes and batch size? (Stage 2.)
 2. Final RRF constant and FTS `OR`-vs-`AND` expression policy after fixture
    runs. (Stage 2.)
-3. What numeric sidecar, WAL/headroom, and global model-cache warn/refuse
-   budgets follow from the Stage 0/2 measurements?
+3. What global model-cache warn/refuse budget follows from the selected
+   profile's Stage 2 artifact and staging measurements?
 4. Whether measured cold-invocation latency justifies the `rld`
    `embed_query` endpoint. (Stage 4.)
 
@@ -1125,8 +1185,9 @@ Normal CI downloads nothing and uses the deterministic fake.
   <https://www.sqlite.org/lang_vacuum.html>.
 - SQLite WAL checkpoint modes define the truncating checkpoint used by clear:
   <https://www.sqlite.org/pragma.html#pragma_wal_checkpoint>.
-- SQLite FTS5 — BM25, external-content tables and their trigger maintenance
-  pattern, trigram tokenizer: <https://sqlite.org/fts5.html>.
+- SQLite FTS5 — BM25, external-content tables, trigger maintenance,
+  `delete-all`, integrity checks, and the trigram tokenizer:
+  <https://sqlite.org/fts5.html>.
 - Reciprocal rank fusion combines independent result rankings without score
   calibration: <https://doi.org/10.1145/1571941.1572114>.
 - Sentence Transformers — asymmetric query/corpus instructions and exact
