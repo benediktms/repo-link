@@ -1,6 +1,7 @@
 # RFC 0007 — Local task search over current task content
 
-Status: Draft (2026-07-21, revised 2026-07-24)
+Status: Draft (2026-07-21, revised 2026-07-25: full-hash reconciliation with
+an in-place transactional sidecar)
 Tracking epic: **#TBD**
 
 ## 1. Context
@@ -29,7 +30,7 @@ repo-link manages tasks, not a general document collection. The search corpus is
 limited to current task titles, bodies, and comments. Search does not introduce
 repository-file, source-code, RFC, ADR, pull-request, or commit indexing.
 
-The sidecar uses the term **search chunk** for one formatted piece of task
+This RFC uses the term **search chunk** for one formatted piece of task
 content. It deliberately does not use a generic `documents` table or API that
 could imply a broader document-management feature.
 
@@ -39,16 +40,14 @@ could imply a broader document-management feature.
 - `task_comments` stores current synced and pending comments on a separate
   persistence axis; comment writes do not append task snapshots or change
   `sync_state`.
-- `TaskRepository::list` deliberately skips comments, while point reads hydrate
-  them.
-- Synced comments are currently replaced wholesale, which changes their local
-  surrogate IDs even when their remote identity and content are unchanged.
-- `task_comments` currently stores `created_at` but not the remote comment's
-  `updated_at`, even though GitHub comments are editable.
+- Synced comments are currently replaced wholesale on refresh, which changes
+  their local surrogate IDs even when their remote identity and content are
+  unchanged. This design absorbs that churn instead of requiring a persistence
+  rewrite (D3, D6).
 - `task_snapshots` contains append-only history and repeats title/body over
   time. Snapshot history is audit data, not search input.
-- SQLite is authoritative for task state. The search index must remain a
-  disposable projection that cannot affect task correctness or sync.
+- SQLite is authoritative for task state. The search index is a derived
+  projection that cannot affect task correctness or sync.
 
 ### Measured capacity
 
@@ -63,52 +62,40 @@ On 2026-07-24 the local database contained:
 | Current title-anchored comment text | 0.15 MiB |
 | Existing authoritative database | 18.75 MiB |
 
-Ignoring long-content chunking, 658 current search units at 384 float32
-dimensions require approximately 0.96 MiB of raw vectors:
-
-```text
-vector_bytes = search_chunks × dimensions × bytes_per_component
-             = 658 × 384 × 4
-             = 1,010,688 bytes
-```
-
 A conservative prototype split the current corpus into 1,150 chunks of at most
-1,200 text bytes, stored 384-dimensional vectors, retained the formatted search
-text, added task mappings, and built FTS5. After `VACUUM`, the complete sidecar
-was 4.79 MiB:
+1,200 text bytes, stored 384-dimensional float32 vectors, retained the
+formatted search text, and built FTS5. The complete index was 4.79 MiB after
+`VACUUM` — roughly a quarter of the authoritative database. Raw vectors alone
+were 1.68 MiB.
 
-| Prototype component | Size |
-|---|---:|
-| Raw vectors | 1.68 MiB |
-| Formatted search text | 0.97 MiB |
-| Complete SQLite sidecar including FTS5 and mappings | 4.79 MiB |
-| Authoritative revision metadata with every task dirty | approximately 92 KiB |
+Two consequences drive the design:
 
-The 1,200-byte split is a sizing proxy, not the production tokenizer rule. The
-model, tokenizer, and real chunker are selected and re-measured in Stage 0.
-These measurements establish the order of magnitude and a conservative current
-baseline; the production path still enforces a preflight storage budget.
-
-The embedding model itself is likely to consume more disk than the index.
-Storage becomes dangerous through unbounded chunks, history retention, orphaned
-content, retained model versions, or non-atomic rebuilds—not through current
-task volume.
+1. **Reading and hashing the whole corpus is milliseconds.** 0.91 MiB of
+   current text can be re-read, re-chunked, and re-hashed on every search.
+   Only embedding is expensive, and content addressing limits embedding to
+   genuinely new text regardless of how change is detected. Incremental
+   change tracking is not justified before the Stage 0 measurement crosses
+   the D6 ceiling (§7).
+2. **The embedding model dominates disk**, not the index. Storage becomes a
+   problem through retained model versions or unbounded chunking — not through
+   current task volume.
 
 ## 2. Goals
 
 1. Search current task title, body, and comments using exact, lexical, and
    semantic retrieval.
 2. Keep title and body together so the title anchors the description's meaning.
-3. Preserve all indexed text when long bodies, comments, paragraphs, or titles
-   require chunking; never truncate silently.
-4. Detect task-content changes correctly without scanning the entire corpus on
-   every warm search.
+3. Preserve all source text in literal, lexical, and semantic retrieval; no
+   lane silently truncates indexed content.
+4. Re-derive the index shape before every query. Concurrent source edits may be
+   one query behind, but stale evidence is never returned and the next search
+   converges without relying on a write-path change feed.
 5. Keep model inference local and prevent ordinary search from downloading.
-6. Bound authoritative metadata, sidecar growth, temporary rebuild space, and
-   model-cache growth.
-7. Keep the search index disposable, inspectable, rebuildable, and isolated
-   from task correctness.
-8. Reconcile one global current-task index; apply workspace, repo, and lifecycle
+6. Search is usable without any model: the literal and lexical lanes degrade
+   gracefully instead of refusing.
+7. Keep the search index disposable, inspectable, rebuildable, size-capped,
+   and isolated from the authoritative database and task correctness.
+8. Maintain one global current-task index; apply workspace, repo, and lifecycle
    filters only while ranking results.
 9. Return task results with enough evidence to explain the winning match.
 10. Preserve the existing architecture: domain rules remain pure, search
@@ -135,10 +122,10 @@ work would remove much of the useful corpus. Workspace, repo, and lifecycle
 filters are read from current authoritative task state and restrict eligible
 task IDs at query time.
 
-Search maintains one global current-task index across all workspaces. A scoped
-query never creates, reconciles, prunes, or fingerprints a scoped sub-index.
+Search maintains one global current-task index. A scoped query never builds or
+prunes a scoped sub-index.
 
-### D2 — Title and body form the core search content
+### D2 — Title and body form the core search content; chunking is deterministic and model-independent
 
 For a short task, construct one core search chunk with stable field labels:
 
@@ -153,29 +140,29 @@ Title and body are not embedded independently. The title supplies the task's
 subject; the body supplies detail. Averaging or ranking independent title/body
 vectors would discard that relationship.
 
-The selected tokenizer determines the exact input budget, including model
-special tokens and the fixed field labels. The chunker:
+Lexical chunk boundaries are **model-independent**: the chunker packs complete
+body paragraphs under a fixed UTF-8 byte budget (initially approximately 900
+bytes of body text per chunk, recorded in `chunk_format_version`), splits an
+oversized paragraph at sentence boundaries and then valid UTF-8 scalar
+boundaries, and prepends the complete title to every body chunk. When the title
+itself exceeds the budget, body chunks carry a deterministic, explicitly
+`…`-marked title anchor and the full title is still indexed as its own chunk.
+An empty body produces title-only core content. No source text is dropped.
 
-1. tokenizes the title and fixed labels;
-2. packs complete body paragraphs while the formatted chunk fits;
-3. splits an oversized paragraph at sentence boundaries and then tokenizer
-   boundaries when necessary;
-4. prepends the complete title to every body chunk when it fits; and
-5. emits title-only chunks plus body chunks with the largest deterministic
-   title anchor when the complete title itself exceeds the model budget.
-
-The full title remains indexed even in the fifth case. A shortened body-chunk
-anchor is explicitly marked in the formatted input; no title or body text is
-silently discarded.
+When a model profile is active, each lexical chunk is further split into one or
+more **semantic inputs** using that profile's tokenizer. The effective token
+budget includes instruction prefixes, field labels, and model special tokens.
+Every lexical chunk byte is covered by at least one semantic input; the adapter
+must never rely on the model runtime's truncation behavior. Semantic inputs map
+back to their lexical chunk and may change when the embedding profile changes
+without rebuilding FTS or formatted text.
 
 V1 uses no overlapping chunks. Paragraph-preserving boundaries plus title
 anchoring retain context without duplicating an arbitrary overlap window.
-Overlap may be added only if the evaluation fixture demonstrates boundary
-misses.
 
-An empty body still produces title-only core content. Chunk formatting and
-boundary rules carry an explicit `chunk_format_version` in sidecar metadata;
-changing them invalidates the sidecar and requires an explicit rebuild.
+Chunk formatting and lexical boundary rules carry an explicit
+`chunk_format_version` in index metadata. Tokenizer-specific semantic-input
+rules are part of the embedding profile. D8 defines version transitions.
 
 ### D3 — Comments are separate, title-anchored search content
 
@@ -189,444 +176,477 @@ Comment:
 ```
 
 Author and timestamp are omitted from the indexed text because they are
-metadata, not task meaning. A long comment follows D2's tokenizer-aware
-chunking rule.
+metadata, not task meaning. A long comment follows D2's chunking rule.
 
 The implementation must not concatenate the entire comment thread into core
 content. Threads can be long, repetitive, or operational; merging them would
 dilute the task's primary meaning and make every comment change re-embed the
 whole thread.
 
-`task_comments.id`, the stable local surrogate, is always the search source ID.
-The remote comment ID remains optional metadata. To make that identity stable:
+**Comment identity is deliberately not a search dependency.** Search chunks
+are keyed by `(task_id, content_hash)` (D5), so the wholesale delete-and-
+reinsert behaviour of current comment persistence — which churns local
+surrogate IDs on every refresh — produces byte-identical formatted chunks and
+therefore zero index writes and zero re-embeds. The stable comment-upsert
+rework (adding `task_comments.updated_at`, upserting by
+`(task_id, remote_comment_id)`) remains desirable for its own reasons but is
+**not a prerequisite** of this RFC.
 
-- add `task_comments.updated_at`, backfilled from `created_at`;
-- map the remote provider's comment update timestamp when present;
-- upsert synced comments by `(task_id, remote_comment_id)`;
-- preserve `task_comments.id` for an existing remote comment;
-- update a pending row in place when its remote ID is assigned; and
-- delete only remote comments that disappeared from the fetched remote set.
+Result evidence still names the source comment where possible: when the
+winning chunk has comment kind, result rendering joins the chunk text back to
+the current `task_comments` rows of that task and reports
+`remote_comment_id` when the match is unambiguous (D10).
 
-This replaces wholesale delete-and-reinsert comment persistence. It prevents
-unchanged remote refreshes from generating false search invalidations and makes
-edited comments observable without relying on creation timestamps.
+### D4 — Hybrid exact, lexical, and semantic retrieval with query modes
 
-### D4 — Hybrid exact, lexical, and semantic retrieval
+`rl task search` is a general task-search command, not a dense-vector
+debugging surface. V1 combines three retrieval lanes:
 
-`rl task search` is a general task-search command, not a dense-vector debugging
-surface. V1 combines three retrieval lanes over eligible current task chunks:
-
-1. **Literal lane.** Case-folded literal substring matches. A literal match is
-   marked explicitly and sorts ahead of non-literal results.
-2. **Lexical lane.** SQLite FTS5/BM25 over formatted task-search text.
+1. **Literal lane.** Case-folded (Unicode) substring matching **over raw
+   authoritative text**: `tasks.title`, `tasks.body`, and
+   `task_comments.body`. Running this lane over the authoritative rows rather
+   than formatted chunks means a literal query can never be broken by a chunk
+   boundary and can never false-match the injected `Title:` /
+   `Description:` / `Comment:` labels. The scan covers ~0.91 MiB and needs no
+   index, no model, and no reconciliation to be fresh. The needle is the full
+   query string; in identifier mode the lane additionally tests each
+   identifier-shaped token as its own needle. If its measured latency
+   ever becomes material, the named replacement is an FTS5 trigram-tokenizer
+   index (already compiled into the bundled SQLite) whose candidates are
+   verified by the same substring test.
+2. **Lexical lane.** SQLite FTS5/BM25 over formatted chunk text, tokenizer
+   `unicode61` with `tokenchars '_-'` so code identifiers survive
+   tokenization. The adapter builds the MATCH expression from the plain-text
+   query only: each term is double-quoted with internal double quotes doubled,
+   terms are joined with ` OR `, and the resulting string is bound as a
+   parameter. No user character can become FTS syntax or SQL.
 3. **Semantic lane.** The query and corpus chunks are embedded with the same
    pinned model profile and its corpus/query instructions. Vectors are
-   normalized and v1 computes exact cosine similarity.
+   normalized and v1 computes exact cosine similarity by brute-force scan over
+   all available vectors. A query whose instruction-prefixed text exceeds the
+   model input limit is never truncated: the semantic lane is skipped for that
+   query with an explicit reason in JSON and stderr, while literal and lexical
+   retrieval still use the complete query.
 
-The CLI query is plain text, not raw FTS5 query syntax. The lexical adapter
-constructs and binds an escaped FTS expression from validated query terms;
-quotes, operators, punctuation, and code symbols in user input cannot alter SQL
-or accidentally become FTS control syntax.
+**Query modes.** `--exact` explicitly selects exact mode. Otherwise a small
+deterministic token classifier selects identifier mode when any token has
+identifier shape (contains `_`, `::`, `/`, `#` followed by digits, a `rpl-`
+style prefix, mid-word capitals, two-plus uppercase letters, or a
+digits-and-letters error-code shape). All other queries use natural-language
+mode. Shell quoting only groups an argument and is not treated as a signal
+because quote characters are removed before the CLI receives the value. The
+selected mode is reported in JSON.
 
-The literal lane collapses to a task-level match flag. The lexical and semantic
-lanes each collapse chunk results to the best rank for each task, then combine
-those task ranks with reciprocal-rank fusion (RRF), using one documented
-constant selected in Stage 0. RRF combines rank positions rather than
-pretending BM25 and cosine scores share a calibrated numeric scale.
+The lexical and semantic lanes collapse chunk results to the best rank per
+task and are combined with reciprocal-rank fusion (RRF), constant `k = 60`
+(the literature default; the fixture may revise it). RRF combines rank
+positions rather than pretending BM25 and cosine scores share a calibrated
+numeric scale. The literal lane participates by mode:
 
-The final ordering is:
+- **exact mode:** tasks containing the complete query as a substring sort ahead
+  of all other tasks, then by fused rank.
+- **identifier mode:** tasks containing the full query — or, failing that,
+  every identifier-shaped token — as substrings sort ahead of all other
+  tasks, then by fused rank. Exact lookup keeps its hard guarantee exactly
+  where the user signalled exactness, including mixed identifier+prose
+  queries whose full sentence never occurs verbatim.
+- **natural-language mode:** the full-query literal match set forms a third
+  RRF lane (ranked by occurrence count, ties by task ID) instead of a hard
+  sort, so an incidental substring cannot outrank the true paraphrase answer.
 
-1. tasks with a literal match before tasks without one;
-2. descending fused rank; and
-3. task ID as a deterministic tie-breaker.
+Ties resolve by task ID in all modes.
 
-The result retains the winning source kind (`core` or `comment`), stable source
-ID, chunk index, bounded excerpt, and the contributing lane metadata. Dense
-similarity and fused scores are ranking signals, not probabilities.
+Results retain the winning source kind (`core` or `comment`), a bounded excerpt
+windowed around the match position, and per-lane metadata. A literal-only win
+derives its kind from the matched raw column (title/body → `core`, comment body
+→ `comment`) and its excerpt from the raw text; it maps to no stored chunk.
+Before rendering, the command verifies the current authoritative task/source.
+A source deleted or changed after reconciliation is omitted, so a racing edit
+may produce fewer than `--limit` results or one-query-old recall; the next
+search repairs the sidecar. Dense similarity and fused scores are ranking
+signals, not probabilities.
 
 There is no fixed minimum semantic-similarity threshold in v1. The command
 returns the top `--limit` eligible tasks. Thresholds vary by model and corpus;
 silently filtering on an uncalibrated score would hide valid results.
 
-The literal scan is acceptable at the measured corpus size. If its measured
-latency becomes material, a trigram or equivalent SQLite-native index may
-replace that lane without changing the application contract.
-
 Approximate vector indexing, reranking, multi-vector late interaction, and
 learned score fusion require measured quality or latency evidence before
-introduction.
+introduction (§7 "Late interaction and reranking").
 
-### D5 — Search state lives in a task-specific SQLite sidecar
+### D5 — Search state lives in an in-place SQLite sidecar
 
-The authoritative `repo-link.db` receives only small revision-tracking metadata
-described in D7. It receives no search text, FTS tables, embedding columns, or
-vectors.
-
-Store the derived task-search index in a sibling database:
+The authoritative `repo-link.db` receives no search tables, triggers, FTS data,
+formatted search text, or vectors. Store the derived index beside it by
+appending a suffix to the complete authoritative filename:
 
 ```text
-<authoritative-db-stem>.task-search.db
+<authoritative-db-filename>.task-search.db
 ```
 
-For the default path this is `repo-link.task-search.db`. For
-`rl --db /tmp/test.db`, the sidecar is `/tmp/test.task-search.db`. No
-independent path configuration is introduced in v1.
+The default is `repo-link.db.task-search.db`; `rl --db /tmp/test.db` uses
+`/tmp/test.db.task-search.db`. Appending to the full filename avoids the
+stem-collision in the previous draft.
 
-The sidecar is:
+The sidecar is created with `auto_vacuum=FULL` before any tables, WAL journaling,
+foreign keys enabled, and a `max_page_count` derived from the hard index budget.
+Unlike enabling auto-vacuum on the existing authoritative database, this needs
+no one-time rewrite and affects only disposable search storage.
 
-- safe to delete at any time;
-- excluded from authoritative task backup, sync, snapshots, and migrations;
-- rebuilt from current authoritative task content;
-- limited to one active embedding profile after a successful transition;
-- permitted one temporary sidecar and model profile during an atomic rebuild or
-  upgrade; and
-- never consulted by task mutation or GitHub reconciliation.
-
-Search unavailability, FTS failure, model failure, or sidecar corruption must
-not prevent task creation, editing, comment sync, daemon polling, or shutdown.
-
-### D6 — Store content-addressed task-search chunks once
-
-The sidecar has four logical storage components:
+The sidecar schema is:
 
 ```text
-search_meta(
-    singleton PRIMARY KEY,
-    schema_version,
-    embedding_profile_id,
-    chunk_format_version,
-    last_applied_revision,
-    built_at,
-    last_reconciled_at
-)
-
-search_chunks(
-    id INTEGER PRIMARY KEY,
-    content_hash BLOB UNIQUE,
-    text TEXT NOT NULL,
-    vector BLOB NOT NULL
+task_search_meta(
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    schema_version INTEGER NOT NULL,
+    chunk_format_version INTEGER NOT NULL,
+    embedding_profile_id TEXT            -- NULL until a prepared profile claims it
 )
 
 task_search_chunks(
-    task_id,
-    source_kind,
-    source_id,
-    chunk_index,
-    search_chunk_id REFERENCES search_chunks(id),
-    PRIMARY KEY(task_id, source_kind, source_id, chunk_index)
+    id INTEGER PRIMARY KEY,              -- rowid, shared with FTS
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('core','comment')),
+    content_hash BLOB NOT NULL,          -- SHA-256 of formatted UTF-8 text
+    text TEXT NOT NULL,                  -- immutable lexical chunk
+    UNIQUE(task_id, content_hash)
 )
 
-search_chunks_fts  -- FTS5 external-content index over search_chunks.text
+task_search_vectors(
+    search_chunk_id INTEGER NOT NULL
+      REFERENCES task_search_chunks(id) ON DELETE CASCADE,
+    segment_index INTEGER NOT NULL,
+    embedding_input_hash BLOB NOT NULL,
+    vector BLOB NOT NULL,                -- little-endian normalized f32
+    PRIMARY KEY(search_chunk_id, segment_index)
+)
+
+task_search_fts                          -- FTS5 external-content over task_search_chunks(text)
 ```
 
-`search_chunks` contains only formatted current task title/body/comment chunks.
-It is an internal search projection, not a user-visible document store and not
-a foundation for indexing other artifact types.
+Keying lexical chunks by `(task_id, content_hash)` makes reconciliation
+convergent and makes comment-surrogate churn invisible (D3). Within-task
+duplicate formatted chunks collapse to one row. Cross-task deduplication is
+deliberately omitted at current scale. Semantic-input rows map one or more
+tokenizer-bounded vectors back to each lexical chunk.
 
-`content_hash` is the SHA-256 digest of the exact formatted UTF-8 chunk.
-Identical formatted chunks share text, vector, and one FTS entry; mapping rows
-connect that content to every task/source occurrence.
+`task_search_fts` uses the chunk table as external content and follows SQLite's
+documented insert/delete trigger pattern. A guard trigger rejects updates to
+chunk identity or text; chunks are deleted and inserted rather than mutated.
+Vector rows live separately, so embedding updates cannot desynchronize FTS.
+`status` and `rebuild` run FTS5 `integrity-check`.
 
-The core source ID is the stable literal `core`. Comment source IDs are the
-stable local surrogates defined in D3.
+FTS5 and DBSTAT availability are compile-time facts in the current bundled
+SQLite build. An offline CI smoke test pins both capabilities.
 
-Vectors are fixed-length little-endian float32 BLOBs. The adapter rejects a
-vector with the wrong dimension or a non-finite component. Exact semantic
-search streams vectors and keeps bounded task candidates; it does not load the
-complete vector corpus into memory.
+A stable sibling `<sidecar>.lock` file is never renamed or deleted. Every
+command that opens the sidecar holds a standard-library shared file lock for
+the connection lifetime, except `search-index clear`, which obtains the
+exclusive lock before opening it. Normal reconcile and rebuild operations use
+ordinary SQLite transactions and update the existing database in place; they
+never unlink, rename, or swap it. A failed transaction leaves the previous
+committed state intact.
 
-FTS5 uses `search_chunks` as its external-content table, avoiding a second
-stored copy of formatted text. The adapter maintains both in the same sidecar
-transaction. Deleting an unreferenced chunk removes its vector, formatted text,
-and FTS entry together.
+`search-index clear` transactionally deletes all derived rows, commits the full
+auto-vacuum, and runs `PRAGMA wal_checkpoint(TRUNCATE)` before releasing its
+exclusive lock. If the sidecar cannot be opened as SQLite, the command instead
+confirms the failure while exclusively locked, removes the sidecar together
+with its `-wal`/`-shm`, and creates a fresh sidecar. Cooperating processes
+cannot retain an old database handle or mispair WAL state. Ordinary search
+never performs this destructive recovery.
 
-Result rendering verifies the current authoritative task/source and produces a
-bounded excerpt. A source deleted between ranking and verification is discarded;
-the command may return fewer than `--limit` results for that race, and the next
-revision reconciliation repairs the sidecar. A task edited after the
-reconciliation snapshot may return one-search-old evidence and is repaired by
-the next revision; the sidecar never overwrites authoritative text.
+Before adding text, FTS entries, vectors, or model artifacts, the command
+preflights projected bytes and filesystem headroom. `max_page_count` is the
+native final backstop for the sidecar; an exceeded limit rolls back the derived
+write and never affects authoritative task operations. The model cache has a
+separate hard budget and refuses a new prepared profile until enough space is
+available or an explicitly selected old profile is removed. Numeric sidecar/WAL
+thresholds are selected and folded into this RFC before Stage 1 ships; the
+model-cache threshold is fixed before Stage 3.
 
-### D7 — Track relevant content changes transactionally
+Full auto-vacuum moves reclaimable pages to the end at clear's commit; the
+truncating checkpoint then materializes the smaller database and removes
+reclaimable WAL bytes. This shrinks disposable storage without vacuuming or
+rewriting `repo-link.db`; status reports residual allocation caused by
+partially filled pages.
 
-Correct incremental reconciliation requires authoritative, monotonic change
-tracking. Timestamps are ordinary task metadata and are not used as a
-correctness watermark.
+### D6 — Freshness by serialized per-search hash-diff reconciliation
 
-Add two small authoritative tables:
+Every `rl task search` begins with a full-corpus reconcile:
 
-```text
-task_search_projection_state(
-    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    revision INTEGER NOT NULL,
-    compacted_through INTEGER NOT NULL
-)
+1. open the sidecar and validate its schema/format state under D8;
+2. start `BEGIN IMMEDIATE` on the **sidecar**, establishing the reconciliation
+   session before reading authoritative content;
+3. in one read transaction on `repo-link.db`, load all current task
+   title/body/comment rows; never read snapshots or audit data;
+4. construct deterministic D2/D3 lexical chunks and SHA-256 hashes;
+5. calculate the desired `(task_id, content_hash)` set and projected storage;
+   refuse before growth if D5 budgets or filesystem headroom would be exceeded;
+6. inside the still-open sidecar transaction, delete rows absent from the
+   desired set and insert missing rows; FTS follows through D5 triggers; and
+7. commit the sidecar transaction.
 
-task_search_dirty_tasks(
-    task_id TEXT PRIMARY KEY,
-    revision INTEGER NOT NULL
-)
-```
+The ordering is intentional. SQLite serializes sidecar writers, and every
+later reconciler takes its authoritative snapshot only after acquiring that
+writer slot. A slow reconcile therefore cannot land an older snapshot after a
+newer reconcile. The authoritative database remains read-only throughout and
+its writer slot is never held by search.
 
-`task_search_dirty_tasks.task_id` deliberately has no foreign key. A tombstone
-must survive task deletion long enough for the sidecar to remove that task's
-mappings.
+A zero-change reconcile writes no rows. Source edits committed after step 3's
+snapshot may remain one query behind; result verification in D4 removes stale
+evidence, and the next reconcile repairs omissions or changed chunks. No
+source write can be skipped indefinitely.
 
-SQLite triggers run inside the same transaction as the source mutation. Each
-relevant mutation increments the singleton revision and upserts the affected
-task ID with the new revision:
+When the sidecar's active profile matches a prepared local profile, semantic
+input planning and inference happen after the lexical transaction commits.
+Missing semantic inputs are embedded in batches. Each vector insert is one
+guarded statement that succeeds only when:
 
-- task insert or delete;
-- task title or body change;
-- comment insert or delete;
-- comment body change.
+- sidecar metadata still names the same embedding profile;
+- `search_chunk_id`, `task_id`, and `content_hash` still identify the source
+  chunk; and
+- `embedding_input_hash` still matches the tokenizer-derived input.
 
-Changes to lifecycle, workspace, logical repo, filing repo, sync state,
-priority, assignees, and other non-indexed metadata do not dirty embeddings.
-Those fields are read from current authoritative state when computing eligible
-task IDs and rendering results.
+If any guard fails, the stale batch result is discarded. This prevents both
+ROWID reuse and concurrent chunk/profile transitions from attaching a vector
+to the wrong text. Vector dimensions and finite components are validated
+before storage. Exact semantic search streams vectors with a bounded top-k
+heap.
 
-The dirty table coalesces repeated mutations to one row per task. A task is the
-correct invalidation unit because a title change affects its core chunks and
-every title-anchored comment. Reconciliation may re-hash unchanged chunks for a
-dirty task, but content addressing embeds only genuinely new formatted
-content.
+The read/chunk/hash/diff target is under approximately 20 ms at current scale.
+Incremental authoritative change tracking remains a follow-up only if measured
+p95 reconciliation exceeds approximately 150 ms or 30 MiB of current source
+text. Until then, O(corpus) per search is the explicit, measured ceiling.
 
-Comment persistence must use D3's stable upsert semantics before these triggers
-ship. Otherwise a no-op remote refresh would delete and insert every comment,
-creating false revisions and needless reconciliation.
-
-### D8 — Reconcile one global index from revision deltas
-
-The sidecar stores `last_applied_revision = L`. A warm search reconciles as
-follows:
-
-1. read the source and sidecar revisions; if they match, skip maintenance;
-2. when they differ, acquire the task-search interprocess maintenance lock;
-3. re-read sidecar metadata and validate schema, format, and model profile;
-4. begin a read transaction on the authoritative database;
-5. read current source revision `R` and `compacted_through`;
-6. if `L < compacted_through`, refuse warm reconciliation and require an
-   explicit rebuild because required deltas were compacted;
-7. read dirty task IDs with `L < revision <= R`;
-8. read the current task title/body/comments for those IDs from the same SQLite
-   snapshot; a missing task is a deletion tombstone;
-9. commit the authoritative read transaction;
-10. construct D2/D3 chunks and content hashes;
-11. estimate resulting storage and refuse before inference if the configured
-    budget would be exceeded;
-12. embed only hashes absent from `search_chunks`;
-13. in one sidecar transaction, replace mappings for dirty tasks, delete
-    mappings for tombstoned tasks, store new chunks, prune unreferenced chunks,
-    update FTS5, and set `last_applied_revision = R`; and
-14. after the sidecar commit succeeds, delete authoritative dirty rows through
-    `R` and advance `compacted_through` in one authoritative transaction.
-
-The cross-database commit order is intentionally replay-safe:
-
-- a failure before the sidecar commit leaves dirty rows available;
-- a failure after the sidecar commit but before compaction leaves redundant
-  dirty rows that `last_applied_revision` safely ignores; and
-- a missing or older sidecar below `compacted_through` cannot guess—it requires
-  a full rebuild.
-
-The interprocess lock serializes reconcile, rebuild, clear, and model-profile
-transitions. A search whose source and sidecar revisions already match does not
-take the maintenance path. SQLite WAL continues to protect authoritative
-read/write concurrency.
-
-Reconciliation is always global. `--workspace`, `--repo`, and `--status` do not
-limit D8 source reads or pruning; they are applied only to eligible task IDs in
-D4.
-
-A task edited after the authoritative snapshot may appear with its previous
-search content for one query. Its higher revision remains dirty and is applied
-by the next reconciliation. No source change can be skipped indefinitely.
-
-### D9 — Pin a complete local embedding profile
+### D7 — Pin one complete local embedding profile with an in-binary trust root
 
 V1 sends no title, body, comment, or query text to a remote embedding API.
 After explicit model preparation, inference performs no network access.
 
-The embedding profile is a canonical manifest containing:
+The embedding profile is a canonical manifest containing: model repository and
+immutable revision; SHA-256 digest and size for every artifact; tokenizer and
+pooling configuration; corpus/query instruction prefixes; normalization rule;
+output dimensions; maximum model input; and deterministic semantic-input
+splitting rules. `embedding_profile_id` is the SHA-256 of the canonical
+manifest. Lexical chunk formatting is versioned separately in
+`task_search_meta.chunk_format_version` (D2), so a lexical format bump never
+changes the model-cache identity.
 
-- model repository and immutable revision;
-- expected digest for every downloaded artifact;
-- tokenizer and pooling configuration;
-- corpus/query instruction prefixes;
-- normalization rule;
-- output dimensions;
-- maximum model input;
-- chunk-format version; and
-- runtime-relevant options that change embedding output.
+**The trust root is the repo-link source tree.** The manifest — including
+every artifact digest — is authored during profile selection (§9 Stage 2),
+checked into the repository, and compiled into the binary. `prepare-model`
+downloads into an rl-owned temporary directory, verifies every byte against
+the embedded digests, and atomically renames the profile into the cache. It
+never trusts an upstream-fetched manifest, config, or file list. Verification
+is therefore not trust-on-first-use: a swapped or tampered upstream artifact
+fails at first install. Only digest-pinned artifact formats are permitted —
+`safetensors` weights and JSON/text configs; pickle-based formats
+(`pytorch_model.bin`) are excluded outright.
 
-`embedding_profile_id` is the SHA-256 digest of that canonical manifest. A
-mutable model name alone is not an identity.
+**The model cache is global and content-addressed:**
+`<platform data dir>/repo-link/models/<embedding_profile_id>/`. It is keyed by
+profile digest, so multiple profiles coexist and multiple databases share one
+cache. `prepare-model` preflights the manifest-declared download, staging copy,
+final cache size, filesystem headroom, and the hard global model-cache budget
+before network or file growth. Removing a superseded profile is explicit
+(`search-index prepare-model --remove <profile-id>`), never a side effect of
+building an index for one particular database.
 
-`prepare-model` downloads into an rl-owned temporary directory, verifies the
-manifest and artifact digests, and atomically installs the profile into the
-rl-owned model cache. Search and rebuild open only verified local files and
-must not call a runtime constructor that downloads on cache miss.
+**The inference runtime is committed, not open:** candle
+(`candle-core`/`candle-transformers`) + `tokenizers` + memory-mapped
+`safetensors`, CPU only, in a new `infra-embed` crate. The selected dependency
+features must perform no build-script network download, require no external C++
+runtime, pass `cargo build --offline` after ordinary dependency fetch, and meet
+the repository's `-D warnings` gates. (`ort`'s default feature downloads
+onnxruntime binaries in `build.rs`; vendoring it adds cmake and a C++ toolchain.
+Rejected, §7.) Candle's actual cold-load and CPU inference cost is measured in
+Stage 2/4 rather than assumed. The `EmbeddingProvider` port keeps the choice
+reversible: a runtime swap is an explicit profile transition, not a task-data
+migration.
 
-The selected profile must:
+The selected model must: have a license compatible with repo-link
+distribution; run on CPU on macOS and Linux via candle; produce at most 384
+dimensions; document its corpus/query instructions; and pass the per-category
+fixture gates in §10. The candidate set is small and named —
+`bge-small-en-v1.5`, `e5-small-v2`, `all-MiniLM-L6-v2`, plus
+`multilingual-e5-small` if the fixture demands non-English coverage — and the
+winner is pinned as the single shipped profile.
 
-- have a license compatible with repo-link distribution;
-- support local CPU inference on macOS and Linux;
-- produce at most 384 dimensions, or support validated truncation to at most
-  384; v1 targets 384 unless Stage 0 shows equal quality and better latency at
-  256;
-- document its corpus/query instructions;
-- expose reliable tokenizer accounting for D2/D3; and
-- pass the quality, latency, binary-size, model-size, and storage gates in §10.
+### D8 — Degrade safely; make version transitions explicit
 
-The RFC deliberately does not select the model or inference runtime before the
-spike. Model choice determines binary dependencies, cache size, chunk limits,
-latency, and retrieval quality.
+`rl task search` always returns the best results the current state supports:
 
-A schema, format, or embedding-profile mismatch makes `task search` refuse with
-guidance to run `search-index rebuild`. Ordinary search never deletes or
-rebuilds an incompatible sidecar implicitly.
+- **No sidecar:** search creates one for the current schema/chunk version and
+  builds literal+lexical state under D5/D6.
+- **No model prepared:** literal and lexical lanes run; JSON reports
+  `"semantic_available": false` and stderr names `prepare-model`. Searching for
+  an identifier never requires a model download.
+- **Unclaimed profile:** when metadata is NULL and the current binary's
+  prepared profile exists, one compare-and-set claims it. Other binaries then
+  observe that choice rather than replacing it.
+- **Different embedding profile:** literal and lexical lanes remain available,
+  but semantic search is skipped. Ordinary search never clears vectors,
+  changes the profile ID, or re-embeds into a different space. An explicit
+  `search-index rebuild` performs the transition.
+- **Different sidecar schema or lexical chunk format:** search falls back to the
+  raw literal lane with `"lexical_available": false`; it does not rewrite the
+  sidecar. `search-index rebuild` explicitly replaces the derived contents
+  in-place for the current binary.
+- **Missing matching cache:** stored vectors remain untouched, but the semantic
+  lane is unavailable until that exact profile is prepared again.
+- **Embedding failure:** already-stored vectors for the active profile keep
+  serving; missing semantic inputs remain absent until a later batch succeeds.
+- **FTS corruption in an openable sidecar:** the authoritative literal lane
+  still works and the command reports `search-index rebuild` guidance.
+- **Unopenable sidecar:** the authoritative literal lane still works and the
+  command reports `search-index clear` guidance. That explicit command uses
+  D5's exclusive lifecycle lock to recreate only the disposable sidecar.
 
-### D10 — Search orchestration belongs in `application-search`
+These rules prevent alternating old and new binaries from repeatedly claiming
+metadata, wiping vectors, or rebuilding lexical chunks. Hard errors are
+reserved for authoritative SQLite failures and explicit maintenance failures;
+search-index faults never mutate or block task operations.
 
-`application-query` is intentionally read-only, while task search reconciles a
-derived index, compacts revision metadata, prepares models, and rebuilds
-storage. Those responsibilities belong in a new `application-search` crate.
+### D9 — Search orchestration belongs in `application-search`
+
+`application-query` is intentionally read-only, while task search writes a
+derived projection and prepares models. Those responsibilities go to a new
+`application-search` crate.
 
 Infrastructure supplies three capabilities:
 
 ```text
-TaskSearchSourceRepository
-  current_revision()
-  snapshot_delta(after_revision)
-  full_snapshot()
-  acknowledge_through(revision)
+TaskSearchSourceRepository      (infra-sqlite: repo-link.db)
+  load_snapshot()               -- current task/comment text, one read snapshot
   eligible_task_ids(scope)
-  current_match_source(task_id, source_id)
+  verify_match_sources(...)
+  search_literal(query)
 
-EmbeddingProvider
+TaskSearchIndex                 (infra-sqlite: task-search sidecar)
+  begin_reconcile()             -- starts sidecar BEGIN IMMEDIATE
+    -> TaskSearchReconcileSession
+       diff_chunks(desired, projected_bytes)
+       commit()
+  metadata()
+  claim_empty_profile(expected_profile)
+  missing_semantic_inputs(limit)
+  store_vectors_guarded(...)
+  search_lexical(match_expr)
+  search_semantic(query_vector)
+  stats()
+  clear()
+
+EmbeddingProvider               (infra-embed)
   profile_id()
   dimensions()
   input_limit()
-  embed_chunks(texts)
+  plan_semantic_inputs(text)     -- complete tokenizer-bounded coverage
+  embed_inputs(texts)
   embed_query(query)
-
-TaskSearchIndex
-  metadata()
-  missing_hashes(...)
-  reconcile_tasks(...)
-  search_literal(...)
-  search_lexical(...)
-  search_semantic_exact(...)
-  clear()
-  stats()
 ```
 
-`application-search` owns chunk construction, revision policy, storage
-preflight, hybrid fusion, task-level roll-up, and result DTOs.
-`infra-sqlite` implements the authoritative source/change port and the
-task-search sidecar. The selected local runtime lives in a small infrastructure
-adapter. `testing-fixtures` supplies deterministic fake implementations.
+`application-search` owns chunk construction, hashing, the reconcile policy,
+query-mode classification, lane roll-up, RRF fusion, excerpt selection, and
+semantic-input coverage validation. Public search rows and the top-level CLI
+response live in `dto-shared`, preserving the repository's cross-boundary DTO
+rule; application-internal orchestration types stay in `application-search`.
+`testing-fixtures` supplies a deterministic fake embedder (hash-derived
+pseudo-vectors) so CI stays offline.
 
-No search type enters `domain-task`. Chunks, embeddings, model profiles, ranks,
-and scores are derived query concerns, not task invariants.
+No search type enters `domain-task`. The CLI constructs the embedding runtime
+and sidecar adapter only for `task search` and `task search-index`; ordinary
+commands load neither. There is no cargo feature in v1. If measured binary size
+ever demands a slim build, a `search` feature ships only with a dedicated
+`cargo check --no-default-features` CI leg.
 
-The CLI constructs the embedding runtime and sidecar adapters only for `task
-search` and `task search-index` commands. Ordinary `rl` commands do not load a
-model, open the sidecar, or acquire its maintenance lock.
-
-### D11 — CLI, JSON, rebuild, and lifecycle contract
+### D10 — CLI, JSON, and lifecycle contract
 
 The user-facing query is:
 
 ```text
 rl task search <query> [--workspace <id>] [--repo <handle>]
-                       [--status open|closed|all] [--limit <N>]
+                       [--status open|closed|all] [--limit <N>] [--exact]
 ```
 
-Search spans all workspaces by default. `--workspace` and `--repo` use existing
-resolvers and narrow eligible task IDs; `--status` defaults to `all`; `--limit`
-defaults to 10. `--limit 0` and an empty or whitespace-only query are rejected.
+Search spans all workspaces by default: an **omitted** `--workspace`/`--repo`
+means **no filter** — the cwd-derivation path is deliberately not invoked.
+An explicit `--repo` resolves through the existing repo-handle resolver
+(prefix/name/alias, keeping its ambiguity/exit-2 contract); an explicit
+`--workspace` remains a verbatim workspace UUID, as in every existing
+command.
+`--status` defaults to `all`; `--limit` defaults to 10. `--limit 0` and an
+empty or whitespace-only query are rejected.
 
-Each JSON result contains:
+Top-level JSON includes the selected mode, lane availability, and results:
 
 ```json
 {
-  "rank": 1,
-  "id": "rpl-abc",
-  "task_id": "<uuid>",
-  "workspace_id": "<uuid>",
-  "workspace_name": "...",
-  "title": "...",
-  "match": {
-    "literal": true,
-    "lexical_rank": 3,
-    "semantic_rank": 1,
-    "semantic_score": 0.82,
-    "fused_score": 0.03
-  },
-  "matched_source": {
-    "kind": "core|comment",
-    "source_id": "<stable local source id>",
-    "remote_comment_id": null,
-    "chunk_index": 0,
-    "excerpt": "..."
-  }
+  "query": "retry-safe event",
+  "query_mode": "natural",
+  "lexical_available": true,
+  "semantic_available": true,
+  "results": [
+    {
+      "rank": 1,
+      "id": "rpl-abc",
+      "task_id": "<uuid>",
+      "workspace_id": "<uuid>",
+      "workspace_name": "...",
+      "title": "...",
+      "match": {
+        "literal": true,
+        "lexical_rank": 3,
+        "semantic_rank": 1,
+        "semantic_score": 0.82,
+        "fused_score": 0.03
+      },
+      "matched_source": {
+        "kind": "core",
+        "remote_comment_id": null,
+        "excerpt": "..."
+      }
+    }
+  ]
 }
 ```
 
 Optional lane fields are omitted when that lane did not contribute.
+`semantic_skipped_reason` is omitted when semantic search was available and
+the query fit the profile.
 `semantic_score` and `fused_score` are ranking signals, not calibrated
-probabilities. They are comparable only within results produced by the same
-profile/index version.
+probabilities, comparable only within one profile/index version.
+`remote_comment_id` is present when the winning chunk is a comment whose
+current row is unambiguously identified (D3).
 
 Index maintenance is explicit and JSON-emitting:
 
 ```text
-rl task search-index prepare-model
+rl task search-index prepare-model [--remove <profile-id>]
 rl task search-index status
 rl task search-index rebuild
 rl task search-index clear
 ```
 
-`prepare-model` is the only command permitted to download. It reports the
-profile ID, pinned revision, dimensions, model size, temporary bytes required,
-and final cache path.
+- `prepare-model` is the only command permitted to download (D7). It reports
+  profile ID, pinned revision, dimensions, artifact sizes, and cache path.
+- `status` reports lexical/semantic availability; chunk, semantic-input, and
+  vector counts; per-component text/vector/FTS/mapping bytes; sidecar, WAL, and
+  model-cache bytes; configured warn/refuse budgets and filesystem headroom;
+  schema/chunk/profile identity; and FTS5 integrity.
+- `rebuild` explicitly transitions schema, chunk format, and—when prepared—the
+  current binary's embedding profile. Lexical replacement is one in-place
+  sidecar transaction; guarded vector fill follows in batches and never holds a
+  write transaction during inference.
+- `clear` holds the exclusive lifecycle lock, transactionally deletes sidecar
+  contents, and truncates the WAL after auto-vacuum. If SQLite cannot open the
+  sidecar, it recreates that disposable file under the same lock. Tasks,
+  comments, `repo-link.db`, and model artifacts are untouched. The next search
+  recreates literal+lexical state.
 
-`rebuild`:
-
-1. verifies the prepared model profile;
-2. reads a consistent full current-task snapshot and revision;
-3. preflights active sidecar, temporary sidecar, active model, and staging-model
-   storage;
-4. builds `<db>.task-search.db.tmp` without touching the active sidecar, then
-   checkpoints and closes it so no required WAL file remains;
-5. reopens the temporary file and validates schema, row counts, vector
-   dimensions, FTS availability, profile, and source revision;
-6. syncs the validated file, atomically renames it over the active sidecar, and
-   syncs the parent directory; and
-7. only after a successful swap, prunes obsolete rl-owned model artifacts and
-   acknowledges the built-through source revision.
-
-A failed rebuild leaves the prior sidecar and model usable. The one-active-model
-invariant applies after a successful transition; one staging profile is allowed
-while preparing an atomic upgrade.
-
-`status` reports:
-
-- source revision, applied revision, compacted-through revision, and lag;
-- dirty-task count;
-- profile identity, dimensions, and format version;
-- task/chunk/unique-content counts;
-- raw vector, formatted-text, FTS, mapping, and total sidecar bytes;
-- model-cache and staging bytes;
-- bytes required for an atomic rebuild;
-- configured warn/refuse budgets; and
-- last successful build and reconciliation times.
-
-`clear` removes only the disposable sidecar and temporary search files. It does
-not delete tasks, comments, revision state, or the prepared model. The next
-search refuses with rebuild guidance.
+Progress (reconcile counts, embedding batches) goes to stderr; JSON goes to
+stdout. `agents_intro.md` gains task search / search-index guidance and
+`rl agents docs` is rerun (the command reference is hand-curated, not
+generated from the clap tree).
 
 ## 4. Crate map
 
@@ -635,415 +655,482 @@ app-cli
   └─ rl task search / search-index
        └─ application-search: TaskSearchService
             ├─ ports::TaskSearchSourceRepository
-            │    └─ infra-sqlite: repo-link.db revision + task sources
-            ├─ ports::EmbeddingProvider
-            │    └─ infra embedding adapter: pinned local model profile
-            └─ ports::TaskSearchIndex
-                 └─ infra-sqlite: repo-link.task-search.db
+            │    └─ infra-sqlite: authoritative task/comment reads
+            ├─ ports::TaskSearchIndex
+            │    └─ infra-sqlite: repo-link.db.task-search.db
+            └─ ports::EmbeddingProvider
+                 ├─ infra-embed: candle + verified model cache
+                 └─ testing-fixtures: deterministic fake embedder
 ```
-
-DTOs crossing into CLI JSON live in `dto-shared`, following the existing flat
-query-row convention. Application-internal search types remain in
-`application-search`. The CLI remains a thin composition and dispatch layer.
 
 ## 5. Storage and lifecycle invariants
 
 1. **Task-only corpus.** Only current task title/body/comment text is indexed.
-2. **Small authoritative footprint.** The authoritative DB stores only one
-   revision row, coalesced dirty task IDs, comment update timestamps, and
-   triggers—not vectors, FTS, or search text.
-3. **One active profile.** A profile change atomically replaces the sidecar and
-   eventually removes the old rl-owned model; one staging copy is allowed
-   during the transition.
-4. **One row per unique current chunk.** SHA-256 content addressing deduplicates
-   formatted text and vectors.
-5. **No history.** Snapshots and prior chunk versions are never indexed.
-6. **Bounded text copy.** The sidecar stores one formatted text copy per unique
-   current chunk solely for literal/FTS search and explanation.
-7. **No ANN copy.** V1 stores raw vectors only; there is no HNSW/PQ/IVF copy.
-8. **Atomic rebuild.** The active index survives failure; preflight budgets both
-   active and staging copies.
-9. **Reclaimable.** Pruning removes unreferenced current chunks; `clear` removes
-   all sidecar bytes.
-10. **Observable and capped.** Status exposes every storage class and the
-    production path refuses before exceeding configured budgets.
+2. **Derived and disposable.** Every search row is re-derivable from
+   authoritative rows; `clear` removes all of them from the sidecar.
+3. **No history.** Snapshots and prior chunk versions are never indexed.
+4. **Authoritative isolation.** `repo-link.db` stores no search schema, text,
+   FTS, or vectors and is never written by search.
+5. **In-place transactions.** Routine sidecar updates are transactional and
+   need no file replacement or cross-database acknowledgement protocol. Only
+   explicit clear may recreate an unopenable sidecar under the exclusive
+   lifecycle lock.
+6. **FTS consistency by construction.** External-content triggers on the
+   derived table are the only triggers this feature introduces; authoritative
+   tables carry none.
+7. **Explicit profile transitions.** Ordinary search never replaces a sidecar
+   profile chosen by another binary.
+8. **Complete semantic coverage.** Tokenizer-bounded semantic inputs cover all
+   lexical chunk text; no runtime truncation is accepted.
+9. **Observable and capped.** Status exposes every storage class and budget;
+   preflight plus `max_page_count` refuses growth before disk pressure can
+   affect authoritative task operations.
 
-At 384 float32 dimensions:
-
-| Unique chunks | Raw vector payload |
-|---:|---:|
-| 1,150 measured conservative current proxy | 1.68 MiB |
-| 10,000 | 14.6 MiB |
-| 100,000 | 146 MiB |
-| 1,000,000 | 1.43 GiB |
-
-The measured complete hybrid sidecar used approximately 4.3 KiB per
-conservative current chunk. A linear projection is roughly 42 MiB at 10,000
-similar chunks and 420 MiB at 100,000, but text length, tokenizer boundaries,
-deduplication, and FTS amplification vary. Stage 0 measures the real profile and
-sets numeric warn/refuse thresholds; projections never replace the preflight.
-
-The model cache is reported and budgeted separately from SQLite. It is expected
-to dominate at current corpus size.
+At 384 float32 dimensions raw vectors cost ~1.5 KiB per chunk: ~1.7 MiB at
+the current ~1,150-chunk proxy, ~15 MiB at 10k chunks, and ~146 MiB at 100k
+before tokenizer-driven semantic splitting. The measured complete lexical +
+vector + FTS sidecar amplification was approximately 4.3 KiB per conservative
+chunk: roughly 42 MiB at 10k similar chunks and 420 MiB at 100k. These are
+planning estimates, not limits; D5 preflight, filesystem headroom, and
+`max_page_count` enforce the numeric budgets selected before Stage 1.
 
 ## 6. Non-goals
 
 - Managing or indexing repository files, ADR/RFC contents, pull requests,
   commits, source code, audit logs, task snapshots, or remote issues that are
   not tasks.
-- Inferring meaning absent from all current indexed task title/body/comment
-  text.
-- A remote embedding API or hosted vector database.
-- A standalone vector-store process.
-- ANN indexes, product quantization, HNSW, reranking, or GPU inference in v1.
-- Cross-user or server synchronization of the task-search sidecar.
-- Persisting embeddings or FTS data in task JSON, snapshots, GitHub Issues, or
-  events.
+- Inferring meaning absent from all current indexed task text.
+- A remote embedding API, hosted vector database, or standalone vector-store
+  process.
+- ANN indexes, quantization, HNSW, reranking, late interaction, or GPU
+  inference in v1 (§7 names the upgrade path).
+- Triggers, revision counters, or any change-tracking state on authoritative
+  tables.
+- Daemon-maintained index state (below the D6 ceiling there is no background
+  maintenance to schedule; a per-search reconcile is milliseconds).
+- Cross-user or server synchronization of search state.
 - Automatically relating, editing, closing, or deduplicating tasks based on
   similarity.
-- Turning `search_chunks` into a general-purpose document abstraction.
+- Persisting search text, FTS, or vectors in `repo-link.db`, task snapshots,
+  events, or GitHub.
+- Turning `task_search_chunks` into a general-purpose document abstraction.
 
 ## 7. Alternatives considered
 
+### Trigger-based revision feed and rename-based sidecar rebuild
+
+The 2026-07-21 draft specified: SQLite triggers on `tasks`/`task_comments`
+incrementing a singleton revision and coalescing dirty task IDs; a
+`<db-stem>.task-search.db` sidecar reconciled from revision deltas with a
+replay-safe sidecar-first commit order and compaction watermark; an
+interprocess maintenance lock; and an atomic temp-file rename swap for
+rebuilds. Adversarial review confirmed the machinery was both defective as
+specified and unnecessary at this scale:
+
+- The atomic rename ignored the **active** sidecar's `-wal`/`-shm`. SQLite
+  pairs a WAL with its database by filename, so a hot WAL left by a crashed
+  process — or by a concurrent lock-free reader, which the draft explicitly
+  permitted — is silently replayed into the freshly built index on the next
+  open (the documented `howtocorrupt.html` class).
+- The maintenance lock was unspecified, and the natural implementation
+  (locking the sidecar file) is broken by the rename itself: file locks bind
+  to inodes, so a swap lets two maintainers hold "the" lock concurrently.
+- The triggers false-dirtied every task on every save, because task
+  persistence is a full-row upsert: `UPDATE OF title, body` fires whenever
+  the columns are assigned, not when they change.
+- The FTS5 external-content maintenance discipline was unspecified; violations
+  desync silently.
+- The stem-derived sidecar name collided across sibling databases, and the
+  sidecar carried no identity binding it to its source.
+- All of it existed to avoid re-reading and re-hashing 0.91 MiB of text —
+  milliseconds — while content addressing already prevented redundant
+  embedding, which is the only expensive step.
+
+The sidecar itself was not the defect. D5/D6 retain it but update it in place:
+SQLite owns writer serialization and crash recovery, no file is renamed, the
+full source snapshot is re-derived before each query, and no authoritative
+revision or acknowledgement state exists. The stable sibling lifecycle lock
+protects only explicit replacement of an unopenable sidecar; it is not an
+application writer lock. Incremental tracking returns behind the same source
+port only after the measured D6 ceiling is crossed.
+
+### Search tables in `repo-link.db`, with or without auto-vacuum
+
+Rejected. `auto_vacuum=FULL` could return freelist pages after deletes, but the
+existing authoritative database was created with auto-vacuum disabled.
+Enabling it requires a one-time `VACUUM` rewrite and additional pointer-map
+metadata; it still places FTS, vectors, write amplification, WAL growth, and
+derived-data high-water marks in authoritative backups. It also cannot bound
+the external model cache. D5 enables full auto-vacuum on the new disposable
+sidecar instead, where page movement and fragmentation cannot affect task
+storage.
+
 ### Dense semantic search only
 
-Rejected for the generic `task search` command. Dense retrieval bridges
-paraphrases but can miss exact identifiers, code symbols, or error strings.
-Literal and FTS5 lanes provide predictable exact/lexical behavior while dense
-retrieval covers the semantic gap.
+Rejected. Dense retrieval bridges paraphrases but can miss exact identifiers,
+code symbols, or error strings. Literal and FTS5 lanes provide predictable
+exact/lexical behavior while dense retrieval covers the semantic gap.
 
 ### FTS5 only
 
-Rejected as the complete solution. FTS5 is compact and useful for exact and
-lexical matching, but it cannot intentionally bridge relevant wording with
-little token overlap. It remains one lane in D4.
+Rejected as the complete solution: it cannot bridge relevant wording with
+little token overlap, which is the stated motivating gap. It is one lane in
+D4 — and, deliberately, the whole of PR1 (§9), so useful search ships before
+any model exists.
 
-### Count and `max(updated_at)` fingerprint
+### Unconditional literal-first ordering
 
-Rejected. Comments historically had no update timestamp, timestamps can
-collide, scoped fingerprints cannot safely describe one global sidecar, and a
-heuristic can leave content stale indefinitely. D7 uses transactional monotonic
-revisions.
+Rejected (previously accepted). On natural-language queries an incidental
+substring match ("search index" mentioned in passing) would outrank the true
+paraphrase answer. D4 keeps the hard guarantee where exactness is signalled by
+`--exact` or identifier-shaped input and demotes the literal flag to fusion
+evidence elsewhere.
 
-### Full corpus diff before every search
+### Literal lane over formatted chunk text
 
-Correct but rejected as the steady-state design. It is cheap at the current
-corpus, but work grows with all tasks rather than changed tasks. The coalesced
-dirty-task table keeps warm reconciliation proportional to the delta while a
-full scan remains the explicit rebuild path.
+Rejected (previously accepted). Non-overlapping chunking breaks exact
+matching for long strings straddling a boundary — precisely the error-string
+use case the lane exists for — and injected field labels create false
+matches. Raw authoritative text is the same order of scan cost with neither
+artifact.
 
-### Append-only search change log
+### Count and `max(updated_at)` fingerprints; append-only change logs; per-comment invalidation
 
-Rejected in favor of a coalesced dirty-task table. Search only needs the latest
-current state for each affected task, not every intermediate mutation. One row
-per dirty task bounds unattended growth and naturally collapses edit bursts.
+All superseded by per-search hash-diffing, which needs no fingerprint, no
+log, and no invalidation unit at all.
 
-### Per-comment invalidation
+### Late interaction (ColBERT-style) and cross-encoder reranking
 
-Rejected. Every comment chunk includes the task title, so a title change would
-still need to fan out across all comments. Task-level invalidation is simpler
-and correct; content hashes avoid re-embedding unchanged chunks.
-
-### Semantic orchestration in `application-query`
-
-Rejected because search reconciliation, compaction, model preparation, and
-rebuild mutate derived state. `application-search` preserves
-`application-query`'s read-only contract.
-
-### Embedding or FTS columns in `repo-link.db`
-
-Rejected. Search text, vectors, and FTS are large, profile-specific,
-replaceable data and do not belong in the authoritative backup lifecycle.
-Only tiny revision metadata belongs in the source database.
-
-### LanceDB or another vector store
-
-Rejected for v1. Current scale does not require a vector-store dependency,
-index-version retention, compaction lifecycle, or separate process. SQLite
-plus exact cosine and FTS5 is sufficient and inspectable.
-
-### Delete the old sidecar before rebuilding
-
-Rejected. It saves temporary disk but turns an inference, disk, or validation
-failure into avoidable search downtime. D11 preflights and atomically swaps a
-temporary sidecar.
-
-### Eager embedding on every task/comment mutation
-
-Rejected. Ordinary task correctness must not depend on model availability, and
-a local edit must not wait for CPU inference. Authoritative triggers record only
-small revision metadata; search performs inference later.
+The strongest quality upgrade at this corpus size — exhaustive MaxSim over
+token vectors is tens of milliseconds at 519 tasks, and a small calibrated
+cross-encoder over a top-40 pool adds principled no-answer signalling.
+Rejected for v1 on cost: a second pinned artifact doubles the supply-chain
+surface, ort-class runtimes conflict with offline builds, token matrices grow
+the index ~7×, and every calibration constant depends on a labelled fixture
+that must exist and be trusted first. This is the named follow-up once the
+§10 fixture exists and shows the single-vector lane leaving quality on the
+table.
 
 ### Daemon-maintained search index
 
-Rejected for v1. It adds another background lifecycle and recovery path before
-search frequency requires one. The revision feed permits a future daemon
-consumer without changing task mutation semantics.
+Rejected, and more strongly than before: with per-search reconciliation
+costing milliseconds there is no background maintenance to schedule at any
+foreseeable scale. The named future daemon contribution is different — a
+warm `embed_query` endpoint in `rld` (unix socket, second `EmbeddingProvider`
+impl with in-process fallback) if the measured per-invocation model load
+(§10) proves unacceptable.
+
+### `ort` / onnxruntime as the inference runtime
+
+Rejected for v1. The default feature downloads prebuilt binaries in
+`build.rs`, violating offline deterministic builds; the vendored alternative
+requires cmake and a C++ toolchain on every contributor machine and CI
+runner. Candle's selected features avoid build-time binary downloads; Stage
+2/4 measures its CPU and cold-load cost. The port keeps the choice reversible.
+
+### LanceDB / sqlite-vec / tantivy
+
+Rejected for v1. Current scale requires neither a vector store's versioning
+lifecycle, a C extension plumbed through sqlx, nor a second on-disk index
+format with segment merging. Raw BLOB scan plus FTS5 is sufficient,
+inspectable, and disposable.
 
 ### Remote embedding API
 
-Rejected. Sending task/comment content externally conflicts with the local-first
-default and makes offline search impossible.
+Rejected. Sending task/comment content externally conflicts with the
+local-first default and makes offline search impossible.
+
+### Eager embedding on every task/comment mutation
+
+Rejected. Ordinary task correctness must not depend on model availability,
+and a local edit must not wait for CPU inference. Reconciliation happens at
+search time, when the user has expressed interest in fresh results.
 
 ## 8. Risks and mitigations
 
-- **Model quality.** General embeddings may collapse repo-specific distinctions.
-  Mitigation: the labelled evaluation and predeclared acceptance gate in §10.
+- **Model quality.** General embeddings may collapse repo-specific
+  distinctions. Mitigation: the per-category labelled fixture and relative
+  gates in §10, run before pinning and before any profile swap.
 - **Exact identifiers.** Dense models may tokenize opaque strings poorly.
-  Mitigation: literal and FTS5 lanes rank exact text independently of embeddings.
-- **Language coverage.** An English-only model may fail on multilingual tasks.
-  Mitigation: represent actual supported task languages in the evaluation
-  fixture and select the profile accordingly.
-- **Long-content truncation.** A runtime may truncate silently.
-  Mitigation: tokenizer-owned limits, no-discard chunking, and oversized
-  title/paragraph tests.
-- **Chunk explosion.** Small limits or overlap can multiply vectors.
-  Mitigation: no overlap, preflight chunk counts, content hashing, and a hard
-  storage budget.
-- **Long/noisy task bias.** A task with many chunks has more chances for a high
-  dense score.
-  Mitigation: task-level per-lane collapse plus explicit noisy-thread cases in
-  the evaluation set.
-- **Missed invalidation.** A new write path might omit application-level
-  bookkeeping.
-  Mitigation: SQLite triggers observe storage mutations regardless of caller,
-  and migration tests enumerate every relevant column/action.
-- **Remote comment churn.** Wholesale refresh would dirty every task repeatedly.
-  Mitigation: D3 stable upserts and body-aware no-op updates.
-- **Cross-database crash.** Source metadata and sidecar cannot share one atomic
-  commit.
-  Mitigation: replay-safe sidecar-first commit order and compacted-gap detection.
-- **Concurrent maintenance.** Two CLI processes could reconcile or rebuild
-  against different revisions.
-  Mitigation: one task-search interprocess lock plus metadata revalidation after
-  lock acquisition.
-- **Rebuild disk pressure.** Atomic replacement temporarily needs two indexes
-  and may need two models.
-  Mitigation: preflight the actual active/staging requirement before download,
-  inference, or file growth.
-- **SQLite FTS availability.** A platform SQLite build might lack FTS5.
-  Mitigation: verify the production-linked SQLite feature during Stage 0 and
-  fail preparation/rebuild with a clear diagnostic rather than silently
-  dropping the lexical lane.
+  Mitigation: the literal lane runs over raw text, and identifier-mode
+  queries keep the literal-first hard guarantee independent of embeddings.
+- **Language coverage.** The English-first candidate set may fail on
+  multilingual tasks. Mitigation: represent actual task languages in the
+  fixture; `multilingual-e5-small` is the named fallback candidate.
+- **O(corpus) per search.** The reconcile pass grows with total corpus, not
+  the delta. Mitigation: measured cost target and a named ceiling (D6) with
+  an additive upgrade path behind the same port.
+- **Per-invocation model load.** A fresh CLI process pays model
+  deserialization on every semantic query, and it plausibly dominates
+  end-to-end latency. Mitigation: it is measured explicitly as an acceptance
+  gate (§10), mmap-able safetensors keeps it small, and the named escape is a
+  warm `embed_query` endpoint in `rld` (§7).
+- **Semantic input length.** Model-independent lexical chunks may exceed the
+  active model's effective token budget. Mitigation: D2 derives complete
+  tokenizer-bounded semantic inputs and validates coverage before inference;
+  overlong queries skip the semantic lane rather than truncate.
+- **Concurrent duplicate work.** Two CLI processes reconciling after the same
+  edit burst can embed the same semantic input. Mitigation: identity/profile
+  guards discard stale results; duplicate inference wastes CPU but cannot
+  attach a vector to different text.
+- **Sidecar growth.** Text, FTS, and semantic segments amplify source bytes.
+  Mitigation: conservative preflight, filesystem headroom, auto-vacuum,
+  `max_page_count`, cache budgets, and observable warn/refuse thresholds.
+- **Mixed binaries.** Different chunk or profile versions could otherwise
+  rebuild each other's state. Mitigation: ordinary search never changes
+  non-NULL format/profile ownership; explicit rebuild is the only transition.
+- **Sidecar corruption.** Search-index faults must not affect task data.
+  Mitigation: a separate file, FTS integrity checks, literal-only degradation,
+  in-place rebuild when SQLite remains openable, and explicit locked
+  recreation otherwise.
 - **Model supply chain.** Mutable upstream artifacts could change output or
-  introduce unverified files.
-  Mitigation: immutable revisions, manifest digests, rl-owned cache, and atomic
-  verified installation.
-- **Sensitive local text copy.** The sidecar contains formatted task text.
-  Mitigation: same-directory permissions as the authoritative DB, no sync or
-  backup, bounded current-only content, and explicit `clear`.
+  introduce unverified files. Mitigation: in-binary digest manifest (no
+  TOFU), safetensors-only artifacts, atomic verified install into a
+  content-addressed cache.
+- **FTS expression injection.** Mitigation: the exact construction is
+  specified (D4) — tokenize, double-quote terms with internal quotes doubled,
+  join with OR, bind as a parameter — and tested with hostile inputs.
 - **Misleading scores.** Users may read cosine or fused scores as confidence.
-  Mitigation: expose lane metadata, call them ranking signals, and never label
+  Mitigation: expose lane metadata, call them ranking signals, never label
   them probabilities.
 
 ## 9. Staged implementation plan
 
-### Stage 0 — Quality, runtime, latency, and storage spike
+### Stage 0 — Reconciliation and storage spike
 
-- Build a reviewed synthetic or sanitized task-only evaluation corpus using the
-  D2/D3 formatting rules.
-- Record literal and FTS5 baselines before scoring embedding candidates.
-- Declare quality, exact-match retention, p95 latency, binary-size, model-size,
-  and storage acceptance thresholds before comparing candidates.
-- Evaluate a small set of eligible local models at no more than 384 dimensions.
-- Measure tokenizer-derived chunk counts, batch sizes, indexing throughput,
-  warm-delta latency, exact-vector query latency, Recall@10, MRR, literal/FTS
-  behavior, RRF settings, raw vector bytes, complete sidecar bytes, temporary
-  rebuild bytes, and model-cache bytes.
-- Select the model, immutable revision, runtime, tokenizer limits, batch size,
-  RRF constant, and numeric warn/refuse budgets.
-- Verify CPU support and linked FTS5 availability on supported macOS and Linux
-  builds.
+- Build the exact D5 sidecar schema against current plus synthetic 10k/100k
+  chunk corpora.
+- Measure zero-change and changed full-hash reconciliation, sidecar/WAL peak,
+  `auto_vacuum=FULL` plus truncating-checkpoint clear-time reclamation, FTS
+  amplification, and `max_page_count` failure behavior.
+- Exercise serialized concurrent reconciles, a source edit during reconcile,
+  ROWID reuse during an embedding batch, mixed-version metadata, and exclusive
+  recovery of an unopenable sidecar while another process holds a shared
+  lifecycle lock.
+- Select and record numeric sidecar, WAL/headroom, and warn/refuse budgets
+  before PR1 begins.
 
-No production search schema or CLI contract ships before this evidence passes
-the declared gate.
+### Stage 1 — PR1: search without a model
 
-### Stage 1 — Authoritative revision feed and stable comment identity
+- Sidecar schema: metadata, lexical chunks, semantic-input vectors, FTS5,
+  immutable-content triggers, `auto_vacuum=FULL`, and `max_page_count`; no
+  authoritative database migration. Add FTS5/DBSTAT smoke tests.
+- D2/D3 chunker with `chunk_format_version`; SHA-256 hashing.
+- `application-search` with serialized sidecar reconciliation, storage
+  preflight, query-mode classifier, explicit `--exact`, literal + lexical
+  lanes, fusion, excerpt verification, and `dto-shared` result contracts.
+- `rl task search` and `search-index status|rebuild|clear` under the final
+  CLI/JSON contract, with `"lexical_available": true` and
+  `"semantic_available": false`.
+- Full deterministic test coverage (§10). Ships alone and is immediately
+  useful for exact identifiers, error strings, and keyword recall.
 
-- Add `task_comments.updated_at` and backfill it.
-- Replace wholesale synced-comment persistence with stable upsert/delete.
-- Preserve a pending comment's local surrogate through remote promotion.
-- Add `task_search_projection_state`, `task_search_dirty_tasks`, and triggers.
-- Add migration, adapter, crash-order, and no-op-refresh tests.
+### Stage 2 — Fixture and profile selection
 
-### Stage 2 — Search application and deterministic fixtures
+- Build the reviewed, synthetic-or-sanitized labelled fixture (§10
+  categories; raw local task content is never committed).
+- Run literal/FTS baselines, then the named candidate models via candle.
+- Select and pin the profile by the predeclared relative gates; author the
+  manifest and digests into the source tree.
+- Measure complete semantic-input amplification and choose the numeric
+  model-cache budget before PR2 acceptance.
 
-- Add `application-search`.
-- Add the three D10 ports and result DTOs.
-- Implement deterministic fake source, embedding, and search-index adapters.
-- Implement D2/D3 formatting, versioned chunking, SHA-256 hashing, global
-  revision reconciliation, storage preflight, task-level lane roll-up, RRF, and
-  explanation selection.
+### Stage 3 — PR2: semantic lane
 
-### Stage 3 — SQLite sidecar and pinned local embedder
+- `infra-embed` (candle adapter, verified cache, `prepare-model`).
+- Complete tokenizer-bounded semantic-input planning, guarded vector batches,
+  semantic lane, and three-lane fusion.
+- No change to any PR1 shape; `prepare-model` and the semantic lane are
+  purely additive.
 
-- Add sidecar schema, FTS5 maintenance, literal search, lexical search, exact
-  cosine scan, pruning, stats, interprocess locking, and atomic rebuild.
-- Add the selected local embedding adapter and verified rl-owned model cache.
-- Implement profile mismatch, compacted-gap, corruption, and disk-budget error
-  paths.
+### Stage 4 — Measure and record
 
-### Stage 4 — CLI and operational surface
-
-- Add `rl task search` and `rl task search-index`.
-- Wire cwd-aware workspace/repo resolution and current lifecycle filtering.
-- Add prepare-model, rebuild, clear, status, progress on stderr, and JSON on
-  stdout.
-- Refresh `rl agents docs` for the new command help.
-
-### Stage 5 — Measure before extending
-
-- Run the labelled fixture against the finished production path.
-- Record p50/p95 warm reconciliation, exact/lexical/semantic query latency,
-  rebuild time, model memory, sidecar amplification, and temporary peak disk.
-- Add ANN, quantization, reranking, background maintenance, or overlap only
-  through a follow-up RFC backed by observed need.
+- Record: reconcile pass p50/p95 (zero-change and bursty), end-to-end cold
+  `rl task search` wall time including process start and model load, rebuild
+  time, per-component sidecar/WAL bytes, semantic-input amplification, model
+  cache bytes, and budget headroom.
+- Fold the numbers into this RFC. ANN, incremental tracking, reranking, or the
+  `rld` warm-embed endpoint are follow-up RFCs gated on measured ceilings.
 
 ## 10. Testing and evaluation strategy
 
-### Deterministic unit and integration tests
+### Deterministic unit and integration tests (offline, fake embedder)
 
-- Short title/body content produces one core chunk.
-- Empty body produces title-only content.
-- Every long-body/comment chunk preserves all source text without overlap.
-- An oversized paragraph falls back from paragraph to sentence/token splitting.
-- An oversized title remains fully searchable and body chunks use a marked,
+Chunking and hashing:
+
+- Short title/body produces one core chunk; empty body produces title-only
+  content.
+- Long bodies/comments chunk without overlap and without dropping text;
+  oversized paragraphs fall back to sentence/valid-UTF-8-boundary splitting.
+- An oversized title stays fully indexed; body chunks carry the marked,
   deterministic bounded anchor.
-- Comment author/timestamp are omitted from indexed text.
-- Stable remote-comment refresh preserves local source IDs and creates no dirty
-  revision when content is unchanged.
-- A remote comment body edit with unchanged creation time increments revision
-  and replaces only affected search content.
-- Pending-comment promotion preserves its local search source ID and does not
-  dirty unchanged indexed text.
-- Task title edits invalidate core and all title-anchored comments.
-- Task body/comment edits dirty the task, while lifecycle/repo/status-only edits
-  do not dirty embeddings.
-- Task deletion leaves a tombstone until its sidecar mappings are removed.
-- Repeated task mutations coalesce to one dirty row at the latest revision.
-- Identical formatted chunks share stored text/vector/FTS content.
-- Reconciliation is idempotent when source revision is unchanged.
-- A body edit replaces mappings and prunes orphaned chunks.
-- Snapshots never create search chunks or revision events.
-- Search filtering reads current workspace/repo/lifecycle state without
-  reconciling a scoped index.
-- Literal matches sort ahead of non-literal results.
-- Quotes, operators, punctuation, and code symbols are treated as plain query
-  input and cannot alter SQL or FTS syntax.
-- FTS and semantic lane ranks collapse to task level and fuse deterministically.
-- Ties resolve by task ID.
-- A cold sidecar refuses with rebuild/prepare guidance.
-- Schema, format, or profile mismatch refuses rather than rebuilding inline.
-- `last_applied_revision < compacted_through` requires a full rebuild.
-- Failure before sidecar commit leaves dirty rows replayable.
-- Failure after sidecar commit but before acknowledgement is idempotent.
-- Concurrent reconcile/rebuild/clear operations serialize through the
-  interprocess lock and cannot regress the applied revision.
-- Reconciliation updates mappings, FTS, pruning, and metadata atomically.
-- A source deleted between ranking and result verification is omitted safely.
-- A failed temporary rebuild preserves the active sidecar.
-- A successful rebuild atomically swaps and then prunes obsolete model state.
-- Search and rebuild perform no network access when the model is absent.
-- Storage preflight refuses before model inference or sidecar growth.
-- Search/index failures never mutate or block authoritative task operations.
-- `status`, `rebuild`, `clear`, and `prepare-model` emit JSON and affect only
-  their documented search/model/revision state.
+- Comment author/timestamp never appear in indexed text.
+- Chunking is deterministic across runs and platforms;
+  `chunk_format_version` mismatch never rewrites implicitly.
+- Tokenizer-derived semantic inputs fit the effective model budget and cover
+  every lexical chunk byte without runtime truncation.
 
-### Retrieval-quality evaluation
+Reconciliation:
 
-The checked-in evaluation fixture must be synthetic or explicitly reviewed and
-sanitized. Raw local task/comment content must never be committed merely because
-it was used during the spike.
+- Create/edit/delete of tasks and comments converge the index in one
+  reconcile; a zero-change reconcile performs zero writes.
+- Wholesale comment refresh with unchanged bodies (current persistence
+  behaviour) produces zero index writes and zero re-embeds.
+- Task deletion removes all its rows, vectors, and FTS entries.
+- Metadata-only edits (lifecycle, workspace, repo, priority, assignees)
+  produce zero index writes.
+- Concurrent reconciles acquire the sidecar transaction before their source
+  snapshot; a slow older process cannot regress a newer committed index.
+- Snapshots never produce search rows.
+- Duplicate identical comment bodies on one task collapse to one row and
+  keep the zero-writes property.
+- A deleted/reused ROWID cannot accept a stale vector because task ID, content
+  hash, embedding-input hash, and profile guards must all match.
+- Alternating binaries with different chunk/profile versions degrade without
+  mutating or thrashing the sidecar; only explicit rebuild changes ownership.
+- Embedding failure leaves committed vectors serving and missing semantic
+  inputs retryable.
+- Sidecar path derivation distinguishes `foo.db` from `foo.sqlite`.
+- Sidecar clear takes the exclusive lifecycle lock, shrinks the database and
+  WAL under full auto-vacuum plus a truncating checkpoint, and leaves
+  `repo-link.db` byte-for-byte and schema-for-schema unchanged.
+- Unopenable-sidecar recovery waits for existing shared lifecycle locks, then
+  recreates the sidecar and its WAL companions without exposing mixed
+  generations to a concurrent command.
+- Projected sidecar, WAL, free-space, and model-cache budget violations refuse
+  before growth; `max_page_count` rolls back an attempted overrun.
 
-The fixture contains task content, queries, and labelled relevant task IDs. It
-must include:
+Retrieval:
 
-- exact identifiers, phrases, code symbols, and error strings;
-- paraphrases with little or no token overlap;
-- clusters containing design, implementation, bug, and follow-up language;
-- opaque identifiers with and without surrounding semantic context;
-- misleading generic software terms;
-- long descriptions and comments whose relevant paragraph is not first;
-- tasks with many irrelevant comments/chunks to expose length bias;
-- supported task languages; and
-- closed historical tasks.
+- Literal lane matches across what would be chunk boundaries and never
+  matches the injected field labels (raw-text scan).
+- Query-mode classification covers explicit `--exact`, identifier shapes,
+  natural-language queries, and mixed identifier+prose queries; shell quoting
+  alone does not alter mode.
+- FTS expression construction: quotes, operators, punctuation, and code
+  symbols in user input cannot alter SQL or FTS syntax (hostile-input
+  corpus).
+- Identifier tokens (`snake_case`, `dashed-name`) survive the FTS tokenizer.
+- Lane collapse to task level and RRF fusion are deterministic; ties resolve
+  by task ID.
+- A source changed after reconciliation is omitted during authoritative result
+  verification and repaired by the next query.
+- Degraded mode: no profile prepared → literal+lexical results,
+  `semantic_available: false`, stderr hint.
+- Schema/chunk mismatch → literal-only results, `lexical_available: false`, and
+  explicit rebuild guidance without mutation.
+- Overlong query → literal+lexical results and
+  `semantic_skipped_reason: "query_too_long"`; no truncation.
+- Comment evidence: `remote_comment_id` reported when unambiguous, omitted
+  otherwise.
+- Search and reconcile perform no network access under any state.
+- The top-level JSON wrapper includes query mode, lane availability, optional
+  semantic skip reason, and results.
+- `status`/`rebuild`/`clear`/`prepare-model` emit JSON and touch only their
+  documented sidecar/cache state; FTS5 `integrity-check` passes after every
+  mutation test.
+- FTS5 availability smoke test (in-memory virtual table) pins the bundled
+  build configuration.
 
-Report literal, FTS-only, semantic-only, and fused results. For each candidate
-profile/dimension, report at least Recall@10 and MRR, plus exact-match retention,
-false positives, and false negatives. Candidate selection must follow
-predeclared thresholds; a model is not accepted merely because it is the best
-of a weak set.
+### Retrieval-quality evaluation (Stage 2, opt-in real models)
+
+The checked-in fixture is synthetic or explicitly reviewed and sanitized. It
+contains task content, queries, and labelled relevant task IDs, with
+**predeclared minimum counts per category**:
+
+- exact identifiers, phrases, code symbols, and error strings (≥20);
+- paraphrases with little or no token overlap (≥30);
+- misleading generic software terms (≥15);
+- long descriptions whose relevant paragraph is not first (≥10);
+- tasks with many irrelevant comments (length bias) (≥10);
+- typo'd near-misses of identifiers and words (≥10);
+- supported task languages (≥10 per language);
+- closed historical tasks (≥10).
+
+Gates are **relative and per-category**, not aggregate-absolute:
+
+1. exact-match retention is 100% — no candidate may lose a literal/identifier
+   query that the Stage 1 baseline answers;
+2. fused results are non-regressive versus the FTS-only baseline on every
+   category;
+3. the semantic lane beats the FTS-only baseline on the paraphrase category
+   by a predeclared margin (this is the entire justification for the lane —
+   if no candidate clears it, PR2 does not ship until one does);
+4. report Recall@10 and MRR per category with bootstrap confidence intervals;
+   a candidate is accepted only when its paraphrase gain exceeds the noise
+   band. A model is not accepted merely for being the best of a weak set.
 
 Real-model tests are opt-in and use only explicitly prepared local profiles.
-Normal CI downloads no model and uses deterministic fakes so builds remain
-offline and reproducible.
+Normal CI downloads nothing and uses the deterministic fake.
 
-### Performance and storage evaluation
+### Performance evaluation (Stage 4)
 
-Measure:
-
-- cold full rebuild time and peak resident memory;
-- warm reconciliation for zero, one, and bursty dirty-task deltas;
-- literal, FTS, exact-vector, and fused p50/p95 query latency;
-- authoritative revision metadata growth;
-- raw vectors, formatted text, FTS, mappings, total sidecar, and model cache;
-- atomic rebuild peak disk requirement; and
-- behavior at measured current scale plus synthetic 10k and 100k chunk scales.
-
-The numeric production budgets are recorded in the Stage 0 report and then
-folded into this RFC before implementation is accepted.
+- Reconcile pass p50/p95: zero-change, single-edit, bursty (100 edits), at
+  current scale and synthetic 10k/100k-chunk scales.
+- **End-to-end cold `rl task search` wall time — process start to JSON on
+  stdout — with and without the semantic lane.** Model load time reported
+  separately. This, not the in-process vector scan, is the latency
+  acceptance gate, and the bound is predeclared: literal+lexical-only p95
+  ≤ 300 ms; semantic p95 ≤ 2 s. Exceeding the semantic bound triggers the
+  named remedies in order — a smaller candidate model, then the `rld`
+  `embed_query` endpoint (§7).
+- Full rebuild time and peak memory; per-component bytes via `dbstat`.
+- Sidecar, WAL peak, clear-time reclamation, and model-cache budgets are
+  re-stated against measured numbers.
 
 ## 11. Open questions
 
 ### Resolved
 
-- **Corpus:** current task title/body/comments only; no general document
-  management or repository-file indexing.
-- **Retrieval:** literal + FTS5/BM25 + exact dense cosine, fused at task level.
-- **Freshness:** transactional monotonic revision plus coalesced dirty task IDs;
-  no timestamp/count fingerprint.
-- **Scope:** one global index; workspace/repo/lifecycle filters are query-time
-  eligibility only.
-- **Comment identity:** stable local surrogate, remote ID as metadata, remote
-  updates upserted in place.
-- **Rebuild:** preflighted temporary sidecar and atomic swap; failed rebuilds
-  preserve the active index.
-- **Application boundary:** stateful orchestration lives in
-  `application-search`, not `application-query`.
-- **Dimensions:** target 384; use 256 only if Stage 0 shows equal quality and
-  better latency.
-- **Installation:** explicit verified `prepare-model` is the only download path.
-- **Default result count:** 10.
-- **Pending comments:** searchable immediately.
-- **Storage direction:** hard preflight covers authoritative metadata, active
-  and staging sidecars, and active/staging model cache.
+- **Corpus:** current task title/body/comments only.
+- **Freshness:** per-search hash-diff reconcile; no authoritative-table
+  triggers or revisions; SQLite serializes in-place sidecar reconciles;
+  incremental tracking is deferred behind a measured ceiling.
+- **Storage:** size-capped `repo-link.db.task-search.db` sidecar with full
+  auto-vacuum; no search schema or bytes in `repo-link.db`.
+- **Retrieval:** literal (raw text) + FTS5/BM25 + exact cosine, query-mode
+  conditional ordering, explicit `--exact`, and RRF k=60 default.
+- **Comment identity:** not a search dependency; content addressing absorbs
+  surrogate churn; `remote_comment_id` recovered at render time.
+- **Runtime:** candle, committed. **Trust root:** in-binary digests.
+  **Cache:** global, content-addressed, and hard-budgeted.
+- **Versioning:** ordinary search never changes an incompatible chunk/profile
+  owner; explicit rebuild transitions it.
+- **Degraded mode:** literal always works; lexical/semantic availability is
+  explicit and incompatible states do not mutate automatically.
+- **Semantic coverage:** tokenizer-bounded inputs cover all lexical text; no
+  runtime truncation.
+- **Default result count:** 10. **Pending comments:** searchable immediately.
 
-### Remaining, Stage 0 gated
+### Remaining
 
-1. Which local model, immutable revision, and Rust inference runtime pass D9 and
-   the §10 gate?
-2. What tokenizer-derived input limit and batch size fit supported machines?
-3. What RRF constant and FTS tokenizer/query settings produce the best labelled
-   task-level results?
-4. What exact quality and latency acceptance thresholds are required before
-   model comparison?
-5. What numeric warn/refuse budgets apply to sidecar size, model cache, and
-   atomic rebuild peak disk?
+1. Which of the named candidate models clears the §10 per-category gates, and
+   with which instruction prefixes and batch size? (Stage 2.)
+2. Final RRF constant and FTS `OR`-vs-`AND` expression policy after fixture
+   runs. (Stage 2.)
+3. What numeric sidecar, WAL/headroom, and global model-cache warn/refuse
+   budgets follow from the Stage 0/2 measurements?
+4. Whether measured cold-invocation latency justifies the `rld`
+   `embed_query` endpoint. (Stage 4.)
 
 ## 12. References
 
-- SQLite Vec1 recommends exact nearest-neighbour mode for relatively small
-  vector sets (approximately fewer than 5,000) and requires trained ANN models
-  at larger scale: <https://sqlite.org/vec1/doc/trunk/doc/vec1intro.md>.
-- SQLite FTS5 provides BM25 lexical ranking and the virtual-table primitives
-  used by the lexical lane: <https://sqlite.org/fts5.html>.
-- Sentence Transformers recommends distinct query/corpus encoding for
-  asymmetric semantic search and documents exact, chunked corpus scans for
-  small corpora:
+- SQLite, "How To Corrupt An SQLite Database File" — the
+  hot-journal/WAL-mispairing class that motivated abandoning the sidecar
+  rename swap: <https://www.sqlite.org/howtocorrupt.html>.
+- SQLite auto-vacuum and VACUUM document why existing authoritative databases
+  do not shrink after DELETE without a rewrite, and why D5 enables full
+  auto-vacuum only on the new sidecar:
+  <https://www.sqlite.org/pragma.html#pragma_auto_vacuum> and
+  <https://www.sqlite.org/lang_vacuum.html>.
+- SQLite WAL checkpoint modes define the truncating checkpoint used by clear:
+  <https://www.sqlite.org/pragma.html#pragma_wal_checkpoint>.
+- SQLite FTS5 — BM25, external-content tables and their trigger maintenance
+  pattern, trigram tokenizer: <https://sqlite.org/fts5.html>.
+- Reciprocal rank fusion combines independent result rankings without score
+  calibration: <https://doi.org/10.1145/1571941.1572114>.
+- Sentence Transformers — asymmetric query/corpus instructions and exact
+  corpus scans for small corpora:
   <https://www.sbert.net/examples/sentence_transformer/applications/semantic-search/README.html>.
-- Reciprocal rank fusion combines independent result rankings without requiring
-  score calibration: <https://doi.org/10.1145/1571941.1572114>.
-- LanceDB documents version retention and delayed disk reclamation, illustrating
-  lifecycle avoided by the single disposable SQLite sidecar:
-  <https://docs.lancedb.com/tables/versioning> and
-  <https://docs.lancedb.com/indexing/reindexing>.
+- SQLite Vec1 intro — exact nearest-neighbour recommended below ~5,000
+  vectors: <https://sqlite.org/vec1/doc/trunk/doc/vec1intro.md>.
