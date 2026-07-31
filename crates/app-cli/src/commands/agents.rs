@@ -12,7 +12,7 @@ pub(crate) async fn agents_dispatch(cmd: AgentsCmd, svc: &Services) -> Result<()
         AgentsCmd::Docs => {
             let cwd = std::env::current_dir()
                 .map_err(|e| anyhow!("failed to read current directory: {e}"))?;
-            let abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+            let abs = dunce::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
 
             let canonical_url = discover_canonical_or_none(&abs)?;
 

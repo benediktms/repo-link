@@ -762,7 +762,7 @@ fn worktree_unlink_tombstoned_path_with_symlinked_prefix_resolves() {
         .as_str()
         .unwrap()
         .to_string();
-    let expected_canonical = std::fs::canonicalize(&child).unwrap().display().to_string();
+    let expected_canonical = dunce::canonicalize(&child).unwrap().display().to_string();
     assert_eq!(
         stored, expected_canonical,
         "link should store canonical form"
@@ -1057,7 +1057,7 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     // `/private/var`).
     let alive_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(alive_dir.path(), "git@github.com:o/r.git");
-    let alive = std::fs::canonicalize(alive_dir.path())
+    let alive = dunce::canonicalize(alive_dir.path())
         .unwrap()
         .display()
         .to_string();
@@ -1066,7 +1066,7 @@ fn worktree_reconcile_marks_missing_against_real_fs() {
     // the link canonical check passes, then the reconcile will see it missing.
     let gone_dir = TempDir::new().unwrap();
     init_git_repo_with_origin(gone_dir.path(), "git@github.com:o/r.git");
-    let gone = std::fs::canonicalize(gone_dir.path())
+    let gone = dunce::canonicalize(gone_dir.path())
         .unwrap()
         .display()
         .to_string();
@@ -1269,9 +1269,8 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
     // Use canonicalize so symlinks (e.g. /var → /private/var on macOS) don't
     // cause a mismatch between the path the binary resolves and what we built.
-    let canonical_token_file = token_file
-        .canonicalize()
-        .unwrap_or_else(|_| token_file.clone());
+    let canonical_token_file =
+        dunce::canonicalize(&token_file).unwrap_or_else(|_| token_file.clone());
     assert_eq!(result["file"], canonical_token_file.display().to_string());
     assert_eq!(result["mode"], "0600");
 
@@ -1844,7 +1843,7 @@ fn here_bound_repo_reports_binding_filing_repo_and_roster() {
     // service stores (macOS reports tempdirs as `/var/...`, but attach
     // canonicalizes to `/private/var/...` before saving).
     let canonical_path =
-        std::fs::canonicalize(repo_dir.path()).unwrap_or_else(|_| repo_dir.path().to_path_buf());
+        dunce::canonicalize(repo_dir.path()).unwrap_or_else(|_| repo_dir.path().to_path_buf());
     let path = canonical_path.display().to_string();
 
     let attach_a = run_json(
@@ -2029,6 +2028,8 @@ fn agents_docs_creates_file_with_markers() {
 
     assert_eq!(value["action"], "created");
     let path = dir.path().join("AGENTS.md");
+    #[cfg(windows)]
+    assert!(!value["file"].as_str().unwrap().starts_with(r"\\?\"));
     // macOS reports tempdir paths as `/var/folders/...` but `current_dir()` in
     // the child process resolves the `/var → /private/var` symlink, so compare
     // by canonical form.

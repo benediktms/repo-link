@@ -73,9 +73,7 @@ async fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Re
 
     write_token_file(&cfg.token_file_path, &trimmed, login.as_deref())?;
 
-    let path_str = cfg
-        .token_file_path
-        .canonicalize()
+    let path_str = dunce::canonicalize(&cfg.token_file_path)
         .unwrap_or_else(|_| cfg.token_file_path.clone())
         .display()
         .to_string();
