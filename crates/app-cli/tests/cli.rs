@@ -2199,6 +2199,9 @@ fn daemon_bin(env: &DaemonEnv, launcher_mode: &str) -> Command {
     cmd
 }
 
+// `rl daemon install/status/uninstall` only support launchd and systemd --user,
+// so on Windows they exit non-zero by design. Only `daemon logs` is portable.
+#[cfg(unix)]
 fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
     if cfg!(target_os = "macos") {
         env.home
@@ -2217,6 +2220,7 @@ fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_install_writes_manifest_with_correct_paths() {
     let env = daemon_env();
     let outcome = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
@@ -2243,6 +2247,7 @@ fn daemon_install_writes_manifest_with_correct_paths() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_install_is_idempotent() {
     let env = daemon_env();
 
@@ -2296,6 +2301,7 @@ fn daemon_install_enables_before_bootstrap() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_install_then_status_is_loaded_no_tick() {
     let env = daemon_env();
     let _ = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
@@ -2311,6 +2317,7 @@ fn daemon_install_then_status_is_loaded_no_tick() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_status_reads_last_tick_when_present() {
     let env = daemon_env();
     let last_tick = serde_json::json!({
@@ -2339,6 +2346,7 @@ fn daemon_status_reads_last_tick_when_present() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_status_flags_wedged_when_stale() {
     let env = daemon_env();
     let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
@@ -2484,6 +2492,7 @@ fn daemon_logs_follow_handles_rotation_truncation_and_ctrl_c() {
 }
 
 #[test]
+#[cfg(unix)]
 fn daemon_uninstall_is_idempotent() {
     let env = daemon_env();
 

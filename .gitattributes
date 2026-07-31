@@ -1,0 +1,2 @@
+# Force LF line endings across all platforms for consistent builds and tests
+* text=auto eol=lf
