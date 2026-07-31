@@ -164,11 +164,10 @@ fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) ->
 
 #[cfg(not(unix))]
 fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("failed to create config dir: {e}"))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| anyhow!("failed to create config dir: {e}"))?;
     }
     std::fs::write(path, render_token_file_body(token, login))
         .map_err(|e| anyhow!("failed to write token file: {e}"))?;
