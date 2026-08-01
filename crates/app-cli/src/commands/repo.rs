@@ -222,7 +222,7 @@ pub(crate) async fn repo_dispatch(
                 None => std::env::current_dir()
                     .map_err(|e| anyhow!("failed to determine current directory: {e}"))?,
             };
-            let abs = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            let abs = dunce::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
             let query_path = abs.display().to_string();
 
             let canonical_url = super::discover_canonical_or_none(&abs)?;
@@ -268,7 +268,7 @@ fn resolve_attach_link_path(
         None => std::env::current_dir()
             .map_err(|e| anyhow!("failed to determine current directory: {e}"))?,
     };
-    let abs = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+    let abs = dunce::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
 
     match discover_canonical(&abs) {
         Err(infra_git::GitError::NotARepo(_)) if explicit_path => anyhow::bail!(
@@ -304,7 +304,7 @@ fn resolve_attach_link_path(
 fn canonicalize_for_lookup(input: &str) -> String {
     let raw = PathBuf::from(input);
 
-    if let Ok(p) = std::fs::canonicalize(&raw) {
+    if let Ok(p) = dunce::canonicalize(&raw) {
         return p.display().to_string();
     }
 
@@ -318,7 +318,7 @@ fn canonicalize_for_lookup(input: &str) -> String {
             break;
         }
         suffix.push(name);
-        if let Ok(canonical) = std::fs::canonicalize(&prefix) {
+        if let Ok(canonical) = dunce::canonicalize(&prefix) {
             let mut result = canonical;
             for piece in suffix.iter().rev() {
                 result.push(piece);
@@ -352,8 +352,7 @@ pub(crate) async fn worktree_dispatch(cmd: WorktreeCmd, svc: &Services) -> Resul
             br: BranchArg { branch },
         } => {
             let raw_path = std::path::Path::new(&path);
-            let abs_path =
-                std::fs::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
+            let abs_path = dunce::canonicalize(raw_path).unwrap_or_else(|_| raw_path.to_path_buf());
 
             let discovered = match discover_canonical(&abs_path) {
                 Err(infra_git::GitError::NotARepo(_)) => {
@@ -503,7 +502,7 @@ pub(crate) async fn resolve_repo_handle_required(svc: &Services, handle: &str) -
 pub(crate) fn cwd_canonical() -> Result<Option<String>> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
-    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let abs = dunce::canonicalize(&cwd).unwrap_or(cwd);
     super::discover_canonical_or_none(&abs)
 }
 
@@ -520,7 +519,7 @@ pub(crate) async fn resolve_repo_or_cwd(svc: &Services, repo: Option<String>) ->
     }
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
-    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let abs = dunce::canonicalize(&cwd).unwrap_or(cwd);
     let canonical = match discover_canonical(&abs) {
         Ok(Some(c)) => c,
         Ok(None) | Err(GitError::NotARepo(_)) => {
@@ -573,7 +572,7 @@ pub(crate) async fn resolve_workspace(svc: &Services, workspace: Option<String>)
     }
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow!("failed to determine current directory: {e}"))?;
-    let abs = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let abs = dunce::canonicalize(&cwd).unwrap_or(cwd);
     let canonical = match discover_canonical(&abs) {
         Ok(Some(c)) => c,
         Ok(None) | Err(GitError::NotARepo(_)) => {

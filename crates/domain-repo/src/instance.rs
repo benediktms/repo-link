@@ -55,24 +55,21 @@ impl RepoInstance {
 
     pub fn link_worktree(&mut self, path: PathBuf, branch: Option<String>) {
         let now = Timestamp::now();
-        if let Some(existing) = self.worktrees.iter_mut().find(|w| w.path == path) {
-            existing.branch = branch;
-            existing.status = LinkStatus::Linked;
-            existing.last_seen_at = now;
-        } else {
-            self.worktrees.push(WorktreeLink {
-                path,
-                branch,
-                status: LinkStatus::Linked,
-                last_seen_at: now,
-            });
-        }
+        self.worktrees
+            .retain(|w| !same_worktree_path(&w.path, &path));
+        self.worktrees.push(WorktreeLink {
+            path,
+            branch,
+            status: LinkStatus::Linked,
+            last_seen_at: now,
+        });
         self.touch();
     }
 
     pub fn unlink_worktree(&mut self, path: &Path) -> Result<()> {
         let before = self.worktrees.len();
-        self.worktrees.retain(|w| w.path != path);
+        self.worktrees
+            .retain(|w| !same_worktree_path(&w.path, path));
         if self.worktrees.len() == before {
             return Err(DomainError::validation("worktree path not registered"));
         }
@@ -84,7 +81,7 @@ impl RepoInstance {
         let link = self
             .worktrees
             .iter_mut()
-            .find(|w| w.path == path)
+            .find(|w| same_worktree_path(&w.path, path))
             .ok_or_else(|| DomainError::validation("worktree path not registered"))?;
         link.status = LinkStatus::MissingPath;
         self.touch();
@@ -106,6 +103,10 @@ impl RepoInstance {
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }
+}
+
+fn same_worktree_path(lhs: &Path, rhs: &Path) -> bool {
+    dunce::simplified(lhs) == dunce::simplified(rhs)
 }
 
 impl Aggregate for RepoInstance {
@@ -169,5 +170,56 @@ mod tests {
     fn unlink_unknown_path_errors() {
         let mut i = instance();
         assert!(i.unlink_worktree(Path::new("/nope")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn link_deduplicates_windows_verbatim_prefix_variants() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), Some("main".into()));
+        let mut duplicate = i.worktrees[0].clone();
+        duplicate.path = PathBuf::from(r"C:\tmp\a");
+        i.worktrees.push(duplicate);
+        i.link_worktree(PathBuf::from(r"C:\tmp\a"), Some("dev".into()));
+        assert_eq!(i.worktrees.len(), 1);
+        assert_eq!(i.worktrees[0].path, PathBuf::from(r"C:\tmp\a"));
+        assert_eq!(i.worktrees[0].branch.as_deref(), Some("dev"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unlink_matches_windows_verbatim_prefix_variant() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
+        i.unlink_worktree(Path::new(r"C:\tmp\a")).unwrap();
+        assert!(i.worktrees.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mark_missing_matches_windows_verbatim_prefix_variant() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
+        i.mark_path_missing(Path::new(r"C:\tmp\a")).unwrap();
+        assert_eq!(i.worktrees[0].status, LinkStatus::MissingPath);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_prefix_like_paths_remain_distinct_on_other_platforms() {
+        assert!(!same_worktree_path(
+            Path::new(r"\\?\C:\tmp\a"),
+            Path::new(r"C:\tmp\a")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_remain_distinct() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let lhs = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x80]));
+        let rhs = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x81]));
+        assert!(!same_worktree_path(&lhs, &rhs));
     }
 }
