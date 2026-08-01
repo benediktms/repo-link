@@ -7,5 +7,6 @@ publish.workspace = true
 
 [dependencies]
 domain-core = { workspace = true }
+dunce = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

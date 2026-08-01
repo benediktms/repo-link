@@ -798,6 +798,7 @@ name = "domain-repo"
 version = "0.1.0"
 dependencies = [
  "domain-core",
+ "dunce",
  "serde",
  "thiserror 2.0.18",
 ]

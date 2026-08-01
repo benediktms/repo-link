@@ -55,29 +55,21 @@ impl RepoInstance {
 
     pub fn link_worktree(&mut self, path: PathBuf, branch: Option<String>) {
         let now = Timestamp::now();
-        if let Some(existing) = self
-            .worktrees
-            .iter_mut()
-            .find(|w| same_worktree_path(&w.path, &path))
-        {
-            existing.path = path;
-            existing.branch = branch;
-            existing.status = LinkStatus::Linked;
-            existing.last_seen_at = now;
-        } else {
-            self.worktrees.push(WorktreeLink {
-                path,
-                branch,
-                status: LinkStatus::Linked,
-                last_seen_at: now,
-            });
-        }
+        self.worktrees
+            .retain(|w| !same_worktree_path(&w.path, &path));
+        self.worktrees.push(WorktreeLink {
+            path,
+            branch,
+            status: LinkStatus::Linked,
+            last_seen_at: now,
+        });
         self.touch();
     }
 
     pub fn unlink_worktree(&mut self, path: &Path) -> Result<()> {
         let before = self.worktrees.len();
-        self.worktrees.retain(|w| !same_worktree_path(&w.path, path));
+        self.worktrees
+            .retain(|w| !same_worktree_path(&w.path, path));
         if self.worktrees.len() == before {
             return Err(DomainError::validation("worktree path not registered"));
         }
@@ -114,15 +106,7 @@ impl RepoInstance {
 }
 
 fn same_worktree_path(lhs: &Path, rhs: &Path) -> bool {
-    lhs == rhs || normalize_windows_verbatim_path(lhs) == normalize_windows_verbatim_path(rhs)
-}
-
-fn normalize_windows_verbatim_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    raw.strip_prefix(r"\\?\UNC\")
-        .map(|rest| format!(r"\\{rest}"))
-        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_owned))
-        .unwrap_or_else(|| raw.into_owned())
+    dunce::simplified(lhs) == dunce::simplified(rhs)
 }
 
 impl Aggregate for RepoInstance {
@@ -188,21 +172,45 @@ mod tests {
         assert!(i.unlink_worktree(Path::new("/nope")).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn link_same_windows_path_without_verbatim_prefix_updates_existing_entry() {
+    fn link_deduplicates_windows_verbatim_prefix_variants() {
         let mut i = instance();
         i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), Some("main".into()));
+        let mut duplicate = i.worktrees[0].clone();
+        duplicate.path = PathBuf::from(r"C:\tmp\a");
+        i.worktrees.push(duplicate);
         i.link_worktree(PathBuf::from(r"C:\tmp\a"), Some("dev".into()));
         assert_eq!(i.worktrees.len(), 1);
         assert_eq!(i.worktrees[0].path, PathBuf::from(r"C:\tmp\a"));
         assert_eq!(i.worktrees[0].branch.as_deref(), Some("dev"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn unlink_matches_windows_verbatim_prefix_variant() {
         let mut i = instance();
         i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
         i.unlink_worktree(Path::new(r"C:\tmp\a")).unwrap();
         assert!(i.worktrees.is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn windows_prefix_like_paths_remain_distinct_on_other_platforms() {
+        assert!(!same_worktree_path(
+            Path::new(r"\\?\C:\tmp\a"),
+            Path::new(r"C:\tmp\a")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_remain_distinct() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let lhs = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x80]));
+        let rhs = PathBuf::from(std::ffi::OsString::from_vec(vec![b'a', 0x81]));
+        assert!(!same_worktree_path(&lhs, &rhs));
     }
 }
