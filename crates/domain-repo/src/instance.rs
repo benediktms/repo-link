@@ -81,7 +81,7 @@ impl RepoInstance {
         let link = self
             .worktrees
             .iter_mut()
-            .find(|w| w.path == path)
+            .find(|w| same_worktree_path(&w.path, path))
             .ok_or_else(|| DomainError::validation("worktree path not registered"))?;
         link.status = LinkStatus::MissingPath;
         self.touch();
@@ -193,6 +193,15 @@ mod tests {
         i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
         i.unlink_worktree(Path::new(r"C:\tmp\a")).unwrap();
         assert!(i.worktrees.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mark_missing_matches_windows_verbatim_prefix_variant() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
+        i.mark_path_missing(Path::new(r"C:\tmp\a")).unwrap();
+        assert_eq!(i.worktrees[0].status, LinkStatus::MissingPath);
     }
 
     #[cfg(not(windows))]
