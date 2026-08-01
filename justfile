@@ -7,6 +7,8 @@
 # `~/.local/bin/` on PATH.
 rl := "./target/release/rl"
 
+set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
+
 default: list
 
 list:
@@ -26,12 +28,22 @@ list:
 # predates this feature.
 
 # Build, symlink into ~/.local/bin, and load the daemon unit.
+[unix]
 install:
     cargo build --release
     mkdir -p ~/.local/bin
     ln -sf "$(pwd)/target/release/rl"  ~/.local/bin/rl
     ln -sf "$(pwd)/target/release/rld" ~/.local/bin/rld
     {{rl}} daemon install
+
+# Build and copy Windows executables into ~/.local/bin.
+[windows]
+install:
+    cargo build --release
+    New-Item -ItemType Directory -Force -ErrorAction Stop (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
+    $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
+    Copy-Item -Force -ErrorAction Stop ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
+    Copy-Item -Force -ErrorAction Stop ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")
 
 # uninstall — `rl daemon uninstall` itself reports `manifest_existed: false`
 # on a clean checkout and exits 0, but `{{rl}}` points at the freshly-built
@@ -41,17 +53,24 @@ install:
 # still useful.
 
 # Unload the unit, delete the manifest, remove the ~/.local/bin symlinks.
+[unix]
 uninstall:
     if [ -x {{rl}} ]; then {{rl}} daemon uninstall; \
     elif [ -x ~/.local/bin/rl ]; then ~/.local/bin/rl daemon uninstall; \
     else echo "rl not built and not on PATH; skipping daemon uninstall"; fi
     rm -f ~/.local/bin/rl ~/.local/bin/rld
 
+# Remove Windows executables and legacy extensionless installs.
+[windows]
+uninstall:
+    $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
+
 # daemon-restart — `stop` can legitimately fail when the unit was never
 # installed; `|| true` keeps the recipe useful mid-recovery so `start`
 # always runs.
 
 # Toggle the persistent unit off then on.
+[unix]
 daemon-restart:
     {{rl}} daemon stop  || true
     {{rl}} daemon start
