@@ -55,7 +55,12 @@ impl RepoInstance {
 
     pub fn link_worktree(&mut self, path: PathBuf, branch: Option<String>) {
         let now = Timestamp::now();
-        if let Some(existing) = self.worktrees.iter_mut().find(|w| w.path == path) {
+        if let Some(existing) = self
+            .worktrees
+            .iter_mut()
+            .find(|w| same_worktree_path(&w.path, &path))
+        {
+            existing.path = path;
             existing.branch = branch;
             existing.status = LinkStatus::Linked;
             existing.last_seen_at = now;
@@ -72,7 +77,7 @@ impl RepoInstance {
 
     pub fn unlink_worktree(&mut self, path: &Path) -> Result<()> {
         let before = self.worktrees.len();
-        self.worktrees.retain(|w| w.path != path);
+        self.worktrees.retain(|w| !same_worktree_path(&w.path, path));
         if self.worktrees.len() == before {
             return Err(DomainError::validation("worktree path not registered"));
         }
@@ -106,6 +111,18 @@ impl RepoInstance {
     fn touch(&mut self) {
         self.updated_at = Timestamp::now();
     }
+}
+
+fn same_worktree_path(lhs: &Path, rhs: &Path) -> bool {
+    lhs == rhs || normalize_windows_verbatim_path(lhs) == normalize_windows_verbatim_path(rhs)
+}
+
+fn normalize_windows_verbatim_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    raw.strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| raw.strip_prefix(r"\\?\").map(str::to_owned))
+        .unwrap_or_else(|| raw.into_owned())
 }
 
 impl Aggregate for RepoInstance {
@@ -169,5 +186,23 @@ mod tests {
     fn unlink_unknown_path_errors() {
         let mut i = instance();
         assert!(i.unlink_worktree(Path::new("/nope")).is_err());
+    }
+
+    #[test]
+    fn link_same_windows_path_without_verbatim_prefix_updates_existing_entry() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), Some("main".into()));
+        i.link_worktree(PathBuf::from(r"C:\tmp\a"), Some("dev".into()));
+        assert_eq!(i.worktrees.len(), 1);
+        assert_eq!(i.worktrees[0].path, PathBuf::from(r"C:\tmp\a"));
+        assert_eq!(i.worktrees[0].branch.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn unlink_matches_windows_verbatim_prefix_variant() {
+        let mut i = instance();
+        i.link_worktree(PathBuf::from(r"\\?\C:\tmp\a"), None);
+        i.unlink_worktree(Path::new(r"C:\tmp\a")).unwrap();
+        assert!(i.worktrees.is_empty());
     }
 }
