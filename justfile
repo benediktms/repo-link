@@ -40,10 +40,10 @@ install:
 [windows]
 install:
     cargo build --release
-    New-Item -ItemType Directory -Force (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
-    $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force
-    Copy-Item -Force ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
-    Copy-Item -Force ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")
+    New-Item -ItemType Directory -Force -ErrorAction Stop (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
+    $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
+    Copy-Item -Force -ErrorAction Stop ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
+    Copy-Item -Force -ErrorAction Stop ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")
 
 # uninstall — `rl daemon uninstall` itself reports `manifest_existed: false`
 # on a clean checkout and exits 0, but `{{rl}}` points at the freshly-built
@@ -63,13 +63,14 @@ uninstall:
 # Remove Windows executables and legacy extensionless installs.
 [windows]
 uninstall:
-    $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force
+    $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
 
 # daemon-restart — `stop` can legitimately fail when the unit was never
 # installed; `|| true` keeps the recipe useful mid-recovery so `start`
 # always runs.
 
 # Toggle the persistent unit off then on.
+[unix]
 daemon-restart:
     {{rl}} daemon stop  || true
     {{rl}} daemon start

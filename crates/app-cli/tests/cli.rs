@@ -1022,6 +1022,33 @@ fn rl_alias_is_a_working_binary() {
 }
 
 #[test]
+fn install_recipes_keep_platform_binary_names() {
+    let justfile = include_str!("../../../justfile").replace("\r\n", "\n");
+    let section = |start, end| {
+        justfile
+            .split_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0
+    };
+    let unix_install = section("[unix]\ninstall:", "[windows]\ninstall:");
+    let windows_install = section("[windows]\ninstall:", "# uninstall");
+    let windows_uninstall = section("[windows]\nuninstall:", "# daemon-restart");
+
+    for name in ["rl", "rld"] {
+        assert!(unix_install.contains(&format!("target/release/{name}")));
+        assert!(unix_install.contains(&format!("~/.local/bin/{name}")));
+        assert!(windows_install.contains(&format!("target\\release\\{name}.exe")));
+        assert!(windows_install.contains(&format!(".local\\bin\\{name}\"")));
+        assert!(windows_uninstall.contains(&format!(".local\\bin\\{name}.exe")));
+        assert!(windows_uninstall.contains(&format!(".local\\bin\\{name}\"")));
+    }
+    assert!(!windows_install.contains("daemon install"));
+}
+
+#[test]
 fn worktree_reconcile_marks_missing_against_real_fs() {
     let dir = TempDir::new().unwrap();
     let workspace = run_json(
