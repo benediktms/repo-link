@@ -41,7 +41,7 @@ install:
 install:
     cargo build --release
     New-Item -ItemType Directory -Force (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")
+    $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force
     Copy-Item -Force ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
     Copy-Item -Force ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")
 
@@ -63,7 +63,7 @@ uninstall:
 # Remove Windows executables and legacy extensionless installs.
 [windows]
 uninstall:
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")
+    $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force
 
 # daemon-restart — `stop` can legitimately fail when the unit was never
 # installed; `|| true` keeps the recipe useful mid-recovery so `start`
