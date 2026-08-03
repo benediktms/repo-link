@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use super::{InstallOutcome, StartStopOutcome, StatusOutcome, UninstallOutcome};
 use crate::daemon::launcher::{LaunchOutcome, Launcher, require_success};
-use crate::daemon::manifest::{path_to_string, write_if_changed, xml_escape};
+use crate::daemon::manifest::{path_to_string, write_if_changed, xml_escape_ascii};
 
 pub(super) const PLATFORM: &str = "windows";
 
@@ -253,10 +253,13 @@ fn render_task_xml(binary_path: &Path, log_path: &Path, user_id: &str) -> String
         .replace("{{LABEL}}", DAEMON_LABEL)
         .replace(
             "{{BINARY_PATH}}",
-            &xml_escape(&binary_path.to_string_lossy()),
+            &xml_escape_ascii(&binary_path.to_string_lossy()),
         )
-        .replace("{{LOG_PATH}}", &xml_escape(&log_path.to_string_lossy()))
-        .replace("{{USER_ID}}", &xml_escape(user_id))
+        .replace(
+            "{{LOG_PATH}}",
+            &xml_escape_ascii(&log_path.to_string_lossy()),
+        )
+        .replace("{{USER_ID}}", &xml_escape_ascii(user_id))
 }
 
 /// `DOMAIN\user` for the account the task runs as. Task Scheduler defaults a
@@ -350,5 +353,22 @@ Logon Mode:                           Interactive only
         assert!(rendered.contains(r"C:\R&amp;D\rld.exe"));
         assert!(rendered.contains(r"C:\R&amp;D\daemon.log"));
         assert!(rendered.contains(r"<UserId>R&amp;D\dev</UserId>"));
+    }
+
+    /// `schtasks /Create /XML` rejects a definition whose bytes disagree with
+    /// its declared encoding, so neither the template nor an interpolated
+    /// path may put a non-ASCII byte in the file.
+    #[test]
+    fn render_task_xml_is_ascii_only_even_for_a_non_ascii_path() {
+        let rendered = render_task_xml(
+            std::path::Path::new(r"C:\Users\Jörg\.local\bin\rld.exe"),
+            std::path::Path::new(r"C:\Users\Jörg\daemon.log"),
+            r"DESKTOP-1\Jörg",
+        );
+        assert!(
+            rendered.is_ascii(),
+            "non-ASCII byte in the rendered task XML: {rendered}"
+        );
+        assert!(rendered.contains(r"C:\Users\J&#xF6;rg\.local\bin\rld.exe"));
     }
 }

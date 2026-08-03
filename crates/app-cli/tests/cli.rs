@@ -1049,6 +1049,12 @@ fn install_recipes_keep_platform_binary_names() {
     // never strands a scheduled task pointing at a deleted `rld.exe`.
     assert!(windows_install.contains("daemon install"));
     assert!(windows_uninstall.contains("daemon uninstall"));
+    // Windows can't overwrite a running executable image, so a re-install has
+    // to stop the daemon before `Copy-Item` reaches `rld.exe`.
+    assert!(
+        windows_install.find("daemon stop").unwrap() < windows_install.find("Copy-Item").unwrap(),
+        "the daemon must be stopped before its binary is overwritten"
+    );
     assert!(
         windows_uninstall.find("daemon uninstall").unwrap()
             < windows_uninstall.find("Remove-Item").unwrap(),

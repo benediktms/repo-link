@@ -37,6 +37,27 @@ pub(super) fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// As [`xml_escape`], but also folds non-ASCII characters into numeric
+/// character references. `schtasks /Create /XML` rejects a task definition
+/// whose bytes disagree with its declared encoding and wants ANSI or UTF-16 LE
+/// rather than the UTF-8 these manifests are written as, so the Windows
+/// manifest has to stay pure ASCII even when the path it embeds is not
+/// (`C:\Users\Jörg\.local\bin\rld.exe`).
+pub(super) fn xml_escape_ascii(s: &str) -> String {
+    use std::fmt::Write as _;
+
+    let escaped = xml_escape(s);
+    let mut out = String::with_capacity(escaped.len());
+    for c in escaped.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let _ = write!(out, "&#x{:X};", c as u32);
+        }
+    }
+    out
+}
+
 /// Manifest paths get handed to `launchctl` / `schtasks` as argv, which is
 /// `&str`-shaped — so a non-UTF-8 path has to fail loudly here rather than be
 /// lossily mangled into a path the platform tool can't find.

@@ -37,10 +37,16 @@ install:
     {{rl}} daemon install
 
 # Build, copy Windows executables into ~/.local/bin, and register the task.
+# The `daemon stop` must precede the copy: Windows refuses to overwrite a
+# running executable image, so a re-install over a live daemon would fail on
+# `Copy-Item` before `daemon install` ever ran. `|| true` has no PowerShell
+# equivalent here, so the call is guarded on the binary existing instead —
+# there is nothing to stop before the first install.
 [windows]
 install:
     cargo build --release
     New-Item -ItemType Directory -Force -ErrorAction Stop (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
+    $installed = Join-Path $env:USERPROFILE ".local\bin\rl.exe"; if (Test-Path -LiteralPath $installed) { & $installed daemon stop }
     $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
     Copy-Item -Force -ErrorAction Stop ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
     Copy-Item -Force -ErrorAction Stop ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")

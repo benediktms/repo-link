@@ -1,4 +1,9 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0"?>
+<!-- No encoding declaration, and every rendered byte stays ASCII (see
+     manifest::xml_escape_ascii): schtasks /Create /XML rejects task
+     definitions whose bytes disagree with the declared encoding, and it
+     expects ANSI or UTF-16 LE rather than the UTF-8 this file is written as.
+     ASCII-only content is byte-identical under all three. -->
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>repo-link reconciliation daemon</Description>
@@ -13,7 +18,7 @@
            exit and is capped. An endless repetition (no Duration) re-requests
            a start every 5 minutes, which MultipleInstancesPolicy=IgnoreNew
            turns into a no-op while the daemon is up and a relaunch once it
-           is not — so a clean exit is recovered too, within one interval. -->
+           is not, so a clean exit is recovered too within one interval. -->
       <Repetition>
         <Interval>PT5M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
