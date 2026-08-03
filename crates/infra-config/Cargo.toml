@@ -12,7 +12,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-permissions = { workspace = true }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

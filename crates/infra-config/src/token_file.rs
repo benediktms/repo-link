@@ -82,42 +82,13 @@ fn enforce_secure_permissions(
     _metadata: &std::fs::Metadata,
     path: &Path,
 ) -> Result<(), TokenFileError> {
-    use windows_permissions::constants::{SeObjectType, SecurityInformation};
-    use windows_permissions::utilities::current_process_sid;
-    use windows_permissions::wrappers::GetNamedSecurityInfo;
-
-    let me = current_process_sid().map_err(|e| acl_fault(path, e))?;
-    let descriptor = GetNamedSecurityInfo(
-        path,
-        SeObjectType::SE_FILE_OBJECT,
-        SecurityInformation::Dacl,
-    )
-    .map_err(|e| acl_fault(path, e))?;
-
-    // An absent DACL is not an empty one: Windows reads NULL as "grant everyone
-    // full control", the exact opposite of the empty-ACL deny-all.
-    let Some(dacl) = descriptor.dacl() else {
-        return Err(TokenFileError::InsecureAcl {
-            path: path.to_path_buf(),
-            principal: "everyone (no DACL is set)".to_string(),
-        });
-    };
-
-    for index in 0..dacl.len() {
-        let Some(ace) = dacl.get_ace(index) else {
-            continue;
-        };
-        let principal = match ace.sid() {
-            Some(sid) if *sid == *me => continue,
-            Some(sid) => sid.to_string(),
-            None => format!("an entry of type {:?} carrying no SID", ace.ace_type()),
-        };
-        return Err(TokenFileError::InsecureAcl {
+    match win::sole_foreign_principal(path)? {
+        Some(principal) => Err(TokenFileError::InsecureAcl {
             path: path.to_path_buf(),
             principal,
-        });
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Replace the file's DACL with a single entry granting the current user full
@@ -125,43 +96,288 @@ fn enforce_secure_permissions(
 /// Called after creating the file and before the token is written into it.
 #[cfg(windows)]
 pub fn restrict_token_file(path: &Path) -> Result<(), TokenFileError> {
-    use windows_permissions::constants::{SeObjectType, SecurityInformation};
-    use windows_permissions::utilities::current_process_sid;
-    use windows_permissions::wrappers::SetNamedSecurityInfo;
-    use windows_permissions::{LocalBox, SecurityDescriptor};
-
-    let me = current_process_sid().map_err(|e| acl_fault(path, e))?;
-    let descriptor: LocalBox<SecurityDescriptor> = format!("D:P(A;;FA;;;{me})")
-        .parse()
-        .map_err(|e| acl_fault(path, e))?;
-    let dacl = descriptor.dacl().ok_or_else(|| TokenFileError::Acl {
-        path: path.to_path_buf(),
-        message: "built a security descriptor with no DACL".to_string(),
-    })?;
-
-    SetNamedSecurityInfo(
+    let me = win::current_user_sid(path)?;
+    win::apply_dacl(
         path,
-        SeObjectType::SE_FILE_OBJECT,
-        SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
-        None,
-        None,
-        Some(dacl),
-        None,
+        &format!("D:P(A;;FA;;;{})", win::sid_string(path, &me)?),
     )
-    .map_err(|e| acl_fault(path, e))
-}
-
-#[cfg(windows)]
-fn acl_fault(path: &Path, e: impl std::fmt::Display) -> TokenFileError {
-    TokenFileError::Acl {
-        path: path.to_path_buf(),
-        message: format!("could not read or set the Windows security descriptor: {e}"),
-    }
 }
 
 #[cfg(not(windows))]
 pub fn restrict_token_file(_path: &Path) -> Result<(), TokenFileError> {
     Ok(())
+}
+
+/// The Win32 calls behind the two functions above. `windows-sys` is a raw
+/// binding crate, so every call here is `unsafe`; the module exists to keep
+/// that contained and to own the `LocalFree`/`CloseHandle` pairings, which
+/// are the only way these APIs hand memory back.
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorDacl, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    use crate::error::TokenFileError;
+
+    /// A `LocalAlloc`-owned pointer. Every Win32 call below that returns
+    /// memory returns it on the local heap, and leaks it if we forget.
+    struct LocalPtr(*mut c_void);
+
+    impl Drop for LocalPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0 as HLOCAL) };
+            }
+        }
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+
+    /// The process token's user SID, kept alive by the `TOKEN_USER` buffer it
+    /// points into. `u64` backing rather than `u8` so the buffer satisfies the
+    /// struct's pointer alignment.
+    pub(super) struct UserSid(Vec<u64>);
+
+    impl UserSid {
+        fn psid(&self) -> PSID {
+            unsafe { (*(self.0.as_ptr() as *const TOKEN_USER)).User.Sid }
+        }
+    }
+
+    fn fault(path: &Path, what: &str, e: std::io::Error) -> TokenFileError {
+        TokenFileError::Acl {
+            path: path.to_path_buf(),
+            message: format!("{what}: {e}"),
+        }
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    pub(super) fn current_user_sid(path: &Path) -> Result<UserSid, TokenFileError> {
+        let mut raw: HANDLE = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } == 0 {
+            return Err(fault(
+                path,
+                "OpenProcessToken",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let token = OwnedHandle(raw);
+
+        // First call sizes the buffer: it is expected to fail with
+        // ERROR_INSUFFICIENT_BUFFER while writing the length back.
+        let mut needed = 0u32;
+        unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(fault(
+                path,
+                "GetTokenInformation (sizing)",
+                std::io::Error::last_os_error(),
+            ));
+        }
+
+        let mut buf = vec![0u64; needed.div_ceil(8) as usize];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buf.as_mut_ptr() as *mut c_void,
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            return Err(fault(
+                path,
+                "GetTokenInformation",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(UserSid(buf))
+    }
+
+    pub(super) fn sid_string(path: &Path, sid: &UserSid) -> Result<String, TokenFileError> {
+        let mut raw: *mut u16 = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid.psid(), &mut raw) } == 0 {
+            return Err(fault(
+                path,
+                "ConvertSidToStringSidW",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let owned = LocalPtr(raw as *mut c_void);
+        let mut len = 0;
+        while unsafe { *raw.add(len) } != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+        drop(owned);
+        Ok(s)
+    }
+
+    /// Parse `sddl` and install its DACL on `path`, protected so inherited
+    /// ACEs cannot re-apply.
+    pub(super) fn apply_dacl(path: &Path, sddl: &str) -> Result<(), TokenFileError> {
+        let sddl_w: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut psd: PSECURITY_DESCRIPTOR = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl_w.as_ptr(),
+                SDDL_REVISION_1,
+                &mut psd,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(fault(
+                path,
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let _owned = LocalPtr(psd);
+
+        let mut present = 0i32;
+        let mut dacl: *mut ACL = null_mut();
+        let mut defaulted = 0i32;
+        if unsafe { GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted) } == 0 {
+            return Err(fault(
+                path,
+                "GetSecurityDescriptorDacl",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        if present == 0 || dacl.is_null() {
+            return Err(TokenFileError::Acl {
+                path: path.to_path_buf(),
+                message: "built a security descriptor with no DACL".to_string(),
+            });
+        }
+
+        let mut name = wide(path);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                name.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        if status != 0 {
+            return Err(fault(
+                path,
+                "SetNamedSecurityInfoW",
+                std::io::Error::from_raw_os_error(status as i32),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Name the first principal in the file's DACL that is not the current
+    /// user, or `None` when every entry is. An unreadable ACE type counts as
+    /// foreign: object ACEs put the SID at a different offset, so refusing to
+    /// interpret one is safer than reading the wrong bytes as a SID.
+    pub(super) fn sole_foreign_principal(path: &Path) -> Result<Option<String>, TokenFileError> {
+        let me = current_user_sid(path)?;
+
+        let name = wide(path);
+        let mut dacl: *mut ACL = null_mut();
+        let mut psd: PSECURITY_DESCRIPTOR = null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut psd,
+            )
+        };
+        if status != 0 {
+            return Err(fault(
+                path,
+                "GetNamedSecurityInfoW",
+                std::io::Error::from_raw_os_error(status as i32),
+            ));
+        }
+        let _owned = LocalPtr(psd);
+
+        // A NULL DACL is not an empty one: Windows reads it as "grant everyone
+        // full control", the exact opposite of the empty-ACL deny-all.
+        if dacl.is_null() {
+            return Ok(Some("everyone (no DACL is set)".to_string()));
+        }
+
+        for index in 0..unsafe { (*dacl).AceCount } as u32 {
+            let mut ace: *mut c_void = null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+                return Err(fault(path, "GetAce", std::io::Error::last_os_error()));
+            }
+            let ace_type = unsafe { (*(ace as *const ACE_HEADER)).AceType } as u32;
+            if ace_type != ACCESS_ALLOWED_ACE_TYPE && ace_type != ACCESS_DENIED_ACE_TYPE {
+                return Ok(Some(format!("an access-control entry of type {ace_type}")));
+            }
+            // ACCESS_ALLOWED_ACE and ACCESS_DENIED_ACE share a layout, with the
+            // SID beginning at `SidStart` and running past it.
+            let sid = unsafe { std::ptr::addr_of!((*(ace as *const ACCESS_ALLOWED_ACE)).SidStart) }
+                as PSID;
+            if unsafe { EqualSid(sid, me.psid()) } == 0 {
+                return Ok(Some(sid_string_raw(path, sid)?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn sid_string_raw(path: &Path, sid: PSID) -> Result<String, TokenFileError> {
+        let mut raw: *mut u16 = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 {
+            return Err(fault(
+                path,
+                "ConvertSidToStringSidW",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let owned = LocalPtr(raw as *mut c_void);
+        let mut len = 0;
+        while unsafe { *raw.add(len) } != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(raw, len) });
+        drop(owned);
+        Ok(s)
+    }
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -249,28 +465,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn read_token_file_rejects_a_dacl_naming_any_other_principal() {
-        use windows_permissions::constants::{SeObjectType, SecurityInformation};
-        use windows_permissions::utilities::current_process_sid;
-        use windows_permissions::wrappers::SetNamedSecurityInfo;
-        use windows_permissions::{LocalBox, SecurityDescriptor};
-
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("github_token");
         std::fs::write(&path, "abc123").unwrap();
 
-        let me = current_process_sid().unwrap();
-        let loosened: LocalBox<SecurityDescriptor> =
-            format!("D:P(A;;FA;;;{me})(A;;FR;;;WD)").parse().unwrap();
-        SetNamedSecurityInfo(
-            &path,
-            SeObjectType::SE_FILE_OBJECT,
-            SecurityInformation::Dacl | SecurityInformation::ProtectedDacl,
-            None,
-            None,
-            loosened.dacl(),
-            None,
-        )
-        .unwrap();
+        let me = win::current_user_sid(&path).unwrap();
+        let sid = win::sid_string(&path, &me).unwrap();
+        win::apply_dacl(&path, &format!("D:P(A;;FA;;;{sid})(A;;FR;;;WD)")).unwrap();
 
         match read_token_file_contents(&path).unwrap_err() {
             TokenFileError::InsecureAcl { principal, .. } => {
@@ -278,6 +479,22 @@ mod tests {
             }
             other => panic!("expected InsecureAcl, got {other:?}"),
         }
+    }
+
+    /// The SID round-trips through the string form used to build the SDDL —
+    /// a wrong length or a missing NUL walk in `sid_string` would corrupt the
+    /// DACL that `restrict_token_file` installs.
+    #[cfg(windows)]
+    #[test]
+    fn current_user_sid_renders_as_a_well_formed_sid_string() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("github_token");
+        std::fs::write(&path, "abc123").unwrap();
+
+        let me = win::current_user_sid(&path).unwrap();
+        let sid = win::sid_string(&path, &me).unwrap();
+        assert!(sid.starts_with("S-1-"), "unexpected SID form: {sid}");
+        assert!(!sid.contains('\0'), "SID string kept its terminator: {sid}");
     }
 
     #[cfg(unix)]
