@@ -1350,6 +1350,98 @@ fn gh_auth_writes_secure_file_and_blocks_sync_when_loosened() {
     );
 }
 
+/// Windows sibling of the above. Loosening goes through `icacls` rather than
+/// the ACL crate so the test binary needs no Windows dependency of its own.
+#[test]
+#[cfg(windows)]
+fn gh_auth_writes_owner_only_file_and_blocks_sync_when_loosened() {
+    let dir = TempDir::new().unwrap();
+    let token_file = dir.path().join("github_token");
+
+    let mut cmd = bin("rl", &dir);
+    cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    cmd.env_remove("GITHUB_TOKEN");
+    cmd.env("REPO_LINK_GITHUB_API_BASE_URL", "http://127.0.0.1:1");
+    let result = run_json(&mut cmd, &["gh", "auth", "--token", "abc123"]);
+    let canonical_token_file =
+        dunce::canonicalize(&token_file).unwrap_or_else(|_| token_file.clone());
+    assert_eq!(result["file"], canonical_token_file.display().to_string());
+    assert_eq!(result["mode"], "owner-only");
+    assert_eq!(
+        std::fs::read_to_string(&token_file).unwrap().trim(),
+        "abc123"
+    );
+
+    // The freshly written file must be readable — proof the DACL rl applied
+    // satisfies the check rl enforces.
+    let mut ok_cmd = bin("rl", &dir);
+    ok_cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    ok_cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    ok_cmd.env_remove("GITHUB_TOKEN");
+    let ok_stderr = String::from_utf8(
+        ok_cmd
+            .args([
+                "sync",
+                "push",
+                "--task",
+                "00000000-0000-0000-0000-000000000000",
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        !ok_stderr.contains("grants access to"),
+        "owner-only file must pass the ACL check; got: {ok_stderr}"
+    );
+
+    let granted = std::process::Command::new("icacls")
+        .args([
+            token_file.to_str().unwrap(),
+            "/grant",
+            "*S-1-1-0:(R)", // Everyone, by SID so the name isn't localised
+        ])
+        .output()
+        .expect("icacls should be on PATH");
+    assert!(
+        granted.status.success(),
+        "icacls /grant failed: {}",
+        String::from_utf8_lossy(&granted.stderr)
+    );
+
+    let mut sync_cmd = bin("rl", &dir);
+    sync_cmd.env("REPO_LINK_GITHUB_TOKEN_FILE", &token_file);
+    sync_cmd.env_remove("REPO_LINK_GITHUB_TOKEN");
+    sync_cmd.env_remove("GITHUB_TOKEN");
+    let stderr = String::from_utf8(
+        sync_cmd
+            .args([
+                "sync",
+                "push",
+                "--task",
+                "00000000-0000-0000-0000-000000000000",
+            ])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stderr.contains("grants access to"),
+        "expected insecure-ACL error; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("S-1-1-0"),
+        "expected the offending principal in the error; got: {stderr}"
+    );
+}
+
 // `sync import` validates the URL and resolves the repo binding *before* any
 // network call, so these paths are testable with a dummy token and no mock.
 

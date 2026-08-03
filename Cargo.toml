@@ -88,3 +88,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2"
 dunce = "1"
+windows-permissions = "0.2"

@@ -80,7 +80,9 @@ async fn gh_auth(token: Option<String>, force: bool, cfg: &RepoLinkConfig) -> Re
 
     #[cfg(unix)]
     let mode_value = "0600";
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let mode_value = "owner-only";
+    #[cfg(all(not(unix), not(windows)))]
     let mode_value = "unrestricted";
 
     let mut payload = serde_json::json!({ "file": path_str, "mode": mode_value });
@@ -167,6 +169,14 @@ fn write_token_file(path: &std::path::Path, token: &str, login: Option<&str>) ->
     {
         std::fs::create_dir_all(parent).map_err(|e| anyhow!("failed to create config dir: {e}"))?;
     }
+
+    // Create empty, tighten, then write. A file created under `%APPDATA%`
+    // inherits ACEs for SYSTEM and Administrators, so writing the token first
+    // would expose it for the window before the DACL is replaced. `create`
+    // also truncates, so a previous token is gone before the loosened handle
+    // is dropped.
+    drop(std::fs::File::create(path).map_err(|e| anyhow!("failed to create token file: {e}"))?);
+    infra_config::restrict_token_file(path)?;
     std::fs::write(path, render_token_file_body(token, login))
         .map_err(|e| anyhow!("failed to write token file: {e}"))?;
     Ok(())

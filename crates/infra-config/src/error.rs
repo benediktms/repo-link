@@ -16,7 +16,11 @@ pub enum ConfigError {
 ///
 /// `InsecurePermissions` mirrors OpenSSH's private-key check: any group or
 /// world bit set means we refuse to read the file rather than silently use
-/// a token that's exposed via `ls -la` or backups.
+/// a token that's exposed via `ls -la` or backups. `InsecureAcl` is the
+/// Windows counterpart — any principal in the file's DACL other than the
+/// current user, including the SYSTEM and Administrators entries a file
+/// inherits from `%APPDATA%`. `Acl` reports the DACL query itself failing,
+/// which is an operational fault rather than a verdict about the file.
 ///
 /// Notably absent: there's no `NotFound` or `InvalidToken` variant.
 /// - **Missing file** is not an error — the file is one entry in a fallback
@@ -42,4 +46,12 @@ pub enum TokenFileError {
         p = path.display()
     )]
     InsecurePermissions { path: PathBuf, mode: u32 },
+    #[error(
+        "token file {p} grants access to {principal}, not just your account.\n\
+         Restrict it by re-running: rl gh auth",
+        p = path.display()
+    )]
+    InsecureAcl { path: PathBuf, principal: String },
+    #[error("token file {p}: {message}", p = path.display())]
+    Acl { path: PathBuf, message: String },
 }

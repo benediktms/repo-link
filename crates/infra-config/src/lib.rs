@@ -20,4 +20,4 @@ pub use paths::{
     DAEMON_LABEL, default_daemon_log_path, default_db_path, default_last_tick_path,
     default_launch_agent_path, default_systemd_unit_path, default_token_file_path,
 };
-pub use token_file::TokenFileContents;
+pub use token_file::{TokenFileContents, restrict_token_file};
