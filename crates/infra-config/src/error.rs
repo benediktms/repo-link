@@ -52,6 +52,12 @@ pub enum TokenFileError {
         p = path.display()
     )]
     InsecureAcl { path: PathBuf, principal: String },
+    #[error(
+        "token file {p} is owned by {owner}, not by you — its owner can rewrite \
+         the permissions at will.\nDelete it and re-run: rl gh auth",
+        p = path.display()
+    )]
+    ForeignOwner { path: PathBuf, owner: String },
     #[error("token file {p}: {message}", p = path.display())]
     Acl { path: PathBuf, message: String },
 }
