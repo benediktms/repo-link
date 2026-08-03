@@ -40,13 +40,15 @@ install:
 # The `daemon stop` must precede the copy: Windows refuses to overwrite a
 # running executable image, so a re-install over a live daemon would fail on
 # `Copy-Item` before `daemon install` ever ran. `|| true` has no PowerShell
-# equivalent here, so the call is guarded on the binary existing instead —
-# there is nothing to stop before the first install.
+# equivalent here, so the call is guarded on the installed `rld.exe` existing
+# instead — that is the image the task runs and the one the copy overwrites,
+# and there is nothing to stop before the first install. The stop is issued
+# through the freshly built `rl.exe`, which the `cargo build` above guarantees.
 [windows]
 install:
     cargo build --release
     New-Item -ItemType Directory -Force -ErrorAction Stop (Join-Path $env:USERPROFILE ".local\bin") | Out-Null
-    $installed = Join-Path $env:USERPROFILE ".local\bin\rl.exe"; if (Test-Path -LiteralPath $installed) { & $installed daemon stop }
+    $installed = Join-Path $env:USERPROFILE ".local\bin\rld.exe"; if (Test-Path -LiteralPath $installed) { .\target\release\rl.exe daemon stop }
     $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
     Copy-Item -Force -ErrorAction Stop ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
     Copy-Item -Force -ErrorAction Stop ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")

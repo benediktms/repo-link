@@ -36,9 +36,11 @@ pub(super) fn install(
     launcher: &dyn Launcher,
     binary_path: PathBuf,
     manifest_path: PathBuf,
-    log_path: PathBuf,
+    _log_path: PathBuf,
 ) -> Result<InstallOutcome> {
-    let desired = render_task_xml(&binary_path, &log_path, &current_user()?);
+    // The task execs rld directly, which writes its own rotated JSON log, so
+    // the _log_path arg is accepted for signature parity with macOS but unused.
+    let desired = render_task_xml(&binary_path, &current_user()?);
     let manifest_changed = write_if_changed(&manifest_path, &desired)?;
     let manifest_str = path_to_string(&manifest_path)?;
 
@@ -248,16 +250,12 @@ fn parse_schtasks_status(stdout: &str) -> Option<&str> {
 /// launches is indistinguishable from a healthy one.
 const RUNNING: &str = "Running";
 
-fn render_task_xml(binary_path: &Path, log_path: &Path, user_id: &str) -> String {
+fn render_task_xml(binary_path: &Path, user_id: &str) -> String {
     TEMPLATE
         .replace("{{LABEL}}", DAEMON_LABEL)
         .replace(
             "{{BINARY_PATH}}",
             &xml_escape_ascii(&binary_path.to_string_lossy()),
-        )
-        .replace(
-            "{{LOG_PATH}}",
-            &xml_escape_ascii(&log_path.to_string_lossy()),
         )
         .replace("{{USER_ID}}", &xml_escape_ascii(user_id))
 }
@@ -332,12 +330,10 @@ Logon Mode:                           Interactive only
     fn render_task_xml_substitutes_all_placeholders() {
         let rendered = render_task_xml(
             std::path::Path::new(r"C:\Users\dev\.local\bin\rld.exe"),
-            std::path::Path::new(r"C:\Users\dev\AppData\repo-link\daemon.log"),
             r"DESKTOP-1\dev",
         );
-        assert!(rendered.contains(
-            r#"/D /C ""C:\Users\dev\.local\bin\rld.exe" --log-format=json &gt;&gt; "C:\Users\dev\AppData\repo-link\daemon.log" 2&gt;&amp;1"#
-        ));
+        assert!(rendered.contains(r"<Command>C:\Users\dev\.local\bin\rld.exe</Command>"));
+        assert!(rendered.contains("<Arguments>--log-format=json</Arguments>"));
         assert!(rendered.contains(r"<UserId>DESKTOP-1\dev</UserId>"));
         assert!(rendered.contains("<URI>\\com.benediktms.repo-link</URI>"));
         assert!(!rendered.contains("{{"));
@@ -345,14 +341,24 @@ Logon Mode:                           Interactive only
 
     #[test]
     fn render_task_xml_escapes_markup_in_substituted_values() {
-        let rendered = render_task_xml(
-            std::path::Path::new(r"C:\R&D\rld.exe"),
-            std::path::Path::new(r"C:\R&D\daemon.log"),
-            r"R&D\dev",
-        );
+        let rendered = render_task_xml(std::path::Path::new(r"C:\R&D\rld.exe"), r"R&D\dev");
         assert!(rendered.contains(r"C:\R&amp;D\rld.exe"));
-        assert!(rendered.contains(r"C:\R&amp;D\daemon.log"));
         assert!(rendered.contains(r"<UserId>R&amp;D\dev</UserId>"));
+    }
+
+    /// `<Command>` reaches CreateProcess without a shell, so a path holding a
+    /// space, a `%` pair that names a real variable, or a cmd metacharacter
+    /// must land in the XML byte-for-byte (bar XML escaping).
+    #[test]
+    fn render_task_xml_keeps_shell_metacharacters_literal() {
+        let rendered = render_task_xml(
+            std::path::Path::new(r"C:\Program Files\100%USERNAME%^&\rld.exe"),
+            r"DESKTOP-1\dev",
+        );
+        assert!(
+            rendered.contains(r"<Command>C:\Program Files\100%USERNAME%^&amp;\rld.exe</Command>"),
+            "metacharacters were altered: {rendered}"
+        );
     }
 
     /// `schtasks /Create /XML` rejects a definition whose bytes disagree with
@@ -362,7 +368,6 @@ Logon Mode:                           Interactive only
     fn render_task_xml_is_ascii_only_even_for_a_non_ascii_path() {
         let rendered = render_task_xml(
             std::path::Path::new(r"C:\Users\Jörg\.local\bin\rld.exe"),
-            std::path::Path::new(r"C:\Users\Jörg\daemon.log"),
             r"DESKTOP-1\Jörg",
         );
         assert!(

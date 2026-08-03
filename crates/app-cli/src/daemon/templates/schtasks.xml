@@ -59,12 +59,14 @@
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <!-- Task Scheduler discards a task's stdout/stderr, so the shell
-           wrapper is the only way to keep the pre-tracing catch-all that
-           launchd's StandardOutPath and systemd's journald provide. cmd /C
-           strips the outermost quote pair, hence the doubled quoting. -->
-      <Command>cmd.exe</Command>
-      <Arguments>/D /C ""{{BINARY_PATH}}" --log-format=json &gt;&gt; "{{LOG_PATH}}" 2&gt;&amp;1"</Arguments>
+      <!-- No cmd.exe wrapper: Task Scheduler hands Command and Arguments to
+           CreateProcess verbatim, so a path holding a space, a percent sign
+           or an ampersand stays literal. The trade is that Task Scheduler
+           discards stdout/stderr, so there is no pre-tracing panic catcher
+           here; `--log-format=json` makes rld write its own rotated file,
+           the same arrangement as under systemd. -->
+      <Command>{{BINARY_PATH}}</Command>
+      <Arguments>--log-format=json</Arguments>
     </Exec>
   </Actions>
 </Task>
