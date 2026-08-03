@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{InstallOutcome, StartStopOutcome, StatusOutcome, UninstallOutcome};
-use crate::daemon::launcher::{LaunchOutcome, Launcher};
-use crate::daemon::manifest::write_if_changed;
+use crate::daemon::launcher::{LaunchOutcome, Launcher, require_success};
+use crate::daemon::manifest::{path_to_string, write_if_changed, xml_escape};
 
 pub(super) const PLATFORM: &str = "macos";
 
@@ -213,14 +213,11 @@ pub(super) fn stop(launcher: &dyn Launcher) -> Result<StartStopOutcome> {
 fn render_plist(binary_path: &Path, log_path: &Path) -> String {
     TEMPLATE
         .replace("{{LABEL}}", DAEMON_LABEL)
-        .replace("{{BINARY_PATH}}", &binary_path.to_string_lossy())
-        .replace("{{LOG_PATH}}", &log_path.to_string_lossy())
-}
-
-fn path_to_string(p: &Path) -> Result<String> {
-    p.to_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow!("path is not valid UTF-8: {p:?}"))
+        .replace(
+            "{{BINARY_PATH}}",
+            &xml_escape(&binary_path.to_string_lossy()),
+        )
+        .replace("{{LOG_PATH}}", &xml_escape(&log_path.to_string_lossy()))
 }
 
 fn current_uid() -> Result<u32> {
@@ -236,18 +233,6 @@ fn current_uid() -> Result<u32> {
     s.trim()
         .parse::<u32>()
         .map_err(|e| anyhow!("uid parse: {e}"))
-}
-
-fn require_success(action: &str, outcome: &LaunchOutcome) -> Result<()> {
-    match outcome {
-        LaunchOutcome::Success { .. } => Ok(()),
-        LaunchOutcome::NotFound => Err(anyhow!(
-            "{action}: launchd reported the unit is not registered"
-        )),
-        LaunchOutcome::Failed { code, stderr } => {
-            Err(anyhow!("{action} failed (exit {code}): {stderr}"))
-        }
-    }
 }
 
 #[cfg(test)]

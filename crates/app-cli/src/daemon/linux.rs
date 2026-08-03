@@ -13,7 +13,7 @@ use infra_config::default_systemd_unit_path;
 use std::path::{Path, PathBuf};
 
 use super::{InstallOutcome, StartStopOutcome, StatusOutcome, UninstallOutcome};
-use crate::daemon::launcher::{LaunchOutcome, Launcher};
+use crate::daemon::launcher::{LaunchOutcome, Launcher, require_success};
 use crate::daemon::manifest::write_if_changed;
 
 pub(super) const PLATFORM: &str = "linux";
@@ -166,18 +166,6 @@ pub(super) fn stop(launcher: &dyn Launcher) -> Result<StartStopOutcome> {
 
 fn render_unit(binary_path: &Path) -> String {
     TEMPLATE.replace("{{BINARY_PATH}}", &binary_path.to_string_lossy())
-}
-
-fn require_success(action: &str, outcome: &LaunchOutcome) -> Result<()> {
-    match outcome {
-        LaunchOutcome::Success { .. } => Ok(()),
-        LaunchOutcome::NotFound => Err(anyhow!(
-            "{action}: systemd reported the unit is not registered"
-        )),
-        LaunchOutcome::Failed { code, stderr } => {
-            Err(anyhow!("{action} failed (exit {code}): {stderr}"))
-        }
-    }
 }
 
 #[cfg(test)]
