@@ -535,7 +535,9 @@ mod tests {
     }
 
     /// A deny ACE hands out no access, so it must not be reported as a
-    /// principal the token is exposed to.
+    /// principal the token is exposed to. Denies `AN` (anonymous logon)
+    /// rather than `WD` (everyone), which would include the test's own
+    /// account and lock it out of its own file.
     #[cfg(windows)]
     #[test]
     fn read_token_file_ignores_a_deny_ace_for_another_principal() {
@@ -545,7 +547,7 @@ mod tests {
 
         let me = win::current_user_sid(&path).unwrap();
         let sid = win::sid_string(&path, me.psid()).unwrap();
-        win::apply_security(&path, &format!("O:{sid}D:P(D;;FA;;;WD)(A;;FA;;;{sid})")).unwrap();
+        win::apply_security(&path, &format!("O:{sid}D:P(D;;FA;;;AN)(A;;FA;;;{sid})")).unwrap();
 
         let c = read_token_file_contents(&path).unwrap();
         assert_eq!(c.token.as_deref(), Some("abc123"));
