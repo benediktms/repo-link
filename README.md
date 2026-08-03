@@ -23,11 +23,12 @@ cd repo-link
 just install
 ```
 
-On macOS and Linux, `just install` builds the release binaries, symlinks `rl`
-and `rld` into `~/.local/bin/`, and registers the daemon. On Windows, it copies
-`rl.exe` and `rld.exe` into the same directory; daemon registration is not
-currently supported. Make sure `~/.local/bin` is on your `PATH`. From that
-point on, use the bare `rl` command anywhere — it's cwd-independent.
+`just install` builds the release binaries, puts `rl` and `rld` into
+`~/.local/bin/`, and registers the daemon — as a launchd agent on macOS, a
+`systemd --user` unit on Linux, and a Task Scheduler task on Windows (where the
+binaries are copied rather than symlinked). Make sure `~/.local/bin` is on your
+`PATH`. From that point on, use the bare `rl` command anywhere — it's
+cwd-independent.
 
 To uninstall: `just uninstall`.
 

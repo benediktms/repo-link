@@ -36,7 +36,7 @@ install:
     ln -sf "$(pwd)/target/release/rld" ~/.local/bin/rld
     {{rl}} daemon install
 
-# Build and copy Windows executables into ~/.local/bin.
+# Build, copy Windows executables into ~/.local/bin, and register the task.
 [windows]
 install:
     cargo build --release
@@ -44,6 +44,7 @@ install:
     $legacy = @((Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $legacy | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
     Copy-Item -Force -ErrorAction Stop ".\target\release\rl.exe" (Join-Path $env:USERPROFILE ".local\bin\rl.exe")
     Copy-Item -Force -ErrorAction Stop ".\target\release\rld.exe" (Join-Path $env:USERPROFILE ".local\bin\rld.exe")
+    .\target\release\rl.exe daemon install
 
 # uninstall — `rl daemon uninstall` itself reports `manifest_existed: false`
 # on a clean checkout and exits 0, but `{{rl}}` points at the freshly-built
@@ -60,9 +61,13 @@ uninstall:
     else echo "rl not built and not on PATH; skipping daemon uninstall"; fi
     rm -f ~/.local/bin/rl ~/.local/bin/rld
 
-# Remove Windows executables and legacy extensionless installs.
+# Unregister the task, then remove Windows executables and legacy
+# extensionless installs. The daemon step must precede the deletions: it
+# terminates the running `rld.exe`, which would otherwise hold a lock on its
+# own file.
 [windows]
 uninstall:
+    $rl = @(".\target\release\rl.exe", (Join-Path $env:USERPROFILE ".local\bin\rl.exe")) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1; if ($rl) { & $rl daemon uninstall } else { Write-Host "rl not built and not installed; skipping daemon uninstall" }
     $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
 
 # daemon-restart — `stop` can legitimately fail when the unit was never

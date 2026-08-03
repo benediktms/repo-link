@@ -1,8 +1,9 @@
 //! `rl daemon` — manage the platform unit that keeps `rld` running across
 //! reboots, inspect its status, and read its logs. One source of truth per
-//! platform lives in [`macos`] / [`linux`]; the dispatcher in [`dispatch`]
-//! picks via `cfg!(target_os = "macos")`. Both modules compile on every
-//! platform so a Linux CI run still type-checks the macOS path.
+//! platform lives in [`macos`] / [`linux`] / [`windows`]; the dispatcher in
+//! [`dispatch`] picks via `cfg!(target_os = "macos")`. All three modules
+//! compile on every platform so a Linux CI run still type-checks the macOS
+//! path.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -18,6 +19,7 @@ mod launcher;
 mod linux;
 mod macos;
 mod manifest;
+mod windows;
 
 use launcher::current_launcher;
 
@@ -103,6 +105,8 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
                 macos::install(launcher.as_ref(), bin, log_path)?
             } else if cfg!(target_os = "linux") {
                 linux::install(launcher.as_ref(), bin, log_path)?
+            } else if cfg!(target_os = "windows") {
+                windows::install(launcher.as_ref(), bin, scheduled_task_path(cfg)?, log_path)?
             } else {
                 return Err(unsupported_platform());
             };
@@ -113,6 +117,8 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
                 macos::uninstall(launcher.as_ref())?
             } else if cfg!(target_os = "linux") {
                 linux::uninstall(launcher.as_ref())?
+            } else if cfg!(target_os = "windows") {
+                windows::uninstall(launcher.as_ref(), scheduled_task_path(cfg)?)?
             } else {
                 return Err(unsupported_platform());
             };
@@ -125,6 +131,8 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
                 macos::status(launcher.as_ref(), last_tick, log_path)?
             } else if cfg!(target_os = "linux") {
                 linux::status(launcher.as_ref(), last_tick, log_path)?
+            } else if cfg!(target_os = "windows") {
+                windows::status(launcher.as_ref(), last_tick, log_path)?
             } else {
                 return Err(unsupported_platform());
             };
@@ -135,6 +143,8 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
                 macos::start(launcher.as_ref())?
             } else if cfg!(target_os = "linux") {
                 linux::start(launcher.as_ref())?
+            } else if cfg!(target_os = "windows") {
+                windows::start(launcher.as_ref())?
             } else {
                 return Err(unsupported_platform());
             };
@@ -145,6 +155,8 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
                 macos::stop(launcher.as_ref())?
             } else if cfg!(target_os = "linux") {
                 linux::stop(launcher.as_ref())?
+            } else if cfg!(target_os = "windows") {
+                windows::stop(launcher.as_ref())?
             } else {
                 return Err(unsupported_platform());
             };
@@ -320,23 +332,36 @@ fn same_file(left: &Metadata, right: &Metadata) -> bool {
 /// `systemctl`/`launchctl` and exploding with a confusing "command not
 /// found" further down the stack.
 fn unsupported_platform() -> anyhow::Error {
-    anyhow::anyhow!("rl daemon is only supported on macOS (launchd) and Linux (systemd --user)")
+    anyhow::anyhow!(
+        "rl daemon is only supported on macOS (launchd), Linux (systemd --user), and Windows (Task Scheduler)"
+    )
+}
+
+/// Staging path for the Windows Task Scheduler XML. Windows has no
+/// per-user convention for these — Task Scheduler keeps its own copy under
+/// `%WINDIR%\System32\Tasks` once registered — so this lives with the rest of
+/// the daemon's state next to the SQLite db, and follows `--db`/`REPO_LINK_DB`
+/// like the log and heartbeat paths do.
+fn scheduled_task_path(cfg: &RepoLinkConfig) -> Result<PathBuf> {
+    Ok(db_parent(cfg)?.join("repo-link.task.xml"))
 }
 
 /// Absolute path to the `rld` binary the unit will launch. `just install`
-/// is the canonical install method, which symlinks `~/.local/bin/rld` to
-/// `target/release/rld` — so that's the single supported lookup. Tests set
-/// `REPO_LINK_RLD_PATH` to point at a tempdir without touching `$HOME`.
+/// is the canonical install method, which puts `rld` in `~/.local/bin`
+/// (symlinked on unix, copied as `rld.exe` on Windows) — so that's the
+/// single supported lookup. Tests set `REPO_LINK_RLD_PATH` to point at a
+/// tempdir without touching `$HOME`.
 fn installed_rld_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("REPO_LINK_RLD_PATH") {
         return Ok(PathBuf::from(p));
     }
-    let canonical = home_dir()?.join(".local").join("bin").join("rld");
+    let file_name = if cfg!(windows) { "rld.exe" } else { "rld" };
+    let canonical = home_dir()?.join(".local").join("bin").join(file_name);
     if canonical.exists() {
         return Ok(canonical);
     }
     Err(anyhow::anyhow!(
-        "`rld` not found at ~/.local/bin/rld; run `just install` first"
+        "`rld` not found at ~/.local/bin/{file_name}; run `just install` first"
     ))
 }
 

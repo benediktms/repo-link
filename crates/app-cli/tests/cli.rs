@@ -1045,7 +1045,15 @@ fn install_recipes_keep_platform_binary_names() {
         assert!(windows_uninstall.contains(&format!(".local\\bin\\{name}.exe")));
         assert!(windows_uninstall.contains(&format!(".local\\bin\\{name}\"")));
     }
-    assert!(!windows_install.contains("daemon install"));
+    // Both platforms register and unregister the daemon, so `just uninstall`
+    // never strands a scheduled task pointing at a deleted `rld.exe`.
+    assert!(windows_install.contains("daemon install"));
+    assert!(windows_uninstall.contains("daemon uninstall"));
+    assert!(
+        windows_uninstall.find("daemon uninstall").unwrap()
+            < windows_uninstall.find("Remove-Item").unwrap(),
+        "the daemon must be stopped before its binary is deleted"
+    );
 }
 
 #[test]
@@ -2224,12 +2232,13 @@ fn daemon_bin(env: &DaemonEnv, launcher_mode: &str) -> Command {
     // is deterministic regardless of host XDG settings (and so a macOS host
     // running the test still has a sensible XDG resolution).
     cmd.env("XDG_CONFIG_HOME", env.home.path().join(".config"));
+    // The Windows backend names the account the scheduled task runs as;
+    // pinning these keeps the rendered principal deterministic.
+    cmd.env("USERDOMAIN", "TEST-HOST");
+    cmd.env("USERNAME", "test-user");
     cmd
 }
 
-// `rl daemon install/status/uninstall` only support launchd and systemd --user,
-// so on Windows they exit non-zero by design. Only `daemon logs` is portable.
-#[cfg(unix)]
 fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
     if cfg!(target_os = "macos") {
         env.home
@@ -2237,6 +2246,10 @@ fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
             .join("Library")
             .join("LaunchAgents")
             .join("com.benediktms.repo-link.plist")
+    } else if cfg!(target_os = "windows") {
+        // The task XML lives with the daemon's state next to the db, which
+        // REPO_LINK_DB already redirects into the tempdir.
+        env.db_dir.path().join("repo-link.task.xml")
     } else {
         env.home
             .path()
@@ -2248,7 +2261,6 @@ fn expected_manifest_path(env: &DaemonEnv) -> std::path::PathBuf {
 }
 
 #[test]
-#[cfg(unix)]
 fn daemon_install_writes_manifest_with_correct_paths() {
     let env = daemon_env();
     let outcome = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
@@ -2275,7 +2287,6 @@ fn daemon_install_writes_manifest_with_correct_paths() {
 }
 
 #[test]
-#[cfg(unix)]
 fn daemon_install_is_idempotent() {
     let env = daemon_env();
 
@@ -2328,8 +2339,73 @@ fn daemon_install_enables_before_bootstrap() {
     );
 }
 
+/// `install` registers the task and then starts it only when it isn't
+/// already up: `MultipleInstancesPolicy=IgnoreNew` makes a `/Run` against a
+/// live task an error, so an unguarded start would fail every re-install on a
+/// machine where the daemon is healthy. The fake launcher reports `Running`,
+/// so this asserts the guard suppresses `/Run`.
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "windows")]
+fn daemon_install_registers_the_task_and_skips_running_a_live_one() {
+    let env = daemon_env();
+    let outcome = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+    assert_eq!(outcome["loaded"], true);
+
+    let log = std::fs::read_to_string(&env.launcher_log).unwrap();
+    let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    let create_idx = lines
+        .iter()
+        .position(|l| l.contains("\"/Create\""))
+        .expect("install issues schtasks /Create");
+    let query_idx = lines
+        .iter()
+        .position(|l| l.contains("\"/Query\""))
+        .expect("install probes the run state before starting");
+    assert!(
+        create_idx < query_idx,
+        "the task must exist before its run state is probed; log:\n{log}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("\"/Run\"")),
+        "an already-running task must not be started again; log:\n{log}"
+    );
+
+    let manifest = std::fs::read_to_string(expected_manifest_path(&env)).unwrap();
+    assert!(
+        manifest.contains(r"<UserId>TEST-HOST\test-user</UserId>"),
+        "task XML should name the account it runs as: {manifest}"
+    );
+}
+
+/// `uninstall` must terminate the running instance before unregistering it —
+/// `/Delete` alone leaves `rld.exe` holding the SQLite db open, and the
+/// Windows `just uninstall` recipe then fails to delete the locked binary.
+#[test]
+#[cfg(target_os = "windows")]
+fn daemon_uninstall_ends_the_task_before_deleting_it() {
+    let env = daemon_env();
+    run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
+    std::fs::write(&env.launcher_log, "").unwrap();
+
+    run_json(&mut daemon_bin(&env, "fake"), &["daemon", "uninstall"]);
+
+    let log = std::fs::read_to_string(&env.launcher_log).unwrap();
+    let lines: Vec<&str> = log.lines().filter(|l| !l.is_empty()).collect();
+    let end_idx = lines
+        .iter()
+        .position(|l| l.contains("\"/End\""))
+        .expect("uninstall issues schtasks /End");
+    let delete_idx = lines
+        .iter()
+        .position(|l| l.contains("\"/Delete\""))
+        .expect("uninstall issues schtasks /Delete");
+    assert!(
+        end_idx < delete_idx,
+        "the daemon must be terminated before the task is unregistered; log:\n{log}"
+    );
+}
+
+#[test]
 fn daemon_install_then_status_is_loaded_no_tick() {
     let env = daemon_env();
     let _ = run_json(&mut daemon_bin(&env, "fake"), &["daemon", "install"]);
@@ -2345,7 +2421,6 @@ fn daemon_install_then_status_is_loaded_no_tick() {
 }
 
 #[test]
-#[cfg(unix)]
 fn daemon_status_reads_last_tick_when_present() {
     let env = daemon_env();
     let last_tick = serde_json::json!({
@@ -2374,7 +2449,6 @@ fn daemon_status_reads_last_tick_when_present() {
 }
 
 #[test]
-#[cfg(unix)]
 fn daemon_status_flags_wedged_when_stale() {
     let env = daemon_env();
     let stale = chrono::Utc::now() - chrono::Duration::seconds(3600);
@@ -2520,7 +2594,6 @@ fn daemon_logs_follow_handles_rotation_truncation_and_ctrl_c() {
 }
 
 #[test]
-#[cfg(unix)]
 fn daemon_uninstall_is_idempotent() {
     let env = daemon_env();
 

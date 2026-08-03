@@ -1,6 +1,6 @@
-//! Shared manifest writing for the macOS plist and the Linux systemd unit.
-//! The idempotency contract — "running install twice writes the file once"
-//! — lives in [`write_if_changed`].
+//! Shared manifest writing for the macOS plist, the Linux systemd unit, and
+//! the Windows task XML. The idempotency contract — "running install twice
+//! writes the file once" — lives in [`write_if_changed`].
 
 use std::path::Path;
 
@@ -25,6 +25,25 @@ pub(super) fn write_if_changed(path: &Path, desired: &str) -> std::io::Result<bo
     }
     write_atomic(path, desired.as_bytes())?;
     Ok(true)
+}
+
+/// Both manifest formats are XML — the launchd plist and the Task Scheduler
+/// task definition — and both interpolate user-derived paths, so a home
+/// directory containing `&` would otherwise produce a manifest the platform
+/// tool refuses to parse.
+pub(super) fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Manifest paths get handed to `launchctl` / `schtasks` as argv, which is
+/// `&str`-shaped — so a non-UTF-8 path has to fail loudly here rather than be
+/// lossily mangled into a path the platform tool can't find.
+pub(super) fn path_to_string(p: &Path) -> anyhow::Result<String> {
+    p.to_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {p:?}"))
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

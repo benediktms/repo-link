@@ -1,5 +1,6 @@
 //! Abstraction over the platform process-control tool — `launchctl` on
-//! macOS, `systemctl --user` on Linux. The [`Launcher`] trait exists so the
+//! macOS, `systemctl --user` on Linux, `schtasks` on Windows. The
+//! [`Launcher`] trait exists so the
 //! public CLI integration tests can drive `rl daemon install` without
 //! actually touching the user agent on the test runner: tests set
 //! `REPO_LINK_LAUNCHER=fake`, which routes every call into [`FakeLauncher`]
@@ -8,7 +9,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Result of a single `launchctl` / `systemctl` invocation. We separate
+/// Result of a single `launchctl` / `systemctl` / `schtasks` invocation. We separate
 /// `NotFound` from `Failed` so idempotent bootout/disable can keep going
 /// on a fresh checkout where the unit was never registered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +49,10 @@ impl Launcher for RealLauncher {
         // launchctl exits 113 with "Could not find service" when bootout/print
         // run against a label that isn't loaded. systemctl exits 5 (or 4 in
         // older versions) for an unknown unit. Both are "nothing to do, keep
-        // going" from an idempotent-uninstall perspective.
+        // going" from an idempotent-uninstall perspective. schtasks is not
+        // covered here: its "unregistered task" message is indistinguishable
+        // from a missing file, so `windows::tolerate_missing_task` applies
+        // that reading per-verb rather than to every invocation.
         let not_found = code == 113
             || code == 5
             || code == 4
@@ -111,12 +115,26 @@ impl Launcher for FakeLauncher {
 pub fn current_launcher() -> Box<dyn Launcher> {
     match std::env::var("REPO_LINK_LAUNCHER").as_deref() {
         Ok("fake") => Box::new(FakeLauncher::new(LaunchOutcome::Success {
-            // Carries both macOS (`pid = N`) and Linux (`MainPID=N` +
-            // `ActiveState=active`) patterns so the cross-platform status
-            // tests see a consistent "loaded with pid 12345" view.
-            stdout: "MainPID=12345\nActiveState=active\npid = 12345\n".to_string(),
+            // Carries the macOS (`pid = N`), Linux (`MainPID=N` +
+            // `ActiveState=active`) and Windows (`Status: Running`) patterns
+            // so the cross-platform status tests see a consistent "loaded"
+            // view.
+            stdout: "MainPID=12345\nActiveState=active\npid = 12345\nStatus: Running\n".to_string(),
         })),
         Ok("fake_not_found") => Box::new(FakeLauncher::new(LaunchOutcome::NotFound)),
         _ => Box::new(RealLauncher),
+    }
+}
+
+/// Turn a launcher call into an error unless it succeeded. `NotFound` is a
+/// failure here on purpose: callers that tolerate a missing unit match on
+/// [`LaunchOutcome`] directly instead.
+pub(super) fn require_success(action: &str, outcome: &LaunchOutcome) -> anyhow::Result<()> {
+    match outcome {
+        LaunchOutcome::Success { .. } => Ok(()),
+        LaunchOutcome::NotFound => Err(anyhow::anyhow!("{action}: the unit is not registered")),
+        LaunchOutcome::Failed { code, stderr } => {
+            Err(anyhow::anyhow!("{action} failed (exit {code}): {stderr}"))
+        }
     }
 }

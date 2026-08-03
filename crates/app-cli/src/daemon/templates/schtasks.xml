@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>repo-link reconciliation daemon</Description>
+    <URI>\{{LABEL}}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{{USER_ID}}</UserId>
+      <!-- Task Scheduler has no equivalent of launchd KeepAlive or systemd
+           Restart=always: RestartOnFailure below only fires on a non-zero
+           exit and is capped. An endless repetition (no Duration) re-requests
+           a start every 5 minutes, which MultipleInstancesPolicy=IgnoreNew
+           turns into a no-op while the daemon is up and a relaunch once it
+           is not — so a clean exit is recovered too, within one interval. -->
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER_ID}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <!-- PT0S disables the 72h default kill that schtasks-created tasks
+         inherit; a reconciliation daemon is meant to outlive it. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <!-- Task Scheduler discards a task's stdout/stderr, so the shell
+           wrapper is the only way to keep the pre-tracing catch-all that
+           launchd's StandardOutPath and systemd's journald provide. cmd /C
+           strips the outermost quote pair, hence the doubled quoting. -->
+      <Command>cmd.exe</Command>
+      <Arguments>/D /C ""{{BINARY_PATH}}" --log-format=json &gt;&gt; "{{LOG_PATH}}" 2&gt;&amp;1"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
