@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use infra_config::RepoLinkConfig;
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -171,13 +172,21 @@ pub async fn dispatch(cmd: DaemonCmd, cfg: &RepoLinkConfig) -> Result<()> {
 struct LogFile {
     path: PathBuf,
     file: File,
+    /// Identity of the open file, so the follower can tell a rotation from a
+    /// quiet log. Taken from the handle rather than the path: the file this
+    /// answers for is the one being read, not whatever the name resolves to
+    /// by the time the question is asked.
+    handle: Handle,
     offset: u64,
 }
 
 impl LogFile {
     fn open(path: PathBuf) -> std::io::Result<Self> {
+        let file = File::open(&path)?;
+        let handle = Handle::from_file(file.try_clone()?)?;
         Ok(Self {
-            file: File::open(&path)?,
+            file,
+            handle,
             path,
             offset: 0,
         })
@@ -275,12 +284,17 @@ async fn print_logs(cfg: &RepoLinkConfig, follow: bool, lines: usize) -> Result<
         let replace = match log.as_ref() {
             Some(current) => {
                 current.path != path
-                    || !same_file(
-                        &current.file.metadata().with_context(|| {
-                            format!("failed to inspect {}", current.path.display())
-                        })?,
-                        &metadata,
-                    )
+                    || match Handle::from_path(&path) {
+                        Ok(handle) => handle != current.handle,
+                        // Rotation is not atomic: the name can be gone for an
+                        // instant between the metadata call above and this one.
+                        // Wait for the next tick rather than ending the follow.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => {
+                            return Err(e)
+                                .with_context(|| format!("failed to inspect {}", path.display()));
+                        }
+                    }
             }
             None => true,
         };
@@ -310,20 +324,6 @@ async fn print_logs(cfg: &RepoLinkConfig, follow: bool, lines: usize) -> Result<
         current
             .print_appended()
             .with_context(|| format!("failed to read {}", path.display()))?;
-    }
-}
-
-#[cfg(unix)]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    match (left.created(), right.created()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => true,
     }
 }
 
@@ -553,5 +553,31 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "").unwrap();
         let newest = newest_log_segment(dir.path()).unwrap();
         assert_eq!(newest.file_name().unwrap(), "daemon.2026-05-26.log");
+    }
+
+    /// The rotation check `--follow` runs each tick: the open file's identity
+    /// against whatever the same name resolves to now. Recreating the file
+    /// under its original name is the case a creation-timestamp comparison
+    /// misses on NTFS, where tunneling replays the old timestamp.
+    #[test]
+    fn log_file_handle_distinguishes_a_recreated_file_of_the_same_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::write(&path, "first\n").unwrap();
+
+        let open = LogFile::open(path.clone()).unwrap();
+        assert_eq!(
+            Handle::from_path(&path).unwrap(),
+            open.handle,
+            "an untouched file must compare equal to the open handle"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "second\n").unwrap();
+        assert_ne!(
+            Handle::from_path(&path).unwrap(),
+            open.handle,
+            "a recreated file must not be mistaken for the one still open"
+        );
     }
 }
