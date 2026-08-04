@@ -88,6 +88,14 @@ daemon-restart:
     {{rl}} daemon stop  || true
     {{rl}} daemon start
 
+# No `|| true` counterpart: `rl daemon stop` on Windows already treats an
+# unregistered task as a no-op (`tolerate_missing_task` covers both `schtasks
+# /End` and `/Change /DISABLE`), so there is nothing for it to swallow.
+[windows]
+daemon-restart:
+    .\target\release\rl.exe daemon stop
+    .\target\release\rl.exe daemon start
+
 # logs — convenience alias for the first-class CLI command.
 
 # Tail the daemon log file.
