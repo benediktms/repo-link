@@ -185,15 +185,15 @@ impl NoticeLine for QueryNoticeDto {
     fn line(&self) -> String {
         match self {
             QueryNoticeDto::DriftPartiallyLive(n) => format!(
-                "{} row(s) read live from the board, {} fell back to the cached status                  — see each row's `last_refreshed_at`",
+                "{} row(s) read live from the board; {} fell back to the cached status",
                 n.live_count, n.cached_count,
             ),
             QueryNoticeDto::DriftLiveUnavailable(n) => format!(
-                "reporting cached board status: the live read was unavailable ({}).                  Pass --offline to ask for this deliberately",
+                "reporting cached board status — the live read was unavailable ({})",
                 n.reason,
             ),
             QueryNoticeDto::DriftCacheNotRefreshed(n) => format!(
-                "these rows are live, but the status cache could not be refreshed ({})                  — a later --offline run will still show the old values",
+                "these rows are live, but the status cache could not be refreshed ({})",
                 n.reason,
             ),
         }

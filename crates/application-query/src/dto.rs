@@ -125,6 +125,21 @@ pub struct DriftReport {
     pub messages: Vec<QueryNoticeDto>,
 }
 
+/// How [`crate::QueryService::drift_report`] should source board status.
+///
+/// Three states, not two: asking for `--offline` and being unable to go live
+/// both end at the cache, but only the second is a surprise the caller has to
+/// be told about.
+pub enum LiveRead<'a> {
+    /// Cached only, because that is what was asked for. Emits no notice.
+    Offline,
+    /// Live was wanted and could not happen — no token, an unreadable token
+    /// file, a provider that would not build. Reported as a notice.
+    Unavailable(String),
+    /// Read the board through this provider.
+    Provider(&'a dyn ports::RemoteProjectProvider),
+}
+
 /// A user-facing notice attached to a query result. Internally tagged
 /// (`"kind"`) so new kinds can be added without breaking the wire shape, and
 /// structured only — the human-readable line is formatted by the CLI renderer,
@@ -134,8 +149,10 @@ pub struct DriftReport {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryNoticeDto {
-    /// Some rows carry live board status and the rest fell back to the cache,
-    /// so `last_refreshed_at` differs across the report.
+    /// Some rows carry live board status and the rest fell back to the cache.
+    /// Nothing on a row marks which is which — `last_refreshed_at` is the
+    /// issue-sync timestamp and is untouched by either path — so the counts
+    /// are all the report can honestly say.
     DriftPartiallyLive(DriftPartiallyLiveNotice),
     /// The live read could not run, so every row is cached. Distinct from
     /// `--offline`, which is the user asking for exactly this and needs no

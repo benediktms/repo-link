@@ -921,6 +921,7 @@ async fn fetch_item_statuses_maps_by_field_id_and_skips_unresolved_ids() {
                   ] } },
                 { "__typename": "ProjectV2Item", "id": "PVTI_b",
                   "fieldValues": { "nodes": [] } },
+                { "__typename": "Issue" },
                 null
             ] }
         })))
@@ -932,6 +933,7 @@ async fn fetch_item_statuses_maps_by_field_id_and_skips_unresolved_ids() {
             &[
                 "PVTI_a".to_string(),
                 "PVTI_b".to_string(),
+                "PVTI_other".to_string(),
                 "PVTI_gone".to_string(),
             ],
             "PVTSSF_status",
@@ -948,6 +950,12 @@ async fn fetch_item_statuses_maps_by_field_id_and_skips_unresolved_ids() {
     assert!(
         !page.statuses.contains_key("PVTI_gone"),
         "an unresolved id must be absent so the caller keeps its cached value"
+    );
+    assert_eq!(
+        page.statuses.len(),
+        2,
+        "a node that is not a project item carries no id and is skipped, \
+         not a deserialization failure that sinks the whole batch"
     );
     assert!(!page.truncated, "three ids is one chunk");
 }

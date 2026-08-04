@@ -203,7 +203,7 @@ query($ids: [ID!]!) {
     __typename
     ... on ProjectV2Item {
       id
-      fieldValues(first: 20) {
+      fieldValues(first: 100) {
         nodes {
           __typename
           ... on ProjectV2ItemFieldSingleSelectValue {
@@ -601,16 +601,25 @@ impl GraphqlClient {
     /// out of the map so the caller falls back to its cached value for them.
     ///
     /// Ids that GitHub resolves to something other than a project item (a
-    /// deleted item comes back as a JSON `null`) are likewise absent rather
-    /// than an error: an item disappearing from a board is a normal race
-    /// against a local cache, not a failure of the read.
+    /// deleted item comes back as a JSON `null`, and a node of some other type
+    /// carries no `id`) are likewise absent rather than an error: an item
+    /// disappearing from a board is a normal race against a local cache, not a
+    /// failure of the read.
+    ///
+    /// A chunk that fails outright ends the walk but keeps what earlier chunks
+    /// returned, reported as `truncated`. Only a failure with nothing yet in
+    /// hand surfaces as `Err`, because there the caller has no partial result
+    /// to prefer over its cache. GitHub answers an unresolvable id with a
+    /// `null` node *and* a top-level `errors` array, which octocrab surfaces as
+    /// an error for the whole request — so one deleted card costs its chunk,
+    /// not the whole read.
     pub(crate) async fn fetch_item_statuses(
         &self,
         item_node_ids: &[String],
         status_field_id: &str,
     ) -> PortResult<ItemStatusPage> {
         let cap = (MAX_POLL_PAGES * POLL_PAGE_SIZE) as usize;
-        let truncated = item_node_ids.len() > cap;
+        let mut truncated = item_node_ids.len() > cap;
         let mut statuses = HashMap::new();
 
         for chunk in item_node_ids
@@ -618,8 +627,19 @@ impl GraphqlClient {
             .unwrap_or_default()
             .chunks(POLL_PAGE_SIZE as usize)
         {
-            let data: ItemStatusesData = self.run(ITEM_STATUSES, json!({ "ids": chunk })).await?;
+            let data: ItemStatusesData =
+                match self.run(ITEM_STATUSES, json!({ "ids": chunk })).await {
+                    Ok(data) => data,
+                    Err(_) if !statuses.is_empty() => {
+                        truncated = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
             for node in data.nodes.into_iter().flatten() {
+                let Some(id) = node.id else {
+                    continue;
+                };
                 let option_id = node
                     .field_values
                     .nodes
@@ -628,7 +648,7 @@ impl GraphqlClient {
                         v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(status_field_id)
                     })
                     .and_then(|v| v.option_id);
-                statuses.insert(node.id, option_id);
+                statuses.insert(id, option_id);
             }
         }
 
@@ -919,7 +939,10 @@ struct ItemStatusesData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ItemStatusNode {
-    id: String,
+    /// Absent when the node resolved to something that is not a project item,
+    /// which the `... on ProjectV2Item` fragment simply does not populate.
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     field_values: FieldValuesConn,
 }

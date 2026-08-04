@@ -1,6 +1,7 @@
 //! `rl query` dispatch — the read-only workspace views.
 
 use anyhow::{Result, anyhow};
+use application_query::LiveRead;
 use infra_config::RepoLinkConfig;
 
 use crate::cli::{QueryCmd, WorkspaceArg};
@@ -55,26 +56,38 @@ pub(crate) async fn query_dispatch(
             offline,
         } => {
             let workspace = resolve_workspace(svc, workspace).await?;
-            // A missing token is not an error here: drift degrades to the
-            // cached read and reports why, so the command still answers on a
-            // machine that has never run `rl gh auth`.
-            let provider = match offline {
-                true => None,
-                false => match cfg.resolve_github_token() {
-                    Ok(Some(token)) => Some(build_github_provider(&token, cfg)?),
-                    Ok(None) => None,
-                    Err(e) => return Err(anyhow!("{e}")),
-                },
+            // Nothing about going live may cost the caller the cached answer:
+            // drift was a pure local read before this flag existed, and
+            // `query mine` sets the same precedent for token trouble.
+            let mut unavailable: Option<String> = None;
+            let provider = if offline {
+                None
+            } else {
+                match cfg.resolve_github_token() {
+                    Ok(Some(token)) => match build_github_provider(&token, cfg) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            unavailable = Some(e.to_string());
+                            None
+                        }
+                    },
+                    Ok(None) => {
+                        unavailable =
+                            Some("no GitHub token — run `rl gh auth`, or pass --offline".into());
+                        None
+                    }
+                    Err(e) => {
+                        unavailable = Some(e.to_string());
+                        None
+                    }
+                }
             };
-            let report = svc
-                .query
-                .drift_report(
-                    &workspace,
-                    provider
-                        .as_ref()
-                        .map(|p| p as &dyn ports::RemoteProjectProvider),
-                )
-                .await?;
+            let live = match (&provider, unavailable) {
+                (Some(p), _) => LiveRead::Provider(p),
+                (None, Some(reason)) => LiveRead::Unavailable(reason),
+                (None, None) => LiveRead::Offline,
+            };
+            let report = svc.query.drift_report(&workspace, live).await?;
             render::drift(&report);
         }
         QueryCmd::Ready {

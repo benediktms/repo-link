@@ -7,15 +7,14 @@ use domain_project::Project;
 use domain_repo::LinkStatus;
 use domain_task::{Lifecycle, RelationKind, SyncState, Task};
 use ports::{
-    ProjectRepository, RemoteProjectProvider, RepoBindingRepository, TaskFilter, TaskRepository,
-    WorkspaceRepository,
+    ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
 };
 
 use crate::dto::{
     AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow,
     DriftCacheNotRefreshedNotice, DriftLiveUnavailableNotice, DriftPartiallyLiveNotice,
-    DriftReport, DriftRow, QueryNoticeDto, ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow,
-    WorkspaceOverview,
+    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyTaskRow, StaleWorktreeRow,
+    UnsyncedTaskRow, WorkspaceOverview,
 };
 use crate::error::Result;
 
@@ -410,9 +409,12 @@ impl QueryService {
     /// archived (`NotPlanned`) tasks are skipped before the axis runs (never
     /// flagged).
     /// Cached-only drift — the `--offline` path, and what every non-drift
-    /// caller wants. Equivalent to [`Self::drift_report`] with no provider.
+    /// caller wants.
     pub async fn drift(&self, workspace_id: &str) -> Result<Vec<DriftRow>> {
-        Ok(self.drift_report(workspace_id, None).await?.rows)
+        Ok(self
+            .drift_report(workspace_id, LiveRead::Offline)
+            .await?
+            .rows)
     }
 
     /// Drift with an optional live read of the board.
@@ -433,7 +435,7 @@ impl QueryService {
     pub async fn drift_report(
         &self,
         workspace_id: &str,
-        provider: Option<&dyn RemoteProjectProvider>,
+        live: LiveRead<'_>,
     ) -> Result<DriftReport> {
         let id: WorkspaceId = workspace_id.parse()?;
         // Load both open and closed (`is_open: None`); archived (now
@@ -454,7 +456,7 @@ impl QueryService {
 
         let mut messages = Vec::new();
         let live = self
-            .live_statuses(provider, project.as_ref(), &tasks, &mut messages)
+            .live_statuses(live, project.as_ref(), &tasks, &mut messages)
             .await?;
 
         let mut rows = Vec::new();
@@ -469,9 +471,7 @@ impl QueryService {
                 SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
             );
 
-            // Project-status axis, independent of sync_state. A live value wins
-            // over the cache; a task the live read didn't cover falls back to
-            // its cached column, so the axis still runs for every task.
+            // A live value wins; an item the live read missed keeps its cache.
             let actual_id = match t.project_item_id.as_deref().and_then(|i| live.get(i)) {
                 Some(live_option) => live_option.as_deref(),
                 None => t.project_status_option_id.as_deref(),
@@ -559,20 +559,25 @@ impl QueryService {
     /// optimistic cache refresh would be the wrong trade.
     async fn live_statuses(
         &self,
-        provider: Option<&dyn RemoteProjectProvider>,
+        live: LiveRead<'_>,
         project: Option<&Project>,
         tasks: &[Task],
         messages: &mut Vec<QueryNoticeDto>,
     ) -> Result<HashMap<String, Option<String>>> {
-        let (Some(provider), Some(field_id)) =
-            (provider, project.and_then(|p| p.status_field_id()))
-        else {
+        let provider = match live {
+            LiveRead::Offline => return Ok(HashMap::new()),
+            LiveRead::Unavailable(reason) => {
+                messages.push(QueryNoticeDto::DriftLiveUnavailable(
+                    DriftLiveUnavailableNotice { reason },
+                ));
+                return Ok(HashMap::new());
+            }
+            LiveRead::Provider(provider) => provider,
+        };
+        let Some(field_id) = project.and_then(|p| p.status_field_id()) else {
             return Ok(HashMap::new());
         };
 
-        // Only tasks the project-status axis will actually evaluate: archived
-        // tasks are skipped by the caller, and a task with no board item has
-        // nothing to look up.
         let candidates: Vec<(&Task, &str)> = tasks
             .iter()
             .filter(|t| t.lifecycle != Lifecycle::NotPlanned)
@@ -605,8 +610,6 @@ impl QueryService {
             ));
         }
 
-        // Write the fresh values through, but only where they actually moved —
-        // an unchanged board costs no writes at all.
         for (task, item_id) in &candidates {
             let Some(live) = page.statuses.get(*item_id) else {
                 continue;
@@ -1748,7 +1751,7 @@ mod tests {
         let provider = InMemoryRemoteProjectProvider::new();
         provider.set_item_status(&item, Some("o_backlog"));
         let report = svc
-            .drift_report(&wid.to_string(), Some(&provider))
+            .drift_report(&wid.to_string(), LiveRead::Provider(&provider))
             .await
             .unwrap();
         assert!(
@@ -1770,7 +1773,7 @@ mod tests {
         // Provider seeded with nothing: the id resolves to no status at all.
         let provider = InMemoryRemoteProjectProvider::new();
         let report = svc
-            .drift_report(&wid.to_string(), Some(&provider))
+            .drift_report(&wid.to_string(), LiveRead::Provider(&provider))
             .await
             .unwrap();
 
@@ -1782,6 +1785,47 @@ mod tests {
             }
             other => panic!("expected a partially-live notice, got {other:?}"),
         }
+    }
+
+    /// A live read the CLI could not even attempt — no token, an unreadable
+    /// token file — must still report, and must say why it is cached. The gap
+    /// this closes: it previously looked identical to `--offline`.
+    #[tokio::test]
+    async fn drift_reports_why_when_live_was_wanted_but_impossible() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, _tid, _item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        let report = svc
+            .drift_report(
+                &wid.to_string(),
+                LiveRead::Unavailable("no GitHub token".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.rows.len(), 1, "the cached row is still reported");
+        match report.messages.as_slice() {
+            [QueryNoticeDto::DriftLiveUnavailable(n)] => assert_eq!(n.reason, "no GitHub token"),
+            other => panic!("expected a live-unavailable notice, got {other:?}"),
+        }
+    }
+
+    /// `--offline` is the caller getting what they asked for, so it must stay
+    /// silent — the notice is reserved for the unasked-for fallback above.
+    #[tokio::test]
+    async fn drift_offline_is_quiet() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, _tid, _item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        let report = svc
+            .drift_report(&wid.to_string(), LiveRead::Offline)
+            .await
+            .unwrap();
+        assert_eq!(report.rows.len(), 1);
+        assert!(
+            report.messages.is_empty(),
+            "asked-for cache needs no notice"
+        );
     }
 
     /// A failed live read degrades to the cache instead of failing the
@@ -1797,7 +1841,7 @@ mod tests {
         provider.fail_next(1);
 
         let report = svc
-            .drift_report(&wid.to_string(), Some(&provider))
+            .drift_report(&wid.to_string(), LiveRead::Provider(&provider))
             .await
             .unwrap();
         assert_eq!(report.rows.len(), 1, "cached rows still reported");
@@ -1819,7 +1863,7 @@ mod tests {
 
         let provider = InMemoryRemoteProjectProvider::new();
         provider.set_item_status(&item, Some("o_backlog"));
-        svc.drift_report(&wid.to_string(), Some(&provider))
+        svc.drift_report(&wid.to_string(), LiveRead::Provider(&provider))
             .await
             .unwrap();
 
