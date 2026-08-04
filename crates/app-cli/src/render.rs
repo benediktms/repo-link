@@ -2,8 +2,8 @@
 //! predictable, parseable shape. Human reading is via `jq` / `fx` / etc.
 
 use application_query::{
-    AssignedTaskRow, BlockedTaskRow, ChildrenRollup, ContributorRow, DriftRow, ReadyTaskRow,
-    StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
+    AssignedTaskRow, BlockedTaskRow, ChildrenRollup, ContributorRow, DriftReport, QueryNoticeDto,
+    ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
@@ -135,8 +135,9 @@ pub fn contributors(rows: &[ContributorRow]) {
     print_json(&rows);
 }
 
-pub fn drift(rows: &[DriftRow]) {
-    print_json(&rows);
+pub fn drift(report: &DriftReport) {
+    notices(&report.messages);
+    print_json(report);
 }
 
 pub fn ready(rows: &[ReadyTaskRow]) {
@@ -158,10 +159,51 @@ pub fn sync(summary: &SyncSummaryDto) {
     if let Some(note) = &summary.note {
         eprintln!("note: {note}");
     }
-    for msg in &summary.messages {
-        eprintln!("note: {}", sync_notice_line(msg));
-    }
+    notices(&summary.messages);
     print_json(summary);
+}
+
+/// One line of prose for a structured notice, for stderr.
+///
+/// The structured form stays in the stdout JSON for scripts; this is the human
+/// half. It lives here rather than on the DTOs so the wire types carry no
+/// prose — one source of truth per message, in the layer that renders.
+/// Implemented per notice enum so a view emitting a new kind of notice gets
+/// [`notices`] for free.
+pub(crate) trait NoticeLine {
+    fn line(&self) -> String;
+}
+
+/// Print every notice as a `note:` line on stderr, leaving stdout to the JSON.
+fn notices<N: NoticeLine>(items: &[N]) {
+    for n in items {
+        eprintln!("note: {}", n.line());
+    }
+}
+
+impl NoticeLine for QueryNoticeDto {
+    fn line(&self) -> String {
+        match self {
+            QueryNoticeDto::DriftPartiallyLive(n) => format!(
+                "{} row(s) read live from the board; {} fell back to the cached status",
+                n.live_count, n.cached_count,
+            ),
+            QueryNoticeDto::DriftLiveUnavailable(n) => format!(
+                "reporting cached board status — the live read was unavailable ({})",
+                n.reason,
+            ),
+            QueryNoticeDto::DriftCacheNotRefreshed(n) => format!(
+                "these rows are live, but the status cache could not be refreshed ({})",
+                n.reason,
+            ),
+        }
+    }
+}
+
+impl NoticeLine for SyncNoticeDto {
+    fn line(&self) -> String {
+        sync_notice_line(self)
+    }
 }
 
 /// Format a structured sync notice into a one-line human message for stderr.

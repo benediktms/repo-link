@@ -1,5 +1,7 @@
 //! Remote project provider port and its DTOs, plus the project repository.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
 use domain_project::{OrgIssueTypeRegistry, Project};
@@ -75,6 +77,21 @@ pub struct PollPage {
     /// `true` when the provider could not see the whole result set (e.g. it hit
     /// its pagination cap). The poller treats such a page as partial and does
     /// NOT advance the watermark, so the next cycle refetches the same window.
+    pub truncated: bool,
+}
+
+/// One [`RemoteProjectProvider::fetch_item_statuses`] result.
+///
+/// `statuses` is keyed by project-item node id, and the difference between the
+/// two "no status" cases is load-bearing: a key present with `None` is an item
+/// whose status field is genuinely unset, while a key **absent** is an item the
+/// provider could not read — deleted, or past its cap. Callers fall back to
+/// their cached value only for the absent ones.
+#[derive(Clone, Debug, Default)]
+pub struct ItemStatusPage {
+    pub statuses: HashMap<String, Option<String>>,
+    /// `true` when the provider stopped short of reading every id it was
+    /// given. As with [`PollPage`], trust this rather than comparing lengths.
     pub truncated: bool,
 }
 
@@ -179,6 +196,30 @@ pub trait RemoteProjectProvider: Send + Sync {
         status_field_id: &str,
         query: &str,
     ) -> PortResult<PollPage>;
+
+    /// Read the *current* status of specific project items in one batched
+    /// call — the live counterpart to the `project_status_option_id` cache the
+    /// poller writes through. Backs `rl query drift`'s default live mode
+    /// (RFC 0004 Part B), which needs fresh state on demand rather than
+    /// whatever the last poll left behind.
+    ///
+    /// Addressed by item node id rather than by walking the board, so the cost
+    /// is proportional to the tasks being checked instead of to the project's
+    /// size. `status_field_id` selects the option by field id, exactly as
+    /// [`Self::poll_project_items`] does.
+    ///
+    /// The default returns an empty, untruncated page so the non-GitHub
+    /// implementors (the in-memory fixture + the daemon's test doubles)
+    /// compile untouched; only the GitHub adapter overrides it. With the
+    /// default in place every id reads as "not resolved", so a caller falls
+    /// back to its cached values — degraded, never wrong.
+    async fn fetch_item_statuses(
+        &self,
+        _item_node_ids: &[String],
+        _status_field_id: &str,
+    ) -> PortResult<ItemStatusPage> {
+        Ok(ItemStatusPage::default())
+    }
 
     /// Fetch the owner's org-level native issue-type catalog (RFC 0006
     /// D5/D8). Called at `rl project link` time to (re)build the org registry
