@@ -32,6 +32,7 @@ rpassword = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dunce = { workspace = true }
+same-file = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
