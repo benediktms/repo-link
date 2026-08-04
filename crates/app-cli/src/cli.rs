@@ -659,6 +659,14 @@ pub(crate) enum QueryCmd {
     Drift {
         #[command(flatten)]
         ws: WorkspaceArg,
+        /// Compare against the cached board status instead of reading the
+        /// board live. Needs no token and makes no network call — the fast
+        /// path, at the cost of being only as fresh as the last poll.
+        ///
+        /// Live is the default. Without a token, or if the read fails, the
+        /// live mode degrades to this and says so in `messages`.
+        #[arg(long)]
+        offline: bool,
     },
     /// Tasks that are actionable now: open + not transitively blocked.
     Ready {

@@ -7,9 +7,9 @@
 use async_trait::async_trait;
 use domain_core::Timestamp;
 use ports::{
-    PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteIssueType, RemoteProjectProvider,
-    RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider, RemoteTaskSnapshot,
-    RemoteTaskUpdate,
+    ItemStatusPage, PollPage, PortResult, RemoteChildIssue, RemoteComment, RemoteIssueType,
+    RemoteProjectProvider, RemoteProjectSnapshot, RemoteTaskCreate, RemoteTaskProvider,
+    RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 
 use crate::graphql::GraphqlClient;
@@ -285,6 +285,16 @@ impl RemoteProjectProvider for GithubAdapter {
     ) -> PortResult<PollPage> {
         self.graphql
             .poll_project_items(project_node_id, status_field_id, query)
+            .await
+    }
+
+    async fn fetch_item_statuses(
+        &self,
+        item_node_ids: &[String],
+        status_field_id: &str,
+    ) -> PortResult<ItemStatusPage> {
+        self.graphql
+            .fetch_item_statuses(item_node_ids, status_field_id)
             .await
     }
 

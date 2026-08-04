@@ -111,6 +111,59 @@ pub struct AssignedTaskRow {
     pub project_status: Option<String>,
 }
 
+/// What `query drift` returns: the rows, plus any notice about how they were
+/// produced.
+///
+/// An object rather than a bare array because a live read can be partial — some
+/// rows fresh, others fallen back to cache — and that qualification has to
+/// travel with the data instead of only reaching a human on stderr.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftReport {
+    pub rows: Vec<DriftRow>,
+    /// Empty on the happy path (every row live, or `--offline` as asked).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<QueryNoticeDto>,
+}
+
+/// A user-facing notice attached to a query result. Internally tagged
+/// (`"kind"`) so new kinds can be added without breaking the wire shape, and
+/// structured only — the human-readable line is formatted by the CLI renderer,
+/// so there is one source of truth for the prose. Same contract as
+/// [`dto_shared::SyncNoticeDto`]; the CLI's `NoticeLine` trait is what lets one
+/// renderer handle both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QueryNoticeDto {
+    /// Some rows carry live board status and the rest fell back to the cache,
+    /// so `last_refreshed_at` differs across the report.
+    DriftPartiallyLive(DriftPartiallyLiveNotice),
+    /// The live read could not run, so every row is cached. Distinct from
+    /// `--offline`, which is the user asking for exactly this and needs no
+    /// notice.
+    DriftLiveUnavailable(DriftLiveUnavailableNotice),
+    /// The live read worked but the fresh values could not be written back to
+    /// the cache — most likely the daemon holding the database. The rows are
+    /// still live and correct; only the next `--offline` run loses out.
+    DriftCacheNotRefreshed(DriftCacheNotRefreshedNotice),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftPartiallyLiveNotice {
+    pub live_count: usize,
+    pub cached_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftLiveUnavailableNotice {
+    /// Why the live read did not happen — a missing token, or the API error.
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriftCacheNotRefreshedNotice {
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriftRow {
     pub task_id: String,

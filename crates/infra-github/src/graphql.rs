@@ -17,9 +17,11 @@
 
 use chrono::{DateTime, Utc};
 use octocrab::Octocrab;
+use std::collections::HashMap;
+
 use ports::{
-    PollPage, PortError, PortResult, RemoteIssueType, RemoteProjectField, RemoteProjectFieldOption,
-    RemoteProjectItem, RemoteProjectSnapshot,
+    ItemStatusPage, PollPage, PortError, PortResult, RemoteIssueType, RemoteProjectField,
+    RemoteProjectFieldOption, RemoteProjectItem, RemoteProjectSnapshot,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -187,6 +189,30 @@ const CLEAR_SINGLE_SELECT_OPTION: &str = r#"
 mutation($input: ClearProjectV2ItemFieldValueInput!) {
   clearProjectV2ItemFieldValue(input: $input) {
     projectV2Item { id }
+  }
+}"#;
+
+/// Batched read of specific items' single-select values. Addressed by node id
+/// rather than by walking the board, so `rl query drift` pays for the tasks it
+/// is checking rather than for the project's size. Deliberately omits
+/// `content` — drift compares status only, and the local task already holds
+/// everything else.
+const ITEM_STATUSES: &str = r#"
+query($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    __typename
+    ... on ProjectV2Item {
+      id
+      fieldValues(first: 20) {
+        nodes {
+          __typename
+          ... on ProjectV2ItemFieldSingleSelectValue {
+            optionId
+            field { ... on ProjectV2FieldCommon { id } }
+          }
+        }
+      }
+    }
   }
 }"#;
 
@@ -565,6 +591,54 @@ impl GraphqlClient {
     }
 }
 
+impl GraphqlClient {
+    /// Read the current status option of each item in `item_node_ids`.
+    ///
+    /// `nodes(ids:)` takes at most [`POLL_PAGE_SIZE`] ids per call, so the list
+    /// is chunked rather than cursor-paged — the ids are already in hand, which
+    /// makes this a `chunks()` loop instead of a `pageInfo` walk. The same
+    /// [`MAX_POLL_PAGES`] ceiling bounds it, and ids past that ceiling are left
+    /// out of the map so the caller falls back to its cached value for them.
+    ///
+    /// Ids that GitHub resolves to something other than a project item (a
+    /// deleted item comes back as a JSON `null`) are likewise absent rather
+    /// than an error: an item disappearing from a board is a normal race
+    /// against a local cache, not a failure of the read.
+    pub(crate) async fn fetch_item_statuses(
+        &self,
+        item_node_ids: &[String],
+        status_field_id: &str,
+    ) -> PortResult<ItemStatusPage> {
+        let cap = (MAX_POLL_PAGES * POLL_PAGE_SIZE) as usize;
+        let truncated = item_node_ids.len() > cap;
+        let mut statuses = HashMap::new();
+
+        for chunk in item_node_ids
+            .get(..cap.min(item_node_ids.len()))
+            .unwrap_or_default()
+            .chunks(POLL_PAGE_SIZE as usize)
+        {
+            let data: ItemStatusesData = self.run(ITEM_STATUSES, json!({ "ids": chunk })).await?;
+            for node in data.nodes.into_iter().flatten() {
+                let option_id = node
+                    .field_values
+                    .nodes
+                    .into_iter()
+                    .find(|v| {
+                        v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(status_field_id)
+                    })
+                    .and_then(|v| v.option_id);
+                statuses.insert(node.id, option_id);
+            }
+        }
+
+        Ok(ItemStatusPage {
+            statuses,
+            truncated,
+        })
+    }
+}
+
 /// Map one polled GraphQL node into a [`RemoteProjectItem`]. Returns `Ok(None)`
 /// for content kinds we don't model (e.g. a `PullRequest` attached to the
 /// board) so the caller skips them rather than erroring.
@@ -836,6 +910,19 @@ struct UpdateIssueWrap {
     issue: OptionalIdNode,
 }
 
+#[derive(Deserialize)]
+struct ItemStatusesData {
+    /// `nodes(ids:)` returns a positional `null` for any id it cannot resolve,
+    /// so the element type is optional even though the ids are non-null.
+    nodes: Vec<Option<ItemStatusNode>>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemStatusNode {
+    id: String,
+    #[serde(default)]
+    field_values: FieldValuesConn,
+}
 #[derive(Deserialize)]
 struct PollData {
     node: Option<PollNode>,

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -7,12 +7,15 @@ use domain_project::Project;
 use domain_repo::LinkStatus;
 use domain_task::{Lifecycle, RelationKind, SyncState, Task};
 use ports::{
-    ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
+    ProjectRepository, RemoteProjectProvider, RepoBindingRepository, TaskFilter, TaskRepository,
+    WorkspaceRepository,
 };
 
 use crate::dto::{
-    AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow, DriftRow,
-    ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
+    AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow,
+    DriftCacheNotRefreshedNotice, DriftLiveUnavailableNotice, DriftPartiallyLiveNotice,
+    DriftReport, DriftRow, QueryNoticeDto, ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow,
+    WorkspaceOverview,
 };
 use crate::error::Result;
 
@@ -406,7 +409,32 @@ impl QueryService {
     /// a projectless task has no expected option (never flagged), and
     /// archived (`NotPlanned`) tasks are skipped before the axis runs (never
     /// flagged).
+    /// Cached-only drift — the `--offline` path, and what every non-drift
+    /// caller wants. Equivalent to [`Self::drift_report`] with no provider.
     pub async fn drift(&self, workspace_id: &str) -> Result<Vec<DriftRow>> {
+        Ok(self.drift_report(workspace_id, None).await?.rows)
+    }
+
+    /// Drift with an optional live read of the board.
+    ///
+    /// With a `provider`, the project-status axis compares against the board's
+    /// *current* state instead of the poller's write-through cache, and the
+    /// fresh values are written back so a later `--offline` run benefits. The
+    /// provider is passed per call rather than held on the service: a query
+    /// service is constructed once at startup from local repositories, while
+    /// network access is per-verb and token-gated (the same split
+    /// `build_sync_service` makes).
+    ///
+    /// A live read that fails does not fail the command. Drift is a diagnostic;
+    /// answering from cache with a notice saying so beats refusing to answer.
+    /// Rows the provider could not resolve — deleted items, or ids past its cap
+    /// — silently keep their cached value, which is why the report is complete
+    /// even when the read was not.
+    pub async fn drift_report(
+        &self,
+        workspace_id: &str,
+        provider: Option<&dyn RemoteProjectProvider>,
+    ) -> Result<DriftReport> {
         let id: WorkspaceId = workspace_id.parse()?;
         // Load both open and closed (`is_open: None`); archived (now
         // `NotPlanned`) tasks are skipped per-task below so a dropped task never
@@ -424,6 +452,11 @@ impl QueryService {
         // One workspace per query, so its project (if any) resolves once.
         let project = self.resolve_workspace_project(id).await?;
 
+        let mut messages = Vec::new();
+        let live = self
+            .live_statuses(provider, project.as_ref(), &tasks, &mut messages)
+            .await?;
+
         let mut rows = Vec::new();
         for t in &tasks {
             // Archived (now `NotPlanned`) tasks never surface as drift — a
@@ -436,9 +469,15 @@ impl QueryService {
                 SyncState::DirtyLocal | SyncState::DirtyRemote | SyncState::Conflict
             );
 
-            // Project-status axis, independent of sync_state.
+            // Project-status axis, independent of sync_state. A live value wins
+            // over the cache; a task the live read didn't cover falls back to
+            // its cached column, so the axis still runs for every task.
+            let actual_id = match t.project_item_id.as_deref().and_then(|i| live.get(i)) {
+                Some(live_option) => live_option.as_deref(),
+                None => t.project_status_option_id.as_deref(),
+            };
             let (project_status, project_status_expected, project_drift) =
-                project_axis(project.as_ref(), t);
+                project_axis(project.as_ref(), t, actual_id);
 
             // A third axis that catches the silent divergence
             // where a task's recorded `filing_repo_id` references a
@@ -505,7 +544,87 @@ impl QueryService {
                 last_refreshed_at: t.synced_at.map(Into::into),
             });
         }
-        Ok(rows)
+        Ok(DriftReport { rows, messages })
+    }
+
+    /// Read the board's current status for every task that has an item on it,
+    /// and refresh the cache with what comes back.
+    ///
+    /// Returns a map keyed by project-item node id — empty whenever the live
+    /// read is skipped or fails, which collapses the caller to the cached path.
+    /// Every failure here is reported as a notice rather than an error: drift
+    /// is a diagnostic, and a stale answer that says it is stale beats no
+    /// answer. Notably that includes the cache write, which can lose a race
+    /// with the daemon holding the database — failing the whole report over an
+    /// optimistic cache refresh would be the wrong trade.
+    async fn live_statuses(
+        &self,
+        provider: Option<&dyn RemoteProjectProvider>,
+        project: Option<&Project>,
+        tasks: &[Task],
+        messages: &mut Vec<QueryNoticeDto>,
+    ) -> Result<HashMap<String, Option<String>>> {
+        let (Some(provider), Some(field_id)) =
+            (provider, project.and_then(|p| p.status_field_id()))
+        else {
+            return Ok(HashMap::new());
+        };
+
+        // Only tasks the project-status axis will actually evaluate: archived
+        // tasks are skipped by the caller, and a task with no board item has
+        // nothing to look up.
+        let candidates: Vec<(&Task, &str)> = tasks
+            .iter()
+            .filter(|t| t.lifecycle != Lifecycle::NotPlanned)
+            .filter_map(|t| t.project_item_id.as_deref().map(|item| (t, item)))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let ids: Vec<String> = candidates.iter().map(|(_, i)| (*i).to_string()).collect();
+        let page = match provider.fetch_item_statuses(&ids, field_id).await {
+            Ok(page) => page,
+            Err(e) => {
+                messages.push(QueryNoticeDto::DriftLiveUnavailable(
+                    DriftLiveUnavailableNotice {
+                        reason: e.to_string(),
+                    },
+                ));
+                return Ok(HashMap::new());
+            }
+        };
+
+        let cached_count = ids.len().saturating_sub(page.statuses.len());
+        if cached_count > 0 {
+            messages.push(QueryNoticeDto::DriftPartiallyLive(
+                DriftPartiallyLiveNotice {
+                    live_count: page.statuses.len(),
+                    cached_count,
+                },
+            ));
+        }
+
+        // Write the fresh values through, but only where they actually moved —
+        // an unchanged board costs no writes at all.
+        for (task, item_id) in &candidates {
+            let Some(live) = page.statuses.get(*item_id) else {
+                continue;
+            };
+            if live.as_deref() == task.project_status_option_id.as_deref() {
+                continue;
+            }
+            if let Err(e) = self.tasks.cache_project_status(task.id, live.clone()).await {
+                messages.push(QueryNoticeDto::DriftCacheNotRefreshed(
+                    DriftCacheNotRefreshedNotice {
+                        reason: e.to_string(),
+                    },
+                ));
+                break;
+            }
+        }
+
+        Ok(page.statuses)
     }
 
     /// Resolve the workspace's parent project, if any. `None` for projectless
@@ -585,12 +704,15 @@ fn cached_project_status(project: Option<&Project>, task: &Task) -> Option<Strin
 ///   `Some` and differ. A NULL cache (`None` actual) is "not yet polled" — not
 ///   a mismatch. Archived (`NotPlanned`) tasks are skipped by the caller before
 ///   this axis runs, so they're never flagged.
-fn project_axis(project: Option<&Project>, task: &Task) -> (Option<String>, Option<String>, bool) {
+fn project_axis(
+    project: Option<&Project>,
+    task: &Task,
+    actual_id: Option<&str>,
+) -> (Option<String>, Option<String>, bool) {
     let Some(project) = project else {
         return (None, None, false);
     };
 
-    let actual_id = task.project_status_option_id.as_deref();
     let expected_id = project.resolved_option_id_for(task.is_open());
 
     let actual_name = actual_id.and_then(|id| project.option_name_for(id).map(str::to_string));
@@ -653,8 +775,8 @@ mod tests {
     use domain_workspace::{Workspace, WorkspaceName};
     use std::path::PathBuf;
     use testing_fixtures::{
-        InMemoryProjectRepository, InMemoryRepoBindingRepository, InMemoryTaskRepository,
-        InMemoryWorkspaceRepository,
+        InMemoryProjectRepository, InMemoryRemoteProjectProvider, InMemoryRepoBindingRepository,
+        InMemoryTaskRepository, InMemoryWorkspaceRepository,
     };
 
     fn svc() -> (
@@ -1587,5 +1709,130 @@ mod tests {
         // load-bearing assertion: a `Synced` task with a dangling
         // filing binding is invisible to drift WITHOUT this axis.
         assert_eq!(row.reasons, vec!["filing_repo".to_string()]);
+    }
+
+    /// Seed a workspace + project with one Synced, Open task carrying a board
+    /// item, whose CACHED status is "Done" — stale, and a drift row on its own.
+    /// Returns the task id and its item node id.
+    async fn live_drift_fixture(
+        ws: &Arc<InMemoryWorkspaceRepository>,
+        ts: &Arc<InMemoryTaskRepository>,
+        ps: &Arc<InMemoryProjectRepository>,
+    ) -> (WorkspaceId, domain_core::TaskId, String) {
+        let mut workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+        attach_project(&mut workspace, ws, ps).await;
+
+        let mut t = Task::new_draft(wid, None, "card on the board".into()).unwrap();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(RemoteRef::new("github", "7")).unwrap();
+        t.set_project_status_option_id(Some("o_done".into()));
+        t.project_item_id = Some("PVTI_1".into());
+        let tid = t.id;
+        ts.save(&t, SnapshotSource::Push).await.unwrap();
+        (wid, tid, "PVTI_1".to_string())
+    }
+
+    /// The point of Part B: a cache that says "Done" is stale, and the live
+    /// board says "Backlog" — which matches the task's Open lifecycle. The
+    /// cached read would report drift; the live read must not.
+    #[tokio::test]
+    async fn drift_live_status_overrides_a_stale_cache() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, _tid, item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        let cached = svc.drift(&wid.to_string()).await.unwrap();
+        assert_eq!(cached.len(), 1, "the stale cache alone reports drift");
+
+        let provider = InMemoryRemoteProjectProvider::new();
+        provider.set_item_status(&item, Some("o_backlog"));
+        let report = svc
+            .drift_report(&wid.to_string(), Some(&provider))
+            .await
+            .unwrap();
+        assert!(
+            report.rows.is_empty(),
+            "the board actually agrees with local; got {:?}",
+            report.rows
+        );
+        assert!(report.messages.is_empty(), "a complete live read is quiet");
+    }
+
+    /// An item the provider could not resolve keeps its cached value rather
+    /// than vanishing, so the report stays complete — and says how many rows
+    /// were not live.
+    #[tokio::test]
+    async fn drift_falls_back_to_cache_for_items_the_live_read_missed() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, _tid, _item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        // Provider seeded with nothing: the id resolves to no status at all.
+        let provider = InMemoryRemoteProjectProvider::new();
+        let report = svc
+            .drift_report(&wid.to_string(), Some(&provider))
+            .await
+            .unwrap();
+
+        assert_eq!(report.rows.len(), 1, "the row survives on its cached value");
+        assert_eq!(report.rows[0].project_status.as_deref(), Some("Done"));
+        match report.messages.as_slice() {
+            [QueryNoticeDto::DriftPartiallyLive(n)] => {
+                assert_eq!((n.live_count, n.cached_count), (0, 1));
+            }
+            other => panic!("expected a partially-live notice, got {other:?}"),
+        }
+    }
+
+    /// A failed live read degrades to the cache instead of failing the
+    /// command — drift is a diagnostic, and a stale answer that admits it is
+    /// stale beats no answer.
+    #[tokio::test]
+    async fn drift_live_read_failure_reports_cached_rows_with_a_notice() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, _tid, item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        let provider = InMemoryRemoteProjectProvider::new();
+        provider.set_item_status(&item, Some("o_backlog"));
+        provider.fail_next(1);
+
+        let report = svc
+            .drift_report(&wid.to_string(), Some(&provider))
+            .await
+            .unwrap();
+        assert_eq!(report.rows.len(), 1, "cached rows still reported");
+        assert!(
+            matches!(
+                report.messages.as_slice(),
+                [QueryNoticeDto::DriftLiveUnavailable(_)]
+            ),
+            "got {:?}",
+            report.messages
+        );
+    }
+
+    /// The live values are written back, so a later `--offline` run is fresh.
+    #[tokio::test]
+    async fn drift_live_read_refreshes_the_status_cache() {
+        let (svc, ws, _bs, ts, ps) = svc_with_projects();
+        let (wid, tid, item) = live_drift_fixture(&ws, &ts, &ps).await;
+
+        let provider = InMemoryRemoteProjectProvider::new();
+        provider.set_item_status(&item, Some("o_backlog"));
+        svc.drift_report(&wid.to_string(), Some(&provider))
+            .await
+            .unwrap();
+
+        let stored = ts.get(tid).await.unwrap();
+        assert_eq!(
+            stored.project_status_option_id.as_deref(),
+            Some("o_backlog"),
+            "the stale cached value must have been replaced"
+        );
+        assert_eq!(
+            stored.sync,
+            SyncState::Synced,
+            "a cache refresh must not touch the sync axis"
+        );
     }
 }

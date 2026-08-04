@@ -7,7 +7,7 @@ use crate::cli::{QueryCmd, WorkspaceArg};
 use crate::commands::repo::resolve_workspace;
 use crate::commands::task::git_user_name;
 use crate::render;
-use crate::services::Services;
+use crate::services::{Services, build_github_provider};
 
 pub(crate) async fn query_dispatch(
     cmd: QueryCmd,
@@ -52,10 +52,30 @@ pub(crate) async fn query_dispatch(
         }
         QueryCmd::Drift {
             ws: WorkspaceArg { workspace },
+            offline,
         } => {
             let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.drift(&workspace).await?;
-            render::drift(&v);
+            // A missing token is not an error here: drift degrades to the
+            // cached read and reports why, so the command still answers on a
+            // machine that has never run `rl gh auth`.
+            let provider = match offline {
+                true => None,
+                false => match cfg.resolve_github_token() {
+                    Ok(Some(token)) => Some(build_github_provider(&token, cfg)?),
+                    Ok(None) => None,
+                    Err(e) => return Err(anyhow!("{e}")),
+                },
+            };
+            let report = svc
+                .query
+                .drift_report(
+                    &workspace,
+                    provider
+                        .as_ref()
+                        .map(|p| p as &dyn ports::RemoteProjectProvider),
+                )
+                .await?;
+            render::drift(&report);
         }
         QueryCmd::Ready {
             ws: WorkspaceArg { workspace },

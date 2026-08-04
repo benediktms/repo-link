@@ -898,3 +898,56 @@ async fn graphql_errors_map_to_backend() {
         .unwrap_err();
     assert!(matches!(err, PortError::Backend(_)), "got {err:?}");
 }
+
+/// The live-drift read (#201): the option comes from the field whose id
+/// matches, an id GitHub cannot resolve arrives as a positional `null` and is
+/// simply absent from the map, and an item with no value for the Status field
+/// is present with `None` — the distinction drift relies on to tell "unset on
+/// the board" from "we could not read it".
+#[tokio::test]
+async fn fetch_item_statuses_maps_by_field_id_and_skips_unresolved_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("nodes(ids:"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "nodes": [
+                { "__typename": "ProjectV2Item", "id": "PVTI_a",
+                  "fieldValues": { "nodes": [
+                    { "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                      "optionId": "PRIO_HIGH", "field": { "id": "PVTSSF_priority" } },
+                    { "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                      "optionId": "o_done", "field": { "id": "PVTSSF_status" } }
+                  ] } },
+                { "__typename": "ProjectV2Item", "id": "PVTI_b",
+                  "fieldValues": { "nodes": [] } },
+                null
+            ] }
+        })))
+        .mount(&server)
+        .await;
+
+    let page = provider(&server)
+        .fetch_item_statuses(
+            &[
+                "PVTI_a".to_string(),
+                "PVTI_b".to_string(),
+                "PVTI_gone".to_string(),
+            ],
+            "PVTSSF_status",
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.statuses.get("PVTI_a"), Some(&Some("o_done".into())));
+    assert_eq!(
+        page.statuses.get("PVTI_b"),
+        Some(&None),
+        "present-with-None is an item whose Status is unset"
+    );
+    assert!(
+        !page.statuses.contains_key("PVTI_gone"),
+        "an unresolved id must be absent so the caller keeps its cached value"
+    );
+    assert!(!page.truncated, "three ids is one chunk");
+}

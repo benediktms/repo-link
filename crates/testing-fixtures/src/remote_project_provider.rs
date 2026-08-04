@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ports::{
-    PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectProvider,
+    ItemStatusPage, PollPage, PortError, PortResult, RemoteProjectItem, RemoteProjectProvider,
     RemoteProjectSnapshot,
 };
 
@@ -53,6 +53,12 @@ pub enum ProjectCall {
         status_field_id: String,
         query: String,
     },
+    /// One `fetch_item_statuses` invocation — the live drift read. Tests
+    /// assert which item ids were batched and against which Status field.
+    FetchItemStatuses {
+        item_node_ids: Vec<String>,
+        status_field_id: String,
+    },
     /// One `set_issue_type` invocation (RFC 0006 §0 A1 / #228) — the
     /// off-axis GraphQL `updateIssue` projection, distinct from
     /// `SetSingleSelectOption` (which only ever addresses a project-item
@@ -89,11 +95,24 @@ pub struct InMemoryRemoteProjectProvider {
     /// node id. Lets the poller's tests drive a truncated page directly rather
     /// than synthesising a giant item vec. Absent key → `false` (complete).
     poll_truncated: Mutex<std::collections::HashMap<String, bool>>,
+    /// Statuses `fetch_item_statuses` reports, keyed by item node id. An id the
+    /// caller asks for that is absent here is left out of the returned page —
+    /// the "item did not resolve" case that makes drift fall back to cache.
+    item_statuses: Mutex<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl InMemoryRemoteProjectProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Seed the status `fetch_item_statuses` reports for one item. Leaving an
+    /// item unseeded is how a test drives the "did not resolve" path.
+    pub fn set_item_status(&self, item_node_id: &str, option_id: Option<&str>) {
+        self.item_statuses
+            .lock()
+            .unwrap()
+            .insert(item_node_id.to_string(), option_id.map(str::to_string));
     }
 
     pub fn set_add_item_returns(&self, id: &str) {
@@ -292,6 +311,32 @@ impl RemoteProjectProvider for InMemoryRemoteProjectProvider {
                 .clone()
                 .unwrap_or_else(|| option_id.to_string()),
         ))
+    }
+
+    async fn fetch_item_statuses(
+        &self,
+        item_node_ids: &[String],
+        status_field_id: &str,
+    ) -> PortResult<ItemStatusPage> {
+        if self.should_fail() {
+            return Err(PortError::Backend("stub: item statuses transient".into()));
+        }
+        self.calls
+            .lock()
+            .unwrap()
+            .push(ProjectCall::FetchItemStatuses {
+                item_node_ids: item_node_ids.to_vec(),
+                status_field_id: status_field_id.to_string(),
+            });
+        let seeded = self.item_statuses.lock().unwrap();
+        let statuses = item_node_ids
+            .iter()
+            .filter_map(|id| seeded.get(id).map(|s| (id.clone(), s.clone())))
+            .collect();
+        Ok(ItemStatusPage {
+            statuses,
+            truncated: false,
+        })
     }
 
     async fn poll_project_items(
