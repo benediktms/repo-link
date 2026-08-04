@@ -25,10 +25,30 @@ just install
 
 `just install` builds the release binaries, puts `rl` and `rld` into
 `~/.local/bin/`, and registers the daemon — as a launchd agent on macOS, a
-`systemd --user` unit on Linux, and a Task Scheduler task on Windows (where the
-binaries are copied rather than symlinked). Make sure `~/.local/bin` is on your
-`PATH`. From that point on, use the bare `rl` command anywhere — it's
-cwd-independent.
+`systemd --user` unit on Linux, and a Task Scheduler task on Windows. Make sure
+`~/.local/bin` is on your `PATH`. From that point on, use the bare `rl` command
+anywhere — it's cwd-independent.
+
+### Windows
+
+The install directory is `%USERPROFILE%\.local\bin`. That is not a Windows
+convention and nothing puts it on `PATH` for you, so add it once from
+PowerShell:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  'PATH',
+  "$([Environment]::GetEnvironmentVariable('PATH', 'User'));$env:USERPROFILE\.local\bin",
+  'User')
+```
+
+Then open a new terminal. This reads and writes the *user* `PATH` only. Avoid
+`setx PATH "%PATH%;..."`, which flattens the machine `PATH` into your user one
+and truncates at 1024 characters.
+
+Windows copies the binaries instead of symlinking them, because creating a
+symlink needs Developer Mode or an elevated shell. A rebuild therefore does not
+take effect on its own — re-run `just install` after each one.
 
 To uninstall: `just uninstall`.
 
