@@ -72,7 +72,8 @@ were 1.68 MiB.
 On 2026-07-25 a one-off harness exercised the exact D5 schema with 4 KiB pages,
 full auto-vacuum, WAL, external-content FTS5 triggers, and one 384-dimensional
 float32 vector per lexical chunk. The current corpus used D2's approximately
-900-byte boundary; synthetic rows used comparable 918-byte formatted chunks.
+900-byte formatted-chunk budget; synthetic rows used comparable ~900-byte
+formatted chunks.
 Capacity measurements ran on SQLite 3.53.1. A separate build probe confirmed
 the schema, FTS5 `delete-all`/`integrity-check`, and DBSTAT on repo-link's
 bundled SQLite 3.46.0.
@@ -178,8 +179,9 @@ subject; the body supplies detail. Averaging or ranking independent title/body
 vectors would discard that relationship.
 
 Lexical chunk boundaries are **model-independent**: the chunker packs complete
-body paragraphs under a fixed UTF-8 byte budget (initially approximately 900
-bytes of body text per chunk, recorded in `chunk_format_version`), splits an
+body paragraphs under a fixed UTF-8 byte budget — initially approximately 900
+bytes of **formatted chunk text** (title anchor plus its body paragraph) per
+chunk, recorded exactly in `chunk_format_version` — splits an
 oversized paragraph at sentence boundaries and then valid UTF-8 scalar
 boundaries, and prepends the complete title to every body chunk. When the title
 itself exceeds the budget, body chunks carry a deterministic, explicitly
@@ -342,9 +344,17 @@ introduction (§7 "Late interaction and reranking").
 
 ### D5 — Search state lives in an in-place SQLite sidecar
 
-The authoritative `repo-link.db` receives no search tables, triggers, FTS data,
-formatted search text, or vectors. Store the derived index beside it by
-appending a suffix to the complete authoritative filename:
+The sidecar is a **second, distinct SQLite database file** sitting beside
+`repo-link.db` on disk, opened as its own SQLite connection by the same `rl`
+process that performs search. It is **not** tables added to the authoritative
+database, and it is **not** a separate process or daemon — there is no
+always-running search service; every `rl task search` reconciles and reads the
+sidecar in-process. `rld` appears only as a gated, optional warm-`embed_query`
+endpoint in Stage 4, never as a search-index process (§7).
+
+Accordingly, the authoritative `repo-link.db` receives no search tables,
+triggers, FTS data, formatted search text, or vectors. Store the derived index
+beside it by appending a suffix to the complete authoritative filename:
 
 ```text
 <authoritative-db-filename>.task-search.db
@@ -366,10 +376,17 @@ SQLite opens either file; a repo-link-created parent data directory uses
 database, and the adapter verifies all four file modes after open, checkpoint,
 and recovery. Existing files with broader permissions are tightened before any
 search text is written. A custom authoritative database's parent directory is
-not chmodded, but every derived file beside it remains `0600`. Other platforms
-use the equivalent owner-only ACL. Failure to establish or verify that policy
-is a sidecar-unavailable condition under D8, not permission to continue with a
-broader mode.
+not chmodded, but the sidecar must still fail closed on an untrusted parent:
+before creating or opening the sidecar, stable lock, `-wal`, or `-shm` file,
+the adapter requires a trusted, non-world-writable parent — a repo-link-created
+`0700` data directory qualifies, while a world-writable or non-owned custom
+parent, or any symlink in the sidecar path, is a sidecar-unavailable failure
+under D8, never a reason to broaden a mode or follow the link. Files are
+created no-follow with explicit ownership checks, and the same parent-trust and
+no-follow validation applies at open, checkpoint, and recovery — not just first
+creation. Other platforms use the equivalent owner-only ACL. Failure to
+establish or verify that policy is a sidecar-unavailable condition under D8, not
+permission to continue with a broader mode.
 
 The sidecar schema is:
 
@@ -378,7 +395,13 @@ task_search_meta(
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     schema_version INTEGER NOT NULL,
     chunk_format_version INTEGER NOT NULL,
-    embedding_profile_id TEXT            -- NULL until a prepared profile claims it
+    embedding_profile_id TEXT,           -- NULL until a prepared profile claims it
+    -- Validated-integrity marker (D6): NULL until the FTS5 index is verified
+    -- for the recorded content fingerprint and sidecar file identity.
+    validated_content_fingerprint BLOB,  -- SHA-256 of the desired-set signature
+    validated_file_size INTEGER,         -- sidecar file size at validation
+    validated_file_mtime INTEGER,        -- sidecar file mtime at validation
+    validated_at TEXT                    -- ISO-8601 instant of the check
 )
 
 task_search_chunks(
@@ -412,8 +435,9 @@ tokenizer-bounded vectors back to each lexical chunk.
 documented insert/delete trigger pattern. A guard trigger rejects updates to
 chunk identity or text; chunks are deleted and inserted rather than mutated.
 Vector rows live separately, so embedding updates cannot desynchronize FTS.
-`status` and `rebuild` run FTS5 `integrity-check`; D6 also runs it before every
-non-empty trigger-driven reconcile.
+`status` and `rebuild` run FTS5 `integrity-check`; D6 also runs it before any
+lexical read or mutation whose validated-integrity marker is missing or stale,
+or whose reconcile diff is non-empty.
 
 FTS5 and DBSTAT availability are compile-time facts in the current bundled
 SQLite build. An offline CI smoke test pins both capabilities.
@@ -421,7 +445,11 @@ SQLite build. An offline CI smoke test pins both capabilities.
 A stable sibling `<sidecar>.lock` file is never renamed or deleted. Search,
 status, and ordinary reconciliation hold a standard-library shared file lock
 for the sidecar connection lifetime. Explicit `rebuild` and `clear` obtain the
-exclusive lock before opening it. Normal reconciliation uses ordinary SQLite
+exclusive lock before opening it. The lock maps to the platform's equivalent
+owned-lockfile primitive (on Windows, the same `windows-sys` file-handle
+discipline the rest of repo-link uses for the token ACL); a lock-acquisition
+failure is a sidecar-unavailable condition under D8, never a reason to proceed
+unsynchronized. Normal reconciliation uses ordinary SQLite
 transactions and updates the existing database in place; it never unlinks,
 renames, or swaps it. A failed transaction leaves the previous committed state
 intact.
@@ -478,12 +506,16 @@ Every `rl task search` begins with a full-corpus reconcile:
 4. construct deterministic D2/D3 lexical chunks and SHA-256 hashes;
 5. calculate the desired `(task_id, content_hash)` set and projected storage;
    refuse before growth if D5 budgets or filesystem headroom would be exceeded;
-6. when the diff is non-empty, run FTS5 `integrity-check` with `rank = 1`
-   inside the still-open transaction, verifying both the index and its external
-   content before any trigger-driven mutation;
+6. when the diff is non-empty, or when the validated-integrity marker for the
+   current sidecar content is missing or stale (the zero-change rule below), run
+   FTS5 `integrity-check` with `rank = 1` inside the still-open transaction,
+   verifying both the index and its external content before any lexical read or
+   trigger-driven mutation;
 7. delete rows absent from the desired set and insert missing rows; FTS follows
-   through D5 triggers; and
-8. commit the sidecar transaction.
+   through D5 triggers;
+8. commit the sidecar transaction and persist a validated-integrity marker bound
+   to the committed content fingerprint and the sidecar's file identity,
+   invalidated by any later diff or file-identity change as described below.
 
 The ordering is intentional. SQLite serializes sidecar writers, and every
 later reconciler takes its authoritative snapshot only after acquiring that
@@ -491,12 +523,33 @@ writer slot. A slow reconcile therefore cannot land an older snapshot after a
 newer reconcile. The authoritative database remains read-only throughout and
 its writer slot is never held by search.
 
-A zero-change reconcile writes no rows and skips the pre-write integrity check.
-The Stage 0 follow-up measured that check at 283 ms on the synthetic 100k
-external-content index, so paying it only before actual mutation preserves the
-fast path while protecting every trigger-driven update. Integrity failure or
-any subsequent SQLite write error rolls back the whole sidecar transaction;
-D8 then returns literal-only results and machine-readable rebuild guidance.
+A zero-change reconcile writes no rows. It must not, however, serve lexical
+results over an unvalidated FTS5 index: a corrupt external-content index would
+otherwise return wrong lexical results without ever triggering the D8
+literal-only fallback. Rather than paying `integrity-check` on every search,
+the adapter persists a validated-integrity marker in `task_search_meta`
+(`validated_*` columns, D5) bound to the sidecar's current content fingerprint
+(the reconcile's desired-set signature) and the sidecar's file identity (size
+and modification time). The marker is invalidated — forcing a fresh
+`integrity-check` (with `rank = 1`) before any lexical read or mutation —
+whenever the reconcile diff is non-empty, the sidecar file identity changes
+(external modification, restoration, or truncation), or any lifecycle
+transition (`rebuild`, `clear`, profile claim/change, or schema/format version
+change) occurs. `rebuild` and `clear` explicitly drop the marker so the next
+search re-establishes it. When no current marker exists or it is stale, the
+integrity check runs before lexical retrieval. This preserves the fast path for
+the common unchanged case while guaranteeing that a changed or externally
+altered index is validated before it can shape lexical results. The Stage 0
+follow-up measured the check at 283 ms on the synthetic 100k external-content
+index; paying it only when the marker is missing, stale, or the diff is
+non-empty keeps that cost off the hot path. The marker is a change-detection
+aid, not a tamper proof: it detects content edits and size/mtime changes, but a
+file owner who deliberately corrupts the sidecar while preserving its fingerprint
+and metadata can defeat it — out of scope, since that same owner can always
+corrupt the disposable file directly; D8's `index_corrupt` fallback and explicit
+`search-index rebuild` cover recovery regardless. Integrity failure or any
+subsequent SQLite write error rolls back the whole sidecar transaction; D8 then
+returns literal-only results and machine-readable rebuild guidance.
 Source edits committed after step 3's snapshot may remain one query behind;
 the D4 response snapshot rejects evidence stale relative to that snapshot, and
 the next reconcile repairs omissions or changed chunks. No source write can be
@@ -823,8 +876,10 @@ app-cli
 2. **Derived and disposable.** Every search row is re-derivable from
    authoritative rows; `clear` removes all of them from the sidecar.
 3. **No history.** Snapshots and prior chunk versions are never indexed.
-4. **Authoritative isolation.** `repo-link.db` stores no search schema, text,
-   FTS, or vectors and is never written by search.
+4. **Authoritative isolation.** `repo-link.db` and the sidecar are two
+   distinct SQLite database files: the authoritative DB stores no search
+   schema, text, FTS, or vectors and is never written by search; all derived
+   search state lives in the sidecar file.
 5. **In-place transactions.** Routine sidecar updates are transactional and
    need no file replacement or cross-database acknowledgement protocol. Only
    explicit clear may recreate an unopenable sidecar under the exclusive
@@ -841,7 +896,8 @@ app-cli
    affect authoritative task operations.
 10. **Owner-only derived files.** Sidecar, lock, WAL, and shared-memory
     companions use owner-only permissions; search degrades rather than writing
-    task content through a broader mode.
+    task content through a broader mode. Creation/open requires a trusted,
+    non-world-writable parent and rejects symlinks in the sidecar path.
 
 With one 384-dimensional float32 vector per lexical chunk, Stage 0 measured
 approximately 3.33 KiB per synthetic chunk for text, indexes, FTS, and vector
@@ -1036,8 +1092,10 @@ search time, when the user has expressed interest in fresh results.
   `max_page_count`, cache budgets, and observable warn/refuse thresholds.
 - **Local data exposure.** The sidecar duplicates current task/comment text.
   Mitigation: pre-create database/lock files as owner-only, verify every SQLite
-  companion before writing content, preserve modes during recovery, and
-  degrade to literal-only search on any permission-policy failure.
+  companion before writing content, preserve modes during recovery, fail closed
+  on an untrusted (world-writable or non-owned) parent and on symlinks in the
+  sidecar path at creation, open, checkpoint, and recovery, and degrade to
+  literal-only search on any permission-policy failure.
 - **Mixed binaries.** Different chunk or profile versions could otherwise
   rebuild each other's state. Mitigation: ordinary search never changes
   non-NULL format/profile ownership; explicit rebuild is the only transition.
@@ -1068,6 +1126,12 @@ search time, when the user has expressed interest in fresh results.
 - Fixed the discovered clear-time FTS retention with native `delete-all`, then
   selected D5's 384 MiB warning, 512 MiB hard sidecar/WAL limits, and 1 GiB /
   512 MiB free-space warning/refusal thresholds.
+
+A reproduceable harness and a fresh measurement run are stored alongside this
+RFC as an appendix: `docs/rfcs/0007-semantic-task-search.spike/` (see
+`RESULTS.md` there for the run commands and how the fresh numbers reconcile
+with the §1 tables). The storage model — not the timings — is the load-bearing
+claim; timings are machine-local evidence.
 
 ### Stage 1 — PR1: search without a model
 
@@ -1137,8 +1201,10 @@ Reconciliation:
 
 - Create/edit/delete of tasks and comments converge the index in one
   reconcile; a zero-change reconcile performs zero writes.
-- A zero-change reconcile skips FTS integrity; every non-empty diff runs
-  `integrity-check` with `rank = 1` before its first delete/insert.
+- A zero-change reconcile reuses a current, file-identity-matched
+  validated-integrity marker and performs zero writes; a missing or stale
+  marker (or a non-empty diff) forces `integrity-check` with `rank = 1` before
+  any lexical read or mutation.
 - Corrupt FTS or any trigger/write failure rolls back all sidecar changes and
   returns literal-only results with the required stable reason.
 - Wholesale comment refresh with unchanged bodies (current persistence
@@ -1161,7 +1227,10 @@ Reconciliation:
 - Sidecar path derivation distinguishes `foo.db` from `foo.sqlite`.
 - Sidecar, stable lock, WAL, and shared-memory companions are owner-only after
   first creation, reopen, checkpoint, and corrupt-sidecar recovery; an
-  inability to enforce the mode writes no search content.
+  inability to enforce the mode writes no search content. Creation/open fail
+  closed on a world-writable or non-owned parent and on any symlink in the
+  sidecar path (no-follow + ownership checks), applied identically at open,
+  checkpoint, and recovery.
 - Sidecar clear takes the exclusive lifecycle lock, shrinks the database and
   WAL under FTS `delete-all`, full auto-vacuum, and a truncating checkpoint,
   and leaves `repo-link.db` byte-for-byte and schema-for-schema unchanged.
@@ -1325,3 +1394,6 @@ Normal CI downloads nothing and uses the deterministic fake.
   <https://www.sbert.net/examples/sentence_transformer/applications/semantic-search/README.html>.
 - SQLite Vec1 intro — exact nearest-neighbour recommended below ~5,000
   vectors: <https://sqlite.org/vec1/doc/trunk/doc/vec1intro.md>.
+- Stage 0 reproduction — the D5 schema, chunker, reconcile, and measurement
+  harness plus fresh results: `docs/rfcs/0007-semantic-task-search.spike/`
+  (`spike.py`, `RESULTS.md`).
