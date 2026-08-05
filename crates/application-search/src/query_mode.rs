@@ -42,7 +42,7 @@ fn is_identifier_token(tok: &str) -> bool {
     if tok.is_empty() {
         return false;
     }
-    if ['_', ':', '/', '#', '-'].iter().any(|&c| tok.contains(c)) {
+    if ['_', '/', '#', '-'].iter().any(|&c| tok.contains(c)) || tok.contains("::") {
         return true;
     }
     let chars: Vec<char> = tok.chars().collect();

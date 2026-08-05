@@ -123,7 +123,12 @@ impl SqliteTaskSearchIndex {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(10));
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            // RFC D6 write serialization comes from `BEGIN IMMEDIATE`, not the
+            // pool width. A reconcile session holds one connection for its
+            // lifetime; keep a second free so `search_lexical`/`stats` never
+            // contend with a held writer connection (a single-connection pool
+            // could wedge them behind an aborted reconcile session).
+            .max_connections(2)
             .connect_with(opts)
             .await
             .map_err(|_| ReconcileFailure {
@@ -247,7 +252,7 @@ fn preflight(projected_bytes: u64) -> Result<(), ReconcileFailure> {
 /// (RFC 0007 D6 ordering). Carries the sidecar file identity captured at open
 /// for the validated-integrity marker.
 struct SqliteReconcileSession {
-    conn: Mutex<sqlx::pool::PoolConnection<Sqlite>>,
+    conn: sqlx::pool::PoolConnection<Sqlite>,
     file_size: i64,
     file_mtime: i64,
 }
@@ -255,12 +260,12 @@ struct SqliteReconcileSession {
 #[async_trait]
 impl ReconcileSession for SqliteReconcileSession {
     async fn diff_chunks(
-        &self,
+        &mut self,
         desired: &[ChunkTarget],
         projected_bytes: u64,
     ) -> Result<ReconcileDiff, ReconcileFailure> {
         preflight(projected_bytes)?;
-        let mut conn = self.conn.lock().await;
+        let conn = &mut self.conn;
 
         // FTS integrity-check before any mutation when the diff is non-empty
         // (RFC 0007 D6 step 6). We don't know the diff yet, so run it ahead of
@@ -344,8 +349,8 @@ impl ReconcileSession for SqliteReconcileSession {
         Ok(diff)
     }
 
-    async fn commit(&self, content_fingerprint: &[u8; 32]) -> Result<(), PortError> {
-        let mut conn = self.conn.lock().await;
+    async fn commit(&mut self, content_fingerprint: &[u8; 32]) -> Result<(), PortError> {
+        let conn = &mut self.conn;
         // Persist a validated-integrity marker bound to the content
         // fingerprint + sidecar file identity (RFC 0007 D6).
         sqlx::query(
@@ -368,8 +373,8 @@ impl ReconcileSession for SqliteReconcileSession {
         Ok(())
     }
 
-    async fn rollback(&self) -> Result<(), PortError> {
-        let mut conn = self.conn.lock().await;
+    async fn rollback(&mut self) -> Result<(), PortError> {
+        let conn = &mut self.conn;
         sqlx::query("ROLLBACK")
             .execute(&mut **conn)
             .await
@@ -432,7 +437,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             })
             .unwrap_or((0, 0));
         Ok(Box::new(SqliteReconcileSession {
-            conn: Mutex::new(conn),
+            conn,
             file_size,
             file_mtime,
         }))
@@ -738,7 +743,7 @@ mod tests {
         ];
 
         // First reconcile: insert 3.
-        let sess = index.begin_reconcile().await.unwrap();
+        let mut sess = index.begin_reconcile().await.unwrap();
         let d1 = sess.diff_chunks(&targets, 10_000).await.unwrap();
         assert_eq!(d1.desired_total, 3);
         assert_eq!(d1.inserted, 3);
@@ -753,7 +758,7 @@ mod tests {
         assert!(ranks.iter().any(|r| r.task_id == b));
 
         // Zero-change reconcile: nothing inserted.
-        let sess = index.begin_reconcile().await.unwrap();
+        let mut sess = index.begin_reconcile().await.unwrap();
         let d2 = sess.diff_chunks(&targets, 10_000).await.unwrap();
         assert_eq!(d2.inserted, 0, "zero-change reconcile writes nothing");
         assert_eq!(d2.deleted, 0);
@@ -765,7 +770,7 @@ mod tests {
             target(a, ChunkKind::Core, "Fix the retry loop"),
             target(b, ChunkKind::Core, "Add retry backoff"),
         ];
-        let sess = index.begin_reconcile().await.unwrap();
+        let mut sess = index.begin_reconcile().await.unwrap();
         let d3 = sess.diff_chunks(&reduced, 10_000).await.unwrap();
         assert_eq!(d3.deleted, 1, "removed chunk must be deleted");
         assert_eq!(d3.inserted, 0);
@@ -783,6 +788,38 @@ mod tests {
         assert_eq!(written, targets.len() as u64);
         let stats = index.stats().await.unwrap();
         assert_eq!(stats.chunk_count, targets.len() as u64);
+        assert!(stats.fts_integrity_ok);
+    }
+    /// A failed reconcile (storage-limit refusal) must roll back cleanly so
+    /// the single-connection pool is not left inside an open transaction.
+    #[tokio::test]
+    async fn failed_reconcile_leaves_sidecar_usable() {
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let index = SqliteTaskSearchIndex::new(&auth);
+        let a = tid(1);
+        let targets = vec![target(a, ChunkKind::Core, "x")];
+
+        let mut sess = index.begin_reconcile().await.unwrap();
+        let err = sess
+            .diff_chunks(&targets, REFUSE_BYTES + 1)
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason, LexicalUnavailableReasonDto::StorageLimit);
+        // The caller (TaskSearchService) always rolls back on a failed
+        // reconcile; verify that clears the raw BEGIN IMMEDIATE so the pool
+        // is not poisoned for the next acquire.
+        sess.rollback().await.unwrap();
+        drop(sess);
+
+        // The pool must accept a fresh reconcile (not poisoned by the aborted
+        // BEGIN IMMEDIATE).
+        let mut sess2 = index.begin_reconcile().await.unwrap();
+        let d2 = sess2.diff_chunks(&targets, 10_000).await.unwrap();
+        assert_eq!(d2.inserted, 1);
+        sess2.commit(&[1u8; 32]).await.unwrap();
+        let stats = index.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1);
         assert!(stats.fts_integrity_ok);
     }
 }

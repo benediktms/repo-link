@@ -2,7 +2,7 @@
 //!
 //! Three capabilities (RFC 0007 D9): the authoritative task/comment source
 //! (`TaskSearchSourceRepository`), the disposable sidecar index
-//! (`TaskSearchIndex`), and — in later stages — the embelding provider
+//! (`TaskSearchIndex`), and — in later stages — the embedding provider
 //! (`EmbeddingProvider`). Only the first two are exercised by PR1.
 //!
 //! Cross-boundary orchestration types that tie a response together
@@ -197,23 +197,23 @@ pub trait TaskSearchIndex: Send + Sync {
 /// writer transaction is acquired before the authoritative snapshot, so a
 /// slow reconciler cannot regress a newer index).
 #[async_trait]
-pub trait ReconcileSession: Send + Sync {
+pub trait ReconcileSession: Send {
     /// Diff the desired set against the sidecar and write the delta.
     /// `projected_bytes` is the RFC 0007 D5 storage preflight (adapter
     /// refuses before growth). Returns counts, or a `ReconcileFailure`
     /// carrying the stable degradation reason.
     async fn diff_chunks(
-        &self,
+        &mut self,
         desired: &[ChunkTarget],
         projected_bytes: u64,
     ) -> Result<ReconcileDiff, ReconcileFailure>;
 
     /// Commit the reconcile and persist a validated-integrity marker bound
     /// to the written content fingerprint (RFC 0007 D6).
-    async fn commit(&self, content_fingerprint: &[u8; 32]) -> PortResult<()>;
+    async fn commit(&mut self, content_fingerprint: &[u8; 32]) -> PortResult<()>;
 
     /// Roll back without persisting the marker.
-    async fn rollback(&self) -> PortResult<()>;
+    async fn rollback(&mut self) -> PortResult<()>;
 }
 
 /// A complete lexical ranking entry: one row per task, with the matched

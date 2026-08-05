@@ -458,10 +458,7 @@ pub(crate) struct TaskSearchArgs {
 /// `rl task search-index` subcommands (RFC 0007 D10).
 #[derive(Subcommand, Debug)]
 pub(crate) enum SearchIndexCmd {
-    Status {
-        #[arg(long)]
-        refresh: bool,
-    },
+    Status {},
     Rebuild {},
     Clear {},
     PrepareModel {},

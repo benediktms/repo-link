@@ -49,6 +49,9 @@ fn target(task_id: TaskId, kind: ChunkKind, text: String) -> ChunkTarget {
 /// `allow_title_only` is true for core (empty body → title-only content, D2)
 /// and false for comments (empty comment → no chunk).
 fn chunk_formatted(title: &str, body: &str, label: &str, allow_title_only: bool) -> Vec<String> {
+    // Normalise CRLF (GitHub-sourced text) so blank-line paragraph breaks are
+    // recognised by the `\n\n` split below (RFC 0007 D2 paragraph-preserving).
+    let body = body.replace("\r\n", "\n");
     if body.trim().is_empty() {
         return if allow_title_only {
             vec![format!("Title: {title}\n\n{label}:")]
@@ -63,10 +66,10 @@ fn chunk_formatted(title: &str, body: &str, label: &str, allow_title_only: bool)
         let mut chunks = vec![format!("Title: {title}\n\n{label}:")];
         let anchor = bounded_anchor(title, label);
         let h = format!("Title: {anchor}\n\n{label}:\n");
-        chunks.extend(pack_body(&h, body));
+        chunks.extend(pack_body(&h, &body));
         return chunks;
     }
-    pack_body(&header, body)
+    pack_body(&header, &body)
 }
 
 /// Deterministic truncated title anchor leaving room for the header + `…`
@@ -123,8 +126,9 @@ fn pack_body(header: &str, body: &str) -> Vec<String> {
     chunks
 }
 
-/// Split `body` into paragraphs on blank-line boundaries (RFC 0007 D2
-/// "paragraph-preserving"); interior single newlines are preserved.
+/// Split normalized body into paragraphs on blank-line boundaries (RFC 0007
+/// D2 "paragraph-preserving"); interior single newlines are preserved.
+/// Callers normalize CRLF before this runs.
 fn split_paragraphs(body: &str) -> Vec<&str> {
     body.split("\n\n").collect()
 }

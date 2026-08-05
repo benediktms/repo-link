@@ -116,10 +116,13 @@ async fn load_all_tasks(db: &Db) -> Result<Vec<TaskTextRow>, PortError> {
             &r.try_get::<String, _>("workspace_id")
                 .map_err(map_sqlx_err)?,
         )?;
-        let repo_id: Option<RepoId> = r
+        let repo_id: Option<RepoId> = match r
             .try_get::<Option<String>, _>("repo_instance_id")
             .map_err(map_sqlx_err)?
-            .and_then(|s| RepoId::from_str(&s).ok());
+        {
+            Some(s) => Some(RepoId::from_str(&s).map_err(|e| PortError::Backend(e.to_string()))?),
+            None => None,
+        };
         let lifecycle: String = r.try_get("lifecycle").map_err(map_sqlx_err)?;
         let title: String = r.try_get("title").map_err(map_sqlx_err)?;
         let body: String = r.try_get("body").map_err(map_sqlx_err)?;
@@ -144,49 +147,57 @@ fn lifecycle_is_open(lifecycle: &str) -> bool {
     matches!(lifecycle, "open" | "reopened")
 }
 
-/// Load identity fields (display id + workspace name) per task in one query.
+/// Load identity fields (display id + workspace name) for all tasks in one
+/// query (RFC 0007 D4 "one read snapshot").
 async fn build_snapshot(db: &Db, tasks: Vec<TaskTextRow>) -> Result<InMemorySnapshot, PortError> {
-    let mut items = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        let (display_id, workspace_name) = identity_for(db, &task).await?;
-        items.push(SnapshotItem {
-            task,
-            display_id,
-            workspace_name,
-        });
-    }
-    Ok(InMemorySnapshot { items })
-}
-
-async fn identity_for(db: &Db, task: &TaskTextRow) -> Result<(String, String), PortError> {
-    let row = sqlx::query(
-        "SELECT w.name AS ws_name, ro.prefix AS repo_prefix, t.hash AS hash \
+    let ids: Vec<String> = tasks.iter().map(|t| t.task_id.to_string()).collect();
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT t.id AS id, w.name AS ws_name, ro.prefix AS repo_prefix, t.hash AS hash \
          FROM tasks t \
          LEFT JOIN workspaces w ON w.id = t.workspace_id \
          LEFT JOIN repo_instances ri ON ri.id = t.repo_instance_id \
          LEFT JOIN repo_origins ro ON ro.id = ri.origin_id \
-         WHERE t.id = ?",
-    )
-    .bind(task.task_id.to_string())
-    .fetch_optional(&db.reads)
-    .await
-    .map_err(map_sqlx_err)?;
-
-    let (ws_name, prefix, hash) = match row {
-        Some(r) => {
-            let ws_name: String = r.try_get("ws_name").unwrap_or_default();
-            let prefix: String = r.try_get("repo_prefix").unwrap_or_default();
-            let hash: String = r.try_get("hash").unwrap_or_default();
-            (ws_name, prefix, hash)
-        }
-        None => (String::new(), String::new(), String::new()),
-    };
-    let display_id = if prefix.is_empty() {
-        hash.clone()
-    } else {
-        format!("{prefix}-{hash}")
-    };
-    Ok((display_id, ws_name))
+         WHERE t.id IN ({placeholders})"
+    );
+    let mut q = sqlx::query(&sql);
+    for id in &ids {
+        q = q.bind(id);
+    }
+    let rows = q.fetch_all(&db.reads).await.map_err(map_sqlx_err)?;
+    let mut by_id: std::collections::HashMap<TaskId, (String, String)> = Default::default();
+    for r in rows {
+        let Ok(tid) =
+            TaskId::from_str(r.try_get::<String, _>("id").map_err(map_sqlx_err)?.as_str())
+        else {
+            continue;
+        };
+        let ws_name: String = r.try_get("ws_name").unwrap_or_default();
+        let prefix: String = r.try_get("repo_prefix").unwrap_or_default();
+        let hash: String = r.try_get("hash").unwrap_or_default();
+        let display_id = if prefix.is_empty() {
+            hash.clone()
+        } else {
+            format!("{prefix}-{hash}")
+        };
+        by_id.insert(tid, (display_id, ws_name));
+    }
+    let items = tasks
+        .into_iter()
+        .map(|task| {
+            let (display_id, workspace_name) = by_id
+                .remove(&task.task_id)
+                .unwrap_or((task.task_id.to_string(), String::new()));
+            SnapshotItem {
+                task,
+                display_id,
+                workspace_name,
+            }
+        })
+        .collect();
+    Ok(InMemorySnapshot { items })
 }
 
 /// In-memory authoritative result snapshot (RFC 0007 D4 "one read snapshot").

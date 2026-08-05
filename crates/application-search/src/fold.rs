@@ -78,7 +78,9 @@ pub fn find_literal_spans(text: &str, needle: &str) -> Vec<std::ops::Range<usize
         if let Some(span) = map_to_raw(&src.chars, mstart, mend) {
             out.push(span);
         }
-        search_from = mstart + 1;
+        // Advance to the end of this match, not `mstart + 1`: the latter can
+        // land inside a multi-byte folded scalar and panic the next slice.
+        search_from = mend;
     }
     out
 }
@@ -168,5 +170,16 @@ mod tests {
             find_literal_spans("error E0308: mismatched types", "e0308"),
             vec![6..11]
         );
+    }
+
+    #[test]
+    fn multi_byte_matched_scalar_does_not_panic() {
+        // Regression: advancing past a multi-byte folded scalar used to land
+        // inside it and panic the next slice. Searching for `é` twice must be
+        // safe and return both matches.
+        let spans = find_literal_spans("aé...é", "é");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&"aé...é"[spans[0].clone()], "é");
+        assert_eq!(&"aé...é"[spans[1].clone()], "é");
     }
 }

@@ -97,19 +97,22 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                     None
                 }
             };
-            if let Some(s) = session {
-                match s.diff_chunks(&targets, projected).await {
-                    Ok(_) => {
-                        if s.commit(&fingerprint).await.is_err() {
-                            lexical_available = false;
-                            lexical_reason =
-                                Some(LexicalUnavailableReasonDto::ReconciliationFailed);
-                        }
-                    }
-                    Err(ReconcileFailure { reason }) => {
-                        lexical_available = false;
-                        lexical_reason = Some(reason);
-                    }
+            if let Some(mut s) = session {
+                let outcome = match s.diff_chunks(&targets, projected).await {
+                    Ok(_) => match s.commit(&fingerprint).await {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(Some(LexicalUnavailableReasonDto::ReconciliationFailed)),
+                    },
+                    Err(ReconcileFailure { reason }) => Err(Some(reason)),
+                };
+                if let Err(reason) = outcome {
+                    // Always release the raw `BEGIN IMMEDIATE` transaction
+                    // before the session's pool connection is returned; a
+                    // live open transaction on the single-connection pool
+                    // would poison every later acquire.
+                    let _ = s.rollback().await;
+                    lexical_available = false;
+                    lexical_reason = reason;
                 }
             }
         }
@@ -161,18 +164,18 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
         let lexical_by_task: HashMap<TaskId, &LexicalRank> =
             lexical.iter().map(|r| (r.task_id, r)).collect();
 
-        // Fuse lexical (when present) + the natural-mode literal occurrence
-        // lane (RFC 0007 D4 third lane).
+        // Fuse lexical (when present) + the literal occurrence lane (RFC
+        // 0007 D4 third lane). The literal lane feeds fusion in EVERY mode:
+        // in exact/identifier it supplies the candidates the hard sort-ahead
+        // then prioritises, so a query still returns literal matches even
+        // when the lexical lane is unavailable.
+        let occ = literal_occurrence_ranking(literal);
         let mut fused = HashMap::new();
-        if !lexical_map.is_empty() {
-            fused = rrf_fuse(&[&lexical_map]);
-        }
-        if mode == QueryMode::Natural {
-            let occ = literal_occurrence_ranking(literal);
-            let fused2 = rrf_fuse(&[&lexical_map, &occ]);
-            if !fused2.is_empty() {
-                fused = fused2;
-            }
+        match (!lexical_map.is_empty(), !occ.is_empty()) {
+            (true, true) => fused = rrf_fuse(&[&lexical_map, &occ]),
+            (true, false) => fused = rrf_fuse(&[&lexical_map]),
+            (false, true) => fused = rrf_fuse(&[&occ]),
+            (false, false) => {}
         }
         let mut ordered = order_fused(&fused);
 
@@ -201,7 +204,7 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
 
             let (kind, comment_id, excerpt_text) = evidence(lit, lex, &identity.title);
             let matched = SearchMatchDto {
-                literal: lit.map(|l| l.contributed),
+                literal: lit.filter(|l| l.contributed).map(|_| true),
                 lexical_rank: lex.map(|r| r.rank as u64),
                 semantic_rank: None,
                 semantic_score: None,
@@ -233,7 +236,13 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                 lexical_reason
             },
             semantic_available: false,
-            semantic_skipped_reason: Some(SemanticSkippedReasonDto::ModelNotPrepared),
+            semantic_skipped_reason: Some(if !lexical_available {
+                // D8/D10 precedence: lexical index unavailable precedes model
+                // not prepared.
+                SemanticSkippedReasonDto::LexicalIndexUnavailable
+            } else {
+                SemanticSkippedReasonDto::ModelNotPrepared
+            }),
             results,
         })
     }

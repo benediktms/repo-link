@@ -99,7 +99,7 @@ pub struct SearchResultDto {
     pub workspace_id: String,
     pub workspace_name: String,
     pub title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched: Option<SearchMatchDto>,
     pub matched_source: MatchedSourceDto,
 }

@@ -86,25 +86,36 @@ pub(crate) async fn search_index_dispatch(
     let index = SqliteTaskSearchIndex::new(&cfg.database_path);
     match cmd {
         SearchIndexCmd::Status { .. } => {
-            let stats = index.stats().await?;
-            let meta = index.metadata().await?;
-            let (lex_available, lex_reason) = match (&meta.available, &meta.schema_mismatch) {
-                (None, _) => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
-                (Some(_), Some(m)) if m.incompatible => {
-                    (false, Some(LexicalUnavailableReasonDto::SchemaMismatch))
+            // Report an unavailable sidecar rather than failing: status is the
+            // diagnostic surface for exactly that condition (RFC 0007 D8).
+            let stats = index.stats().await.ok();
+            let sidecar_available = stats.as_ref().map(|s| s.sidecar_available).unwrap_or(false);
+            let (lex_available, lex_reason) = match stats {
+                Some(_) => {
+                    let meta = index.metadata().await.ok();
+                    match (
+                        meta.as_ref().and_then(|m| m.available.as_ref()),
+                        meta.as_ref().and_then(|m| m.schema_mismatch.as_ref()),
+                    ) {
+                        (None, _) => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
+                        (Some(_), Some(m)) if m.incompatible => {
+                            (false, Some(LexicalUnavailableReasonDto::SchemaMismatch))
+                        }
+                        _ => (true, None),
+                    }
                 }
-                _ => (true, None),
+                None => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
             };
             render::search_index_status(&SearchIndexStatusDto {
                 lexical_available: lex_available,
                 semantic_available: false,
                 lexical_unavailable_reason: lex_reason,
                 semantic_skipped_reason: Some(SemanticSkippedReasonDto::ModelNotPrepared),
-                chunk_count: stats.chunk_count,
-                vector_count: stats.vector_count,
-                fts_integrity_ok: stats.fts_integrity_ok,
-                sidecar_size_bytes: stats.sidecar_size_bytes,
-                sidecar_available: Some(stats.sidecar_available),
+                chunk_count: stats.as_ref().map(|s| s.chunk_count).unwrap_or(0),
+                vector_count: stats.as_ref().map(|s| s.vector_count).unwrap_or(0),
+                fts_integrity_ok: stats.as_ref().map(|s| s.fts_integrity_ok).unwrap_or(false),
+                sidecar_size_bytes: stats.as_ref().map(|s| s.sidecar_size_bytes).unwrap_or(0),
+                sidecar_available: Some(sidecar_available),
             });
         }
         SearchIndexCmd::Rebuild { .. } => {
