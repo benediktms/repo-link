@@ -5,7 +5,7 @@ use chrono::Utc;
 use domain_core::{TaskId, WorkspaceId};
 use domain_project::Project;
 use domain_repo::LinkStatus;
-use domain_task::{Lifecycle, RelationKind, SyncState, Task};
+use domain_task::{Lifecycle, Priority, RelationKind, SyncState, Task};
 use ports::{
     ProjectRepository, RepoBindingRepository, TaskFilter, TaskRepository, WorkspaceRepository,
 };
@@ -13,8 +13,8 @@ use ports::{
 use crate::dto::{
     AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow,
     DriftCacheNotRefreshedNotice, DriftLiveUnavailableNotice, DriftPartiallyLiveNotice,
-    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyTaskRow, StaleWorktreeRow,
-    UnsyncedTaskRow, WorkspaceOverview,
+    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyNode, ReadyTaskRow, ReadyView,
+    ReadyWorkspace, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use crate::error::Result;
 
@@ -309,34 +309,77 @@ impl QueryService {
         // the cached-status semantics for every row (#236); local-only, no reads.
         let project = self.resolve_workspace_project(id).await?;
 
-        // Ready = open, not (transitively) blocked, and not in conflict.
-        let is_ready = |t: &domain_task::Task| t.is_open() && t.sync != SyncState::Conflict;
-
-        let mut ready: Vec<&domain_task::Task> = tasks
-            .iter()
-            .filter(|t| is_ready(t))
-            .filter(|t| !is_transitively_blocked(t.id, &by_id))
-            .collect();
-
-        ready.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| a.updated_at.cmp(&b.updated_at))
-        });
-
-        Ok(ready
+        Ok(select_ready(&by_id, &tasks)
             .into_iter()
-            .map(|t| ReadyTaskRow {
-                task_id: t.id.to_string(),
-                title: t.title.clone(),
-                status: enum_str(&t.lifecycle),
-                sync_state: enum_str(&t.sync),
-                priority: enum_str(&t.priority),
-                assignees: t.assignees.clone(),
-                issue_type: t.issue_type.as_ref().map(enum_str),
-                project_status: cached_project_status(project.as_ref(), t),
-            })
+            .map(|t| ready_row(t, project.as_ref()))
             .collect())
+    }
+
+    /// The ready frontier as a nested tree. `workspace_ids: None` spans every
+    /// active workspace (the fallback when the cwd isn't a bound repo);
+    /// `Some(ids)` restricts to those workspaces. `repo_ids` (binding ids of
+    /// the cwd repo, from `--repo`) narrows to tasks whose logical repo is one
+    /// of them; empty = no repo filter.
+    ///
+    /// Per workspace, the tree's roots are top-level ready tasks (parentless,
+    /// or whose parent is outside this workspace / not in the frontier); ready
+    /// children nest recursively under their parent node, and a parent that is
+    /// not itself ready appears as a container heading so the tree keeps its
+    /// shape. Every level is ordered by priority (best task first), then
+    /// title. Workspaces with nothing ready are omitted.
+    pub async fn ready_view(
+        &self,
+        workspace_ids: Option<&[String]>,
+        repo_ids: &[String],
+    ) -> Result<ReadyView> {
+        use std::collections::{HashMap, HashSet};
+
+        // Global id→task map: both the transitive-blocker walk and the parent
+        // lookup resolve against it, so a blocker or parent living in another
+        // workspace is still found.
+        let all = self.tasks.list(TaskFilter::default()).await?;
+        let by_id: HashMap<domain_core::TaskId, &domain_task::Task> =
+            all.iter().map(|t| (t.id, t)).collect();
+        let repo_filter: HashSet<String> = repo_ids.iter().cloned().collect();
+
+        let workspaces = match workspace_ids {
+            Some(ids) => {
+                let mut ws = Vec::with_capacity(ids.len());
+                for id in ids {
+                    ws.push(self.workspaces.get(id.parse()?).await?);
+                }
+                ws
+            }
+            None => self.workspaces.list(false).await?,
+        };
+
+        let mut out = Vec::new();
+        for ws in workspaces {
+            let ws_tasks: Vec<&domain_task::Task> = all
+                .iter()
+                .filter(|t| t.workspace_id == ws.id)
+                .filter(|t| {
+                    repo_filter.is_empty()
+                        || t.repo_id
+                            .map(|r| repo_filter.contains(&r.to_string()))
+                            .unwrap_or(false)
+                })
+                .collect();
+            let ready_ids: HashSet<domain_core::TaskId> = select_ready(&by_id, ws_tasks.iter().copied())
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+
+            if ready_ids.is_empty() {
+                continue; // nothing ready in this workspace — omit it
+            }
+            out.push(ReadyWorkspace {
+                workspace_id: ws.id.to_string(),
+                workspace_name: ws.name.as_str().to_string(),
+                tree: build_ready_tree(&ws_tasks, &by_id, &ready_ids),
+            });
+        }
+        Ok(ReadyView { workspaces: out })
     }
 
     /// Group non-archived tasks by assignee with lifecycle-status counts.
@@ -678,6 +721,205 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_default()
+}
+
+/// The ready subset of `ws_tasks`: open, not in conflict, and not
+/// transitively blocked. Sorted by priority (P0 first), then `updated_at` asc.
+/// `by_id` is the id→task map the blocker walk resolves against —
+/// per-workspace for [`QueryService::ready_tasks`], global for
+/// [`QueryService::ready_view`] so cross-workspace blockers count.
+fn select_ready<'a>(
+    by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+    ws_tasks: impl IntoIterator<Item = &'a domain_task::Task>,
+) -> Vec<&'a domain_task::Task> {
+    let is_ready = |t: &domain_task::Task| t.is_open() && t.sync != SyncState::Conflict;
+    let mut ready: Vec<&'a domain_task::Task> = ws_tasks
+        .into_iter()
+        .filter(|t| is_ready(t))
+        .filter(|t| !is_transitively_blocked(t.id, by_id))
+        .collect();
+    ready.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.updated_at.cmp(&b.updated_at))
+    });
+    ready
+}
+
+/// The wire row for one ready task, with its workspace's cached board status
+/// resolved once per workspace.
+fn ready_row(t: &domain_task::Task, project: Option<&Project>) -> ReadyTaskRow {
+    ReadyTaskRow {
+        task_id: t.id.to_string(),
+        title: t.title.clone(),
+        status: enum_str(&t.lifecycle),
+        sync_state: enum_str(&t.sync),
+        priority: enum_str(&t.priority),
+        assignees: t.assignees.clone(),
+        issue_type: t.issue_type.as_ref().map(enum_str),
+        project_status: cached_project_status(project, t),
+    }
+}
+
+/// The task `t` rolls up under: its parent, resolved via the global map.
+/// Found from both directions so legacy rows that predate auto-reciprocal
+/// edges still group: the task's own `ChildOf` edge names the parent, and any
+/// task carrying `ParentOf → t` is the parent. `None` when parentless,
+/// self-referential, or the parent is unknown (e.g. pruned).
+fn parent_task<'a>(
+    t: &domain_task::Task,
+    by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+) -> Option<&'a domain_task::Task> {
+    let direct = t
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::ChildOf && r.other != t.id)
+        .and_then(|r| by_id.get(&r.other));
+    direct.or_else(|| {
+        by_id.values().find(|p| {
+            p.relations
+                .iter()
+                .any(|r| r.kind == RelationKind::ParentOf && r.other == t.id)
+        })
+    }).copied()
+}
+
+/// Build the nested ready frontier for one workspace.
+///
+/// Nodes are the ready tasks plus every in-workspace ancestor of a ready task
+/// (a parent that is not itself ready becomes a container heading). A ready
+/// task nests under its parent when that parent is also a node here — a parent
+/// that lives in another workspace or is absent keeps the child at the root
+/// level. Sibling and root order: best priority reachable in the subtree
+/// first, then title, so higher-priority branches surface at every level.
+fn build_ready_tree<'a>(
+    ws_tasks: &[&'a domain_task::Task],
+    by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+    ready_ids: &std::collections::HashSet<domain_core::TaskId>,
+) -> Vec<ReadyNode> {
+    use std::collections::{HashMap, HashSet};
+
+    let ws_ids: HashSet<domain_core::TaskId> = ws_tasks.iter().map(|t| t.id).collect();
+    let id_of: HashMap<domain_core::TaskId, &'a domain_task::Task> =
+        ws_tasks.iter().map(|t| (t.id, *t)).collect();
+
+    // In-workspace parent per task; `children` inverts it.
+    let mut parent: HashMap<domain_core::TaskId, Option<domain_core::TaskId>> = HashMap::new();
+    let mut children: HashMap<domain_core::TaskId, Vec<domain_core::TaskId>> = HashMap::new();
+    for t in ws_tasks {
+        let pid = parent_task(t, by_id)
+            .filter(|p| ws_ids.contains(&p.id))
+            .map(|p| p.id);
+        parent.insert(t.id, pid);
+        if let Some(p) = pid {
+            children.entry(p).or_default().push(t.id);
+        }
+    }
+
+    // Keep ready tasks plus every in-workspace ancestor of one (containers).
+    let mut kept: HashSet<domain_core::TaskId> = ready_ids.clone();
+    let mut stack: Vec<domain_core::TaskId> = ready_ids.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        if let Some(Some(p)) = parent.get(&id) {
+            if kept.insert(*p) {
+                stack.push(*p);
+            }
+        }
+    }
+
+    // Branch sort key: best priority reachable in the kept subtree, then title.
+    let mut rank: HashMap<domain_core::TaskId, Priority> = HashMap::new();
+    for &id in &kept {
+        subtree_priority(id, ready_ids, &id_of, &children, &mut rank);
+    }
+    let order = |a: &domain_core::TaskId, b: &domain_core::TaskId| {
+        rank[a]
+            .cmp(&rank[b])
+            .then_with(|| id_of[a].title.cmp(&id_of[b].title))
+    };
+
+    // Roots: kept nodes with no kept in-workspace parent.
+    let mut roots: Vec<domain_core::TaskId> = kept
+        .iter()
+        .copied()
+        .filter(|id| match parent.get(id) {
+            None => true,
+            Some(None) => true,
+            Some(Some(p)) => !kept.contains(p),
+        })
+        .collect();
+    roots.sort_by(order);
+
+    fn node<'a>(
+        id: domain_core::TaskId,
+        id_of: &HashMap<domain_core::TaskId, &'a domain_task::Task>,
+        ready_ids: &HashSet<domain_core::TaskId>,
+        children: &HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
+        kept: &HashSet<domain_core::TaskId>,
+        rank: &HashMap<domain_core::TaskId, Priority>,
+    ) -> ReadyNode {
+        let task = id_of[&id];
+        let ready = ready_ids.contains(&id);
+        let mut kids: Vec<domain_core::TaskId> = children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|c| kept.contains(c))
+            .collect();
+        kids.sort_by(|a, b| {
+            rank[a]
+                .cmp(&rank[b])
+                .then_with(|| id_of[a].title.cmp(&id_of[b].title))
+        });
+        ReadyNode {
+            task_id: task.id.to_string(),
+            title: task.title.clone(),
+            ready,
+            status: ready.then(|| enum_str(&task.lifecycle)),
+            priority: ready.then(|| enum_str(&task.priority)),
+            assignees: if ready { task.assignees.clone() } else { Vec::new() },
+            children: kids
+                .into_iter()
+                .map(|c| node(c, id_of, ready_ids, children, kept, rank))
+                .collect(),
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|id| node(id, &id_of, ready_ids, &children, &kept, &rank))
+        .collect()
+}
+
+/// Best (highest-priority) task reachable in the kept subtree rooted at `id`
+/// — the branch's sort key. A container heading inherits its best ready
+/// descendant; a ready node ranks by its own priority (or a better child).
+fn subtree_priority<'a>(
+    id: domain_core::TaskId,
+    ready_ids: &std::collections::HashSet<domain_core::TaskId>,
+    id_of: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+    children: &std::collections::HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
+    memo: &mut std::collections::HashMap<domain_core::TaskId, Priority>,
+) -> Priority {
+    if let Some(&m) = memo.get(&id) {
+        return m;
+    }
+    let own = if ready_ids.contains(&id) {
+        id_of[&id].priority
+    } else {
+        Priority::P3 // container headings carry no own priority
+    };
+    let best = children
+        .get(&id)
+        .into_iter()
+        .flatten()
+        .map(|c| subtree_priority(*c, ready_ids, id_of, children, memo))
+        .min()
+        .unwrap_or(own)
+        .min(own);
+    memo.insert(id, best);
+    best
 }
 
 fn is_unsynced(sync: SyncState) -> bool {
@@ -1297,6 +1539,236 @@ mod tests {
         let mine = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
         assert_eq!(mine[0].issue_type.as_deref(), Some("feature"));
         assert_eq!(mine[0].project_status, None);
+    }
+
+    #[tokio::test]
+    async fn ready_view_spans_all_workspaces_and_groups_by_parent() {
+        let (svc, ws, _bs, ts) = svc();
+        let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let w1_id = w1.id;
+        ws.save(&w1).await.unwrap();
+        let w2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+        let w2_id = w2.id;
+        ws.save(&w2).await.unwrap();
+
+        // Archived parent in w1: not itself ready, but still the grouping
+        // header for its children.
+        let mut parent = Task::new_draft(w1_id, None, "epic one".into()).unwrap();
+        parent.archive().unwrap();
+        let mut child_hi = Task::new_draft(w1_id, None, "child hi".into()).unwrap();
+        child_hi.set_priority(domain_task::Priority::P1);
+        child_hi.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+        let mut child_lo = Task::new_draft(w1_id, None, "child lo".into()).unwrap();
+        child_lo.set_priority(domain_task::Priority::P2);
+        child_lo.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+        let mut loose = Task::new_draft(w1_id, None, "loose".into()).unwrap();
+        loose.set_priority(domain_task::Priority::P0);
+        let other = Task::new_draft(w2_id, None, "other ws".into()).unwrap();
+        for t in [&parent, &child_hi, &child_lo, &loose, &other] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let view = svc.ready_view(Some(&[w1_id.to_string(), w2_id.to_string()]), &[]).await.unwrap();
+        assert_eq!(view.workspaces.len(), 2);
+
+        let w1v = view
+            .workspaces
+            .iter()
+            .find(|v| v.workspace_id == w1_id.to_string())
+            .unwrap();
+        assert_eq!(w1v.workspace_name, "w1");
+        // Roots by subtree priority: the P0 loose task first, then the
+        // archived parent as a container heading (subtree best P1).
+        assert_eq!(w1v.tree.len(), 2);
+        let loose_node = &w1v.tree[0];
+        assert!(loose_node.ready);
+        assert_eq!(loose_node.title, "loose");
+        assert_eq!(loose_node.priority.as_deref(), Some("p0"));
+        assert!(loose_node.children.is_empty());
+
+        let epic = &w1v.tree[1];
+        assert!(!epic.ready, "a non-ready parent renders as a container heading");
+        assert_eq!(epic.title, "epic one");
+        assert_eq!(epic.priority, None);
+        assert_eq!(epic.children.len(), 2);
+        assert_eq!(epic.children[0].title, "child hi");
+        assert_eq!(epic.children[0].priority.as_deref(), Some("p1"));
+        assert_eq!(epic.children[1].title, "child lo");
+        assert_eq!(epic.children[1].priority.as_deref(), Some("p2"));
+
+        let w2v = view
+            .workspaces
+            .iter()
+            .find(|v| v.workspace_id == w2_id.to_string())
+            .unwrap();
+        assert_eq!(w2v.workspace_name, "w2");
+        assert_eq!(w2v.tree.len(), 1);
+        let n = &w2v.tree[0];
+        assert!(n.ready);
+        assert_eq!(n.title, "other ws");
+    }
+
+    #[tokio::test]
+    async fn ready_view_filters_to_one_workspace() {
+        let (svc, ws, _bs, ts) = svc();
+        let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let w1_id = w1.id;
+        ws.save(&w1).await.unwrap();
+        let w2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+        let w2_id = w2.id;
+        ws.save(&w2).await.unwrap();
+
+        let a = Task::new_draft(w1_id, None, "in w1".into()).unwrap();
+        let b = Task::new_draft(w2_id, None, "in w2".into()).unwrap();
+        for t in [&a, &b] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let view = svc.ready_view(Some(&[w2_id.to_string()]), &[]).await.unwrap();
+        assert_eq!(view.workspaces.len(), 1);
+        assert_eq!(view.workspaces[0].workspace_id, w2_id.to_string());
+        assert_eq!(view.workspaces[0].tree[0].title, "in w2");
+    }
+
+    #[tokio::test]
+    async fn ready_view_leaves_cross_workspace_child_at_root() {
+        let (svc, ws, _bs, ts) = svc();
+        let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let w1_id = w1.id;
+        ws.save(&w1).await.unwrap();
+        let w2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+        let w2_id = w2.id;
+        ws.save(&w2).await.unwrap();
+
+        // The only link is the reverse `child_of` on a child in another
+        // workspace. The tree nests only within a workspace, so the child
+        // surfaces as a root node in its own workspace — the parent heading
+        // (which lives elsewhere) is not injected.
+        let parent = Task::new_draft(w1_id, None, "parent epic".into()).unwrap();
+        let mut child = Task::new_draft(w2_id, None, "child in w2".into()).unwrap();
+        child.add_relation(domain_task::RelationKind::ChildOf, parent.id);
+        ts.save(&parent, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&child, SnapshotSource::LocalEdit).await.unwrap();
+
+        let view = svc.ready_view(Some(&[w2_id.to_string()]), &[]).await.unwrap();
+        let w2v = view
+            .workspaces
+            .iter()
+            .find(|v| v.workspace_id == w2_id.to_string())
+            .unwrap();
+        assert_eq!(w2v.tree.len(), 1);
+        let n = &w2v.tree[0];
+        assert!(n.ready);
+        assert_eq!(n.title, "child in w2");
+        assert!(n.children.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_view_omits_workspaces_with_nothing_ready() {
+        let (svc, ws, _bs, ts) = svc();
+        let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let w1_id = w1.id;
+        ws.save(&w1).await.unwrap();
+
+        // A self-blocked task: open, but never actionable.
+        let mut t = Task::new_draft(w1_id, None, "self-blocked".into()).unwrap();
+        t.add_relation(domain_task::RelationKind::BlockedBy, t.id);
+        ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let view = svc.ready_view(Some(&[w1_id.to_string()]), &[]).await.unwrap();
+        assert!(view.workspaces.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_view_orders_tree_by_priority() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        // Archived parents are not ready themselves, so they render as
+        // container headings that nest their ready children.
+        let mut pa = Task::new_draft(wid, None, "parent a".into()).unwrap();
+        pa.archive().unwrap();
+        let mut pb = Task::new_draft(wid, None, "parent b".into()).unwrap();
+        pb.archive().unwrap();
+        let mut pc = Task::new_draft(wid, None, "parent c".into()).unwrap();
+        pc.archive().unwrap();
+
+        let mut a0 = Task::new_draft(wid, None, "a p0".into()).unwrap();
+        a0.set_priority(domain_task::Priority::P0);
+        a0.add_relation(domain_task::RelationKind::ChildOf, pa.id);
+        let mut b2 = Task::new_draft(wid, None, "b p2".into()).unwrap();
+        b2.set_priority(domain_task::Priority::P2);
+        b2.add_relation(domain_task::RelationKind::ChildOf, pb.id);
+        let mut c3 = Task::new_draft(wid, None, "c p3".into()).unwrap();
+        c3.set_priority(domain_task::Priority::P3);
+        c3.add_relation(domain_task::RelationKind::ChildOf, pc.id);
+        let mut orphan = Task::new_draft(wid, None, "orphan p3".into()).unwrap();
+        orphan.set_priority(domain_task::Priority::P3);
+
+        for t in [&pa, &pb, &pc, &a0, &b2, &c3, &orphan] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let view = svc.ready_view(Some(&[wid.to_string()]), &[]).await.unwrap();
+        let tree = &view.workspaces[0].tree;
+        // Roots by subtree priority: parent a (P0), parent b (P2), then the P3
+        // tier in title order — "orphan p3" sorts before "parent c".
+        let names: Vec<&str> = tree.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(names, vec!["parent a", "parent b", "orphan p3", "parent c"]);
+        // Containers nest their ready children; the orphan is a ready leaf.
+        assert!(!tree[0].ready);
+        assert_eq!(tree[0].children[0].title, "a p0");
+        assert!(tree[2].ready, "tree[2] is the orphan leaf");
+        assert!(tree[2].children.is_empty());
+        assert!(!tree[3].ready, "tree[3] is the parent c container");
+    }
+
+    #[tokio::test]
+    async fn ready_view_filters_to_repo() {
+        use domain_core::RepoId;
+        let (svc, ws, _bs, ts) = svc();
+        let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = w.id;
+        ws.save(&w).await.unwrap();
+
+        let r1 = RepoId::new();
+        let r2 = RepoId::new();
+        let t1 = Task::new_draft(wid, Some(r1), "in repo one".into()).unwrap();
+        let t2 = Task::new_draft(wid, Some(r2), "in repo two".into()).unwrap();
+        ts.save(&t1, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&t2, SnapshotSource::LocalEdit).await.unwrap();
+
+        let view = svc
+            .ready_view(Some(&[wid.to_string()]), &[r1.to_string()])
+            .await
+            .unwrap();
+        let tree = &view.workspaces[0].tree;
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].title, "in repo one");
+    }
+
+    #[tokio::test]
+    async fn ready_view_none_scopes_to_all_active_workspaces() {
+        let (svc, ws, _bs, ts) = svc();
+        let w1 = Workspace::new(WorkspaceName::new("w1").unwrap(), None, true);
+        let w1_id = w1.id;
+        ws.save(&w1).await.unwrap();
+        let w2 = Workspace::new(WorkspaceName::new("w2").unwrap(), None, true);
+        let w2_id = w2.id;
+        ws.save(&w2).await.unwrap();
+
+        let a = Task::new_draft(w1_id, None, "a".into()).unwrap();
+        let b = Task::new_draft(w2_id, None, "b".into()).unwrap();
+        ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
+
+        // `None` is the all-workspaces fallback when the cwd isn't a bound repo.
+        let view = svc.ready_view(None, &[]).await.unwrap();
+        assert_eq!(view.workspaces.len(), 2);
+        let names: Vec<&str> = view.workspaces.iter().map(|v| v.workspace_name.as_str()).collect();
+        assert!(names.contains(&"w1") && names.contains(&"w2"));
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@
 
 use application_query::{
     AssignedTaskRow, BlockedTaskRow, ChildrenRollup, ContributorRow, DriftReport, QueryNoticeDto,
-    ReadyTaskRow, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
+    ReadyView, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
@@ -140,8 +140,8 @@ pub fn drift(report: &DriftReport) {
     print_json(report);
 }
 
-pub fn ready(rows: &[ReadyTaskRow]) {
-    print_json(&rows);
+pub fn ready(v: &ReadyView) {
+    print_json(v);
 }
 
 pub fn assigned(rows: &[AssignedTaskRow]) {

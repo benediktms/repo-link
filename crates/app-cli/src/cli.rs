@@ -668,10 +668,19 @@ pub(crate) enum QueryCmd {
         #[arg(long)]
         offline: bool,
     },
-    /// Tasks that are actionable now: open + not transitively blocked.
+    /// Tasks that are actionable now: open + not transitively blocked, grouped
+    /// under their parent task. Defaults to the frontier of the workspaces the
+    /// current repo is attached to (all workspaces when the cwd isn't a bound
+    /// repo); `--workspace` filters to one, `--local` to the local repo.
     Ready {
-        #[command(flatten)]
-        ws: WorkspaceArg,
+        /// Workspace UUID. Omitted: every workspace the current repo is
+        /// attached to (or all workspaces when the cwd isn't a bound repo).
+        #[arg(short = 'w', long)]
+        workspace: Option<String>,
+        /// Only tasks belonging to the local repo (this checkout's own repo),
+        /// narrowing the frontier from the workspaces it is attached to.
+        #[arg(long)]
+        local: bool,
     },
     /// Open tasks assigned to a user. Defaults to the cached GitHub login
     /// (so it round-trips with `task claim`), then git config user.name,
