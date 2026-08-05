@@ -920,7 +920,17 @@ fn build_ready_tree<'a>(
     let mut visiting = HashSet::new();
     roots
         .into_iter()
-        .map(|id| node(id, &id_of, ready_ids, &children, &kept, &rank, &mut visiting))
+        .map(|id| {
+            node(
+                id,
+                &id_of,
+                ready_ids,
+                &children,
+                &kept,
+                &rank,
+                &mut visiting,
+            )
+        })
         .collect()
 }
 
