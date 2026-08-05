@@ -30,11 +30,13 @@ rl repo list               # list all active-workspace bindings; add --workspace
 For an explicit “what should I work on?” request, ask `rl` what is actionable:
 
 ```bash
-rl query ready --workspace <id>
+rl query ready                     # ready frontier for this repo's workspaces (all workspaces if unbound)
+rl query ready --local             # only this repo's own ready tasks
+rl query ready --workspace <id>    # a single workspace
 rl query mine  --workspace <id>
 ```
 
-`query ready` accounts for transitive blockers and local-only tasks that GitHub cannot show.
+`query ready` accounts for transitive blockers and local-only tasks that GitHub cannot show, and returns the ready tasks as a nested parent→child tree ordered by priority.
 
 ### Working with a tracked task
 

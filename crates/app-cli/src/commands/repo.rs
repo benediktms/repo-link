@@ -612,3 +612,65 @@ fn pick_workspace(canonical: &str, memberships: Vec<RepoMembershipDto>) -> Resul
         }
     }
 }
+
+/// Resolve the frontier scope for `rl query ready`: an explicit `--workspace`
+/// filters to that one workspace; omitted, it spans every workspace the current
+/// directory's repo is attached to. When the cwd isn't a git repo with an
+/// origin (or its repo is unbound) the scope falls back to **all** active
+/// workspaces rather than erroring.
+///
+/// Returns the workspace scope (`None` = all active workspaces) and an optional
+/// repo filter: the local repo's binding ids when `local_only` is set.
+/// `local_only` narrows the frontier to the local repo's tasks and **errors**
+/// when the cwd has no bound repo (an empty filter or a silent fallback to all
+/// workspaces would both mislead).
+pub(crate) async fn resolve_ready_scope(
+    svc: &Services,
+    workspace: Option<String>,
+    local_only: bool,
+) -> Result<(Option<Vec<String>>, Vec<String>)> {
+    if local_only {
+        let memberships = cwd_repo_memberships(svc).await?.ok_or_else(|| {
+            anyhow!(
+                "--local: this checkout's repo is not bound to any workspace; attach it with \
+                 `rl repo attach`, or drop --local to see all workspaces"
+            )
+        })?;
+        let repo_ids: Vec<String> = memberships.iter().map(|m| m.binding.id.clone()).collect();
+        let workspace_ids: Vec<String> = match workspace {
+            Some(w) => vec![w],
+            None => memberships.iter().map(|m| m.workspace.id.clone()).collect(),
+        };
+        return Ok((Some(workspace_ids), repo_ids));
+    }
+
+    // Non-local: an explicit workspace pins the scope; otherwise the cwd repo's
+    // workspaces, falling back to all active workspaces when unbound.
+    if let Some(w) = workspace {
+        return Ok((Some(vec![w]), Vec::new()));
+    }
+    match cwd_repo_memberships(svc).await? {
+        Some(memberships) => Ok((
+            Some(memberships.iter().map(|m| m.workspace.id.clone()).collect()),
+            Vec::new(),
+        )),
+        None => Ok((None, Vec::new())),
+    }
+}
+
+/// The cwd repo's memberships (workspace + binding per attached workspace), or
+/// `None` when the cwd isn't a git repo with an origin or its repo is unbound.
+async fn cwd_repo_memberships(svc: &Services) -> Result<Option<Vec<RepoMembershipDto>>> {
+    let Some(canonical) = cwd_canonical()? else {
+        return Ok(None);
+    };
+    let memberships = svc
+        .bindings
+        .memberships_for_canonical_url(&canonical, false)
+        .await?;
+    if memberships.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(memberships))
+    }
+}

@@ -91,6 +91,49 @@ pub struct ReadyTaskRow {
     pub project_status: Option<String>,
 }
 
+/// One node of a workspace's ready frontier tree. A node is a task: it is
+/// itself ready (`ready: true` — the actionable fields are populated), or it
+/// is a container heading (`ready: false` — an open/closed parent whose
+/// descendants include ready work, shown so the tree keeps its shape). Ready
+/// children nest recursively under their parent node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyNode {
+    pub task_id: String,
+    pub title: String,
+    pub ready: bool,
+    /// Lifecycle of a ready node ("open"/"in_progress"). `None` for a pure
+    /// container heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Priority of a ready node. `None` for a pure container heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    /// Assignees of a ready node. Empty for a pure container heading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assignees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ReadyNode>,
+}
+
+/// One workspace's ready frontier as a tree: roots are top-level tasks
+/// (parentless, or whose parent is outside this workspace / not in the
+/// frontier); ready children nest under their parent node. Every level is
+/// ordered by priority (best task first), then title.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyWorkspace {
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub tree: Vec<ReadyNode>,
+}
+
+/// The ready frontier, grouped per workspace (and, within it, recursively by
+/// parent task). The caller supplies the workspace scope; the array holds one
+/// entry per workspace in scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyView {
+    pub workspaces: Vec<ReadyWorkspace>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignedTaskRow {
     pub task_id: String,

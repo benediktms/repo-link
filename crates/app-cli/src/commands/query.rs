@@ -5,7 +5,7 @@ use application_query::LiveRead;
 use infra_config::RepoLinkConfig;
 
 use crate::cli::{QueryCmd, WorkspaceArg};
-use crate::commands::repo::resolve_workspace;
+use crate::commands::repo::{resolve_ready_scope, resolve_workspace};
 use crate::commands::task::git_user_name;
 use crate::render;
 use crate::services::{Services, build_github_provider};
@@ -90,11 +90,16 @@ pub(crate) async fn query_dispatch(
             let report = svc.query.drift_report(&workspace, live).await?;
             render::drift(&report);
         }
-        QueryCmd::Ready {
-            ws: WorkspaceArg { workspace },
-        } => {
-            let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.ready_tasks(&workspace).await?;
+        QueryCmd::Ready { workspace, local } => {
+            // `ready` spans the workspaces the cwd repo is attached to (or the
+            // `--workspace` filter), falling back to all active workspaces when
+            // the cwd isn't a bound repo; `--local` narrows it to the local
+            // repo's own tasks.
+            let (workspace_ids, repo_ids) = resolve_ready_scope(svc, workspace, local).await?;
+            let v = svc
+                .query
+                .ready_view(workspace_ids.as_deref(), &repo_ids)
+                .await?;
             render::ready(&v);
         }
         QueryCmd::Mine {
