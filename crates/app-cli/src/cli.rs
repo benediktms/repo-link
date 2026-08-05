@@ -491,7 +491,8 @@ pub(crate) enum TaskCmd {
         priority: Option<String>,
         /// Replace-set: each `--assignee` flag adds one entry; the full
         /// list replaces the current assignees. Omitting `--assignee`
-        /// entirely leaves the existing assignees untouched. Mutually
+        /// entirely leaves the existing assignees untouched only when
+        /// `--clear-assignees` is also omitted. Mutually
         /// exclusive with `--clear-assignees`.
         #[arg(long = "assignee", conflicts_with = "clear_assignees")]
         assignees: Vec<String>,
