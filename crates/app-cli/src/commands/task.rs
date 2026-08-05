@@ -311,6 +311,7 @@ pub(crate) async fn task_dispatch(
             body,
             priority,
             assignees,
+            clear_assignees,
             repo,
             filing_repo,
             issue_type,
@@ -324,18 +325,26 @@ pub(crate) async fn task_dispatch(
                 && body.is_none()
                 && priority.is_none()
                 && assignees.is_empty()
+                && !clear_assignees
                 && repo.is_none()
                 && filing_repo.is_none()
                 && issue_type.is_none()
                 && !clear_type
             {
                 return Err(anyhow!(
-                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --repo, --filing-repo, --type, --clear-type"
+                    "rl task edit requires at least one of --title, --body, --priority, --assignee, --clear-assignees, --repo, --filing-repo, --type, --clear-type"
                 ));
             }
             // Collapse clap's accumulated Vec into the DTO's "None = no
-            // change" shape. The trade-off is that "clear all assignees"
-            // is unreachable via `edit`; the spec explicitly accepts this.
+            // change / Some = replace" shape: `--assignee` supplies a
+            // non-empty replacement set, `--clear-assignees` supplies the
+            // empty set. clap's `conflicts_with` on both flags guarantees
+            // they are never both present.
+            let assignees_cmd = if clear_assignees {
+                Some(Vec::new())
+            } else {
+                (!assignees.is_empty()).then_some(assignees)
+            };
             // `--type`/`--clear-type` collapse onto `UpdateTaskCmd`'s
             // `Option<Option<String>>` shape (RFC 0006 §0 A1 / #228): outer
             // `None` = leave unchanged, `Some(None)` = clear, `Some(Some(_))`
@@ -353,7 +362,7 @@ pub(crate) async fn task_dispatch(
                     title,
                     body,
                     priority,
-                    assignees: (!assignees.is_empty()).then_some(assignees),
+                    assignees: assignees_cmd,
                     repo_id: resolve_repo_handle(svc, repo).await?,
                     filing_repo_override: resolve_repo_handle(svc, filing_repo).await?,
                     issue_type: issue_type_cmd,
