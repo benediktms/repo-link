@@ -26,14 +26,18 @@ This is the same SQLite the RFC's capacity numbers were measured on (3.53.1).
 
 ## Fresh measurements (`python3 spike.py --scales current,10000,100000 --probes`)
 
-| Scale | Chunks | Sidecar | Largest WAL | Initial build | Full-path zero-change p95 | Hash-diff p95 | 100-row tx | Rebuild |
+| Scale | Chunks | Sidecar | WAL peak | Initial build | Full-path zero-change p95 | Hash-diff p95 | 100-row tx | Rebuild |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| current (live DB) | 4,785 | 13.3 MiB | 12.9 MiB | 1.42 s | 122 ms | 11.3 ms | 59.6 ms | 0.87 s |
-| synthetic 10k | 10,000 | 33.2 MiB | 32.0 MiB | 0.98 s | 48.7 ms | 15.1 ms | 62.8 ms | 1.39 s |
-| synthetic 100k | 100,000 | 332 MB | 334 MB | 9.20 s | 628 ms | 159 ms | 1.38 s | 14.2 s |
+| current (live DB) | 4,797 | 12.7 MiB | 12.9 MiB | 0.35 s | 19.9 ms | 5.1 ms | 31.7 ms | 0.55 s |
+| synthetic 10k | 10,000 | 31.7 MiB | 32.0 MiB | 0.73 s | 33.4 ms | 13.3 ms | 48.4 ms | 1.10 s |
+| synthetic 100k | 100,000 | 316.9 MiB | 318.8 MiB | 8.03 s | 383 ms | 154 ms | 457 ms | 11.5 s |
 
-`largest_wal_peak` is the max size observed across the `-wal`/`-shm` companions
-before checkpoint; `sidecar` is the main DB after a truncating checkpoint.
+`largest_wal_peak` is the **`-wal` file size only**, sampled immediately before
+the truncating checkpoint (the main DB and `-shm` are excluded); `sidecar` is
+the main-DB size after that checkpoint. The full-path `zero_change` p95 mirrors
+D6 ordering and includes the authoritative source read inside the timed window
+(an open connection + read of the task/comment rows each iteration), so it is a
+true end-to-end reconcile cost, not just an in-memory re-chunk.
 
 ### Probes
 
@@ -55,75 +59,81 @@ before checkpoint; `sidecar` is the main DB after a truncating checkpoint.
 
 The `current` row above was re-run against the real authoritative database
 (`~/Library/Application Support/repo-link/repo-link.db`, opened read-only) on
-2026-08-04. This is the definitive real-corpus measurement; the earlier
-`current` run's 122 ms reconcile was a cold first pass, the fresh number below
-is the warm fast path.
+2026-08-04. This is the definitive real-corpus measurement.
 
 | Metric | Value |
 |---|---:|
 | Tasks / comments | 607 / 178 |
-| Search chunks | 4,785 |
-| Sidecar | 13.3 MiB |
-| Sidecar vs authoritative DB | 13.3 MiB vs 23 MiB (~57%) |
-| vs 512 MiB cap | ~2.6% |
-| Full-path zero-change p95 (warm) | **16 ms** |
-| hash-diff p95 | 4.1 ms |
-| Initial build | 323 ms |
-| 100-row change tx | 29 ms |
-| Rebuild | 503 ms |
+| Search chunks | 4,797 |
+| Sidecar | 12.7 MiB |
+| Sidecar vs authoritative DB | 12.7 MiB vs 23 MiB (~55%) |
+| vs 512 MiB cap | ~2.5% |
+| Full-path zero-change p95 (warm, incl. authoritative read) | **19.9 ms** |
+| hash-diff p95 | 5.1 ms |
+| Initial build | 345 ms |
+| 100-row change tx | 31.7 ms |
+| Rebuild | 550 ms |
 
 Viability read: well inside every RFC limit. Reconcile is an order of
-magnitude under the 150 ms D6 ceiling; the sidecar is ~2.6% of the 512 MiB cap
-(~40× chunk headroom). The design's scaling cliff (~100k chunks, 628 ms
-reconcile, 332 MB sidecar) is ~20× the current real corpus.
+magnitude under the 150 ms D6 ceiling; the sidecar is ~2.5% of the 512 MiB cap
+(~40× chunk headroom). The design's scaling cliff (~100k chunks, ~383 ms
+reconcile, 317 MiB sidecar) is ~20× the current real corpus.
 
 ## Reconciliation with the RFC numbers
 
 | Scale | Chunks | Sidecar | Chunks | Sidecar |
 |---|---:|---:|---|---:|---:|
 | | **RFC** | **RFC** | **Fresh** | **Fresh** |
-| current | 1,658 | 5.39 MiB | 4,785 | 13.3 MiB |
-| 10k | 10,000 | 31.76 MiB | 10,000 | 33.2 MiB |
-| 100k | 100,000 | 317.7 MiB | 100,000 | 332 MB |
+| current | 1,658 | 5.39 MiB | 4,797 | 12.7 MiB |
+| 10k | 10,000 | 31.76 MiB | 10,000 | 31.7 MiB |
+| 100k | 100,000 | 317.7 MiB | 100,000 | 316.9 MiB |
 
-- **Sizes track the RFC almost exactly** at the synthetic scales (33.2 vs
-  31.76 MiB at 10k; 332 vs 317.7 MiB at 100k) — the storage model (4 KiB pages,
-  `auto_vacuum=FULL`, one 384-dim f32 vector per chunk, FTS5 external content)
-  is validated.
+- **Sizes track the RFC almost exactly** at the synthetic scales (31.7 vs
+  31.76 MiB at 10k; 316.9 vs 317.7 MiB at 100k) — the storage model (4 KiB
+  pages, `auto_vacuum=FULL`, one 384-dim f32 vector per chunk, FTS5 external
+  content) is validated.
 - **`current` differs structurally**: the live DB has grown since the RFC
   (607 tasks / 178 comments / 0.94 MiB text today vs 519 / 139 / 0.76 MiB on
-  2026-07-24), and the D2 chunker here produces 4,785 chunks vs the RFC's
+  2026-07-24), and the D2 chunker here produces 4,797 chunks vs the RFC's
   1,658 — the original chunker's exact boundary decisions were not preserved.
   The per-chunk footprint is consistent; only the corpus grew.
-- **Timings are slower** than the RFC (initial build 9.2 s vs 3.76 s at 100k;
-  full-path zero-change 122 ms vs 62 ms at current). Expected: different
-  machine, Python 3.14 vs the spike's environment, and a single-transaction
-  build in this harness. The RFC pre-declares timings as local evidence; the
-  load-bearing claims (sizes, caps, rollback behavior) reproduce cleanly.
+- **Timings are slower** than the RFC (initial build 8.0 s vs 3.76 s at 100k;
+  full-path zero-change 384 ms vs 62 ms at current — this reproduction measures
+  the complete path including the authoritative read, which the RFC's 62 ms
+  figure also covers). Expected: different machine, Python 3.14 vs the spike's
+  environment, and a single-transaction build in this harness. The RFC
+  pre-declares timings as local evidence; the load-bearing claims (sizes, caps,
+  rollback behavior) reproduce cleanly.
 
 ## Methodology notes / scope
 
 Faithfully reproduced from the RFC text:
 
-- **D5 schema** exactly: `task_search_meta`, `task_search_chunks` (with
-  `UNIQUE(task_id, content_hash)` and a guard trigger rejecting text/identity
-  updates), `task_search_vectors`, and `task_search_fts` (FTS5 external-content
-  over `task_search_chunks(text)`) with the documented insert/delete triggers;
-  4 KiB pages, `auto_vacuum=FULL`, WAL, `foreign_keys=ON`,
-  `max_page_count=131072`.
-- **D2 chunking**: title-anchored, ~918-byte budget, paragraph-preserving with
-  sentence/UTF-8-boundary fallback; empty-body → title-only; `…`-marked title
-  anchor when the title overflows.
+- **D5 schema** exactly (schema parity with the current RFC, including the D6
+  `validated_*` marker columns on `task_search_meta`): `task_search_meta`,
+  `task_search_chunks` (with `UNIQUE(task_id, content_hash)` and a guard trigger
+  rejecting text/identity updates), `task_search_vectors`, and `task_search_fts`
+  (FTS5 external-content over `task_search_chunks(text)`) with the documented
+  insert/delete triggers; 4 KiB pages, `auto_vacuum=FULL`, WAL,
+  `foreign_keys=ON`, `max_page_count=131072`.
+- **D2 chunking**: title-anchored, ~900-byte formatted-chunk budget (reserving
+  header + ellipsis + one UTF-8 scalar for oversized titles, which are emitted
+  as their own full-title chunk), paragraph-preserving with sentence/UTF-8-
+  boundary fallback; empty-body → title-only.
 - **D6 reconcile**: `BEGIN IMMEDIATE`, pre-write `integrity-check` on mutation,
-  delete-missing/insert-new, content-hash keying, within-task dedup.
-
-Note: the harness performs the `integrity-check` only on mutation, matching the
-RFC as recorded at spike time. The RFC has since evolved (PR 256 review) to a
-validated-integrity marker that also forces the check on a zero-change search
-when the marker is missing/stale or the sidecar file identity changed; that
-policy governs the product and is not re-measured by this storage spike.
+  delete-missing/insert-new, content-hash keying, within-task dedup; the
+  full-path benchmark acquires the sidecar writer transaction before the
+  authoritative read and includes that read in the timed window.
 - **Synthetic corpus**: exactly `N` unique single-chunk tasks (~884-byte
-  formatted chunks), matching the RFC's "918-byte formatted chunks" intent.
+  formatted chunks), matching the RFC's ~900-byte formatted-chunk intent.
+
+Scope note: this is a **storage/capacity spike** — it reproduces the D5 schema
+and reconciles it at scale, but it does not exercise the D6
+validated-integrity-marker *lifecycle* (persistence, invalidation on
+diff/file-identity change) or the marker-driven zero-change integrity check.
+Those are product behavior, not storage capacity; the marker columns exist in
+the schema for parity but the harness performs `integrity-check` only on
+mutation.
 
 Not reproduced (deferred to the eventual Rust implementation / follow-up):
 exact `dbstat` per-component byte split, the 512 MiB warn/refuse free-space

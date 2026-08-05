@@ -75,11 +75,19 @@ def create_sidecar(path: Path) -> sqlite3.Connection:
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             schema_version INTEGER NOT NULL,
             chunk_format_version INTEGER NOT NULL,
-            embedding_profile_id TEXT
+            embedding_profile_id TEXT,   -- NULL until a prepared profile claims it
+            -- D6 validated-integrity marker (schema parity with the RFC; this
+            -- storage spike sizes the columns but does not exercise the D6
+            -- marker lifecycle, which is product behavior, not capacity).
+            validated_content_fingerprint BLOB,
+            validated_file_size INTEGER,
+            validated_file_mtime INTEGER,
+            validated_at TEXT
         );
         INSERT INTO task_search_meta(singleton, schema_version, chunk_format_version,
-                                     embedding_profile_id)
-        VALUES (1, 1, 1, NULL);
+                                     embedding_profile_id, validated_content_fingerprint,
+                                     validated_file_size, validated_file_mtime, validated_at)
+        VALUES (1, 1, 1, NULL, NULL, NULL, NULL, NULL);
 
         CREATE TABLE task_search_chunks(
             id INTEGER PRIMARY KEY,
@@ -133,44 +141,55 @@ def format_core_chunks(title: str, body: str) -> list[str]:
     """Return the deterministic lexical chunks for one task's core content."""
     body = body or ""
     budget = APPROX_BODY_BUDGET
+    prefix = "Title: "
+    ellipsis = "…"
+    head_fixed = "\n\nDescription:\n"
 
     def anchor() -> str:
-        # Title always anchors every body chunk. Oversized titles are truncated
-        # deterministically with an explicit ellipsis marker.
-        if len(title.encode("utf-8")) > budget:
-            cut = title.encode("utf-8")[: budget - 3]
-            cut = cut.decode("utf-8", errors="ignore")
-            return f"Title: {cut}…"
-        return f"Title: {title}"
+        # The title anchors every body chunk. An oversized title is truncated
+        # deterministically, reserving room for the header + ellipsis + at least
+        # one UTF-8 scalar of body, so the split budget below is always positive.
+        reserve = len(prefix.encode()) + len(ellipsis.encode()) + len(head_fixed.encode()) + 1
+        avail = max(budget - reserve, 0)
+        tb = title.encode("utf-8")
+        if len(tb) <= avail:
+            return f"{prefix}{title}"
+        return f"{prefix}{tb[:avail].decode('utf-8', errors='ignore')}{ellipsis}"
 
     if not body.strip():
-        return [f"Title: {title}"]
+        return [f"{prefix}{title}"]
 
-    head = f"{anchor()}\n\nDescription:\n"
+    head = f"{anchor()}{head_fixed}"
+    # The full title is always indexed; when it exceeds the per-chunk budget,
+    # emit it as its own chunk (RFC D2) alongside the anchored body chunks.
+    chunks: list[str] = [f"{prefix}{title}"] if len(title.encode("utf-8")) > budget else []
 
-    body_chunks: list[str] = []
     buf = ""
-    for para in re.split(r"\n\s*\n", body):
-        para = para.strip()
-        if not para:
+    for paragraph in re.split(r"\n\s*\n", body):
+        paragraph = paragraph.strip()
+        if not paragraph:
             continue
-        if len((head + buf).encode("utf-8")) + 1 + len(para.encode("utf-8")) <= budget:
-            buf += "\n" + para if buf else para
+        if len((head + buf).encode("utf-8")) + 1 + len(paragraph.encode("utf-8")) <= budget:
+            buf += "\n" + paragraph if buf else paragraph
         else:
             if buf:
-                body_chunks.append(buf)
-            # Paragraph too big for one chunk: split at sentence boundaries,
-            # then valid UTF-8 scalar boundaries.
-            for sentence in _split_oversized(para, budget - len(head.encode("utf-8"))):
-                body_chunks.append(sentence)
+                chunks.append(head + buf)
+            # Sentence split, then valid UTF-8 scalar boundaries. head is
+            # reserved so this budget is >= 1; _split_oversized still guards 0.
+            for sentence in _split_oversized(paragraph, budget - len(head.encode("utf-8"))):
+                chunks.append(head + sentence)
             buf = ""
     if buf:
-        body_chunks.append(buf)
+        chunks.append(head + buf)
 
-    return [head + c for c in body_chunks]
+    return chunks
 
 
 def _split_oversized(para: str, budget: int) -> list[str]:
+    if budget <= 0:
+        # Cannot split below the reserved header; keep the text rather than hang
+        # or drop it. Unreachable with the anchor reservation above.
+        return [para] if para else []
     pieces: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", para):
         if not sentence:
@@ -288,14 +307,25 @@ def _reconcile(conn: sqlite3.Connection, desired: list[dict],
     return len(to_insert), time.perf_counter() - t0, len(to_delete)
 
 
-def reconcile_zero_p95(conn, source, iters) -> float:
-    """p95 of the full D6 reconcile path: read source, chunk, SHA-256 hash,
-    diff against the sidecar, and commit a zero-change transaction."""
+def reconcile_zero_p95(conn, source_loader, iters) -> float:
+    """p95 of the full D6 reconcile path, mirroring D6's ordering: acquire the
+    sidecar writer transaction, then read the authoritative source snapshot,
+    chunk + SHA-256 hash, diff against the sidecar, and commit a zero-change
+    transaction. `source_loader` re-reads the source each iteration so the
+    authoritative read is inside the timed window (for `current`, the live DB)."""
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
+        conn.execute("BEGIN IMMEDIATE")
+        source = source_loader()
         desired = dedupe_chunks(chunk_source(source))
-        _reconcile(conn, desired, fill_vectors=False)
+        existing = set(
+            conn.execute("SELECT task_id, content_hash FROM task_search_chunks").fetchall()
+        )
+        if existing != {(d["task_id"], d["hash"]) for d in desired}:
+            conn.rollback()
+            raise AssertionError("zero-change reconcile requires an unchanged sidecar")
+        conn.commit()
         times.append(time.perf_counter() - t0)
     times.sort()
     return round(times[int(len(times) * 0.95)] * 1000, 4)
@@ -309,12 +339,18 @@ def hash_diff_p95(conn, desired, iters) -> float:
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
+        conn.execute("BEGIN IMMEDIATE")
         existing = set(
             conn.execute("SELECT task_id, content_hash FROM task_search_chunks").fetchall()
         )
         desired_set = {(d["task_id"], content_hash(d["text"])) for d in desired}
-        conn.execute("BEGIN IMMEDIATE")
-        conn.commit()  # zero-change write of nothing
+        # This benchmark must run against a zero-change sidecar: assert both
+        # directions of the D6 diff are empty exactly as a real zero-change
+        # reconcile would, then commit nothing.
+        if existing != desired_set:
+            conn.rollback()
+            raise AssertionError("hash-diff benchmark requires a zero-change sidecar")
+        conn.commit()
         times.append(time.perf_counter() - t0)
     times.sort()
     return round(times[int(len(times) * 0.95)] * 1000, 4)
@@ -332,12 +368,9 @@ def dedupe_chunks(chunks: list[dict]) -> list[dict]:
     return out
 
 
-def sidecar_paths(path: Path) -> list[Path]:
-    return [path, Path(str(path) + "-wal"), Path(str(path) + "-shm")]
-
-
-def largest_companion(path: Path) -> int:
-    return max((p.stat().st_size if p.exists() else 0 for p in sidecar_paths(path)), default=0)
+def wal_bytes(path: Path) -> int:
+    wal = Path(str(path) + "-wal")
+    return wal.stat().st_size if wal.exists() else 0
 
 
 def dbstat_bytes(conn) -> dict:
@@ -401,12 +434,13 @@ def synthetic_source(chunk_target: int) -> list[tuple[str, str, str]]:
 # --- scenario measurement --------------------------------------------------
 
 
-def run_scale(label: str, source, tmpdir: Path):
+def run_scale(label: str, source_loader, tmpdir: Path):
     sidecar = tmpdir / f"{label}.task-search.db"
     conn = create_sidecar(sidecar)
 
     # Initial build. Collapse within-task duplicate chunks once (D6 "desired
     # set") so build, reconcile, and rebuild all operate on the same rows.
+    source = source_loader()
     desired = dedupe_chunks(chunk_source(source))
 
     t0 = time.perf_counter()
@@ -415,15 +449,15 @@ def run_scale(label: str, source, tmpdir: Path):
 
     chunks = conn.execute("SELECT COUNT(*) FROM task_search_chunks").fetchone()[0]
     vectors = conn.execute("SELECT COUNT(*) FROM task_search_vectors").fetchone()[0]
-    sidecar_bytes = sidecar.stat().st_size
-    wal_peak = largest_companion(sidecar)
-    # Force a checkpoint so WAL size reflects the DB, not pending pages.
+    # Measure only the -wal file before the checkpoint; the main DB is measured
+    # AFTER the truncating checkpoint (per the RFC's table definitions).
+    wal_peak = wal_bytes(sidecar)
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    sidecar_after_cp = sidecar.stat().st_size
+    sidecar_bytes = sidecar.stat().st_size
 
     # Zero-change reconcile p95.
     iters = 50 if chunks < 50000 else 20
-    zc_p95 = reconcile_zero_p95(conn, source, iters)
+    zc_p95 = reconcile_zero_p95(conn, source_loader, iters)
     hd_p95 = hash_diff_p95(conn, desired, iters)
 
     # 100-row changed transaction: a true diff where 100 chunks change identity
@@ -467,9 +501,8 @@ def run_scale(label: str, source, tmpdir: Path):
         "scale": label,
         "chunks": chunks,
         "vectors": vectors,
-        "sidecar_bytes": sidecar_bytes,
-        "sidecar_after_checkpoint": sidecar_after_cp,
-        "largest_wal_peak": wal_peak,
+        "sidecar_bytes": sidecar_bytes,   # main DB after truncating checkpoint
+        "largest_wal_peak": wal_peak,      # -wal bytes before the checkpoint
         "initial_build_ms": build_ms,
         "zero_change_p95_ms": zc_p95,
         "hash_diff_p95_ms": hd_p95,
@@ -640,13 +673,17 @@ def main():
             if not Path(args.db).exists():
                 print(json.dumps({"error": f"db not found: {args.db}"}), file=sys.stderr)
                 sys.exit(2)
-            src = current_source(args.db)
+            # Re-read the authoritative DB inside every timed reconcile so the
+            # measured full path includes the real source-snapshot read (D6).
+            loader = lambda: current_source(Path(args.db))
         elif label.isdigit():
-            src = synthetic_source(int(label))
+            n = int(label)
+            src = synthetic_source(n)   # no authoritative DB; read from memory
+            loader = lambda: src
         else:
             print(json.dumps({"error": f"unknown scale {label}"}), file=sys.stderr)
             sys.exit(2)
-        result["scales"].append(run_scale(label, src, tmpdir))
+        result["scales"].append(run_scale(label, loader, tmpdir))
 
     if args.probes:
         result["probes"] = probes(tmpdir)

@@ -1130,7 +1130,12 @@ search time, when the user has expressed interest in fresh results.
 A reproduceable harness and a fresh measurement run are stored alongside this
 RFC as an appendix: `docs/rfcs/0007-semantic-task-search.spike/` (see
 `RESULTS.md` there for the run commands and how the fresh numbers reconcile
-with the §1 tables). The storage model — not the timings — is the load-bearing
+with the §1 tables). The harness reproduces the current D5 schema
+schema-exactly — including the D6 `validated_*` marker columns — and measures
+the full D6 reconcile path (sidecar writer transaction acquired before an
+in-process authoritative read, inside the timed window). It is a
+storage/capacity spike: it does not exercise the marker lifecycle, which is
+product behavior. The storage model — not the timings — is the load-bearing
 claim; timings are machine-local evidence.
 
 ### Stage 1 — PR1: search without a model
