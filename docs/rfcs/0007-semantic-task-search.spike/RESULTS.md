@@ -74,10 +74,13 @@ The `current` row above was re-run against the real authoritative database
 | 100-row change tx | 31.7 ms |
 | Rebuild | 550 ms |
 
-Viability read: well inside every RFC limit. Reconcile is an order of
-magnitude under the 150 ms D6 ceiling; the sidecar is ~2.5% of the 512 MiB cap
-(~40× chunk headroom). The design's scaling cliff (~100k chunks, ~383 ms
-reconcile, 317 MiB sidecar) is ~20× the current real corpus.
+Viability read (same scope): at the current corpus the full-path reconcile is
+**19.9 ms here vs the RFC's 62.15 ms** — both current-corpus full-path
+measurements, so this run is faster and comfortably under the 150 ms D6
+ceiling; the sidecar is ~2.5% of the 512 MiB cap. The synthetic **100,000-chunk
+reconcile (383 ms) exceeds the 150 ms D6 ceiling** and has no same-scope RFC
+full-path baseline (the RFC's 90.71 ms at 100k in its main table is the narrow
+hash-diff p95, not the full path); that scale is ~20× the current real corpus.
 
 ## Reconciliation with the RFC numbers
 
@@ -95,13 +98,16 @@ reconcile, 317 MiB sidecar) is ~20× the current real corpus.
 - **`current` differs structurally**: the live DB has grown since the RFC
   (607 tasks / 178 comments / 0.94 MiB text today vs 519 / 139 / 0.76 MiB on
   2026-07-24), and the D2 chunker here produces 4,797 chunks vs the RFC's
-  1,658 — the original chunker's exact boundary decisions were not preserved.
-  The per-chunk footprint is consistent; only the corpus grew.
-- **Timings are slower** than the RFC (initial build 8.0 s vs 3.76 s at 100k;
-  full-path zero-change 384 ms vs 62 ms at current — this reproduction measures
-  the complete path including the authoritative read, which the RFC's 62 ms
-  figure also covers). Expected: different machine, Python 3.14 vs the spike's
-  environment, and a single-transaction build in this harness. The RFC
+  1,658. The per-chunk footprint is consistent, but **both the corpus and the
+  chunker's boundary rules differ** from the RFC's original evidence, so the
+  chunk counts are not directly comparable.
+- **Timings at the same scope**: full-path zero-change reconcile is **19.9 ms
+  here vs the RFC's 62.15 ms, both at the current corpus** — faster, same scope.
+  The synthetic 100,000-chunk reconcile (383 ms) exceeds the 150 ms D6 ceiling
+  and has **no same-scope RFC full-path baseline** (the RFC's 90.71 ms at 100k
+  in its §1 table is the narrow hash-diff p95). Initial build is slower than the
+  RFC (8.0 s vs 3.76 s at 100k). Expected: different machine, Python 3.14 vs the
+  spike's environment, and a single-transaction build in this harness. The RFC
   pre-declares timings as local evidence; the load-bearing claims (sizes, caps,
   rollback behavior) reproduce cleanly.
 

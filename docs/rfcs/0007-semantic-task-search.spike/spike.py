@@ -144,15 +144,16 @@ def format_core_chunks(title: str, body: str) -> list[str]:
     prefix = "Title: "
     ellipsis = "…"
     head_fixed = "\n\nDescription:\n"
+    tb = title.encode("utf-8")
+    # Reserve for the header + ellipsis + at least one UTF-8 scalar of body, so
+    # the split budget below is always positive.
+    reserve = len(prefix.encode()) + len(ellipsis.encode()) + len(head_fixed.encode()) + 1
+    avail = max(budget - reserve, 0)
+    # True whenever the title must be truncated to fit the per-chunk anchor.
+    truncated = len(tb) > avail
 
     def anchor() -> str:
-        # The title anchors every body chunk. An oversized title is truncated
-        # deterministically, reserving room for the header + ellipsis + at least
-        # one UTF-8 scalar of body, so the split budget below is always positive.
-        reserve = len(prefix.encode()) + len(ellipsis.encode()) + len(head_fixed.encode()) + 1
-        avail = max(budget - reserve, 0)
-        tb = title.encode("utf-8")
-        if len(tb) <= avail:
+        if not truncated:
             return f"{prefix}{title}"
         return f"{prefix}{tb[:avail].decode('utf-8', errors='ignore')}{ellipsis}"
 
@@ -160,9 +161,11 @@ def format_core_chunks(title: str, body: str) -> list[str]:
         return [f"{prefix}{title}"]
 
     head = f"{anchor()}{head_fixed}"
-    # The full title is always indexed; when it exceeds the per-chunk budget,
-    # emit it as its own chunk (RFC D2) alongside the anchored body chunks.
-    chunks: list[str] = [f"{prefix}{title}"] if len(title.encode("utf-8")) > budget else []
+    # The full title is always indexed; whenever anchoring truncates it (RFC
+    # D2), emit the complete title as its own chunk so the dropped suffix stays
+    # searchable. This covers titles within the per-chunk budget whose suffix
+    # is still dropped by the anchor, not just those over the budget.
+    chunks: list[str] = [f"{prefix}{title}"] if truncated else []
 
     buf = ""
     for paragraph in re.split(r"\n\s*\n", body):
@@ -673,13 +676,18 @@ def main():
             if not Path(args.db).exists():
                 print(json.dumps({"error": f"db not found: {args.db}"}), file=sys.stderr)
                 sys.exit(2)
+            db_path = Path(args.db)
+
             # Re-read the authoritative DB inside every timed reconcile so the
             # measured full path includes the real source-snapshot read (D6).
-            loader = lambda: current_source(Path(args.db))
+            def loader():
+                return current_source(db_path)
         elif label.isdigit():
             n = int(label)
             src = synthetic_source(n)   # no authoritative DB; read from memory
-            loader = lambda: src
+
+            def loader():
+                return src
         else:
             print(json.dumps({"error": f"unknown scale {label}"}), file=sys.stderr)
             sys.exit(2)
