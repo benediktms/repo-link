@@ -616,39 +616,44 @@ fn pick_workspace(canonical: &str, memberships: Vec<RepoMembershipDto>) -> Resul
 /// Resolve the frontier scope for `rl query ready`: an explicit `--workspace`
 /// filters to that one workspace; omitted, it spans every workspace the current
 /// directory's repo is attached to. When the cwd isn't a git repo with an
-/// origin (or its repo is unbound), the scope falls back to **all** active
+/// origin (or its repo is unbound) the scope falls back to **all** active
 /// workspaces rather than erroring.
 ///
 /// Returns the workspace scope (`None` = all active workspaces) and an optional
-/// repo filter: the local repo's binding ids, populated when `local_only` is
-/// set and the repo resolves. `local_only` narrows the frontier to tasks whose
-/// logical repo is the local (cwd) repo.
+/// repo filter: the local repo's binding ids when `local_only` is set.
+/// `local_only` narrows the frontier to the local repo's tasks and **errors**
+/// when the cwd has no bound repo (an empty filter or a silent fallback to all
+/// workspaces would both mislead).
 pub(crate) async fn resolve_ready_scope(
     svc: &Services,
     workspace: Option<String>,
     local_only: bool,
 ) -> Result<(Option<Vec<String>>, Vec<String>)> {
-    // An explicit workspace pins the scope; `--local` still resolves against
-    // the cwd (empty when the cwd has no bound repo, so the filter is a no-op).
-    if let Some(w) = workspace {
-        let repo_ids = if local_only {
-            cwd_repo_binding_ids(svc).await?
-        } else {
-            Vec::new()
+    if local_only {
+        let memberships = cwd_repo_memberships(svc).await?.ok_or_else(|| {
+            anyhow!(
+                "--local: this checkout's repo is not bound to any workspace; attach it with \
+                 `rl repo attach`, or drop --local to see all workspaces"
+            )
+        })?;
+        let repo_ids: Vec<String> = memberships.iter().map(|m| m.binding.id.clone()).collect();
+        let workspace_ids: Vec<String> = match workspace {
+            Some(w) => vec![w],
+            None => memberships.iter().map(|m| m.workspace.id.clone()).collect(),
         };
-        return Ok((Some(vec![w]), repo_ids));
+        return Ok((Some(workspace_ids), repo_ids));
+    }
+
+    // Non-local: an explicit workspace pins the scope; otherwise the cwd repo's
+    // workspaces, falling back to all active workspaces when unbound.
+    if let Some(w) = workspace {
+        return Ok((Some(vec![w]), Vec::new()));
     }
     match cwd_repo_memberships(svc).await? {
-        Some(memberships) => {
-            let repo_ids = if local_only {
-                memberships.iter().map(|m| m.binding.id.clone()).collect()
-            } else {
-                Vec::new()
-            };
-            let workspace_ids: Vec<String> =
-                memberships.iter().map(|m| m.workspace.id.clone()).collect();
-            Ok((Some(workspace_ids), repo_ids))
-        }
+        Some(memberships) => Ok((
+            Some(memberships.iter().map(|m| m.workspace.id.clone()).collect()),
+            Vec::new(),
+        )),
         None => Ok((None, Vec::new())),
     }
 }
@@ -668,18 +673,4 @@ async fn cwd_repo_memberships(svc: &Services) -> Result<Option<Vec<RepoMembershi
     } else {
         Ok(Some(memberships))
     }
-}
-
-/// Binding ids of the cwd repo's memberships — the logical repo ids a task's
-/// `repo_id` should match under `--repo`. Empty when the cwd has no bound repo.
-async fn cwd_repo_binding_ids(svc: &Services) -> Result<Vec<String>> {
-    Ok(cwd_repo_memberships(svc)
-        .await?
-        .map(|memberships| {
-            memberships
-                .into_iter()
-                .map(|m| m.binding.id.clone())
-                .collect()
-        })
-        .unwrap_or_default())
 }

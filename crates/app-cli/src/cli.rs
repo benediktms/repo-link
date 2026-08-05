@@ -679,6 +679,7 @@ pub(crate) enum QueryCmd {
         workspace: Option<String>,
         /// Only tasks belonging to the local repo (this checkout's own repo),
         /// narrowing the frontier from the workspaces it is attached to.
+        /// Errors when the checkout isn't bound to a workspace.
         #[arg(long)]
         local: bool,
     },

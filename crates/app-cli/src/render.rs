@@ -140,6 +140,13 @@ pub fn drift(report: &DriftReport) {
     print_json(report);
 }
 
+/// `rl query ready` — a nested ready frontier. This is a breaking shape change
+/// from the earlier flat `[{ReadyTaskRow}]` array: output is now
+/// `{workspaces: [{workspace_id, workspace_name, tree: [ReadyNode]}]}` with
+/// ready tasks nested recursively under their parent task. Consumers that
+/// relied on a flat row list should flatten with
+/// `[.workspaces[].tree[] | .. | objects | select(has("task_id"))]` before
+/// applying prior per-row logic.
 pub fn ready(v: &ReadyView) {
     print_json(v);
 }

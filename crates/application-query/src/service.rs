@@ -762,29 +762,46 @@ fn ready_row(t: &domain_task::Task, project: Option<&Project>) -> ReadyTaskRow {
     }
 }
 
-/// The task `t` rolls up under: its parent, resolved via the global map.
-/// Found from both directions so legacy rows that predate auto-reciprocal
-/// edges still group: the task's own `ChildOf` edge names the parent, and any
-/// task carrying `ParentOf → t` is the parent. `None` when parentless,
-/// self-referential, or the parent is unknown (e.g. pruned).
+/// Reverse `ParentOf` index: child task id → its parent task, so parent lookup
+/// is O(avg relations) instead of a per-task scan. Where more than one task
+/// claims the same child, the lowest parent id wins (deterministic).
+fn reverse_parent_index<'a>(
+    by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+) -> std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task> {
+    let mut index: std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task> =
+        std::collections::HashMap::new();
+    for parent in by_id.values() {
+        for r in &parent.relations {
+            if r.kind == RelationKind::ParentOf && r.other != parent.id {
+                match index.get(&r.other) {
+                    Some(existing) if existing.id.to_string() < parent.id.to_string() => {}
+                    _ => {
+                        index.insert(r.other, parent);
+                    }
+                }
+            }
+        }
+    }
+    index
+}
+
+/// The task `t` rolls up under: its parent, resolved via the global map. Found
+/// from both directions so legacy rows that predate auto-reciprocal edges still
+/// group: the task's own `ChildOf` edge names the parent (taking precedence),
+/// else the reverse `ParentOf` index. `None` when parentless, self-referential,
+/// or the parent is unknown (e.g. pruned).
 fn parent_task<'a>(
     t: &domain_task::Task,
     by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+    reverse: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
 ) -> Option<&'a domain_task::Task> {
     let direct = t
         .relations
         .iter()
         .find(|r| r.kind == RelationKind::ChildOf && r.other != t.id)
-        .and_then(|r| by_id.get(&r.other));
-    direct
-        .or_else(|| {
-            by_id.values().find(|p| {
-                p.relations
-                    .iter()
-                    .any(|r| r.kind == RelationKind::ParentOf && r.other == t.id)
-            })
-        })
-        .copied()
+        .and_then(|r| by_id.get(&r.other))
+        .copied();
+    direct.or_else(|| reverse.get(&t.id).copied())
 }
 
 /// Build the nested ready frontier for one workspace.
@@ -805,12 +822,13 @@ fn build_ready_tree<'a>(
     let ws_ids: HashSet<domain_core::TaskId> = ws_tasks.iter().map(|t| t.id).collect();
     let id_of: HashMap<domain_core::TaskId, &'a domain_task::Task> =
         ws_tasks.iter().map(|t| (t.id, *t)).collect();
+    let reverse = reverse_parent_index(by_id);
 
     // In-workspace parent per task; `children` inverts it.
     let mut parent: HashMap<domain_core::TaskId, Option<domain_core::TaskId>> = HashMap::new();
     let mut children: HashMap<domain_core::TaskId, Vec<domain_core::TaskId>> = HashMap::new();
     for t in ws_tasks {
-        let pid = parent_task(t, by_id)
+        let pid = parent_task(t, by_id, &reverse)
             .filter(|p| ws_ids.contains(&p.id))
             .map(|p| p.id);
         parent.insert(t.id, pid);
@@ -823,10 +841,10 @@ fn build_ready_tree<'a>(
     let mut kept: HashSet<domain_core::TaskId> = ready_ids.clone();
     let mut stack: Vec<domain_core::TaskId> = ready_ids.iter().copied().collect();
     while let Some(id) = stack.pop() {
-        if let Some(Some(p)) = parent.get(&id) {
-            if kept.insert(*p) {
-                stack.push(*p);
-            }
+        if let Some(Some(p)) = parent.get(&id)
+            && kept.insert(*p)
+        {
+            stack.push(*p);
         }
     }
 
@@ -853,28 +871,37 @@ fn build_ready_tree<'a>(
         .collect();
     roots.sort_by(order);
 
-    fn node<'a>(
+    fn node(
         id: domain_core::TaskId,
-        id_of: &HashMap<domain_core::TaskId, &'a domain_task::Task>,
+        id_of: &HashMap<domain_core::TaskId, &domain_task::Task>,
         ready_ids: &HashSet<domain_core::TaskId>,
         children: &HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
         kept: &HashSet<domain_core::TaskId>,
         rank: &HashMap<domain_core::TaskId, Priority>,
+        visiting: &mut HashSet<domain_core::TaskId>,
     ) -> ReadyNode {
         let task = id_of[&id];
         let ready = ready_ids.contains(&id);
+        // Drop children already on the current build path: the domain rejects
+        // parent/child cycles, so a re-entry only occurs on a corrupt/legacy
+        // row — skipping it keeps the shape a tree without recursing forever.
         let mut kids: Vec<domain_core::TaskId> = children
             .get(&id)
             .into_iter()
             .flatten()
             .copied()
-            .filter(|c| kept.contains(c))
+            .filter(|c| kept.contains(c) && !visiting.contains(c))
             .collect();
         kids.sort_by(|a, b| {
             rank[a]
                 .cmp(&rank[b])
                 .then_with(|| id_of[a].title.cmp(&id_of[b].title))
         });
+        visiting.insert(id);
+        let children = kids
+            .into_iter()
+            .map(|c| node(c, id_of, ready_ids, children, kept, rank, visiting))
+            .collect();
         ReadyNode {
             task_id: task.id.to_string(),
             title: task.title.clone(),
@@ -886,32 +913,34 @@ fn build_ready_tree<'a>(
             } else {
                 Vec::new()
             },
-            children: kids
-                .into_iter()
-                .map(|c| node(c, id_of, ready_ids, children, kept, rank))
-                .collect(),
+            children,
         }
     }
 
+    let mut visiting = HashSet::new();
     roots
         .into_iter()
-        .map(|id| node(id, &id_of, ready_ids, &children, &kept, &rank))
+        .map(|id| node(id, &id_of, ready_ids, &children, &kept, &rank, &mut visiting))
         .collect()
 }
 
 /// Best (highest-priority) task reachable in the kept subtree rooted at `id`
 /// — the branch's sort key. A container heading inherits its best ready
 /// descendant; a ready node ranks by its own priority (or a better child).
-fn subtree_priority<'a>(
+fn subtree_priority(
     id: domain_core::TaskId,
     ready_ids: &std::collections::HashSet<domain_core::TaskId>,
-    id_of: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
+    id_of: &std::collections::HashMap<domain_core::TaskId, &domain_task::Task>,
     children: &std::collections::HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
     memo: &mut std::collections::HashMap<domain_core::TaskId, Priority>,
 ) -> Priority {
     if let Some(&m) = memo.get(&id) {
         return m;
     }
+    // Seed a provisional value before descending so a parent/child cycle (only
+    // possible on corrupt/legacy rows — the domain rejects them) terminates on
+    // re-entry; the real value overwrites it after the children are folded in.
+    memo.insert(id, Priority::P3);
     let own = if ready_ids.contains(&id) {
         id_of[&id].priority
     } else {
@@ -1795,6 +1824,32 @@ mod tests {
             .map(|v| v.workspace_name.as_str())
             .collect();
         assert!(names.contains(&"w1") && names.contains(&"w2"));
+    }
+
+    #[tokio::test]
+    async fn ready_view_terminates_on_mutual_parent_cycle() {
+        // The domain rejects parent/child cycles at creation, but a corrupt or
+        // legacy row can still carry one — `ready` must not hang or overflow
+        // the stack while building the tree.
+        let (svc, ws, _bs, ts) = svc();
+        let w = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = w.id;
+        ws.save(&w).await.unwrap();
+
+        let mut a = Task::new_draft(wid, None, "a".into()).unwrap();
+        let mut b = Task::new_draft(wid, None, "b".into()).unwrap();
+        // Reciprocal ChildOf edges make each the other's parent — a genuine
+        // cycle in the parent map that must not hang `subtree_priority`.
+        a.add_relation(domain_task::RelationKind::ChildOf, b.id);
+        b.add_relation(domain_task::RelationKind::ChildOf, a.id);
+        ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
+        ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
+
+        let view = svc.ready_view(Some(&[wid.to_string()]), &[]).await.unwrap();
+        // Both are ready but neither can be rooted (each has a kept parent), so
+        // the workspace renders with an empty tree instead of recursing forever.
+        assert_eq!(view.workspaces.len(), 1);
+        assert!(view.workspaces[0].tree.is_empty());
     }
 
     #[tokio::test]
