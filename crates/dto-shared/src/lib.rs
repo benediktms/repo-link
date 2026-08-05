@@ -6,6 +6,7 @@
 
 mod project;
 mod repo;
+mod search;
 mod sync;
 mod task;
 mod workspace;
@@ -18,6 +19,11 @@ pub use repo::{
     AttachRepoCmd, FilingRepoRefDto, FindRepoMatchDto, FindRepoResponseDto, HereMatchDto,
     HereRepoSummaryDto, HereResponseDto, LinkWorktreeCmd, LocateResponseDto, RepoAttachOutcomeDto,
     RepoBindingDto, RepoMembershipDto, UnlinkWorktreeCmd, WorktreeLinkDto,
+};
+pub use search::{
+    LexicalUnavailableReasonDto, MatchedSourceDto, MatchedSourceKindDto, QueryModeDto,
+    SearchIndexMaintenanceDto, SearchIndexStatusDto, SearchMatchDto, SearchModelStatusDto,
+    SearchResultDto, SemanticSkippedReasonDto, TaskSearchResponseDto,
 };
 pub use sync::{
     PromoteTaskCmd, PullTaskCmd, PushTaskCmd, RelationChange, RelationReconciledNotice,

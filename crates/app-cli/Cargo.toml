@@ -9,6 +9,7 @@ publish.workspace = true
 application-workspace = { workspace = true }
 application-task = { workspace = true }
 application-query = { workspace = true }
+application-search = { workspace = true }
 application-sync = { workspace = true }
 application-project = { workspace = true }
 infra-github = { workspace = true }

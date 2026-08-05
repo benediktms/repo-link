@@ -9,7 +9,8 @@ use application_workspace::ReconcileSummary;
 use domain_task::TaskSnapshot;
 use dto_shared::{
     FindRepoResponseDto, HereResponseDto, LocateResponseDto, RelationChange, RepoAttachOutcomeDto,
-    RepoBindingDto, SyncNoticeDto, SyncSummaryDto, TaskDto, WorkspaceDto,
+    RepoBindingDto, SearchIndexMaintenanceDto, SearchIndexStatusDto, SearchModelStatusDto,
+    SyncNoticeDto, SyncSummaryDto, TaskDto, TaskSearchResponseDto, WorkspaceDto,
 };
 use serde::Serialize;
 
@@ -63,6 +64,24 @@ pub fn here(dto: &HereResponseDto) {
 // ---------- Task ---------------------------------------------------------
 
 pub fn task(dto: &TaskDto) {
+    print_json(dto);
+}
+
+// ---------- Task search (RFC 0007) --------------------------------------
+
+pub fn search(dto: &TaskSearchResponseDto) {
+    print_json(dto);
+}
+
+pub fn search_index_status(dto: &SearchIndexStatusDto) {
+    print_json(dto);
+}
+
+pub fn search_index_maintenance(dto: &SearchIndexMaintenanceDto) {
+    print_json(dto);
+}
+
+pub fn search_model_status(dto: &SearchModelStatusDto) {
     print_json(dto);
 }
 

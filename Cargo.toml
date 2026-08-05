@@ -14,6 +14,7 @@ members = [
     "crates/application-sync",
     "crates/application-query",
     "crates/application-project",
+    "crates/application-search",
     "crates/dto-shared",
     "crates/dto-events",
     "crates/infra-sqlite",
@@ -45,6 +46,7 @@ application-task = { path = "crates/application-task" }
 application-sync = { path = "crates/application-sync" }
 application-query = { path = "crates/application-query" }
 application-project = { path = "crates/application-project" }
+application-search = { path = "crates/application-search" }
 dto-shared = { path = "crates/dto-shared" }
 dto-events = { path = "crates/dto-events" }
 infra-sqlite = { path = "crates/infra-sqlite" }
@@ -89,6 +91,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tracing-appender = "0.2"
 dunce = "1"
 same-file = "1"
+sha2 = "0.10"
+unicode-casefold = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
     "Win32_System_Memory", "Win32_System_SystemServices", "Win32_System_Threading",

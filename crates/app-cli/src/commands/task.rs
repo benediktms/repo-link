@@ -211,6 +211,12 @@ pub(crate) async fn task_dispatch(
     cfg: &RepoLinkConfig,
 ) -> Result<()> {
     match cmd {
+        cmd @ TaskCmd::Search { .. } => {
+            crate::commands::search::task_search_dispatch(cmd, svc, cfg).await?
+        }
+        TaskCmd::SearchIndex { cmd: sci } => {
+            crate::commands::search::search_index_dispatch(sci, svc, cfg).await?
+        }
         TaskCmd::Create {
             ws: WorkspaceArg { workspace },
             repo,
