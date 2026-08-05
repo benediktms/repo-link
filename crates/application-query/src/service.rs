@@ -365,10 +365,11 @@ impl QueryService {
                             .unwrap_or(false)
                 })
                 .collect();
-            let ready_ids: HashSet<domain_core::TaskId> = select_ready(&by_id, ws_tasks.iter().copied())
-                .into_iter()
-                .map(|t| t.id)
-                .collect();
+            let ready_ids: HashSet<domain_core::TaskId> =
+                select_ready(&by_id, ws_tasks.iter().copied())
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect();
 
             if ready_ids.is_empty() {
                 continue; // nothing ready in this workspace — omit it
@@ -775,13 +776,15 @@ fn parent_task<'a>(
         .iter()
         .find(|r| r.kind == RelationKind::ChildOf && r.other != t.id)
         .and_then(|r| by_id.get(&r.other));
-    direct.or_else(|| {
-        by_id.values().find(|p| {
-            p.relations
-                .iter()
-                .any(|r| r.kind == RelationKind::ParentOf && r.other == t.id)
+    direct
+        .or_else(|| {
+            by_id.values().find(|p| {
+                p.relations
+                    .iter()
+                    .any(|r| r.kind == RelationKind::ParentOf && r.other == t.id)
+            })
         })
-    }).copied()
+        .copied()
 }
 
 /// Build the nested ready frontier for one workspace.
@@ -878,7 +881,11 @@ fn build_ready_tree<'a>(
             ready,
             status: ready.then(|| enum_str(&task.lifecycle)),
             priority: ready.then(|| enum_str(&task.priority)),
-            assignees: if ready { task.assignees.clone() } else { Vec::new() },
+            assignees: if ready {
+                task.assignees.clone()
+            } else {
+                Vec::new()
+            },
             children: kids
                 .into_iter()
                 .map(|c| node(c, id_of, ready_ids, children, kept, rank))
@@ -1568,7 +1575,10 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let view = svc.ready_view(Some(&[w1_id.to_string(), w2_id.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[w1_id.to_string(), w2_id.to_string()]), &[])
+            .await
+            .unwrap();
         assert_eq!(view.workspaces.len(), 2);
 
         let w1v = view
@@ -1587,7 +1597,10 @@ mod tests {
         assert!(loose_node.children.is_empty());
 
         let epic = &w1v.tree[1];
-        assert!(!epic.ready, "a non-ready parent renders as a container heading");
+        assert!(
+            !epic.ready,
+            "a non-ready parent renders as a container heading"
+        );
         assert_eq!(epic.title, "epic one");
         assert_eq!(epic.priority, None);
         assert_eq!(epic.children.len(), 2);
@@ -1624,7 +1637,10 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let view = svc.ready_view(Some(&[w2_id.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[w2_id.to_string()]), &[])
+            .await
+            .unwrap();
         assert_eq!(view.workspaces.len(), 1);
         assert_eq!(view.workspaces[0].workspace_id, w2_id.to_string());
         assert_eq!(view.workspaces[0].tree[0].title, "in w2");
@@ -1650,7 +1666,10 @@ mod tests {
         ts.save(&parent, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&child, SnapshotSource::LocalEdit).await.unwrap();
 
-        let view = svc.ready_view(Some(&[w2_id.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[w2_id.to_string()]), &[])
+            .await
+            .unwrap();
         let w2v = view
             .workspaces
             .iter()
@@ -1675,7 +1694,10 @@ mod tests {
         t.add_relation(domain_task::RelationKind::BlockedBy, t.id);
         ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
-        let view = svc.ready_view(Some(&[w1_id.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[w1_id.to_string()]), &[])
+            .await
+            .unwrap();
         assert!(view.workspaces.is_empty());
     }
 
@@ -1767,7 +1789,11 @@ mod tests {
         // `None` is the all-workspaces fallback when the cwd isn't a bound repo.
         let view = svc.ready_view(None, &[]).await.unwrap();
         assert_eq!(view.workspaces.len(), 2);
-        let names: Vec<&str> = view.workspaces.iter().map(|v| v.workspace_name.as_str()).collect();
+        let names: Vec<&str> = view
+            .workspaces
+            .iter()
+            .map(|v| v.workspace_name.as_str())
+            .collect();
         assert!(names.contains(&"w1") && names.contains(&"w2"));
     }
 

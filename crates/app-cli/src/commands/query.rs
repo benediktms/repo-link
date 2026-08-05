@@ -96,7 +96,10 @@ pub(crate) async fn query_dispatch(
             // the cwd isn't a bound repo; `--local` narrows it to the local
             // repo's own tasks.
             let (workspace_ids, repo_ids) = resolve_ready_scope(svc, workspace, local).await?;
-            let v = svc.query.ready_view(workspace_ids.as_deref(), &repo_ids).await?;
+            let v = svc
+                .query
+                .ready_view(workspace_ids.as_deref(), &repo_ids)
+                .await?;
             render::ready(&v);
         }
         QueryCmd::Mine {
