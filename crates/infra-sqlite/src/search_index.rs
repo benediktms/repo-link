@@ -196,8 +196,9 @@ struct MetaRow {
 }
 
 /// Enforce the owner-only + trusted-parent policy for the sidecar file
-/// (RFC 0007 D5). Pre-creates the file with mode `0600` when absent and
-/// refuses when the parent is world-writable or not owned.
+/// (RFC 0007 D5). Pre-creates the file with mode `0600` when absent on Unix
+/// and refuses when the parent is world-writable or not owned.
+#[cfg(unix)]
 fn fix_owner_only(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::PermissionsExt;
@@ -227,6 +228,19 @@ fn fix_owner_only(path: &Path) -> std::io::Result<()> {
     if m.permissions().mode() & 0o077 != 0 {
         return Err(std::io::Error::other("sidecar mode is not owner-only"));
     }
+    Ok(())
+}
+
+/// Windows owner-only policy: the default ACL on a user-created file is
+/// owner-only, so creating it (without touching unix modes) is the best-effort
+/// equivalent. Explicit ACL hardening is a follow-up (RFC 0007 D5).
+#[cfg(not(unix))]
+fn fix_owner_only(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     Ok(())
 }
 
