@@ -2787,6 +2787,68 @@ fn task_edit_updates_in_place_and_writes_snapshot_then_rolls_back() {
 }
 
 #[test]
+fn task_edit_clear_assignees_empties_the_set() {
+    // Contract: `--assignee` is a replace-set and `--clear-assignees` resets
+    // it to empty (mirroring the `--type` / `--clear-type` pairing). A
+    // claimed/mistakenly-assigned task must be recoverable from the CLI
+    // without a direct SQLite edit — that unreachability was the bug.
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "x"],
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    let assigned = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "edit", &task_id, "--assignee", "alice"],
+    );
+    assert_eq!(assigned["assignees"], serde_json::json!(["alice"]));
+
+    let cleared = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "edit", &task_id, "--clear-assignees"],
+    );
+    assert_eq!(
+        cleared["assignees"],
+        serde_json::json!([]),
+        "expected assignees cleared to empty"
+    );
+}
+
+#[test]
+fn task_edit_assignee_and_clear_are_mutually_exclusive() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    let created = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "create", "--workspace", &workspace, "--title", "x"],
+    );
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    bin("repo-link", &dir)
+        .args([
+            "task",
+            "edit",
+            &task_id,
+            "--assignee",
+            "alice",
+            "--clear-assignees",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn task_edit_rejects_empty_flag_set() {
     // Contract: at least one of --title/--body/--priority/--assignee must
     // be supplied. The CLI rejects the empty case at the dispatch boundary

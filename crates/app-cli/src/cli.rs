@@ -479,8 +479,8 @@ pub(crate) enum TaskCmd {
     /// Edit a task in place. Writes a new snapshot at `version = max + 1`
     /// with `source = local_edit`; preserves the task's identity (UUID and
     /// short prefix). At least one of `--title`, `--body`, `--priority`,
-    /// `--assignee`, `--repo`, `--filing-repo`, `--type`, or `--clear-type`
-    /// must be supplied.
+    /// `--assignee`, `--clear-assignees`, `--repo`, `--filing-repo`,
+    /// `--type`, or `--clear-type` must be supplied.
     Edit {
         id: String,
         #[arg(long)]
@@ -491,11 +491,13 @@ pub(crate) enum TaskCmd {
         priority: Option<String>,
         /// Replace-set: each `--assignee` flag adds one entry; the full
         /// list replaces the current assignees. Omitting `--assignee`
-        /// entirely leaves the existing assignees untouched. There is no
-        /// way to clear assignees via `edit` — that's a deliberate gap
-        /// (matches the spec).
-        #[arg(long = "assignee")]
+        /// entirely leaves the existing assignees untouched. Mutually
+        /// exclusive with `--clear-assignees`.
+        #[arg(long = "assignee", conflicts_with = "clear_assignees")]
         assignees: Vec<String>,
+        /// Clear all assignees. Mutually exclusive with `--assignee`.
+        #[arg(long = "clear-assignees", conflicts_with = "assignees")]
+        clear_assignees: bool,
         /// Reassign the task's logical repo binding (code/worktrees/prefix), by
         /// UUID / prefix / name / alias (same forms as `rl repo show`). Use
         /// this to attach a logical repo to a task created without one. The
