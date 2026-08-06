@@ -9,6 +9,7 @@ pub(crate) mod org;
 pub(crate) mod project;
 pub(crate) mod query;
 pub(crate) mod repo;
+pub(crate) mod search;
 pub(crate) mod sync;
 pub(crate) mod task;
 pub(crate) mod workspace;

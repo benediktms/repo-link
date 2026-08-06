@@ -433,6 +433,37 @@ pub(crate) enum WorktreeCmd {
     },
 }
 
+/// `rl task search` positional + flag surface (RFC 0007 D10).
+#[derive(clap::Args, Debug)]
+pub(crate) struct TaskSearchArgs {
+    /// Search query: exact phrase, identifier/error string, or natural
+    /// language. Shell quoting is removed before the CLI receives the value.
+    pub query: String,
+    #[command(flatten)]
+    pub ws: WorkspaceArg,
+    /// Restrict to a repo binding, by UUID / prefix / name / alias.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Filter by lifecycle status: `open` / `closed` / `all`. Default `all`.
+    #[arg(short = 's', long)]
+    pub status: Option<String>,
+    /// Maximum number of results (default 10). `--limit 0` is rejected.
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Force exact substring matching (overrides identifier classification).
+    #[arg(long)]
+    pub exact: bool,
+}
+
+/// `rl task search-index` subcommands (RFC 0007 D10).
+#[derive(Subcommand, Debug)]
+pub(crate) enum SearchIndexCmd {
+    Status {},
+    Rebuild {},
+    Clear {},
+    PrepareModel {},
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum TaskCmd {
     Create {
@@ -536,6 +567,17 @@ pub(crate) enum TaskCmd {
         /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
         #[arg(long)]
         sync_state: Option<String>,
+    },
+    /// Search current task content (RFC 0007): exact / identifier / natural
+    /// retrieval over title, body, and comments. No model required.
+    Search {
+        #[command(flatten)]
+        args: TaskSearchArgs,
+    },
+    /// Maintain the disposable task-search index (RFC 0007 D10).
+    SearchIndex {
+        #[command(subcommand)]
+        cmd: SearchIndexCmd,
     },
     /// Stage one or more tasks for sync.
     Stage {

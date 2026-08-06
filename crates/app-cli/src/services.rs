@@ -14,8 +14,8 @@ use infra_config::RepoLinkConfig;
 use infra_github::GithubAdapter;
 use infra_sqlite::{
     SqliteOrgIssueTypeRepository, SqliteOutboxRepository, SqliteProjectRepository,
-    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteTaskSnapshotRepository,
-    SqliteWorkspaceRepository, open_from_path,
+    SqliteRepoBindingRepository, SqliteTaskRepository, SqliteTaskSearchSourceRepository,
+    SqliteTaskSnapshotRepository, SqliteWorkspaceRepository, open_from_path,
 };
 
 pub(crate) struct Services {
@@ -27,6 +27,8 @@ pub(crate) struct Services {
     /// Org-level native issue-type registry (RFC 0006 D5/D8). Refreshed at
     /// `rl project link`; #228 consumes it for type-on-tasks resolution.
     pub(crate) org_issue_types: OrgIssueTypeService,
+    /// RFC 0007 authoritative search source (raw task/comment text reads).
+    pub(crate) search_source: SqliteTaskSearchSourceRepository,
     pub(crate) tasks_repo: Arc<dyn ports::TaskRepository>,
     pub(crate) bindings_repo: Arc<dyn ports::RepoBindingRepository>,
     /// Raw workspace repo — `build_sync_service` needs it for the RFC 0002 D2
@@ -60,6 +62,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
     // Built before the outbox repo below consumes the last `db` clone.
     let org_issue_types_repo: Arc<dyn ports::OrgIssueTypeRepository> =
         Arc::new(SqliteOrgIssueTypeRepository::new(db.clone()));
+    let search_source = SqliteTaskSearchSourceRepository::new(db.clone());
     let outbox_repo: Arc<dyn ports::OutboxRepository> = Arc::new(SqliteOutboxRepository::new(db));
 
     Ok(Services {
@@ -97,6 +100,7 @@ pub(crate) async fn bootstrap(cfg: &RepoLinkConfig) -> Result<Services> {
         ),
         projects: ProjectService::new(projects_repo.clone()),
         org_issue_types: OrgIssueTypeService::new(org_issue_types_repo.clone()),
+        search_source,
         tasks_repo,
         bindings_repo,
         workspaces_repo,

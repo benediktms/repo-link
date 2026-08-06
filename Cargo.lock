@@ -95,6 +95,7 @@ dependencies = [
  "anyhow",
  "application-project",
  "application-query",
+ "application-search",
  "application-sync",
  "application-task",
  "application-workspace",
@@ -194,6 +195,22 @@ dependencies = [
  "testing-fixtures",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "application-search"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "domain-core",
+ "dto-shared",
+ "ports",
+ "pretty_assertions",
+ "sha2",
+ "tempfile",
+ "testing-fixtures",
+ "thiserror 2.0.18",
+ "unicode-casefold",
 ]
 
 [[package]]
@@ -2142,10 +2159,12 @@ dependencies = [
  "domain-task",
  "domain-workspace",
  "dto-events",
+ "dto-shared",
  "ports",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -4219,6 +4238,12 @@ name = "unicode-bom"
 version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eec5d1121208364f6793f7d2e222bf75a915c19557537745b195b253dd64217"
+
+[[package]]
+name = "unicode-casefold"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f66b1c8f8caa2ab31dc6d3f35386f16efdab89668f93411e565ac368908e8f"
 
 [[package]]
 name = "unicode-ident"
