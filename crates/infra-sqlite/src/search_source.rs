@@ -30,21 +30,24 @@ impl SqliteTaskSearchSourceRepository {
 #[async_trait]
 impl TaskSearchSourceRepository for SqliteTaskSearchSourceRepository {
     async fn load_reconcile_snapshot(&self) -> Result<Vec<TaskTextRow>, PortError> {
-        load_all_tasks(&self.db).await
+        let mut conn = self.db.reads.acquire().await.map_err(map_sqlx_err)?;
+        load_all_tasks_on(&mut conn).await
     }
 
     async fn begin_result_snapshot(
         &self,
         scope: &SearchScope,
     ) -> Result<Box<dyn TaskSearchResultSnapshot>, PortError> {
-        let rows = load_all_tasks(&self.db).await?;
+        // One read connection binds the task/comment/identity reads to a
+        // single SQLite snapshot (RFC 0007 D4): a concurrent sync cannot mix
+        // an old task row with new workspace/display-id metadata.
+        let mut conn = self.db.reads.acquire().await.map_err(map_sqlx_err)?;
+        let rows = load_all_tasks_on(&mut conn).await?;
         let eligible = rows
             .into_iter()
             .filter(|r| scope_matches(scope, r))
             .collect::<Vec<_>>();
-        // Resolve identity (display id, workspace name) from the DB in the
-        // same authoritative view.
-        let snap = build_snapshot(&self.db, eligible).await?;
+        let snap = build_snapshot_on(&mut conn, eligible).await?;
         Ok(Box::new(snap))
     }
 }
@@ -68,13 +71,16 @@ fn scope_matches(scope: &SearchScope, r: &TaskTextRow) -> bool {
     true
 }
 
-/// Load every current task + comment raw text (RFC 0007 D1 corpus).
-async fn load_all_tasks(db: &Db) -> Result<Vec<TaskTextRow>, PortError> {
+/// Load every current task + comment raw text (RFC 0007 D1 corpus) on the
+/// given read connection (a single snapshot).
+async fn load_all_tasks_on(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+) -> Result<Vec<TaskTextRow>, PortError> {
     let trows = sqlx::query(
         "SELECT id, workspace_id, repo_instance_id, lifecycle, title, body \
          FROM tasks ORDER BY id",
     )
-    .fetch_all(&db.reads)
+    .fetch_all(&mut *conn)
     .await
     .map_err(map_sqlx_err)?;
 
@@ -82,7 +88,7 @@ async fn load_all_tasks(db: &Db) -> Result<Vec<TaskTextRow>, PortError> {
         "SELECT task_id, remote_comment_id, body \
          FROM task_comments ORDER BY created_at",
     )
-    .fetch_all(&db.reads)
+    .fetch_all(&mut *conn)
     .await
     .map_err(map_sqlx_err)?;
 
@@ -148,9 +154,15 @@ fn lifecycle_is_open(lifecycle: &str) -> bool {
 }
 
 /// Load identity fields (display id + workspace name) for all tasks in one
-/// query (RFC 0007 D4 "one read snapshot").
-async fn build_snapshot(db: &Db, tasks: Vec<TaskTextRow>) -> Result<InMemorySnapshot, PortError> {
+/// query on the given read connection (RFC 0007 D4 "one read snapshot").
+async fn build_snapshot_on(
+    conn: &mut sqlx::sqlite::SqliteConnection,
+    tasks: Vec<TaskTextRow>,
+) -> Result<InMemorySnapshot, PortError> {
     let ids: Vec<String> = tasks.iter().map(|t| t.task_id.to_string()).collect();
+    if ids.is_empty() {
+        return Ok(InMemorySnapshot { items: Vec::new() });
+    }
     let placeholders = std::iter::repeat_n("?", ids.len())
         .collect::<Vec<_>>()
         .join(", ");
@@ -166,7 +178,7 @@ async fn build_snapshot(db: &Db, tasks: Vec<TaskTextRow>) -> Result<InMemorySnap
     for id in &ids {
         q = q.bind(id);
     }
-    let rows = q.fetch_all(&db.reads).await.map_err(map_sqlx_err)?;
+    let rows = q.fetch_all(&mut *conn).await.map_err(map_sqlx_err)?;
     let mut by_id: std::collections::HashMap<TaskId, (String, String)> = Default::default();
     for r in rows {
         let Ok(tid) =

@@ -78,9 +78,14 @@ pub fn find_literal_spans(text: &str, needle: &str) -> Vec<std::ops::Range<usize
         if let Some(span) = map_to_raw(&src.chars, mstart, mend) {
             out.push(span);
         }
-        // Advance to the end of this match, not `mstart + 1`: the latter can
-        // land inside a multi-byte folded scalar and panic the next slice.
-        search_from = mend;
+        // Advance by one folded scalar from `mstart` (not `mstart+1`, which
+        // can land inside a multi-byte scalar and panic the next slice; not
+        // `mend`, which would drop overlapping matches like "ana" in
+        // "banana").
+        let Some(c) = src.text[mstart..].chars().next() else {
+            break;
+        };
+        search_from = mstart + c.len_utf8();
     }
     out
 }
@@ -181,5 +186,15 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(&"aé...é"[spans[0].clone()], "é");
         assert_eq!(&"aé...é"[spans[1].clone()], "é");
+    }
+
+    #[test]
+    fn overlapping_matches_are_preserved() {
+        // Advancing to the match end would drop the second, overlapping
+        // "ana" in "banana"; advancing by one folded scalar preserves it.
+        let spans = find_literal_spans("banana", "ana");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(&"banana"[spans[0].clone()], "ana");
+        assert_eq!(&"banana"[spans[1].clone()], "ana");
     }
 }

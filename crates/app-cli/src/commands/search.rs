@@ -110,7 +110,11 @@ pub(crate) async fn search_index_dispatch(
                 lexical_available: lex_available,
                 semantic_available: false,
                 lexical_unavailable_reason: lex_reason,
-                semantic_skipped_reason: Some(SemanticSkippedReasonDto::ModelNotPrepared),
+                semantic_skipped_reason: Some(if !lex_available {
+                    SemanticSkippedReasonDto::LexicalIndexUnavailable
+                } else {
+                    SemanticSkippedReasonDto::ModelNotPrepared
+                }),
                 chunk_count: stats.as_ref().map(|s| s.chunk_count).unwrap_or(0),
                 vector_count: stats.as_ref().map(|s| s.vector_count).unwrap_or(0),
                 fts_integrity_ok: stats.as_ref().map(|s| s.fts_integrity_ok).unwrap_or(false),
