@@ -2511,7 +2511,7 @@ mod tests {
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
-        t.set_title("new title".into());
+        t.set_title("new title".into()).unwrap();
         let patch = t.full_mirror_patch();
         assert_eq!(patch.title.as_deref(), Some("new title"));
         assert!(patch.body.is_some(), "body always present");
