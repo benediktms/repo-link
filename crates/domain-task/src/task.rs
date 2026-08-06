@@ -374,7 +374,21 @@ impl Task {
         }
         match (&self.sync, source) {
             (SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote, _) => {}
-            (SyncState::Conflict, SnapshotSource::Push) => {}
+            (SyncState::Conflict, SnapshotSource::Push) => {
+                // Local-wins from Conflict must overwrite every mirrored field:
+                // an empty/partial patch would mark the task Synced while
+                // leaving remote-divergent fields untouched.
+                if patch.title.is_none()
+                    || patch.body.is_none()
+                    || patch.status.is_none()
+                    || patch.assignees.is_none()
+                {
+                    return Err(DomainError::validation(
+                        "confirm_synced_fields from Conflict (local-wins Push) requires a full \
+                         mirrored-field patch — title, body, status, and assignees must all be present",
+                    ));
+                }
+            }
             (SyncState::Conflict, other) => {
                 return Err(DomainError::transition(format!(
                     "cannot confirm_synced_fields from Conflict with source {other:?}; \
@@ -2498,7 +2512,8 @@ mod tests {
         t.mark_conflicted().unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
 
-        let patch = t.diff_against_baseline(); // no local edits => empty patch
+        // Forced local-wins sends the full mirrored-field patch.
+        let patch = t.full_mirror_patch();
         t.confirm_synced_fields(SnapshotSource::Push, &patch)
             .unwrap();
         assert_eq!(t.sync, SyncState::Synced, "forced push clears the conflict");
