@@ -319,7 +319,18 @@ impl SyncService {
             // un-pushed local value by a whole-snapshot rebaseline.
             // We thread the same `patch` we just sent so the rebaseline
             // and the PATCH cannot disagree on what was transmitted.
-            let patch = task.diff_against_baseline();
+            //
+            // Forced local-wins (push --force from a Conflict): the local
+            // content IS the resolution, so send a FULL mirrored-field patch —
+            // a live-vs-baseline diff would omit fields the remote changed but
+            // local left unchanged, leaving that remote divergence in place
+            // while confirm_synced_fields marks the task clean.
+            let forced_local_wins = force_accept_local && task.sync == SyncState::Conflict;
+            let patch = if forced_local_wins {
+                task.full_mirror_patch()
+            } else {
+                task.diff_against_baseline()
+            };
             let canonical_repo = filing_canonical.clone();
             let remote_id = remote.remote_id.clone();
             if let Some(update) =
@@ -367,7 +378,7 @@ impl SyncService {
         } else {
             SyncDecision::Noop
         };
-        let note = force_accept_local.then(|| {
+        let note = (force_accept_local && prev == SyncState::Conflict).then(|| {
             "forced accept-local: local content is the resolution, conflict cleared (local-wins)".to_string()
         });
         Ok(summary_with_note(&task, prev, decision, note))

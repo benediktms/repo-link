@@ -331,9 +331,12 @@ impl Task {
     ///   admits it: a `Link` event rewires the remote identity but does not
     ///   send a PATCH, so there are no per-field transmitted values to merge —
     ///   use the full-snapshot [`Task::confirm_synced`] for a verified relink.
-    /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}` — or
-    ///   `Conflict` when the caller passes a `Push`-source PATCH that is
-    ///   resolving a conflict (`rl sync push --force`, local-wins).
+    /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`; when it is
+    ///   `Conflict`, only a `Push` source is accepted — the forced local-wins
+    ///   resolution (`rl sync push --force`), which sends a full mirrored-field
+    ///   patch. A `Pull`/`Promote`/`ConflictResolve` partial acknowledgment
+    ///   from `Conflict` would not implement the local-wins overwrite and is
+    ///   rejected.
     /// - A baseline must be present — the merge is over the existing baseline,
     ///   not a fresh one. The merged baseline's `source` is stamped with the
     ///   call's `source` argument; `version` / `captured_at` are preserved
@@ -369,12 +372,16 @@ impl Task {
                 "confirm_synced_fields source must be Promote/Push/Pull/ConflictResolve, got {source:?}"
             )));
         }
-        match self.sync {
-            SyncState::Staged
-            | SyncState::DirtyLocal
-            | SyncState::DirtyRemote
-            | SyncState::Conflict => {}
-            other => {
+        match (&self.sync, source) {
+            (SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote, _) => {}
+            (SyncState::Conflict, SnapshotSource::Push) => {}
+            (SyncState::Conflict, other) => {
+                return Err(DomainError::transition(format!(
+                    "cannot confirm_synced_fields from Conflict with source {other:?}; \
+                     only a local-wins Push resolves a conflict"
+                )));
+            }
+            (other, _) => {
                 return Err(DomainError::transition(format!(
                     "cannot confirm_synced_fields from sync={other:?}"
                 )));
@@ -904,6 +911,21 @@ impl Task {
             assignees: MirrorField::Assignees
                 .differs(self, baseline)
                 .then(|| self.assignees.clone()),
+        }
+    }
+
+    /// Build a patch with every mirrored field set to the current local value
+    /// — used by a forced local-wins conflict resolution (`rl sync push
+    /// --force`), where local content IS the resolution and must overwrite the
+    /// remote wholesale, not just the fields that differ from a possibly
+    /// divergent baseline (a diff patch would leave remote-only changes in
+    /// place while still marking the task clean).
+    pub fn full_mirror_patch(&self) -> MirrorPatch {
+        MirrorPatch {
+            title: Some(self.title.clone()),
+            body: Some(self.body.clone()),
+            status: Some(self.lifecycle),
+            assignees: Some(self.assignees.clone()),
         }
     }
 
@@ -2480,5 +2502,23 @@ mod tests {
         t.confirm_synced_fields(SnapshotSource::Push, &patch)
             .unwrap();
         assert_eq!(t.sync, SyncState::Synced, "forced push clears the conflict");
+    }
+    /// The local-wins resolution patch must carry every mirrored field (not
+    /// only what differs from the baseline), so a forced push overwrites the
+    /// remote wholesale.
+    #[test]
+    fn full_mirror_patch_sets_all_mirrored_fields() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.set_title("new title".into());
+        let patch = t.full_mirror_patch();
+        assert_eq!(patch.title.as_deref(), Some("new title"));
+        assert!(patch.body.is_some(), "body always present");
+        assert!(patch.status.is_some(), "status always present");
+        assert!(patch.assignees.is_some(), "assignees always present");
+        // A diff patch at the same state omits untouched fields.
+        let diff = t.diff_against_baseline();
+        assert!(diff.body.is_none() || diff.assignees.is_none() || diff.status.is_none());
     }
 }
