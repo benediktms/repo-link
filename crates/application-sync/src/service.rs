@@ -343,34 +343,29 @@ impl SyncService {
             self.tasks.save(&task, SnapshotSource::Push).await?;
         }
 
-        // Drain pending comments after the snapshot push (independent of it):
-        // POST each, then promote them all to synced in one repo write.
-        //
-        // Not idempotent across a mid-batch failure: if a later POST fails, the
-        // earlier comments are already on GitHub but their local rows stay
-        // pending, so a re-run re-POSTs them (duplicate remote comments). GitHub
-        // issue comments have no idempotency key, so this at-most-once-per-retry
-        // duplication is an accepted tradeoff for a low-frequency operation —
-        // never lost comments, never a corrupted sync state.
+        // Drain pending comments after the snapshot push (independent of it).
+        // Promote each comment to synced immediately after its OWN POST rather
+        // than in one batch write at the end: a later POST failing mid-batch
+        // then can't leave an already-pushed comment pending for a duplicate
+        // re-POST on retry. GitHub issue comments carry no idempotency key, so
+        // the only residual gap is a crash between a POST's success and this
+        // comment's single-row write (one comment re-posts once) — far rarer
+        // than the whole-batch duplication this replaces.
         if has_pending_comments {
-            let mut drained_local_ids = Vec::new();
-            let mut pushed = Vec::new();
             for comment in task.comments.iter().filter(|c| c.remote_id.is_none()) {
                 // Pending comments loaded from storage carry a surrogate id;
                 // skip any in-memory entries that don't (not safely drainable).
                 let Some(local_id) = comment.local_id.clone() else {
                     continue;
                 };
-                pushed.push(
-                    self.provider
-                        .create_comment(&filing_canonical, &remote.remote_id, &comment.body)
-                        .await?,
-                );
-                drained_local_ids.push(local_id);
+                let pushed = self
+                    .provider
+                    .create_comment(&filing_canonical, &remote.remote_id, &comment.body)
+                    .await?;
+                self.tasks
+                    .mark_comments_pushed(id, &[local_id], &[pushed])
+                    .await?;
             }
-            self.tasks
-                .mark_comments_pushed(id, &drained_local_ids, &pushed)
-                .await?;
         }
 
         let decision = if snapshot_dirty {
