@@ -331,7 +331,12 @@ impl Task {
     ///   admits it: a `Link` event rewires the remote identity but does not
     ///   send a PATCH, so there are no per-field transmitted values to merge —
     ///   use the full-snapshot [`Task::confirm_synced`] for a verified relink.
-    /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`.
+    /// - `self.sync` must be in `{Staged, DirtyLocal, DirtyRemote}`; when it is
+    ///   `Conflict`, only a `Push` source is accepted — the forced local-wins
+    ///   resolution (`rl sync push --force`), which sends a full mirrored-field
+    ///   patch. A `Pull`/`Promote`/`ConflictResolve` partial acknowledgment
+    ///   from `Conflict` would not implement the local-wins overwrite and is
+    ///   rejected.
     /// - A baseline must be present — the merge is over the existing baseline,
     ///   not a fresh one. The merged baseline's `source` is stamped with the
     ///   call's `source` argument; `version` / `captured_at` are preserved
@@ -367,9 +372,30 @@ impl Task {
                 "confirm_synced_fields source must be Promote/Push/Pull/ConflictResolve, got {source:?}"
             )));
         }
-        match self.sync {
-            SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote => {}
-            other => {
+        match (&self.sync, source) {
+            (SyncState::Staged | SyncState::DirtyLocal | SyncState::DirtyRemote, _) => {}
+            (SyncState::Conflict, SnapshotSource::Push) => {
+                // Local-wins from Conflict must overwrite every mirrored field:
+                // an empty/partial patch would mark the task Synced while
+                // leaving remote-divergent fields untouched.
+                if patch.title.is_none()
+                    || patch.body.is_none()
+                    || patch.status.is_none()
+                    || patch.assignees.is_none()
+                {
+                    return Err(DomainError::validation(
+                        "confirm_synced_fields from Conflict (local-wins Push) requires a full \
+                         mirrored-field patch — title, body, status, and assignees must all be present",
+                    ));
+                }
+            }
+            (SyncState::Conflict, other) => {
+                return Err(DomainError::transition(format!(
+                    "cannot confirm_synced_fields from Conflict with source {other:?}; \
+                     only a local-wins Push resolves a conflict"
+                )));
+            }
+            (other, _) => {
                 return Err(DomainError::transition(format!(
                     "cannot confirm_synced_fields from sync={other:?}"
                 )));
@@ -404,6 +430,37 @@ impl Task {
         // would be defeated by leaving the task Synced.
         self.reconcile_dirty_against_baseline();
         Ok(())
+    }
+
+    /// Resolve a divergent task in favor of the current in-memory content and
+    /// mark it synced — the CLI escape hatch for a task stuck in `Conflict`
+    /// (RFC 0004 D1, there is no other path out of Conflict). The application
+    /// layer decides which side wins before calling: accept-remote overwrites
+    /// the mirrored fields from the fetched snapshot first; accept-local
+    /// pushes local content (or keeps it) first. The full current snapshot
+    /// becomes the new alignment baseline, so `source` must be an alignment
+    /// event (`Push` / `Pull` / `ConflictResolve`). There is no per-field
+    /// variant here — use [`Task::confirm_synced_fields`] after a PATCH.
+    pub fn confirm_conflict_resolved(&mut self, source: SnapshotSource) -> Result<()> {
+        if !matches!(
+            source,
+            SnapshotSource::Push | SnapshotSource::Pull | SnapshotSource::ConflictResolve
+        ) {
+            return Err(DomainError::validation(format!(
+                "confirm_conflict_resolved source must be Push/Pull/ConflictResolve, got {source:?}"
+            )));
+        }
+        match self.sync {
+            SyncState::Conflict | SyncState::DirtyLocal | SyncState::DirtyRemote => {
+                self.sync = SyncState::Synced;
+                self.touch();
+                self.synced_baseline = Some(self.snapshot_view(source));
+                Ok(())
+            }
+            other => Err(DomainError::transition(format!(
+                "cannot resolve conflict from sync={other:?}"
+            ))),
+        }
     }
 
     pub fn mark_dirty_local(&mut self) -> Result<()> {
@@ -868,6 +925,21 @@ impl Task {
             assignees: MirrorField::Assignees
                 .differs(self, baseline)
                 .then(|| self.assignees.clone()),
+        }
+    }
+
+    /// Build a patch with every mirrored field set to the current local value
+    /// — used by a forced local-wins conflict resolution (`rl sync push
+    /// --force`), where local content IS the resolution and must overwrite the
+    /// remote wholesale, not just the fields that differ from a possibly
+    /// divergent baseline (a diff patch would leave remote-only changes in
+    /// place while still marking the task clean).
+    pub fn full_mirror_patch(&self) -> MirrorPatch {
+        MirrorPatch {
+            title: Some(self.title.clone()),
+            body: Some(self.body.clone()),
+            status: Some(self.lifecycle),
+            assignees: Some(self.assignees.clone()),
         }
     }
 
@@ -2380,5 +2452,88 @@ mod tests {
             "the old TaskStatus enum is deleted (RFC 0004) but a variant use \
              ({needle}) still appears in: {offenders:#?}"
         );
+    }
+    /// The CLI escape hatch: a task stuck in `Conflict` can be pushed back to
+    /// `Synced` via `confirm_conflict_resolved` (accept-remote after the app
+    /// layer copies the fetched snapshot, or accept-local after a local-wins
+    /// push) by rebaselining the current content as the new alignment point.
+    #[test]
+    fn confirm_conflict_resolved_exits_conflict() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.mark_conflicted().unwrap();
+        assert_eq!(t.sync, SyncState::Conflict);
+
+        t.confirm_conflict_resolved(SnapshotSource::Pull).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert!(t.synced_baseline.is_some(), "rebaselines current content");
+    }
+
+    #[test]
+    fn confirm_conflict_resolved_requires_an_alignment_source() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.mark_conflicted().unwrap();
+
+        let err = t
+            .confirm_conflict_resolved(SnapshotSource::LocalEdit)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("source must be Push/Pull/ConflictResolve")
+        );
+        assert_eq!(t.sync, SyncState::Conflict, "rejected source leaves state");
+    }
+
+    #[test]
+    fn confirm_conflict_resolved_from_synced_is_rejected() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        // promote_to_remote lands the task Synced; no divergence to resolve.
+        t.promote_to_remote(remote_ref()).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert!(
+            t.confirm_conflict_resolved(SnapshotSource::ConflictResolve)
+                .is_err(),
+            "resolving a non-divergent task must error"
+        );
+    }
+
+    /// A `Force push` from `Conflict` runs `confirm_synced_fields`, which must
+    /// accept the conflicted state and rebaseline the transmitted fields
+    /// (local-wins) — the `rl sync push --force` escape hatch.
+    #[test]
+    fn confirm_synced_fields_accepts_conflict_for_forced_push() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.mark_conflicted().unwrap();
+        assert_eq!(t.sync, SyncState::Conflict);
+
+        // Forced local-wins sends the full mirrored-field patch.
+        let patch = t.full_mirror_patch();
+        t.confirm_synced_fields(SnapshotSource::Push, &patch)
+            .unwrap();
+        assert_eq!(t.sync, SyncState::Synced, "forced push clears the conflict");
+    }
+    /// The local-wins resolution patch must carry every mirrored field (not
+    /// only what differs from the baseline), so a forced push overwrites the
+    /// remote wholesale.
+    #[test]
+    fn full_mirror_patch_sets_all_mirrored_fields() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        t.promote_to_remote(remote_ref()).unwrap();
+        t.set_title("new title".into()).unwrap();
+        let patch = t.full_mirror_patch();
+        assert_eq!(patch.title.as_deref(), Some("new title"));
+        assert!(patch.body.is_some(), "body always present");
+        assert!(patch.status.is_some(), "status always present");
+        assert!(patch.assignees.is_some(), "assignees always present");
+        // A diff patch at the same state omits untouched fields.
+        let diff = t.diff_against_baseline();
+        assert!(diff.body.is_none() || diff.assignees.is_none() || diff.status.is_none());
     }
 }
