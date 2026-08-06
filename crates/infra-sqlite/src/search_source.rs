@@ -10,6 +10,7 @@ use ports::{
     CommentTextRow, PortError, SearchScope, TaskIdentity, TaskSearchResultSnapshot,
     TaskSearchSourceRepository, TaskTextRow,
 };
+use sqlx::Connection;
 use sqlx::Row;
 use std::str::FromStr;
 
@@ -31,23 +32,29 @@ impl SqliteTaskSearchSourceRepository {
 impl TaskSearchSourceRepository for SqliteTaskSearchSourceRepository {
     async fn load_reconcile_snapshot(&self) -> Result<Vec<TaskTextRow>, PortError> {
         let mut conn = self.db.reads.acquire().await.map_err(map_sqlx_err)?;
-        load_all_tasks_on(&mut conn).await
+        let mut tx = (*conn).begin().await.map_err(map_sqlx_err)?;
+        let rows = load_all_tasks_on(&mut tx).await?;
+        tx.commit().await.map_err(map_sqlx_err)?;
+        Ok(rows)
     }
 
     async fn begin_result_snapshot(
         &self,
         scope: &SearchScope,
     ) -> Result<Box<dyn TaskSearchResultSnapshot>, PortError> {
-        // One read connection binds the task/comment/identity reads to a
-        // single SQLite snapshot (RFC 0007 D4): a concurrent sync cannot mix
-        // an old task row with new workspace/display-id metadata.
+        // One read transaction pins the task/comment/identity reads to a
+        // single SQLite snapshot (RFC 0007 D4): autocommit SELECTs would each
+        // take their own read snapshot and a concurrent sync could mix an old
+        // task row with new workspace/display-id metadata.
         let mut conn = self.db.reads.acquire().await.map_err(map_sqlx_err)?;
-        let rows = load_all_tasks_on(&mut conn).await?;
+        let mut tx = (*conn).begin().await.map_err(map_sqlx_err)?;
+        let rows = load_all_tasks_on(&mut tx).await?;
         let eligible = rows
             .into_iter()
             .filter(|r| scope_matches(scope, r))
             .collect::<Vec<_>>();
-        let snap = build_snapshot_on(&mut conn, eligible).await?;
+        let snap = build_snapshot_on(&mut tx, eligible).await?;
+        tx.commit().await.map_err(map_sqlx_err)?;
         Ok(Box::new(snap))
     }
 }
