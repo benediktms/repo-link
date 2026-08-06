@@ -22,7 +22,7 @@ use ports::{
 use crate::error::{Result, SyncError};
 use crate::summary::{
     ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
-    summary_with_messages,
+    summary_with_note, summary_with_note_and_messages,
 };
 
 /// Outcome of [`SyncService::refresh`] (`rl task show --refresh`, RFC 0004 D4).
@@ -270,6 +270,17 @@ impl SyncService {
     // would land as `--online` flag or `RepoLinkConfig::online_mode: bool`.
     /// Push local edits (`sync = DirtyLocal` or `Staged`) to the remote.
     pub async fn push(&self, task_id: &str) -> Result<SyncSummaryDto> {
+        self.push_inner(task_id, false).await
+    }
+
+    /// Push a task stuck in `Conflict` (local-wins): treat local content as the
+    /// resolution, PATCH it to the remote, and rebaseline — the CLI `--force`
+    /// escape hatch.
+    pub async fn push_accept_local(&self, task_id: &str) -> Result<SyncSummaryDto> {
+        self.push_inner(task_id, true).await
+    }
+
+    async fn push_inner(&self, task_id: &str, force_accept_local: bool) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         let filing_canonical = self.filing_canonical_for(&task).await?;
@@ -279,7 +290,11 @@ impl SyncService {
         // Two independent push axes: the title/body/status snapshot (gated on
         // DirtyLocal|Staged) and pending outbound comments (a separate axis —
         // they never dirty the task, so a Synced task may still owe comments).
-        let snapshot_dirty = matches!(task.sync, SyncState::DirtyLocal | SyncState::Staged);
+        // `--force` (local-wins) additionally treats a `Conflict` task as
+        // pushable: local content is the resolution and overrides the remote
+        // divergence (CLI escape hatch for a stuck conflict).
+        let snapshot_dirty = matches!(task.sync, SyncState::DirtyLocal | SyncState::Staged)
+            || (force_accept_local && task.sync == SyncState::Conflict);
         let has_pending_comments = task.comments.iter().any(|c| c.remote_id.is_none());
         if !snapshot_dirty && !has_pending_comments {
             return Err(SyncError::Domain(domain_core::DomainError::transition(
@@ -352,11 +367,25 @@ impl SyncService {
         } else {
             SyncDecision::Noop
         };
-        Ok(summary(&task, prev, decision))
+        let note = force_accept_local.then(|| {
+            "forced accept-local: local content is the resolution, conflict cleared (local-wins)".to_string()
+        });
+        Ok(summary_with_note(&task, prev, decision, note))
     }
 
     /// Pull the latest remote snapshot and reconcile.
     pub async fn pull(&self, task_id: &str) -> Result<SyncSummaryDto> {
+        self.pull_inner(task_id, false).await
+    }
+
+    /// Pull and, on a manual-merge conflict, automatically accept the remote
+    /// (remote-wins): overwrite local divergence, rebaseline, and clear the
+    /// conflict. The CLI `--force` escape hatch for a task stuck in Conflict.
+    pub async fn pull_accept_remote(&self, task_id: &str) -> Result<SyncSummaryDto> {
+        self.pull_inner(task_id, true).await
+    }
+
+    async fn pull_inner(&self, task_id: &str, force_accept_remote: bool) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
         ensure_not_archived(&task)?;
@@ -422,6 +451,7 @@ impl SyncService {
         // A conflict still records the conflicted state below, but we defer the
         // error so comment mirroring (orthogonal to title/body drift) still runs.
         let mut manual_merge: Option<String> = None;
+        let mut force_note: Option<String> = None;
         match decision {
             SyncDecision::Noop => {}
             SyncDecision::PullRemote => {
@@ -455,9 +485,31 @@ impl SyncService {
                 // that into pull when we want a one-shot reconcile.
             }
             SyncDecision::RequireManualMerge => {
-                task.mark_conflicted()?;
-                self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
-                manual_merge = Some(task_id.to_string());
+                if force_accept_remote {
+                    // Accept remote as truth (remote-wins): capture the local
+                    // pre-pull state as the undo target, overwrite the mirrored
+                    // fields from the fetched snapshot, then rebaseline and
+                    // clear the divergence — including a task already stuck in
+                    // Conflict (the `confirm_conflict_resolved` path).
+                    self.tasks.save(&task, SnapshotSource::PrePull).await?;
+                    crate::copy_inbound_mirror_from_snap(
+                        &mut task,
+                        &snap.title,
+                        &snap.body,
+                        &snap.assignees,
+                        snap.closed,
+                    );
+                    task.confirm_conflict_resolved(SnapshotSource::Pull)?;
+                    self.tasks.save(&task, SnapshotSource::Pull).await?;
+                    force_note = Some(
+                        "forced accept-remote: local divergence discarded, conflict resolved (remote-wins)"
+                            .to_string(),
+                    );
+                } else {
+                    task.mark_conflicted()?;
+                    self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
+                    manual_merge = Some(task_id.to_string());
+                }
             }
         }
 
@@ -500,7 +552,9 @@ impl SyncService {
             .reconcile_relations_inbound(&mut task, &filing_canonical, &remote.remote_id)
             .await?;
 
-        Ok(summary_with_messages(&task, prev, decision, messages))
+        Ok(summary_with_note_and_messages(
+            &task, prev, decision, force_note, messages,
+        ))
     }
 
     /// `rl task show --refresh` (RFC 0004 D4): observe the remote to stamp

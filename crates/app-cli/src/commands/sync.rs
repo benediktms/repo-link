@@ -95,19 +95,27 @@ pub(crate) async fn sync_dispatch(
         }
         SyncCmd::Push {
             t: TaskArg { task },
+            force,
         } => {
             let id = svc.tasks.resolve_id(&task).await?;
-            sync.push(&id)
-                .await
-                .map_err(|e| enrich_issue_moved(&task, e))?
+            let summary = if force {
+                sync.push_accept_local(&id).await
+            } else {
+                sync.push(&id).await
+            };
+            summary.map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Pull {
             t: TaskArg { task },
+            force,
         } => {
             let id = svc.tasks.resolve_id(&task).await?;
-            sync.pull(&id)
-                .await
-                .map_err(|e| enrich_issue_moved(&task, e))?
+            let summary = if force {
+                sync.pull_accept_remote(&id).await
+            } else {
+                sync.pull(&id).await
+            };
+            summary.map_err(|e| enrich_issue_moved(&task, e))?
         }
         SyncCmd::Import { .. } | SyncCmd::Outbox | SyncCmd::ListRemote { .. } => {
             unreachable!("handled above")

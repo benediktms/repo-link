@@ -72,6 +72,22 @@ pub(crate) fn summary_with_note(
     }
 }
 
+/// Build a summary carrying both a caveat `note` and structured notices —
+/// used by the `--force` pull/push escape hatches to explain that a conflict
+/// was auto-resolved (remote-wins / local-wins).
+pub(crate) fn summary_with_note_and_messages(
+    task: &Task,
+    prev: SyncState,
+    decision: SyncDecision,
+    note: Option<String>,
+    messages: Vec<SyncNoticeDto>,
+) -> SyncSummaryDto {
+    SyncSummaryDto {
+        note,
+        ..summary_with_messages(task, prev, decision, messages)
+    }
+}
+
 /// Build a summary carrying structured [`SyncNoticeDto`]s — used by `pull` to
 /// report inbound relation reconciles. `note` stays `None`; the two channels
 /// are independent.
