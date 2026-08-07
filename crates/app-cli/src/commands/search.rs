@@ -37,6 +37,30 @@ fn status_is_open(s: &str) -> Result<Option<bool>> {
     }
 }
 
+/// Build the pinned embedding provider when its prepared profile is present
+/// in the model cache (RFC 0007 D7); None when the model is not prepared, so
+/// the search reports `model_not_prepared` instead of failing.
+fn maybe_build_embedder() -> Result<Option<std::sync::Arc<dyn ports::EmbeddingProvider>>> {
+    use std::sync::Arc;
+    let manifest = infra_embed::profiles::profile();
+    let cache_root = infra_config::default_model_cache_root()
+        .map_err(|e| anyhow!("resolve model cache root: {e}"))?;
+    let dir = cache_root.join(&manifest.profile_id);
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let config = infra_embed::model::EmbedConfig {
+        pooling: infra_embed::model::Pooling::Mean,
+        corpus_prefix: None,
+        query_prefix: None,
+        dims: 384,
+        max_input_tokens: 512,
+    };
+    let provider = infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config)
+        .map_err(|e| anyhow!("load model: {e}"))?;
+    Ok(Some(Arc::new(provider)))
+}
+
 pub(crate) async fn task_search_dispatch(
     cmd: TaskCmd,
     svc: &Services,
@@ -56,7 +80,10 @@ pub(crate) async fn task_search_dispatch(
     };
 
     let index = SqliteTaskSearchIndex::new(&cfg.database_path);
-    let service = TaskSearchService::new(svc.search_source.clone(), index);
+    let mut service = TaskSearchService::new(svc.search_source.clone(), index);
+    if let Some(embedder) = maybe_build_embedder()? {
+        service = service.with_embedder(embedder);
+    }
     let resp = service
         .search(&application_search::SearchRequest {
             query: args.query,
@@ -106,15 +133,19 @@ pub(crate) async fn search_index_dispatch(
                 }
                 None => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
             };
+            let model_prepared = maybe_build_embedder()?.is_some();
+            let (sem_available, sem_reason) = if !lex_available {
+                (false, Some(SemanticSkippedReasonDto::LexicalIndexUnavailable))
+            } else if !model_prepared {
+                (false, Some(SemanticSkippedReasonDto::ModelNotPrepared))
+            } else {
+                (true, None)
+            };
             render::search_index_status(&SearchIndexStatusDto {
                 lexical_available: lex_available,
-                semantic_available: false,
+                semantic_available: sem_available,
                 lexical_unavailable_reason: lex_reason,
-                semantic_skipped_reason: Some(if !lex_available {
-                    SemanticSkippedReasonDto::LexicalIndexUnavailable
-                } else {
-                    SemanticSkippedReasonDto::ModelNotPrepared
-                }),
+                semantic_skipped_reason: sem_reason,
                 chunk_count: stats.as_ref().map(|s| s.chunk_count).unwrap_or(0),
                 vector_count: stats.as_ref().map(|s| s.vector_count).unwrap_or(0),
                 fts_integrity_ok: stats.as_ref().map(|s| s.fts_integrity_ok).unwrap_or(false),
@@ -123,12 +154,11 @@ pub(crate) async fn search_index_dispatch(
             });
         }
         SearchIndexCmd::Rebuild { .. } => {
-            let rows = svc.search_source.load_reconcile_snapshot().await?;
-            let targets: Vec<ports::ChunkTarget> = rows
-                .iter()
-                .flat_map(application_search::chunk_task)
-                .collect();
-            let written = index.rebuild(&targets).await?;
+            let mut service = TaskSearchService::new(svc.search_source.clone(), index);
+            if let Some(embedder) = maybe_build_embedder()? {
+                service = service.with_embedder(embedder);
+            }
+            let written = service.rebuild().await?;
             render::search_index_maintenance(&SearchIndexMaintenanceDto {
                 command: "rebuild".into(),
                 chunks_written: Some(written),
@@ -144,12 +174,20 @@ pub(crate) async fn search_index_dispatch(
             });
         }
         SearchIndexCmd::PrepareModel { .. } => {
-            // PR1 ships with no model; report the not-prepared state (D8).
+            let manifest = infra_embed::profiles::profile();
+            let cache_root = infra_config::default_model_cache_root()
+                .map_err(|e| anyhow!("resolve model cache root: {e}"))?;
+            let dir = match infra_embed::prepare::prepare(&manifest, &cache_root) {
+                Ok(dir) => dir,
+                Err(infra_embed::prepare::PrepareError::AlreadyPrepared { path, .. }) => path,
+                Err(e) => return Err(anyhow!("prepare-model: {e}")),
+            };
             render::search_model_status(&SearchModelStatusDto {
-                prepared: false,
-                profile_id: None,
-                dimensions: None,
+                prepared: true,
+                profile_id: Some(manifest.profile_id.clone()),
+                dimensions: Some(384),
             });
+            eprintln!("model cache: {}", dir.display());
         }
     }
     Ok(())

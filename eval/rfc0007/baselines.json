@@ -1,0 +1,77 @@
+{
+  "gate1_exact_retention_failures": [],
+  "categories": {
+    "exact": {
+      "count": 21,
+      "literal_r10": 0.738,
+      "literal_mrr": 0.81,
+      "fts_r10": 0.976,
+      "fts_mrr": 0.976,
+      "fused_r10": 0.952,
+      "fused_mrr": 1.0
+    },
+    "paraphrase": {
+      "count": 30,
+      "literal_r10": 0.0,
+      "literal_mrr": 0.0,
+      "fts_r10": 0.8,
+      "fts_mrr": 0.619,
+      "fused_r10": 0.8,
+      "fused_mrr": 0.619
+    },
+    "misleading": {
+      "count": 15,
+      "literal_r10": 0.628,
+      "literal_mrr": 0.722,
+      "fts_r10": 0.594,
+      "fts_mrr": 0.783,
+      "fused_r10": 0.594,
+      "fused_mrr": 0.75
+    },
+    "long_desc": {
+      "count": 10,
+      "literal_r10": 0.2,
+      "literal_mrr": 0.15,
+      "fts_r10": 1.0,
+      "fts_mrr": 1.0,
+      "fused_r10": 0.9,
+      "fused_mrr": 0.853
+    },
+    "length_bias": {
+      "count": 10,
+      "literal_r10": 0.1,
+      "literal_mrr": 0.1,
+      "fts_r10": 0.8,
+      "fts_mrr": 0.723,
+      "fused_r10": 0.7,
+      "fused_mrr": 0.717
+    },
+    "typo": {
+      "count": 10,
+      "literal_r10": 0.2,
+      "literal_mrr": 0.2,
+      "fts_r10": 0.3,
+      "fts_mrr": 0.3,
+      "fused_r10": 0.4,
+      "fused_mrr": 0.4
+    },
+    "language": {
+      "count": 20,
+      "literal_r10": 0.25,
+      "literal_mrr": 0.4,
+      "fts_r10": 0.8,
+      "fts_mrr": 0.975,
+      "fused_r10": 0.8,
+      "fused_mrr": 0.975
+    },
+    "closed": {
+      "count": 10,
+      "literal_r10": 0.4,
+      "literal_mrr": 0.4,
+      "fts_r10": 1.0,
+      "fts_mrr": 1.0,
+      "fused_r10": 1.0,
+      "fused_mrr": 1.0
+    }
+  }
+}

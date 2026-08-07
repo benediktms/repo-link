@@ -19,6 +19,7 @@ domain-core = { workspace = true }
 domain-sync = { workspace = true }
 ports = { workspace = true }
 infra-sqlite = { workspace = true }
+infra-embed = { workspace = true }
 infra-filesystem = { workspace = true }
 infra-git = { workspace = true }
 infra-config = { workspace = true }

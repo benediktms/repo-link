@@ -25,11 +25,11 @@ pub use remote_task::{
     RemoteTaskSnapshot, RemoteTaskUpdate,
 };
 pub use search::{
-    ChunkKind, ChunkTarget, CommentTextRow, EmbeddingProvider, IndexMetadata, IndexStats,
-    LexicalRank, LiteralHit, ReconcileDiff, ReconcileFailure, ReconcileSession,
-    SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION, SchemaMismatch, SearchScope, SidecarInfo,
-    TaskIdentity, TaskSearchIndex, TaskSearchResultSnapshot, TaskSearchSourceRepository,
-    TaskTextRow,
+    ChunkKind, ChunkTarget, CommentTextRow, EmbeddingProvider, GuardedVectorRow, IndexMetadata,
+    IndexStats, LexicalRank, LiteralHit, MissingSemanticInput, ReconcileDiff, ReconcileFailure,
+    ReconcileSession, SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION, SchemaMismatch,
+    SearchScope, SemanticRank, SidecarInfo, TaskIdentity, TaskSearchIndex,
+    TaskSearchResultSnapshot, TaskSearchSourceRepository, TaskTextRow,
 };
 pub use task::{
     RepoBindingRepository, SyncedSource, TaskFilter, TaskRepository, TaskSnapshotRepository,

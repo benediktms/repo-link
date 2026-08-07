@@ -23,8 +23,10 @@ mod repo_binding_repo;
 mod task_repo;
 mod task_snapshot_repo;
 mod workspace_repo;
+mod embedder;
 
 pub use clock::FixedClock;
+pub use embedder::{FAKE_DIMS, HashEmbedder};
 pub use event_sink::CapturingEventSink;
 pub use filesystem_probe::StubFilesystemProbe;
 pub use org_issue_type_repo::InMemoryOrgIssueTypeRepository;
