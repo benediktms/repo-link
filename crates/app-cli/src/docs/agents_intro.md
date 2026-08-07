@@ -5,6 +5,7 @@
 Use `rl` only when the request concerns tracked work:
 
 - choosing the next task;
+- locating a task the user describes but cannot name;
 - inspecting or changing an `rl` task;
 - synchronizing a task with GitHub Issues;
 - resolving workspace or repository scope.
@@ -24,6 +25,25 @@ rl repo list               # list all active-workspace bindings; add --workspace
 ```
 
 `rl here` returns every workspace the checkout belongs to, its repo binding, filing repo, and sibling repos. Use the returned `workspace.id` as `--workspace <id>`. An empty `matches` array means the checkout is unbound. `rl repo list` works outside a bound checkout; its optional `--workspace <id>` flag scopes the global result to one workspace.
+
+### Finding a specific task
+
+When the request describes one particular task rather than asking what to do next, search — do not list and filter:
+
+```bash
+rl task search "<the user's own words>"
+rl task search "PortError::Backend" --exact   # force substring, skip query classification
+```
+
+`task search` retrieves over task titles, bodies, and comments, and classifies the query itself (exact / identifier / natural), so a paraphrase finds the task even when it shares no keyword with the title. Each result carries the friendly `id`, the workspace name, and the excerpt that matched — quote that excerpt as evidence. Reach for this before any listing piped through a substring filter, and before searching GitHub.
+
+The response reports `lexical_available` and `semantic_available`. Search degrades rather than fails, but recall on paraphrased queries drops sharply without the semantic lane. When it is unavailable, say so and offer the remedy:
+
+```bash
+rl task search-index status          # lane availability, chunk and vector counts
+rl task search-index prepare-model   # one-time: fetch and verify the pinned embedding model
+rl task search-index rebuild         # re-chunk and re-embed; the index is disposable
+```
 
 ### Choosing work
 
