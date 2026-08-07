@@ -11,19 +11,35 @@ use sha2::{Digest, Sha256};
 /// Dimensions of the fake vectors (matches the real profile's 384).
 pub const FAKE_DIMS: usize = 384;
 
-/// Deterministic fake embedder. `plan_semantic_inputs` returns the chunk
-/// text unchanged (a single input), and `embed_inputs` derives each vector
-/// from the text hash, so tests stay offline and repeatable.
-#[derive(Clone, Debug, Default)]
+/// Deterministic fake embedder. `plan_semantic_inputs` splits the chunk text
+/// at [`HashEmbedder::with_input_limit`] characters (one input by default),
+/// and `embed_inputs` derives each vector from the text hash, so tests stay
+/// offline and repeatable.
+#[derive(Clone, Debug)]
 pub struct HashEmbedder {
     profile_id: String,
+    input_limit: usize,
 }
 
 impl HashEmbedder {
     pub fn new(profile_id: impl Into<String>) -> Self {
         Self {
             profile_id: profile_id.into(),
+            input_limit: usize::MAX,
         }
+    }
+
+    /// Cap a semantic input at `limit` characters so tests can drive the
+    /// multi-segment fill path and the `QueryTooLong` branch.
+    pub fn with_input_limit(mut self, limit: usize) -> Self {
+        self.input_limit = limit.max(1);
+        self
+    }
+}
+
+impl Default for HashEmbedder {
+    fn default() -> Self {
+        Self::new(String::new())
     }
 }
 
@@ -51,11 +67,18 @@ impl EmbeddingProvider for HashEmbedder {
     }
 
     fn input_limit(&self) -> usize {
-        usize::MAX
+        self.input_limit
     }
 
     fn plan_semantic_inputs(&self, chunk_text: &str) -> PortResult<Vec<String>> {
-        Ok(vec![chunk_text.to_string()])
+        let chars: Vec<char> = chunk_text.chars().collect();
+        if chars.len() <= self.input_limit {
+            return Ok(vec![chunk_text.to_string()]);
+        }
+        Ok(chars
+            .chunks(self.input_limit)
+            .map(|c| c.iter().collect())
+            .collect())
     }
 
     async fn embed_query(&self, query: &str) -> PortResult<Vec<f32>> {
@@ -64,5 +87,31 @@ impl EmbeddingProvider for HashEmbedder {
 
     async fn embed_inputs(&self, texts: &[String]) -> PortResult<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| pseudo_vector(t)).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_plans_one_input() {
+        let e = HashEmbedder::new("p");
+        assert_eq!(e.input_limit(), usize::MAX);
+        assert_eq!(e.plan_semantic_inputs("abcdef").unwrap(), vec!["abcdef"]);
+    }
+
+    #[test]
+    fn limit_splits_into_complete_segments() {
+        let e = HashEmbedder::new("p").with_input_limit(4);
+        let inputs = e.plan_semantic_inputs("abcdefghij").unwrap();
+        assert_eq!(inputs, vec!["abcd", "efgh", "ij"]);
+        assert_eq!(inputs.concat(), "abcdefghij", "every byte must be covered");
+    }
+
+    #[test]
+    fn limit_respects_char_boundaries() {
+        let e = HashEmbedder::new("p").with_input_limit(2);
+        assert_eq!(e.plan_semantic_inputs("äöü€").unwrap(), vec!["äö", "ü€"]);
     }
 }

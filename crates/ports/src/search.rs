@@ -200,12 +200,20 @@ pub trait TaskSearchIndex: Send + Sync {
 
     /// List up to `limit` lexical chunks with no stored vectors, oldest
     /// first — the input set for guarded semantic embedding (RFC 0007 D6).
+    ///
+    /// Discovery is chunk-granular: a chunk with any stored vector is
+    /// complete, which holds because [`TaskSearchIndex::store_vectors_guarded`]
+    /// refuses to leave partial coverage behind.
     async fn missing_semantic_inputs(&self, limit: u32) -> PortResult<Vec<MissingSemanticInput>>;
 
     /// Insert one guarded vector batch (RFC 0007 D6 guards: profile, chunk
     /// identity, and input hash must all still match). Rows whose guards
     /// fail are discarded. Returns the number of rows actually stored so the
     /// caller can detect a no-progress batch and stop.
+    ///
+    /// A batch that would leave a chunk covering only part of `0..n` fails
+    /// and stores nothing: callers must supply every segment of a chunk whose
+    /// vectors they write.
     async fn store_vectors_guarded(&self, rows: &[GuardedVectorRow]) -> PortResult<usize>;
 
     /// Complete semantic ranking of `eligible` tasks against `query_vector`
