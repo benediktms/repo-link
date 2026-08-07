@@ -177,7 +177,10 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                     Some(_) => semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch),
                     None => match self.index.claim_empty_profile(&profile_id).await {
                         Ok(true) => semantic_available = true,
-                        _ => semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch),
+                        Ok(false) => {
+                            semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch)
+                        }
+                        Err(_) => semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed),
                     },
                 }
             }
@@ -223,15 +226,16 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
         let mut semantic: Vec<SemanticRank> = Vec::new();
         if semantic_available {
             let embedder = self.embedder.as_ref().expect("checked above");
-            if embedder
-                .plan_semantic_inputs(query)
-                .map(|inputs| inputs.len() > 1)
-                .unwrap_or(true)
-            {
-                semantic_available = false;
-                semantic_reason = Some(SemanticSkippedReasonDto::QueryTooLong);
-            } else {
-                match embedder.embed_query(query).await {
+            match embedder.plan_semantic_inputs(query) {
+                Err(_) => {
+                    semantic_available = false;
+                    semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
+                }
+                Ok(inputs) if inputs.len() > 1 => {
+                    semantic_available = false;
+                    semantic_reason = Some(SemanticSkippedReasonDto::QueryTooLong);
+                }
+                Ok(_) => match embedder.embed_query(query).await {
                     Ok(qv) => {
                         let eligible: Vec<TaskId> = rows.iter().map(|r| r.task_id).collect();
                         semantic = match self.index.search_semantic(&qv, &eligible).await {
@@ -247,7 +251,7 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                         semantic_available = false;
                         semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
                     }
-                }
+                },
             }
         }
 

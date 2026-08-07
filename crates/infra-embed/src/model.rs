@@ -170,6 +170,17 @@ pub fn load(dir: &Path, config: EmbedConfig) -> Result<CandleModel, PortError> {
     )
     .map_err(|e| PortError::Backend(format!("config parse: {e}")))?;
 
+    let hidden = config_json
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| PortError::Backend("config.json missing hidden_size".to_string()))?;
+    if hidden as usize != config.dims {
+        return Err(PortError::Backend(format!(
+            "config.json hidden_size {hidden} != profile dims {}",
+            config.dims
+        )));
+    }
+
     let safetensors_path = dir.join("model.safetensors");
     // Safety: mmap of a digest-verified artifact from an owner-only cache;
     // the mapping is read-only and the file is never written after verify.

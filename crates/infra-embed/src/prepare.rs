@@ -160,12 +160,15 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
     create_dir_private(cache_root)
         .map_err(|e| PortError::Backend(format!("create cache root: {e}")))?;
 
-    // Unique per profile + process: concurrent prepares never share a staging
-    // dir (one would delete the other's half-staged files).
+    let nonce: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
     let tmp = cache_root.join(format!(
-        ".tmp-prepare-{}-{}",
+        ".tmp-prepare-{}-{}-{}",
         manifest.profile_id.get(..8).unwrap_or(&manifest.profile_id),
-        std::process::id()
+        std::process::id(),
+        nonce
     ));
     if tmp.exists() {
         fs::remove_dir_all(&tmp)
