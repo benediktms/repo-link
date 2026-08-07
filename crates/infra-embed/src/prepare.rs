@@ -43,11 +43,21 @@ impl ProfileManifest {
         }
     }
 
+    /// This profile's directory inside `cache_root`. The only way to derive
+    /// it: `profile_id` reaches here from a public manifest, so a value like
+    /// `../outside` would otherwise place the model outside the cache.
+    pub fn cache_dir(&self, cache_root: &Path) -> Result<PathBuf, PortError> {
+        validate_path_component(&self.profile_id, "profile id")?;
+        Ok(cache_root.join(&self.profile_id))
+    }
+
     /// True when every manifest artifact is present at `cache_root/<id>`
     /// and matches its pinned digest. A cheap, non-downloading, non-loading
     /// probe for diagnostics (status) and idempotent prepare.
     pub fn verify_cached(&self, cache_root: &Path) -> bool {
-        let dir = cache_root.join(&self.profile_id);
+        let Ok(dir) = self.cache_dir(cache_root) else {
+            return false;
+        };
         self.artifacts.iter().all(|a| {
             let path = dir.join(&a.filename);
             sha256_file(&path).map(|h| h == a.sha256).unwrap_or(false)
@@ -89,18 +99,16 @@ fn verify_artifact(path: &Path, expected_sha256: &str) -> Result<(), PortError> 
     Ok(())
 }
 
-/// Reject artifact filenames that escape the staging directory: a single
+/// Reject manifest-supplied path segments that escape their parent: a single
 /// normal path component only (no separators, no `.`/`..`).
-fn validate_artifact_filename(filename: &str) -> Result<(), PortError> {
-    let name = std::path::Path::new(filename);
+fn validate_path_component(value: &str, what: &str) -> Result<(), PortError> {
+    let name = std::path::Path::new(value);
     if name.components().count() != 1
-        || name.file_name().and_then(|f| f.to_str()) != Some(filename)
-        || filename == "."
-        || filename == ".."
+        || name.file_name().and_then(|f| f.to_str()) != Some(value)
+        || value == "."
+        || value == ".."
     {
-        return Err(PortError::Backend(format!(
-            "unsafe artifact filename: {filename}"
-        )));
+        return Err(PortError::Backend(format!("unsafe {what}: {value}")));
     }
     Ok(())
 }
@@ -142,7 +150,7 @@ pub type PrepareResult<T> = Result<T, PrepareError>;
 /// Idempotent: a cache that already holds this profile id returns
 /// [`PrepareError::AlreadyPrepared`] with the existing directory.
 pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<PathBuf> {
-    let final_dir = cache_root.join(&manifest.profile_id);
+    let final_dir = manifest.cache_dir(cache_root)?;
     if final_dir.exists() {
         // Idempotent path, but never trust an existing cache: a tampered
         // artifact must fail here, not report `prepared: true`.
@@ -155,7 +163,7 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
         });
     }
     for artifact in &manifest.artifacts {
-        validate_artifact_filename(&artifact.filename)?;
+        validate_path_component(&artifact.filename, "artifact filename")?;
     }
     create_dir_private(cache_root)
         .map_err(|e| PortError::Backend(format!("create cache root: {e}")))?;
@@ -203,4 +211,52 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
         let _ = fs::remove_dir_all(&tmp);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(profile_id: &str) -> ProfileManifest {
+        ProfileManifest {
+            profile_id: profile_id.to_string(),
+            repo_id: "org/model".to_string(),
+            revision: "abc".to_string(),
+            artifacts: vec![ManifestArtifact {
+                filename: "model.safetensors".to_string(),
+                sha256: "00".to_string(),
+            }],
+            pooling: crate::model::Pooling::Mean,
+            corpus_prefix: None,
+            query_prefix: None,
+            dimensions: 384,
+            max_input_tokens: 512,
+        }
+    }
+
+    #[test]
+    fn cache_dir_is_a_child_of_the_cache_root() {
+        let root = Path::new("/cache");
+        let dir = manifest("deadbeef").cache_dir(root).unwrap();
+        assert_eq!(dir, root.join("deadbeef"));
+    }
+
+    #[test]
+    fn cache_dir_rejects_a_profile_id_that_escapes_the_root() {
+        let root = Path::new("/cache");
+        for id in ["../outside", "/etc", "a/b", ".", "..", ""] {
+            assert!(
+                manifest(id).cache_dir(root).is_err(),
+                "profile id {id:?} must be rejected"
+            );
+            assert!(!manifest(id).verify_cached(root));
+        }
+    }
+
+    #[test]
+    fn prepare_refuses_an_escaping_profile_id_before_touching_the_network() {
+        let root = tempfile::TempDir::new().unwrap();
+        let err = prepare(&manifest("../outside"), root.path()).unwrap_err();
+        assert!(matches!(err, PrepareError::Port(_)), "got {err:?}");
+    }
 }

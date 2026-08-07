@@ -774,7 +774,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
                 .execute(&mut *conn)
                 .await
                 .map_err(backend)?;
-            let mut stored = 0usize;
+            let mut vectors_in_place = 0usize;
             let mut written: Vec<i64> = Vec::new();
             for row in rows {
                 let guarded_ok: Option<i64> = sqlx::query_scalar(
@@ -808,7 +808,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
                 .await
                 .map_err(backend)?;
                 let vector_bytes = encode_vector(&row.vector);
-                let res = sqlx::query(
+                sqlx::query(
                     "INSERT OR IGNORE INTO task_search_vectors \
                      (search_chunk_id, segment_index, embedding_input_hash, vector) \
                      VALUES (?, ?, ?, ?)",
@@ -820,7 +820,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
                 .execute(&mut *conn)
                 .await
                 .map_err(backend)?;
-                stored += res.rows_affected() as usize;
+                vectors_in_place += 1;
             }
             written.sort_unstable();
             written.dedup();
@@ -831,7 +831,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
                 .execute(&mut *conn)
                 .await
                 .map_err(backend)?;
-            Ok::<usize, PortError>(stored)
+            Ok::<usize, PortError>(vectors_in_place)
         }
         .await;
         if result.is_err() {
@@ -1179,14 +1179,18 @@ mod tests {
             "a rejected batch must roll back"
         );
 
-        index
-            .store_vectors_guarded(&[row(0), row(1)])
-            .await
-            .unwrap();
+        let batch = [row(0), row(1)];
+        assert_eq!(index.store_vectors_guarded(&batch).await.unwrap(), 2);
         assert_eq!(index.stats().await.unwrap().vector_count, 2);
         assert!(
             index.missing_semantic_inputs(10).await.unwrap().is_empty(),
             "a fully covered chunk is no longer missing"
+        );
+
+        assert_eq!(
+            index.store_vectors_guarded(&batch).await.unwrap(),
+            2,
+            "a writer that loses the fill race sees vectors in place, not no progress"
         );
     }
 

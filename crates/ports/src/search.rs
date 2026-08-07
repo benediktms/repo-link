@@ -208,8 +208,12 @@ pub trait TaskSearchIndex: Send + Sync {
 
     /// Insert one guarded vector batch (RFC 0007 D6 guards: profile, chunk
     /// identity, and input hash must all still match). Rows whose guards
-    /// fail are discarded. Returns the number of rows actually stored so the
-    /// caller can detect a no-progress batch and stop.
+    /// fail are discarded.
+    ///
+    /// Returns how many of `rows` have their vector in place afterwards,
+    /// counting rows a concurrent writer already stored — only a guard
+    /// rejection is no progress, so a caller that stops at zero does not
+    /// mistake a completed race for a failure.
     ///
     /// A batch that would leave a chunk covering only part of `0..n` fails
     /// and stores nothing: callers must supply every segment of a chunk whose

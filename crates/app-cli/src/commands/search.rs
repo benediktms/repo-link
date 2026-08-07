@@ -47,7 +47,7 @@ fn maybe_build_embedder() -> Option<std::sync::Arc<dyn ports::EmbeddingProvider>
     if !manifest.verify_cached(&cache_root) {
         return None;
     }
-    let dir = cache_root.join(&manifest.profile_id);
+    let dir = manifest.cache_dir(&cache_root).ok()?;
     let config = manifest.embed_config();
     match infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config) {
         Ok(provider) => Some(Arc::new(provider)),
