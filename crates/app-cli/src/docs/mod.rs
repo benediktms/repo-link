@@ -228,6 +228,7 @@ mod tests {
         let block = render_block(&repo);
         assert!(block.contains("`rl` (repo-link) is a local-first workspace"));
         assert!(block.contains("## When to use `rl`"));
+        assert!(block.contains("### Finding a specific task"));
         assert!(block.contains("### Choosing work"));
         assert!(block.contains("### Working with a tracked task"));
         assert!(block.contains("rl repo find <query>"));
@@ -237,5 +238,22 @@ mod tests {
         assert!(block.contains("## This repo"));
         assert!(block.contains("status: unbound"));
         assert!(!block.contains("## Command reference"));
+    }
+
+    #[test]
+    fn render_block_directs_a_content_search_at_task_search() {
+        let block = render_block(&render_repo_info(false, None));
+        assert!(block.contains("rl task search"));
+        assert!(block.contains("rl task search-index prepare-model"));
+        assert!(
+            block.contains("semantic_available"),
+            "the degraded-lane signal must be named, or agents present partial recall as complete"
+        );
+        let find = block.find("### Finding a specific task").expect("section");
+        let choose = block.find("### Choosing work").expect("section");
+        assert!(
+            find < choose,
+            "locating a named task is the more common request, so it must be offered first"
+        );
     }
 }
