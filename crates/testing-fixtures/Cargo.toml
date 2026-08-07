@@ -13,6 +13,7 @@ domain-task = { workspace = true }
 domain-sync = { workspace = true }
 domain-project = { workspace = true }
 ports = { workspace = true }
+sha2 = { workspace = true }
 dto-shared = { workspace = true }
 dto-events = { workspace = true }
 async-trait = { workspace = true }

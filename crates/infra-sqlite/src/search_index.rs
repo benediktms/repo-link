@@ -15,9 +15,10 @@ use async_trait::async_trait;
 use domain_core::TaskId;
 use dto_shared::{LexicalUnavailableReasonDto, MatchedSourceKindDto};
 use ports::{
-    ChunkKind, ChunkTarget, IndexMetadata, IndexStats, LexicalRank, PortError, ReconcileDiff,
-    ReconcileFailure, ReconcileSession, SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION,
-    SchemaMismatch, SidecarInfo, TaskSearchIndex,
+    ChunkKind, ChunkTarget, GuardedVectorRow, IndexMetadata, IndexStats, LexicalRank,
+    MissingSemanticInput, PortError, ReconcileDiff, ReconcileFailure, ReconcileSession,
+    SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION, SchemaMismatch, SemanticRank, SidecarInfo,
+    TaskSearchIndex,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -183,7 +184,12 @@ impl SqliteTaskSearchIndex {
         Ok(row.map(|r| MetaRow {
             schema_version: r.try_get("schema_version").unwrap_or(0),
             chunk_format_version: r.try_get("chunk_format_version").unwrap_or(0),
-            embedding_profile_id: r.try_get("embedding_profile_id").ok(),
+            // try_get::<String> on a NULL column returns Ok("") in sqlx —
+            // decode as Option so an unclaimed profile reads None, not "".
+            embedding_profile_id: r
+                .try_get::<Option<String>, _>("embedding_profile_id")
+                .ok()
+                .flatten(),
         }))
     }
 }
@@ -667,6 +673,288 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             .await;
         Ok(written)
     }
+
+    async fn claim_empty_profile(&self, expected: &str) -> Result<bool, PortError> {
+        let pool = self
+            .open()
+            .await
+            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| PortError::Backend(e.to_string()))?;
+        let result = async {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let changed = sqlx::query(
+                "UPDATE task_search_meta SET embedding_profile_id = ? \
+                 WHERE singleton = 1 AND embedding_profile_id IS NULL",
+            )
+            .bind(expected)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected();
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok::<bool, sqlx::Error>(changed > 0)
+        }
+        .await;
+        if result.is_err() {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+        result.map_err(|e| PortError::Backend(e.to_string()))
+    }
+
+    async fn missing_semantic_inputs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MissingSemanticInput>, PortError> {
+        let pool = self
+            .open()
+            .await
+            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let rows = sqlx::query(
+            "SELECT c.id AS id, c.task_id AS task_id, c.kind AS kind, \
+                    c.content_hash AS content_hash, c.text AS text \
+             FROM task_search_chunks c \
+             LEFT JOIN task_search_vectors v ON v.search_chunk_id = c.id \
+             WHERE v.search_chunk_id IS NULL \
+             ORDER BY c.id ASC \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| PortError::Backend(e.to_string()))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id: i64 = r
+                .try_get("id")
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            let task_id_str: String = r
+                .try_get("task_id")
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            let Ok(task_id) = TaskId::from_str(&task_id_str) else {
+                continue;
+            };
+            let kind: String = r.try_get("kind").unwrap_or_default();
+            let content_hash: Vec<u8> = r.try_get("content_hash").unwrap_or_default();
+            let text: String = r.try_get("text").unwrap_or_default();
+            let Ok(content_hash) = content_hash.try_into() else {
+                continue;
+            };
+            out.push(MissingSemanticInput {
+                search_chunk_id: id,
+                task_id,
+                kind: if kind == "comment" {
+                    ChunkKind::Comment
+                } else {
+                    ChunkKind::Core
+                },
+                content_hash,
+                text,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn store_vectors_guarded(&self, rows: &[GuardedVectorRow]) -> Result<usize, PortError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let pool = self
+            .open()
+            .await
+            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| PortError::Backend(e.to_string()))?;
+        let backend = |e: sqlx::Error| PortError::Backend(e.to_string());
+        let result = async {
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *conn)
+                .await
+                .map_err(backend)?;
+            let mut vectors_in_place = 0usize;
+            let mut written: Vec<i64> = Vec::new();
+            for row in rows {
+                let guarded_ok: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM task_search_meta m, task_search_chunks c \
+                     WHERE m.singleton = 1 \
+                       AND m.embedding_profile_id IS NOT NULL \
+                       AND c.id = ? AND c.task_id = ? AND c.content_hash = ?",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.task_id.to_string())
+                .bind(row.content_hash.as_slice())
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(backend)?;
+                if guarded_ok.is_none() {
+                    continue;
+                }
+                written.push(row.search_chunk_id);
+                // A re-embed of the same segment with a different input hash
+                // supersedes the stored row; without this the INSERT OR IGNORE
+                // conflict keeps the stale vector forever.
+                sqlx::query(
+                    "DELETE FROM task_search_vectors \
+                     WHERE search_chunk_id = ? AND segment_index = ? \
+                       AND embedding_input_hash != ?",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.segment_index)
+                .bind(row.embedding_input_hash.as_slice())
+                .execute(&mut *conn)
+                .await
+                .map_err(backend)?;
+                let vector_bytes = encode_vector(&row.vector);
+                sqlx::query(
+                    "INSERT OR IGNORE INTO task_search_vectors \
+                     (search_chunk_id, segment_index, embedding_input_hash, vector) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.segment_index)
+                .bind(row.embedding_input_hash.as_slice())
+                .bind(vector_bytes)
+                .execute(&mut *conn)
+                .await
+                .map_err(backend)?;
+                vectors_in_place += 1;
+            }
+            written.sort_unstable();
+            written.dedup();
+            for chunk_id in written {
+                verify_segment_coverage(&mut conn, chunk_id).await?;
+            }
+            sqlx::query("COMMIT")
+                .execute(&mut *conn)
+                .await
+                .map_err(backend)?;
+            Ok::<usize, PortError>(vectors_in_place)
+        }
+        .await;
+        if result.is_err() {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+        result
+    }
+
+    async fn search_semantic(
+        &self,
+        query_vector: &[f32],
+        eligible: &[TaskId],
+    ) -> Result<Vec<SemanticRank>, PortError> {
+        let pool = self
+            .open()
+            .await
+            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        // Filter eligible tasks in SQL so I/O is O(eligible), not O(vectors).
+        // Chunk the IN list to stay under SQLite's variable limit.
+        const MAX_IN: usize = 500;
+        let mut best: HashMap<TaskId, f32> = HashMap::new();
+        for chunk in eligible.chunks(MAX_IN) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT c.task_id AS task_id, v.vector AS vector \
+                 FROM task_search_vectors v \
+                 JOIN task_search_chunks c ON c.id = v.search_chunk_id \
+                 WHERE c.task_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for tid in chunk {
+                q = q.bind(tid.to_string());
+            }
+            let rows = q
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            for r in rows {
+                let Ok(task_id_str) = r.try_get::<String, _>("task_id") else {
+                    continue;
+                };
+                let Ok(tid) = TaskId::from_str(&task_id_str) else {
+                    continue;
+                };
+                let Ok(blob) = r.try_get::<Vec<u8>, _>("vector") else {
+                    continue;
+                };
+                let Ok(vec) = decode_vector(&blob, query_vector.len()) else {
+                    continue;
+                };
+                let score = cosine(query_vector, &vec);
+                let e = best.entry(tid).or_insert(f32::NEG_INFINITY);
+                if score > *e {
+                    *e = score;
+                }
+            }
+        }
+        let mut out: Vec<SemanticRank> = best
+            .into_iter()
+            .map(|(task_id, score)| SemanticRank { task_id, score })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.task_id.as_uuid().cmp(&b.task_id.as_uuid()))
+        });
+        Ok(out)
+    }
+}
+
+fn encode_vector(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    out
+}
+
+fn decode_vector(blob: &[u8], dims: usize) -> Result<Vec<f32>, String> {
+    if blob.len() != dims * 4 {
+        return Err(format!("vector blob len {} != {dims} dims", blob.len()));
+    }
+    let mut out = Vec::with_capacity(dims);
+    for chunk in blob.chunks_exact(4) {
+        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(out)
+}
+
+/// Reject a chunk whose stored segments are not `0..n` without gaps.
+///
+/// `missing_semantic_inputs` is chunk-granular: one vector row marks the whole
+/// chunk done. Partial coverage would therefore never be re-queued and those
+/// segments would stay unvectorized forever, so a batch that would leave a gap
+/// fails and rolls back instead (RFC 0007 D6).
+async fn verify_segment_coverage(
+    conn: &mut sqlx::SqliteConnection,
+    search_chunk_id: i64,
+) -> Result<(), PortError> {
+    let (count, lo, hi): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(MIN(segment_index), -1), COALESCE(MAX(segment_index), -1) \
+         FROM task_search_vectors WHERE search_chunk_id = ?",
+    )
+    .bind(search_chunk_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| PortError::Backend(e.to_string()))?;
+    if lo != 0 || count != hi + 1 {
+        return Err(PortError::Backend(format!(
+            "incomplete segment coverage for chunk {search_chunk_id}: \
+             {count} rows spanning {lo}..={hi}"
+        )));
+    }
+    Ok(())
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let denom = (norm_a * norm_b).max(f32::EPSILON);
+    dot / denom
 }
 
 /// Transactionally delete all derived rows + FTS `delete-all` (RFC 0007 D5).
@@ -835,5 +1123,168 @@ mod tests {
         let stats = index.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 1);
         assert!(stats.fts_integrity_ok);
+    }
+
+    /// Unclaimed profile reads as `None`, not an empty string (sqlx decodes
+    /// NULL into `Ok("")` for `String`), so claim + semantic availability
+    /// work on a fresh sidecar.
+    #[tokio::test]
+    async fn unclaimed_profile_reads_none() {
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let index = SqliteTaskSearchIndex::new(&auth);
+        let meta = index.metadata().await.unwrap();
+        let profile = meta
+            .available
+            .as_ref()
+            .and_then(|s| s.embedding_profile_id.clone());
+        assert_eq!(profile, None, "fresh sidecar must have no claimed profile");
+    }
+
+    /// A batch that would leave a chunk partially vectorized is rejected:
+    /// chunk-granular discovery would never re-queue the missing segments.
+    #[tokio::test]
+    async fn partial_segment_coverage_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let index = SqliteTaskSearchIndex::new(&auth);
+
+        let a = tid(1);
+        let mut sess = index.begin_reconcile().await.unwrap();
+        sess.diff_chunks(&[target(a, ChunkKind::Core, "Fix the retry loop")], 10_000)
+            .await
+            .unwrap();
+        sess.commit(&[1u8; 32]).await.unwrap();
+        drop(sess);
+        assert!(index.claim_empty_profile("prof-x").await.unwrap());
+
+        let missing = index.missing_semantic_inputs(10).await.unwrap();
+        let m = &missing[0];
+        let row = |segment_index: u32| GuardedVectorRow {
+            search_chunk_id: m.search_chunk_id,
+            task_id: m.task_id,
+            content_hash: m.content_hash,
+            segment_index,
+            embedding_input_hash: [segment_index as u8; 32],
+            vector: vec![1.0f32; 8],
+        };
+
+        assert!(
+            index.store_vectors_guarded(&[row(1)]).await.is_err(),
+            "segment 1 without segment 0 leaves a gap"
+        );
+        assert_eq!(
+            index.stats().await.unwrap().vector_count,
+            0,
+            "a rejected batch must roll back"
+        );
+
+        let batch = [row(0), row(1)];
+        assert_eq!(index.store_vectors_guarded(&batch).await.unwrap(), 2);
+        assert_eq!(index.stats().await.unwrap().vector_count, 2);
+        assert!(
+            index.missing_semantic_inputs(10).await.unwrap().is_empty(),
+            "a fully covered chunk is no longer missing"
+        );
+
+        assert_eq!(
+            index.store_vectors_guarded(&batch).await.unwrap(),
+            2,
+            "a writer that loses the fill race sees vectors in place, not no progress"
+        );
+    }
+
+    /// Claim → missing inputs → guarded store → semantic ranking, with the
+    /// cosine ordering and the stale-chunk guard.
+    #[tokio::test]
+    async fn semantic_vectors_claim_store_search() {
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let index = SqliteTaskSearchIndex::new(&auth);
+
+        let a = tid(1);
+        let b = tid(2);
+        let targets = vec![
+            target(a, ChunkKind::Core, "Fix the retry loop"),
+            target(b, ChunkKind::Core, "Add retry backoff"),
+        ];
+        let mut sess = index.begin_reconcile().await.unwrap();
+        sess.diff_chunks(&targets, 10_000).await.unwrap();
+        sess.commit(&[1u8; 32]).await.unwrap();
+        drop(sess);
+
+        // Claim: first claim wins; second is refused.
+        assert!(index.claim_empty_profile("prof-x").await.unwrap());
+        assert!(!index.claim_empty_profile("prof-y").await.unwrap());
+
+        // All chunks are missing vectors.
+        let missing = index.missing_semantic_inputs(10).await.unwrap();
+        assert_eq!(missing.len(), 2);
+
+        // Build guarded rows: chunk a gets a vector aligned with the query,
+        // chunk b a vector orthogonal to it. Rowid assignment is
+        // nondeterministic (reconcile iterates a HashMap), so pick the rows
+        // by task id, not by iteration order.
+        let mut rows = Vec::new();
+        for m in &missing {
+            let aligned = m.task_id == a;
+            let vec = if aligned {
+                vec![1.0f32; 8]
+            } else {
+                (0..8)
+                    .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+                    .collect()
+            };
+            rows.push(GuardedVectorRow {
+                search_chunk_id: m.search_chunk_id,
+                task_id: m.task_id,
+                content_hash: m.content_hash,
+                segment_index: 0,
+                embedding_input_hash: [9u8; 32],
+                vector: vec,
+            });
+        }
+        index.store_vectors_guarded(&rows).await.unwrap();
+        let stats = index.stats().await.unwrap();
+        assert_eq!(stats.vector_count, 2);
+
+        // Semantic search: a (aligned) ranks above b (orthogonal).
+        let query = vec![1.0f32; 8];
+        let ranks = index.search_semantic(&query, &[a, b]).await.unwrap();
+        assert_eq!(ranks.len(), 2);
+        assert_eq!(ranks[0].task_id, a, "aligned vector must rank first");
+        assert!(
+            (ranks[0].score - 1.0).abs() < 1e-6,
+            "aligned score must be a normalized 1.0, not a dot product; got {}",
+            ranks[0].score
+        );
+        assert!(
+            ranks[1].score.abs() < 1e-6,
+            "orthogonal score must be 0.0, got {}",
+            ranks[1].score
+        );
+
+        // Guard: a stale chunk (deleted before store) must not accept a
+        // vector. Delete chunk a's rows, then attempt a guarded store.
+        let mut sess = index.begin_reconcile().await.unwrap();
+        let reduced = vec![target(b, ChunkKind::Core, "Add retry backoff")];
+        sess.diff_chunks(&reduced, 10_000).await.unwrap();
+        sess.commit(&[2u8; 32]).await.unwrap();
+        drop(sess);
+        let stale = GuardedVectorRow {
+            search_chunk_id: rows
+                .iter()
+                .find(|r| r.task_id == a)
+                .unwrap()
+                .search_chunk_id,
+            task_id: a,
+            content_hash: rows.iter().find(|r| r.task_id == a).unwrap().content_hash,
+            segment_index: 0,
+            embedding_input_hash: [9u8; 32],
+            vector: vec![1.0f32; 8],
+        };
+        index.store_vectors_guarded(&[stale]).await.unwrap();
+        let stats = index.stats().await.unwrap();
+        assert_eq!(stats.vector_count, 1, "stale chunk vector must be rejected");
     }
 }

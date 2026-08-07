@@ -11,6 +11,15 @@ pub fn default_db_path() -> Result<PathBuf, ConfigError> {
     Ok(dirs.data_dir().join("repo-link.db"))
 }
 
+/// Root of the global model cache (RFC 0007 D7): returns the `models`
+/// directory itself; each subdirectory is named by `embedding_profile_id`
+/// and holds one prepared profile. Shared across databases, keyed by profile
+/// id (the SHA-256 of the canonical manifest).
+pub fn default_model_cache_root() -> Result<PathBuf, ConfigError> {
+    let dirs = ProjectDirs::from("", "", "repo-link").ok_or(ConfigError::NoDataDir)?;
+    Ok(dirs.data_dir().join("models"))
+}
+
 pub fn default_token_file_path() -> Result<PathBuf, ConfigError> {
     let dirs = ProjectDirs::from("", "", "repo-link").ok_or(ConfigError::NoDataDir)?;
     Ok(dirs.config_dir().join("github_token"))

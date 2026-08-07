@@ -191,6 +191,42 @@ pub trait TaskSearchIndex: Send + Sync {
     /// Explicit `rebuild`: replace derived schema + rows for the current
     /// chunk format under the exclusive lifecycle lock.
     async fn rebuild(&self, targets: &[ChunkTarget]) -> PortResult<u64>;
+
+    /// Compare-and-set the sidecar's embedding profile: succeeds only when
+    /// `embedding_profile_id` is currently NULL; claims it as `expected`
+    /// (RFC 0007 D8 "Unclaimed profile"). Returns Ok(true) on claim, Ok(false)
+    /// when another profile already owns the sidecar.
+    async fn claim_empty_profile(&self, expected: &str) -> PortResult<bool>;
+
+    /// List up to `limit` lexical chunks with no stored vectors, oldest
+    /// first — the input set for guarded semantic embedding (RFC 0007 D6).
+    ///
+    /// Discovery is chunk-granular: a chunk with any stored vector is
+    /// complete, which holds because [`TaskSearchIndex::store_vectors_guarded`]
+    /// refuses to leave partial coverage behind.
+    async fn missing_semantic_inputs(&self, limit: u32) -> PortResult<Vec<MissingSemanticInput>>;
+
+    /// Insert one guarded vector batch (RFC 0007 D6 guards: profile, chunk
+    /// identity, and input hash must all still match). Rows whose guards
+    /// fail are discarded.
+    ///
+    /// Returns how many of `rows` have their vector in place afterwards,
+    /// counting rows a concurrent writer already stored — only a guard
+    /// rejection is no progress, so a caller that stops at zero does not
+    /// mistake a completed race for a failure.
+    ///
+    /// A batch that would leave a chunk covering only part of `0..n` fails
+    /// and stores nothing: callers must supply every segment of a chunk whose
+    /// vectors they write.
+    async fn store_vectors_guarded(&self, rows: &[GuardedVectorRow]) -> PortResult<usize>;
+
+    /// Complete semantic ranking of `eligible` tasks against `query_vector`
+    /// by exact cosine (best per-task vector), descending score (RFC 0007 D4).
+    async fn search_semantic(
+        &self,
+        query_vector: &[f32],
+        eligible: &[TaskId],
+    ) -> PortResult<Vec<SemanticRank>>;
 }
 
 /// A serialized sidecar reconcile session (RFC 0007 D6 ordering: the sidecar
@@ -274,6 +310,58 @@ pub struct IndexStats {
 pub trait EmbeddingProvider: Send + Sync {
     fn profile_id(&self) -> String;
     fn dimensions(&self) -> usize;
+
+    /// Effective token budget for a single semantic input, including
+    /// instruction prefixes and model special tokens (RFC 0007 D2).
+    fn input_limit(&self) -> usize;
+
+    /// Split one lexical chunk into complete, tokenizer-bounded semantic
+    /// inputs: every byte of the chunk is covered by at least one input, and
+    /// each input fits under [`EmbeddingProvider::input_limit`] including
+    /// the profile's instruction prefix (RFC 0007 D2/D7). The adapter never
+    /// relies on runtime truncation.
+    fn plan_semantic_inputs(&self, chunk_text: &str) -> PortResult<Vec<String>>;
+
     async fn embed_query(&self, query: &str) -> PortResult<Vec<f32>>;
     async fn embed_inputs(&self, texts: &[String]) -> PortResult<Vec<Vec<f32>>>;
+}
+
+/// One semantic input waiting for a vector: a lexical chunk (D2/D3 text)
+/// whose tokenizer-bounded inputs are not yet stored (RFC 0007 D6 "missing
+/// semantic inputs are embedded in batches").
+#[derive(Clone, Debug)]
+pub struct MissingSemanticInput {
+    /// Sidecar row id of the lexical chunk.
+    pub search_chunk_id: i64,
+    pub task_id: TaskId,
+    pub kind: ChunkKind,
+    /// SHA-256 of the formatted chunk text (guard identity, RFC 0007 D6).
+    pub content_hash: [u8; 32],
+    /// Formatted lexical chunk text (title-anchored).
+    pub text: String,
+}
+
+/// A guarded vector batch row (RFC 0007 D6 guards): the insert succeeds only
+/// while sidecar metadata still names the same profile, the chunk identity
+/// (id/task/hash) is unchanged, and the embedding-input hash still matches
+/// the tokenizer-derived input.
+#[derive(Clone, Debug)]
+pub struct GuardedVectorRow {
+    pub search_chunk_id: i64,
+    pub task_id: TaskId,
+    pub content_hash: [u8; 32],
+    pub segment_index: u32,
+    /// SHA-256 of the semantic input text.
+    pub embedding_input_hash: [u8; 32],
+    /// Normalized f32 vector of `dimensions()` floats.
+    pub vector: Vec<f32>,
+}
+
+/// A complete semantic ranking entry: best cosine per eligible task
+/// (RFC 0007 D4 exact scan, memory O(eligible), not O(vectors)).
+#[derive(Clone, Debug)]
+pub struct SemanticRank {
+    pub task_id: TaskId,
+    /// Cosine similarity, higher is better.
+    pub score: f32,
 }

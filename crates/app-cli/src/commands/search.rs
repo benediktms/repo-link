@@ -9,7 +9,7 @@ use dto_shared::{
 };
 use infra_config::RepoLinkConfig;
 use infra_sqlite::SqliteTaskSearchIndex;
-use ports::{TaskSearchIndex, TaskSearchSourceRepository};
+use ports::TaskSearchIndex;
 use std::str::FromStr;
 
 use crate::cli::{SearchIndexCmd, TaskCmd};
@@ -37,6 +37,38 @@ fn status_is_open(s: &str) -> Result<Option<bool>> {
     }
 }
 
+/// Build the pinned embedding provider when its prepared profile is cached
+/// (RFC 0007 D7); None when the model is not prepared or fails to load, so
+/// search reports `model_not_prepared` / degrades instead of failing.
+fn maybe_build_embedder() -> Option<std::sync::Arc<dyn ports::EmbeddingProvider>> {
+    use std::sync::Arc;
+    let manifest = infra_embed::profiles::profile();
+    let cache_root = infra_config::default_model_cache_root().ok()?;
+    if !manifest.verify_cached(&cache_root) {
+        return None;
+    }
+    let dir = manifest.cache_dir(&cache_root).ok()?;
+    let config = manifest.embed_config();
+    match infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config) {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(e) => {
+            tracing::warn!("embedding model failed to load; semantic lane unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// True when the pinned profile is cached and every artifact matches its
+/// digest (RFC 0007 D7). A diagnostic probe: hashes files, never loads
+/// weights, never errors on a corrupt model — status must report an
+/// unavailable component rather than fail (RFC 0007 D8).
+fn model_prepared() -> bool {
+    let manifest = infra_embed::profiles::profile();
+    infra_config::default_model_cache_root()
+        .map(|root| manifest.verify_cached(&root))
+        .unwrap_or(false)
+}
+
 pub(crate) async fn task_search_dispatch(
     cmd: TaskCmd,
     svc: &Services,
@@ -56,7 +88,10 @@ pub(crate) async fn task_search_dispatch(
     };
 
     let index = SqliteTaskSearchIndex::new(&cfg.database_path);
-    let service = TaskSearchService::new(svc.search_source.clone(), index);
+    let mut service = TaskSearchService::new(svc.search_source.clone(), index);
+    if let Some(embedder) = maybe_build_embedder() {
+        service = service.with_embedder(embedder);
+    }
     let resp = service
         .search(&application_search::SearchRequest {
             query: args.query,
@@ -106,15 +141,30 @@ pub(crate) async fn search_index_dispatch(
                 }
                 None => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
             };
+            let model_prepared = model_prepared();
+            let claimed = index
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.available)
+                .and_then(|s| s.embedding_profile_id);
+            let (sem_available, sem_reason) = if !lex_available {
+                (
+                    false,
+                    Some(SemanticSkippedReasonDto::LexicalIndexUnavailable),
+                )
+            } else if !model_prepared {
+                (false, Some(SemanticSkippedReasonDto::ModelNotPrepared))
+            } else if claimed.is_some_and(|p| p != infra_embed::profiles::profile().profile_id) {
+                (false, Some(SemanticSkippedReasonDto::ProfileMismatch))
+            } else {
+                (true, None)
+            };
             render::search_index_status(&SearchIndexStatusDto {
                 lexical_available: lex_available,
-                semantic_available: false,
+                semantic_available: sem_available,
                 lexical_unavailable_reason: lex_reason,
-                semantic_skipped_reason: Some(if !lex_available {
-                    SemanticSkippedReasonDto::LexicalIndexUnavailable
-                } else {
-                    SemanticSkippedReasonDto::ModelNotPrepared
-                }),
+                semantic_skipped_reason: sem_reason,
                 chunk_count: stats.as_ref().map(|s| s.chunk_count).unwrap_or(0),
                 vector_count: stats.as_ref().map(|s| s.vector_count).unwrap_or(0),
                 fts_integrity_ok: stats.as_ref().map(|s| s.fts_integrity_ok).unwrap_or(false),
@@ -123,16 +173,21 @@ pub(crate) async fn search_index_dispatch(
             });
         }
         SearchIndexCmd::Rebuild { .. } => {
-            let rows = svc.search_source.load_reconcile_snapshot().await?;
-            let targets: Vec<ports::ChunkTarget> = rows
-                .iter()
-                .flat_map(application_search::chunk_task)
-                .collect();
-            let written = index.rebuild(&targets).await?;
+            let mut service = TaskSearchService::new(svc.search_source.clone(), index);
+            if let Some(embedder) = maybe_build_embedder() {
+                service = service.with_embedder(embedder);
+            }
+            let (written, fill) = service.rebuild().await?;
             render::search_index_maintenance(&SearchIndexMaintenanceDto {
                 command: "rebuild".into(),
                 chunks_written: Some(written),
-                error: None,
+                error: match fill {
+                    None | Some(application_search::FillOutcome::Complete) => None,
+                    _ => Some(
+                        "semantic vectors failed to fill; run prepare-model and rebuild again"
+                            .into(),
+                    ),
+                },
             });
         }
         SearchIndexCmd::Clear { .. } => {
@@ -144,12 +199,20 @@ pub(crate) async fn search_index_dispatch(
             });
         }
         SearchIndexCmd::PrepareModel { .. } => {
-            // PR1 ships with no model; report the not-prepared state (D8).
+            let manifest = infra_embed::profiles::profile();
+            let cache_root = infra_config::default_model_cache_root()
+                .map_err(|e| anyhow!("resolve model cache root: {e}"))?;
+            let dir = match infra_embed::prepare::prepare(&manifest, &cache_root) {
+                Ok(dir) => dir,
+                Err(infra_embed::prepare::PrepareError::AlreadyPrepared { path, .. }) => path,
+                Err(e) => return Err(anyhow!("prepare-model: {e}")),
+            };
             render::search_model_status(&SearchModelStatusDto {
-                prepared: false,
-                profile_id: None,
-                dimensions: None,
+                prepared: true,
+                profile_id: Some(manifest.profile_id.clone()),
+                dimensions: Some(manifest.dimensions as u32),
             });
+            eprintln!("model cache: {}", dir.display());
         }
     }
     Ok(())

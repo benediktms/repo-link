@@ -1177,10 +1177,40 @@ claim; timings are machine-local evidence.
 
 ### Stage 4 — Measure and record
 
-- Record: reconcile pass p50/p95 (zero-change and bursty), end-to-end cold
-  `rl task search` wall time including process start and model load, rebuild
-  time, per-component sidecar/WAL bytes, semantic-input amplification, model
-  cache bytes, and budget headroom.
+Measured 2026-08-07 on Apple M3 Max (macOS), release build, live corpus of
+2,952 chunks in the repo-link-dev sidecar:
+
+- **End-to-end cold `rl task search` wall time** (process start to JSON on
+  stdout):
+  - literal+lexical-only (no model prepared): p95 ≈ **0.15 s** — well under
+    the 300 ms predeclared gate;
+  - semantic (model load + query embed + full vector scan): p95 ≈ **0.30 s**
+    — well under the 2 s predeclared gate.
+- **Model load + corpus vector fill** (one-time after `rebuild`): ≈ **31 s**
+  for 2,952 chunks on the Metal backend. Pure embed throughput is flat at
+  ~140–160 texts/s regardless of batch size (64→1024), i.e. ≈ **20 s** of
+  pure embedding for the corpus; the remaining ≈ 11 s is model load (mmap +
+  tokenizer) plus per-chunk input-hash computation and sidecar writes. The
+  batches exist for memory, not speed — the fill is compute-bound.
+- **Rebuild time**: ≈ **0.5 s** for chunk rewrite alone; ≈ 31 s including
+  the guarded vector fill (rebuild fills vectors itself per D10 — ordinary
+  search never re-embeds).
+- **Sidecar**: 9.2 MiB at 2,952 chunks; model cache 87 MiB (all-MiniLM-L6-v2,
+  pinned profile).
+- **Zero-change reconcile**: an unchanged sidecar embeds nothing; steady-state
+  semantic search reuses stored vectors and returns in ~0.2–0.3 s.
+
+Backend note: candle 0.9's Metal backend requires the `metal` feature on
+`candle-nn` and `candle-transformers` too — enabling it only on `candle-core`
+leaves layer-norm without a Metal implementation and silently falls back to
+CPU. CUDA remains an opt-in `cuda` feature (needs the CUDA toolkit at build
+time); Vulkan/OpenGL have no candle backend.
+
+Decision: with cold semantic search at ~0.3 s against a 2 s bound, the `rld`
+warm `embed_query` endpoint is **not justified** — the per-invocation model
+load is already inside the gate. It remains the named remedy only if a much
+larger corpus or a slower model pushes semantic p95 past 2 s.
+
 - Fold the numbers into this RFC. ANN, incremental tracking, reranking, or the
   `rld` warm-embed endpoint are follow-up RFCs gated on measured ceilings.
 

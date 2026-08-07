@@ -12,6 +12,7 @@
 //! in-memory DB).
 
 mod clock;
+mod embedder;
 mod event_sink;
 mod filesystem_probe;
 mod org_issue_type_repo;
@@ -25,6 +26,7 @@ mod task_snapshot_repo;
 mod workspace_repo;
 
 pub use clock::FixedClock;
+pub use embedder::{FAKE_DIMS, HashEmbedder};
 pub use event_sink::CapturingEventSink;
 pub use filesystem_probe::StubFilesystemProbe;
 pub use org_issue_type_repo::InMemoryOrgIssueTypeRepository;

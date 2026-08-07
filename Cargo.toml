@@ -22,6 +22,7 @@ members = [
     "crates/infra-git",
     "crates/infra-filesystem",
     "crates/infra-config",
+    "crates/infra-embed",
     "crates/ports",
     "crates/testing-fixtures",
     "crates/testing-integration",
@@ -54,6 +55,7 @@ infra-github = { path = "crates/infra-github" }
 infra-git = { path = "crates/infra-git" }
 infra-filesystem = { path = "crates/infra-filesystem" }
 infra-config = { path = "crates/infra-config" }
+infra-embed = { path = "crates/infra-embed" }
 ports = { path = "crates/ports" }
 testing-fixtures = { path = "crates/testing-fixtures" }
 
@@ -65,6 +67,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 thiserror = "2"
 anyhow = "1"
+sha2 = "0.10"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
@@ -78,6 +81,13 @@ octocrab = { version = "0.51", default-features = false, features = [
 gix = { version = "0.66", default-features = false, features = ["max-performance-safe"] }
 notify = "6"
 walkdir = "2"
+# D7: committed inference runtime; no build-script download, no C++ runtime.
+# `metal` (on-device GPU, fully local/offline) is enabled on macOS only.
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9" }
+candle-transformers = { version = "0.9" }
+tokenizers = "0.21"
+hf-hub = "0.5"
 figment = { version = "0.10", features = ["toml", "env"] }
 directories = "5"
 tempfile = "3"
@@ -91,7 +101,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tracing-appender = "0.2"
 dunce = "1"
 same-file = "1"
-sha2 = "0.10"
 unicode-casefold = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
