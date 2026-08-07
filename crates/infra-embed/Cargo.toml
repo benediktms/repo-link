@@ -20,14 +20,15 @@ ports = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 candle-core = { workspace = true }
-candle-nn = "0.9"
+candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 tokenizers = { workspace = true }
 safetensors = { workspace = true }
 hf-hub = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
 tracing = "0.1"
 
 # On-device GPU inference (Metal) on macOS. The BERT kernels (layer-norm,
@@ -35,5 +36,5 @@ tracing = "0.1"
 # enabled on all three crates — candle-core alone leaves the ops on CPU.
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { workspace = true, features = ["metal"] }
-candle-nn = { version = "0.9", features = ["metal"] }
-candle-transformers = { version = "0.9", features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }

@@ -12,6 +12,7 @@
 //! in-memory DB).
 
 mod clock;
+mod embedder;
 mod event_sink;
 mod filesystem_probe;
 mod org_issue_type_repo;
@@ -23,7 +24,6 @@ mod repo_binding_repo;
 mod task_repo;
 mod task_snapshot_repo;
 mod workspace_repo;
-mod embedder;
 
 pub use clock::FixedClock;
 pub use embedder::{FAKE_DIMS, HashEmbedder};

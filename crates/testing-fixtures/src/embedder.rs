@@ -31,8 +31,6 @@ fn pseudo_vector(text: &str) -> Vec<f32> {
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
     let digest = hasher.finalize();
-    // Normalize the 32 hash bytes into FAKE_DIMS floats in [-1, 1]; a
-    // deterministic, non-trivial vector without any model.
     let mut v = Vec::with_capacity(FAKE_DIMS);
     for i in 0..FAKE_DIMS {
         let b = digest[i % digest.len()] as f32;

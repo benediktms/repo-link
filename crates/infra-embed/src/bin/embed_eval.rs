@@ -77,7 +77,9 @@ fn fetch(repo: &str, revision: &str, out: &PathBuf) -> Result<(), String> {
     ));
     std::fs::create_dir_all(out).map_err(|e| format!("mkdir: {e}"))?;
     for fname in ["model.safetensors", "config.json", "tokenizer.json"] {
-        let src = repo_api.get(fname).map_err(|e| format!("get {fname}: {e}"))?;
+        let src = repo_api
+            .get(fname)
+            .map_err(|e| format!("get {fname}: {e}"))?;
         let dst = out.join(fname);
         std::fs::copy(&src, &dst).map_err(|e| format!("copy {fname}: {e}"))?;
         println!("{fname} sha256={}", sha256(&dst)?);
@@ -96,12 +98,17 @@ fn embed(args: &Cmd) -> Result<(), String> {
         side,
     } = args
     else {
-        unreachable!()
+        return Err("internal: embed called without Embed args".into());
     };
     let pooling = match pooling.as_str() {
         "mean" => Pooling::Mean,
         "cls" => Pooling::Cls,
         other => return Err(format!("unknown pooling: {other}")),
+    };
+    let is_query = match side.as_str() {
+        "query" => true,
+        "corpus" => false,
+        other => return Err(format!("unknown --side {other:?}: expected query | corpus")),
     };
     let config = EmbedConfig {
         pooling,
@@ -111,7 +118,6 @@ fn embed(args: &Cmd) -> Result<(), String> {
         max_input_tokens: *max_tokens,
     };
     let model = model::load(dir, config).map_err(|e| format!("load: {e}"))?;
-    let is_query = side == "query";
 
     let mut buf = String::new();
     std::io::stdin()
@@ -132,7 +138,11 @@ fn embed(args: &Cmd) -> Result<(), String> {
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.cmd {
-        Cmd::Fetch { repo, revision, out } => fetch(repo, revision, out),
+        Cmd::Fetch {
+            repo,
+            revision,
+            out,
+        } => fetch(repo, revision, out),
         cmd @ Cmd::Embed { .. } => embed(cmd),
     };
     if let Err(e) = result {

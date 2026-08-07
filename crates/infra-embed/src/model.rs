@@ -54,17 +54,18 @@ fn load_bert(
     vb: VarBuilder,
     config_json: serde_json::Value,
 ) -> Result<candle_bert::BertModel, PortError> {
-    let config: candle_bert::Config =
-        serde_json::from_value(config_json).map_err(|e| PortError::Backend(format!("bert config: {e}")))?;
-    candle_bert::BertModel::load(vb, &config).map_err(|e| PortError::Backend(format!("bert load: {e}")))
+    let config: candle_bert::Config = serde_json::from_value(config_json)
+        .map_err(|e| PortError::Backend(format!("bert config: {e}")))?;
+    candle_bert::BertModel::load(vb, &config)
+        .map_err(|e| PortError::Backend(format!("bert load: {e}")))
 }
 
 fn load_xlmr(
     vb: VarBuilder,
     config_json: serde_json::Value,
 ) -> Result<candle_xlmr::XLMRobertaModel, PortError> {
-    let config: candle_xlmr::Config =
-        serde_json::from_value(config_json).map_err(|e| PortError::Backend(format!("xlmr config: {e}")))?;
+    let config: candle_xlmr::Config = serde_json::from_value(config_json)
+        .map_err(|e| PortError::Backend(format!("xlmr config: {e}")))?;
     candle_xlmr::XLMRobertaModel::new(&config, vb)
         .map_err(|e| PortError::Backend(format!("xlmr load: {e}")))
 }
@@ -100,13 +101,40 @@ fn word_boundaries(text: &str) -> Vec<usize> {
 }
 
 /// A byte offset into `text` at or before `budget` bytes, aligned to a UTF-8
-/// scalar boundary (never splits a multi-byte char).
+/// scalar boundary. Never returns a non-boundary offset: when even one
+/// character exceeds the budget, it returns that character's full width.
 fn byte_boundary(text: &str, budget: usize) -> usize {
     let mut end = budget.min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    end.max(1)
+    if end == 0 && !text.is_empty() {
+        text.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+    } else {
+        end
+    }
+}
+
+/// Largest ascending boundary whose prefix of `text` tokenizes within
+/// `budget` (binary search: token_count is non-decreasing in the boundary).
+fn largest_fit(
+    model: &CandleModel,
+    text: &str,
+    boundaries: &[usize],
+    budget: usize,
+) -> Result<usize, PortError> {
+    let mut lo = 0usize;
+    let mut hi = boundaries.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let b = boundaries[mid];
+        if model.token_count(&text[..b])? <= budget {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(if lo == 0 { 0 } else { boundaries[lo - 1] })
 }
 
 /// Pick the fastest available inference device (RFC 0007 D7): CUDA when the
@@ -145,19 +173,18 @@ pub fn load(dir: &Path, config: EmbedConfig) -> Result<CandleModel, PortError> {
     let safetensors_path = dir.join("model.safetensors");
     // Safety: mmap of a digest-verified artifact from an owner-only cache;
     // the mapping is read-only and the file is never written after verify.
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(
-            &[safetensors_path],
-            DType::F32,
-            &device,
-        )
-    }
-    .map_err(|e| PortError::Backend(format!("safetensors mmap: {e}")))?;
+    let vb =
+        unsafe { VarBuilder::from_mmaped_safetensors(&[safetensors_path], DType::F32, &device) }
+            .map_err(|e| PortError::Backend(format!("safetensors mmap: {e}")))?;
 
     let model = match model_kind_from_config(&config_json)?.as_str() {
         "bert" => ModelKind::Bert(load_bert(vb, config_json)?),
         "xlm-roberta" => ModelKind::XlmRoberta(load_xlmr(vb, config_json)?),
-        other => return Err(PortError::Backend(format!("unsupported model_type: {other}"))),
+        other => {
+            return Err(PortError::Backend(format!(
+                "unsupported model_type: {other}"
+            )));
+        }
     };
 
     Ok(CandleModel {
@@ -228,22 +255,13 @@ impl CandleModel {
         let mut inputs: Vec<String> = Vec::new();
         let mut remaining = chunk_text;
         while !remaining.is_empty() {
-            let mut best_len = 0usize;
-            for boundary in sentence_boundaries(remaining) {
-                if self.token_count(&remaining[..boundary])? <= budget {
-                    best_len = boundary;
-                } else {
-                    break;
-                }
-            }
+            // Boundaries are ascending and token_count is non-decreasing in
+            // the boundary, so binary-search the largest fit instead of
+            // tokenizing every candidate (O(log N) calls per segment).
+            let mut best_len =
+                largest_fit(self, remaining, &sentence_boundaries(remaining), budget)?;
             if best_len == 0 {
-                for boundary in word_boundaries(remaining) {
-                    if self.token_count(&remaining[..boundary])? <= budget {
-                        best_len = boundary;
-                    } else {
-                        break;
-                    }
-                }
+                best_len = largest_fit(self, remaining, &word_boundaries(remaining), budget)?;
             }
             if best_len == 0 {
                 best_len = byte_boundary(remaining, budget);
@@ -308,17 +326,19 @@ impl CandleModel {
 
         let logits: Tensor = match &self.model {
             ModelKind::Bert(m) => m.forward(&input_ids, &token_type_ids, Some(&attention_mask))?,
-            ModelKind::XlmRoberta(m) => {
-                m.forward(&input_ids, &attention_mask, &token_type_ids, None, None, None)?
-            }
+            ModelKind::XlmRoberta(m) => m.forward(
+                &input_ids,
+                &attention_mask,
+                &token_type_ids,
+                None,
+                None,
+                None,
+            )?,
         };
 
         let (_b, _s, h) = logits.dims3()?;
         if h != self.dims {
-            candle_core::bail!(
-                "model hidden size {h} != profile dims {}",
-                self.dims
-            );
+            candle_core::bail!("model hidden size {h} != profile dims {}", self.dims);
         }
         let f32_logits = logits.to_dtype(DType::F32)?;
         let mask_t = Tensor::new(masks, &self.device)?

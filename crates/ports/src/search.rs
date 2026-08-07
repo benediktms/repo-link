@@ -341,7 +341,7 @@ pub struct GuardedVectorRow {
     pub segment_index: u32,
     /// SHA-256 of the semantic input text.
     pub embedding_input_hash: [u8; 32],
-    /// Little-endian normalized f32 vector of `dimensions()` floats.
+    /// Normalized f32 vector of `dimensions()` floats.
     pub vector: Vec<f32>,
 }
 

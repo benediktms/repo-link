@@ -17,8 +17,8 @@ use dto_shared::{LexicalUnavailableReasonDto, MatchedSourceKindDto};
 use ports::{
     ChunkKind, ChunkTarget, GuardedVectorRow, IndexMetadata, IndexStats, LexicalRank,
     MissingSemanticInput, PortError, ReconcileDiff, ReconcileFailure, ReconcileSession,
-    SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION, SchemaMismatch, SemanticRank,
-    SidecarInfo, TaskSearchIndex,
+    SEARCH_CHUNK_FORMAT_VERSION, SEARCH_SCHEMA_VERSION, SchemaMismatch, SemanticRank, SidecarInfo,
+    TaskSearchIndex,
 };
 use sqlx::Row;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -186,7 +186,10 @@ impl SqliteTaskSearchIndex {
             chunk_format_version: r.try_get("chunk_format_version").unwrap_or(0),
             // try_get::<String> on a NULL column returns Ok("") in sqlx —
             // decode as Option so an unclaimed profile reads None, not "".
-            embedding_profile_id: r.try_get::<Option<String>, _>("embedding_profile_id").ok().flatten(),
+            embedding_profile_id: r
+                .try_get::<Option<String>, _>("embedding_profile_id")
+                .ok()
+                .flatten(),
         }))
     }
 }
@@ -680,27 +683,30 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             .acquire()
             .await
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        sqlx::query("BEGIN IMMEDIATE")
+        let result = async {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let changed = sqlx::query(
+                "UPDATE task_search_meta SET embedding_profile_id = ? \
+                 WHERE singleton = 1 AND embedding_profile_id IS NULL",
+            )
+            .bind(expected)
             .execute(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-        let changed = sqlx::query(
-            "UPDATE task_search_meta SET embedding_profile_id = ? \
-             WHERE singleton = 1 AND embedding_profile_id IS NULL",
-        )
-        .bind(expected)
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| PortError::Backend(e.to_string()))?
-        .rows_affected();
-        sqlx::query("COMMIT")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-        Ok(changed > 0)
+            .await?
+            .rows_affected();
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok::<bool, sqlx::Error>(changed > 0)
+        }
+        .await;
+        if result.is_err() {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+        result.map_err(|e| PortError::Backend(e.to_string()))
     }
 
-    async fn missing_semantic_inputs(&self, limit: u32) -> Result<Vec<MissingSemanticInput>, PortError> {
+    async fn missing_semantic_inputs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MissingSemanticInput>, PortError> {
         let pool = self
             .open()
             .await
@@ -720,7 +726,9 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
         .map_err(|e| PortError::Backend(e.to_string()))?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let id: i64 = r.try_get("id").map_err(|e| PortError::Backend(e.to_string()))?;
+            let id: i64 = r
+                .try_get("id")
+                .map_err(|e| PortError::Backend(e.to_string()))?;
             let task_id_str: String = r
                 .try_get("task_id")
                 .map_err(|e| PortError::Backend(e.to_string()))?;
@@ -730,6 +738,9 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             let kind: String = r.try_get("kind").unwrap_or_default();
             let content_hash: Vec<u8> = r.try_get("content_hash").unwrap_or_default();
             let text: String = r.try_get("text").unwrap_or_default();
+            let Ok(content_hash) = content_hash.try_into() else {
+                continue;
+            };
             out.push(MissingSemanticInput {
                 search_chunk_id: id,
                 task_id,
@@ -738,9 +749,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
                 } else {
                     ChunkKind::Core
                 },
-                content_hash: content_hash
-                    .try_into()
-                    .unwrap_or([0u8; 32]),
+                content_hash,
                 text,
             });
         }
@@ -759,47 +768,59 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             .acquire()
             .await
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-        let mut stored = 0usize;
-        for row in rows {
-            let guarded_ok: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM task_search_meta m, task_search_chunks c \
-                 WHERE m.singleton = 1 \
-                   AND m.embedding_profile_id IS NOT NULL \
-                   AND c.id = ? AND c.task_id = ? AND c.content_hash = ?",
-            )
-            .bind(row.search_chunk_id)
-            .bind(row.task_id.to_string())
-            .bind(row.content_hash.as_slice())
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-            if guarded_ok.is_none() {
-                continue;
+        let result = async {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let mut stored = 0usize;
+            for row in rows {
+                let guarded_ok: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM task_search_meta m, task_search_chunks c \
+                     WHERE m.singleton = 1 \
+                       AND m.embedding_profile_id IS NOT NULL \
+                       AND c.id = ? AND c.task_id = ? AND c.content_hash = ?",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.task_id.to_string())
+                .bind(row.content_hash.as_slice())
+                .fetch_optional(&mut *conn)
+                .await?;
+                if guarded_ok.is_none() {
+                    continue;
+                }
+                // A re-embed of the same segment with a different input hash
+                // supersedes the stored row; without this the INSERT OR IGNORE
+                // conflict keeps the stale vector forever.
+                sqlx::query(
+                    "DELETE FROM task_search_vectors \
+                     WHERE search_chunk_id = ? AND segment_index = ? \
+                       AND embedding_input_hash != ?",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.segment_index)
+                .bind(row.embedding_input_hash.as_slice())
+                .execute(&mut *conn)
+                .await?;
+                let vector_bytes = encode_vector(&row.vector);
+                let res = sqlx::query(
+                    "INSERT OR IGNORE INTO task_search_vectors \
+                     (search_chunk_id, segment_index, embedding_input_hash, vector) \
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(row.search_chunk_id)
+                .bind(row.segment_index)
+                .bind(row.embedding_input_hash.as_slice())
+                .bind(vector_bytes)
+                .execute(&mut *conn)
+                .await?;
+                stored += res.rows_affected() as usize;
             }
-            let vector_bytes = encode_vector(&row.vector);
-            let res = sqlx::query(
-                "INSERT OR IGNORE INTO task_search_vectors \
-                 (search_chunk_id, segment_index, embedding_input_hash, vector) \
-                 VALUES (?, ?, ?, ?)",
-            )
-            .bind(row.search_chunk_id)
-            .bind(row.segment_index)
-            .bind(row.embedding_input_hash.as_slice())
-            .bind(vector_bytes)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-            stored += res.rows_affected() as usize;
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok::<usize, sqlx::Error>(stored)
         }
-        sqlx::query("COMMIT")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| PortError::Backend(e.to_string()))?;
-        Ok(stored)
+        .await;
+        if result.is_err() {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+        }
+        result.map_err(|e| PortError::Backend(e.to_string()))
     }
 
     async fn search_semantic(
@@ -811,36 +832,44 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             .open()
             .await
             .map_err(|f| PortError::Backend(format!("{f:?}")))?;
-        let eligible_set: std::collections::HashSet<TaskId> = eligible.iter().copied().collect();
-        let rows = sqlx::query(
-            "SELECT c.task_id AS task_id, v.vector AS vector \
-             FROM task_search_vectors v \
-             JOIN task_search_chunks c ON c.id = v.search_chunk_id",
-        )
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| PortError::Backend(e.to_string()))?;
+        // Filter eligible tasks in SQL so I/O is O(eligible), not O(vectors).
+        // Chunk the IN list to stay under SQLite's variable limit.
+        const MAX_IN: usize = 500;
         let mut best: HashMap<TaskId, f32> = HashMap::new();
-        for r in rows {
-            let Ok(task_id_str) = r.try_get::<String, _>("task_id") else {
-                continue;
-            };
-            let Ok(tid) = TaskId::from_str(&task_id_str) else {
-                continue;
-            };
-            if !eligible_set.contains(&tid) {
-                continue;
+        for chunk in eligible.chunks(MAX_IN) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT c.task_id AS task_id, v.vector AS vector \
+                 FROM task_search_vectors v \
+                 JOIN task_search_chunks c ON c.id = v.search_chunk_id \
+                 WHERE c.task_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for tid in chunk {
+                q = q.bind(tid.to_string());
             }
-            let Ok(blob) = r.try_get::<Vec<u8>, _>("vector") else {
-                continue;
-            };
-            let Ok(vec) = decode_vector(&blob, query_vector.len()) else {
-                continue;
-            };
-            let score = cosine(&query_vector, &vec);
-            let e = best.entry(tid).or_insert(f32::NEG_INFINITY);
-            if score > *e {
-                *e = score;
+            let rows = q
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            for r in rows {
+                let Ok(task_id_str) = r.try_get::<String, _>("task_id") else {
+                    continue;
+                };
+                let Ok(tid) = TaskId::from_str(&task_id_str) else {
+                    continue;
+                };
+                let Ok(blob) = r.try_get::<Vec<u8>, _>("vector") else {
+                    continue;
+                };
+                let Ok(vec) = decode_vector(&blob, query_vector.len()) else {
+                    continue;
+                };
+                let score = cosine(query_vector, &vec);
+                let e = best.entry(tid).or_insert(f32::NEG_INFINITY);
+                if score > *e {
+                    *e = score;
+                }
             }
         }
         let mut out: Vec<SemanticRank> = best
@@ -867,10 +896,7 @@ fn encode_vector(v: &[f32]) -> Vec<u8> {
 
 fn decode_vector(blob: &[u8], dims: usize) -> Result<Vec<f32>, String> {
     if blob.len() != dims * 4 {
-        return Err(format!(
-            "vector blob len {} != {dims} dims",
-            blob.len()
-        ));
+        return Err(format!("vector blob len {} != {dims} dims", blob.len()));
     }
     let mut out = Vec::with_capacity(dims);
     for chunk in blob.chunks_exact(4) {
@@ -881,7 +907,10 @@ fn decode_vector(blob: &[u8], dims: usize) -> Result<Vec<f32>, String> {
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    dot
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let denom = (norm_a * norm_b).max(f32::EPSILON);
+    dot / denom
 }
 
 /// Transactionally delete all derived rows + FTS `delete-all` (RFC 0007 D5).
@@ -1096,9 +1125,12 @@ mod tests {
         assert_eq!(missing.len(), 2);
 
         // Build guarded rows: chunk a gets a vector aligned with the query,
-        // chunk b a vector orthogonal to it.
+        // chunk b a vector orthogonal to it. Rowid assignment is
+        // nondeterministic (reconcile iterates a HashMap), so pick the rows
+        // by task id, not by iteration order.
         let mut rows = Vec::new();
-        for (m, aligned) in missing.iter().zip([true, false]) {
+        for m in &missing {
+            let aligned = m.task_id == a;
             let vec = if aligned {
                 vec![1.0f32; 8]
             } else {
@@ -1132,9 +1164,13 @@ mod tests {
         sess.commit(&[2u8; 32]).await.unwrap();
         drop(sess);
         let stale = GuardedVectorRow {
-            search_chunk_id: rows[0].search_chunk_id,
+            search_chunk_id: rows
+                .iter()
+                .find(|r| r.task_id == a)
+                .unwrap()
+                .search_chunk_id,
             task_id: a,
-            content_hash: rows[0].content_hash,
+            content_hash: rows.iter().find(|r| r.task_id == a).unwrap().content_hash,
             segment_index: 0,
             embedding_input_hash: [9u8; 32],
             vector: vec![1.0f32; 8],

@@ -3,6 +3,10 @@ use infra_embed::profiles::profile;
 
 #[test]
 fn prepares_pinned_profile_and_rejects_tamper() {
+    if std::env::var("REPO_LINK_E2E").is_err() {
+        eprintln!("skipping prepare test (set REPO_LINK_E2E to run, needs network)");
+        return;
+    }
     let root = std::env::temp_dir().join(format!("rl-embed-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = root.join("models");

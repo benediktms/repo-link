@@ -9,7 +9,7 @@ use dto_shared::{
 };
 use infra_config::RepoLinkConfig;
 use infra_sqlite::SqliteTaskSearchIndex;
-use ports::{TaskSearchIndex, TaskSearchSourceRepository};
+use ports::TaskSearchIndex;
 use std::str::FromStr;
 
 use crate::cli::{SearchIndexCmd, TaskCmd};
@@ -49,16 +49,23 @@ fn maybe_build_embedder() -> Result<Option<std::sync::Arc<dyn ports::EmbeddingPr
     if !dir.exists() {
         return Ok(None);
     }
-    let config = infra_embed::model::EmbedConfig {
-        pooling: infra_embed::model::Pooling::Mean,
-        corpus_prefix: None,
-        query_prefix: None,
-        dims: 384,
-        max_input_tokens: 512,
-    };
-    let provider = infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config)
-        .map_err(|e| anyhow!("load model: {e}"))?;
+    let config = manifest.embed_config();
+    let provider =
+        infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config)
+            .map_err(|e| anyhow!("load model: {e}"))?;
     Ok(Some(Arc::new(provider)))
+}
+
+/// True when the pinned profile's cache directory exists. A diagnostic
+/// probe: never loads weights, never errors on a corrupt model — status must
+/// report an unavailable component rather than fail (RFC 0007 D8).
+fn model_prepared() -> bool {
+    infra_config::default_model_cache_root()
+        .map(|root| {
+            root.join(infra_embed::profiles::profile().profile_id)
+                .exists()
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) async fn task_search_dispatch(
@@ -133,11 +140,22 @@ pub(crate) async fn search_index_dispatch(
                 }
                 None => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
             };
-            let model_prepared = maybe_build_embedder()?.is_some();
+            let model_prepared = model_prepared();
+            let claimed = index
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.available)
+                .and_then(|s| s.embedding_profile_id);
             let (sem_available, sem_reason) = if !lex_available {
-                (false, Some(SemanticSkippedReasonDto::LexicalIndexUnavailable))
+                (
+                    false,
+                    Some(SemanticSkippedReasonDto::LexicalIndexUnavailable),
+                )
             } else if !model_prepared {
                 (false, Some(SemanticSkippedReasonDto::ModelNotPrepared))
+            } else if claimed.is_some_and(|p| p != infra_embed::profiles::profile().profile_id) {
+                (false, Some(SemanticSkippedReasonDto::ProfileMismatch))
             } else {
                 (true, None)
             };
@@ -158,11 +176,18 @@ pub(crate) async fn search_index_dispatch(
             if let Some(embedder) = maybe_build_embedder()? {
                 service = service.with_embedder(embedder);
             }
-            let written = service.rebuild().await?;
+            let (written, filled) = service.rebuild().await?;
             render::search_index_maintenance(&SearchIndexMaintenanceDto {
                 command: "rebuild".into(),
                 chunks_written: Some(written),
-                error: None,
+                error: if filled {
+                    None
+                } else {
+                    Some(
+                        "semantic vectors failed to fill; run prepare-model and rebuild again"
+                            .into(),
+                    )
+                },
             });
         }
         SearchIndexCmd::Clear { .. } => {
@@ -185,7 +210,7 @@ pub(crate) async fn search_index_dispatch(
             render::search_model_status(&SearchModelStatusDto {
                 prepared: true,
                 profile_id: Some(manifest.profile_id.clone()),
-                dimensions: Some(384),
+                dimensions: Some(manifest.dimensions as u32),
             });
             eprintln!("model cache: {}", dir.display());
         }

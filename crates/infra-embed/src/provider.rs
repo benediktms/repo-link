@@ -2,20 +2,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ports::PortResult;
 use ports::EmbeddingProvider;
+use ports::PortResult;
 
 use crate::model::{self, CandleModel, EmbedConfig};
 
 /// A candle-backed `EmbeddingProvider` for one prepared profile directory.
 pub struct CandleEmbeddingProvider {
     profile_id: String,
-    model: CandleModel,
+    model: Arc<CandleModel>,
 }
 
 impl CandleEmbeddingProvider {
     pub fn new(profile_id: &str, cache_dir: &Path, config: EmbedConfig) -> PortResult<Self> {
-        let model = model::load(cache_dir, config)?;
+        let model = Arc::new(model::load(cache_dir, config)?);
         Ok(Self {
             profile_id: profile_id.to_string(),
             model,
@@ -42,14 +42,22 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
     }
 
     async fn embed_query(&self, query: &str) -> PortResult<Vec<f32>> {
-        let mut rows = self
-            .model
-            .embed_batch(&[query.to_string()], true)?;
-        Ok(rows.pop().unwrap_or_default())
+        let model = Arc::clone(&self.model);
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut rows = model.embed_batch(&[query], true)?;
+            Ok(rows.pop().unwrap_or_default())
+        })
+        .await
+        .map_err(|e| ports::PortError::Backend(format!("embed join: {e}")))?
     }
 
     async fn embed_inputs(&self, texts: &[String]) -> PortResult<Vec<Vec<f32>>> {
-        self.model.embed_batch(texts, false)
+        let model = Arc::clone(&self.model);
+        let texts = texts.to_vec();
+        tokio::task::spawn_blocking(move || model.embed_batch(&texts, false))
+            .await
+            .map_err(|e| ports::PortError::Backend(format!("embed join: {e}")))?
     }
 }
 

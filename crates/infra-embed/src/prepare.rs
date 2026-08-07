@@ -14,18 +14,40 @@ pub struct ManifestArtifact {
 }
 
 /// A complete pinned profile: Hub repo id, immutable revision, the artifact
-/// set, and the profile id (SHA-256 of the canonical manifest).
+/// set, the runtime embedding config, and the profile id (SHA-256 of the
+/// canonical manifest including the config fields below).
 #[derive(Debug, Clone)]
 pub struct ProfileManifest {
     pub profile_id: String,
     pub repo_id: String,
     pub revision: String,
     pub artifacts: Vec<ManifestArtifact>,
+    pub pooling: crate::model::Pooling,
+    pub corpus_prefix: Option<String>,
+    pub query_prefix: Option<String>,
+    pub dimensions: usize,
+    pub max_input_tokens: usize,
+}
+
+impl ProfileManifest {
+    /// The runtime embedding configuration this profile pins. Identity
+    /// (`profile_id`) and behaviour (pooling/prefixes/dims/input limit) live
+    /// in one manifest so a change to either changes the profile id.
+    pub fn embed_config(&self) -> crate::model::EmbedConfig {
+        crate::model::EmbedConfig {
+            pooling: self.pooling,
+            corpus_prefix: self.corpus_prefix.clone(),
+            query_prefix: self.query_prefix.clone(),
+            dims: self.dimensions,
+            max_input_tokens: self.max_input_tokens,
+        }
+    }
 }
 
 fn sha256_file(path: &Path) -> Result<String, PortError> {
     use sha2::{Digest, Sha256};
-    let mut file = fs::File::open(path).map_err(|e| PortError::Backend(format!("open {}: {e}", path.display())))?;
+    let mut file = fs::File::open(path)
+        .map_err(|e| PortError::Backend(format!("open {}: {e}", path.display())))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 1 << 16];
     loop {
@@ -37,7 +59,11 @@ fn sha256_file(path: &Path) -> Result<String, PortError> {
         }
         hasher.update(&buf[..n]);
     }
-    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     Ok(hex)
 }
 
@@ -57,10 +83,7 @@ fn verify_artifact(path: &Path, expected_sha256: &str) -> Result<(), PortError> 
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareError {
     #[error("profile {profile_id} already prepared at {path}")]
-    AlreadyPrepared {
-        profile_id: String,
-        path: PathBuf,
-    },
+    AlreadyPrepared { profile_id: String, path: PathBuf },
     #[error(transparent)]
     Port(#[from] PortError),
 }
@@ -77,6 +100,11 @@ pub type PrepareResult<T> = Result<T, PrepareError>;
 pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<PathBuf> {
     let final_dir = cache_root.join(&manifest.profile_id);
     if final_dir.exists() {
+        // Idempotent path, but never trust an existing cache: a tampered
+        // artifact must fail here, not report `prepared: true`.
+        for artifact in &manifest.artifacts {
+            verify_artifact(&final_dir.join(&artifact.filename), &artifact.sha256)?;
+        }
         return Err(PrepareError::AlreadyPrepared {
             profile_id: manifest.profile_id.clone(),
             path: final_dir,
@@ -85,9 +113,16 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
     fs::create_dir_all(cache_root)
         .map_err(|e| PortError::Backend(format!("create cache root: {e}")))?;
 
-    let tmp = cache_root.join(format!(".tmp-prepare-{}", std::process::id()));
+    // Unique per profile + process: concurrent prepares never share a staging
+    // dir (one would delete the other's half-staged files).
+    let tmp = cache_root.join(format!(
+        ".tmp-prepare-{}-{}",
+        &manifest.profile_id[..8],
+        std::process::id()
+    ));
     if tmp.exists() {
-        fs::remove_dir_all(&tmp).map_err(|e| PortError::Backend(format!("clear stale tmp: {e}")))?;
+        fs::remove_dir_all(&tmp)
+            .map_err(|e| PortError::Backend(format!("clear stale tmp: {e}")))?;
     }
     fs::create_dir(&tmp).map_err(|e| PortError::Backend(format!("create tmp: {e}")))?;
 

@@ -45,6 +45,17 @@ pub enum SearchError {
     Source(#[from] ports::PortError),
 }
 
+/// Result of a vector-fill pass (RFC 0007 D6/D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillOutcome {
+    /// Every chunk has a vector.
+    Complete,
+    /// The batch cap was reached with work still outstanding.
+    Incomplete,
+    /// An embed or store failure; the lane must degrade (D8).
+    Failed,
+}
+
 /// The RFC 0007 D6 reconcile + D4 retrieval orchestrator.
 pub struct TaskSearchService<S: TaskSearchSourceRepository, I: TaskSearchIndex> {
     source: S,
@@ -71,16 +82,24 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
     /// Explicit `rebuild`: re-derive the sidecar lexical rows, then — when an
     /// embedder is attached — fill every chunk's vectors in guarded batches
     /// as part of the same command (RFC 0007 D10: rebuild "fills guarded
-    /// vectors in batches"). Returns the chunk count written; vector filling
-    /// failure degrades the semantic lane but leaves lexical search intact.
-    pub async fn rebuild(&self) -> Result<u64, SearchError> {
+    /// vectors in batches"). Returns (chunks written, vectors fully filled).
+    /// A fill failure degrades the semantic lane but leaves lexical search
+    /// intact, and is surfaced to the caller rather than swallowed.
+    pub async fn rebuild(&self) -> Result<(u64, bool), SearchError> {
         let rows = self.source.load_reconcile_snapshot().await?;
         let targets: Vec<ChunkTarget> = rows.iter().flat_map(chunk_task).collect();
         let written = self.index.rebuild(&targets).await?;
-        if let Some(embedder) = &self.embedder {
-            let _ = self.fill_semantic_vectors(&self.index, embedder.as_ref()).await;
-        }
-        Ok(written)
+        let filled = match &self.embedder {
+            Some(embedder) => {
+                matches!(
+                    self.fill_semantic_vectors(&self.index, embedder.as_ref(), usize::MAX)
+                        .await,
+                    FillOutcome::Complete
+                )
+            }
+            None => false,
+        };
+        Ok((written, filled))
     }
 
     pub async fn search(&self, req: &SearchRequest) -> Result<TaskSearchResponseDto, SearchError> {
@@ -159,18 +178,11 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                     .and_then(|s| s.embedding_profile_id.clone());
                 match sidecar_profile {
                     Some(p) if p == profile_id => semantic_available = true,
-                    Some(_) => {
-                        semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch)
-                    }
-                    None => {
-                        match self.index.claim_empty_profile(&profile_id).await {
-                            Ok(true) => semantic_available = true,
-                            _ => {
-                                semantic_reason =
-                                    Some(SemanticSkippedReasonDto::ProfileMismatch)
-                            }
-                        }
-                    }
+                    Some(_) => semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch),
+                    None => match self.index.claim_empty_profile(&profile_id).await {
+                        Ok(true) => semantic_available = true,
+                        _ => semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch),
+                    },
                 }
             }
         } else {
@@ -183,9 +195,20 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
 
         if semantic_available {
             let embedder = self.embedder.as_ref().expect("checked above");
-            if !self.fill_semantic_vectors(&self.index, embedder.as_ref()).await {
-                semantic_available = false;
-                semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
+            // Bound the interactive path: at most one batch per search so a
+            // rebuild-free query never stalls on a large missing set. The
+            // lane runs only when coverage is complete (D8).
+            match self
+                .fill_semantic_vectors(&self.index, embedder.as_ref(), 1)
+                .await
+            {
+                FillOutcome::Complete => {}
+                // Incomplete (bounded batch left work) or Failed: never rank
+                // against partial vector coverage (RFC 0007 D8).
+                FillOutcome::Incomplete | FillOutcome::Failed => {
+                    semantic_available = false;
+                    semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
+                }
             }
         }
 
@@ -219,8 +242,7 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                             Ok(s) => s,
                             Err(_) => {
                                 semantic_available = false;
-                                semantic_reason =
-                                    Some(SemanticSkippedReasonDto::EmbeddingFailed);
+                                semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
                                 Vec::new()
                             }
                         };
@@ -250,30 +272,37 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
     }
 
     /// Fill every chunk missing a vector through the embedder, in guarded
-    /// batches. Returns false (semantic lane unavailable) on any embed or
-    /// store failure — already-stored vectors stay untouched (D8). A batch
-    /// whose guards reject every row also returns false, so a stale-chunk or
-    /// profile-transition stall cannot loop forever on the same missing set.
+    /// batches, stopping after `max_batches` batches. Already-stored vectors
+    /// stay untouched (D8). A batch whose guards reject every row, an embed
+    /// result shorter than its input, or any store failure yields
+    /// [`FillOutcome::Failed`]; running out of batches first yields
+    /// [`FillOutcome::Incomplete`].
     async fn fill_semantic_vectors(
         &self,
         index: &I,
         embedder: &dyn EmbeddingProvider,
-    ) -> bool {
+        max_batches: usize,
+    ) -> FillOutcome {
         const BATCH: u32 = 64;
+        let mut batches = 0usize;
         loop {
             let missing = match index.missing_semantic_inputs(BATCH).await {
                 Ok(m) => m,
-                Err(_) => return false,
+                Err(_) => return FillOutcome::Failed,
             };
             if missing.is_empty() {
-                return true;
+                return FillOutcome::Complete;
             }
+            if batches >= max_batches {
+                return FillOutcome::Incomplete;
+            }
+            batches += 1;
             let mut texts: Vec<String> = Vec::new();
             let mut metas: Vec<(i64, TaskId, [u8; 32], u32)> = Vec::new();
             for m in &missing {
                 let inputs = match embedder.plan_semantic_inputs(&m.text) {
                     Ok(i) => i,
-                    Err(_) => return false,
+                    Err(_) => return FillOutcome::Failed,
                 };
                 for (seg, input) in inputs.iter().enumerate() {
                     texts.push(input.clone());
@@ -282,29 +311,35 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             }
             let vectors = match embedder.embed_inputs(&texts).await {
                 Ok(v) => v,
-                Err(_) => return false,
+                Err(_) => return FillOutcome::Failed,
             };
+            if vectors.len() != texts.len() {
+                // A short result would silently drop trailing segments and
+                // leave them unvectorized forever (missing-input discovery is
+                // chunk-granular). Reject the batch instead.
+                return FillOutcome::Failed;
+            }
             let rows: Vec<GuardedVectorRow> = texts
                 .iter()
                 .zip(vectors)
                 .zip(metas)
-                .map(|((text, vector), (chunk_id, task_id, content_hash, seg))| {
-                    GuardedVectorRow {
+                .map(
+                    |((text, vector), (chunk_id, task_id, content_hash, seg))| GuardedVectorRow {
                         search_chunk_id: chunk_id,
                         task_id,
                         content_hash,
                         segment_index: seg,
                         embedding_input_hash: Sha256::digest(text.as_bytes()).into(),
                         vector,
-                    }
-                })
+                    },
+                )
                 .collect();
             let stored = match index.store_vectors_guarded(&rows).await {
                 Ok(n) => n,
-                Err(_) => return false,
+                Err(_) => return FillOutcome::Failed,
             };
             if stored == 0 {
-                return false;
+                return FillOutcome::Failed;
             }
         }
     }
@@ -330,8 +365,11 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             lexical.iter().map(|r| (r.task_id, r.rank)).collect();
         let lexical_by_task: HashMap<TaskId, &LexicalRank> =
             lexical.iter().map(|r| (r.task_id, r)).collect();
-        let semantic_rank: HashMap<TaskId, usize> =
-            semantic.iter().enumerate().map(|(i, r)| (r.task_id, i + 1)).collect();
+        let semantic_rank: HashMap<TaskId, usize> = semantic
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.task_id, i + 1))
+            .collect();
         let semantic_score: HashMap<TaskId, f32> =
             semantic.iter().map(|r| (r.task_id, r.score)).collect();
 
