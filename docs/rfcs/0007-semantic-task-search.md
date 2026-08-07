@@ -1187,9 +1187,11 @@ Measured 2026-08-07 on Apple M3 Max (macOS), release build, live corpus of
   - semantic (model load + query embed + full vector scan): p95 ≈ **0.30 s**
     — well under the 2 s predeclared gate.
 - **Model load + corpus vector fill** (one-time after `rebuild`): ≈ **31 s**
-  for 2,952 chunks on the Metal backend (~10 ms/chunk). Pure embed
-  throughput is flat at ~140–160 texts/s regardless of batch size (64→1024),
-  so the fill is compute-bound; the batches exist for memory, not speed.
+  for 2,952 chunks on the Metal backend. Pure embed throughput is flat at
+  ~140–160 texts/s regardless of batch size (64→1024), i.e. ≈ **20 s** of
+  pure embedding for the corpus; the remaining ≈ 11 s is model load (mmap +
+  tokenizer) plus per-chunk input-hash computation and sidecar writes. The
+  batches exist for memory, not speed — the fill is compute-bound.
 - **Rebuild time**: ≈ **0.5 s** for chunk rewrite alone; ≈ 31 s including
   the guarded vector fill (rebuild fills vectors itself per D10 — ordinary
   search never re-embeds).

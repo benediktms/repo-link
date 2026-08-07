@@ -1,5 +1,9 @@
-use infra_embed::prepare::prepare;
+use infra_embed::prepare::{PrepareError, prepare};
 use infra_embed::profiles::profile;
+
+fn temp_root() -> tempfile::TempDir {
+    tempfile::TempDir::new().expect("tempdir")
+}
 
 #[test]
 fn prepares_pinned_profile_and_rejects_tamper() {
@@ -7,14 +11,21 @@ fn prepares_pinned_profile_and_rejects_tamper() {
         eprintln!("skipping prepare test (set REPO_LINK_E2E to run, needs network)");
         return;
     }
-    let root = std::env::temp_dir().join(format!("rl-embed-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let cache = root.join("models");
+    let root = temp_root();
+    let cache = root.path().join("models");
 
     let dir = prepare(&profile(), &cache).expect("prepare should install the pinned profile");
     assert_eq!(dir, cache.join(profile().profile_id));
     for a in &profile().artifacts {
         assert!(dir.join(&a.filename).exists(), "missing {}", a.filename);
+    }
+
+    match prepare(&profile(), &cache) {
+        Err(PrepareError::AlreadyPrepared { profile_id, path }) => {
+            assert_eq!(profile_id, profile().profile_id);
+            assert_eq!(path, dir);
+        }
+        other => panic!("expected AlreadyPrepared, got {other:?}"),
     }
 
     // tamper: a wrong digest must be rejected on a fresh profile id
@@ -23,6 +34,4 @@ fn prepares_pinned_profile_and_rejects_tamper() {
     bad.artifacts[0].sha256 = "0".repeat(64);
     let err = prepare(&bad, &cache).unwrap_err();
     assert!(err.to_string().contains("digest mismatch"), "err: {err}");
-
-    let _ = std::fs::remove_dir_all(&root);
 }

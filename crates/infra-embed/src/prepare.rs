@@ -89,6 +89,39 @@ fn verify_artifact(path: &Path, expected_sha256: &str) -> Result<(), PortError> 
     Ok(())
 }
 
+/// Reject artifact filenames that escape the staging directory: a single
+/// normal path component only (no separators, no `.`/`..`).
+fn validate_artifact_filename(filename: &str) -> Result<(), PortError> {
+    let name = std::path::Path::new(filename);
+    if name.components().count() != 1
+        || name.file_name().and_then(|f| f.to_str()) != Some(filename)
+        || filename == "."
+        || filename == ".."
+    {
+        return Err(PortError::Backend(format!(
+            "unsafe artifact filename: {filename}"
+        )));
+    }
+    Ok(())
+}
+
+/// Create a directory tree with owner-only (`0o700`) permissions: the mmap
+/// in `model::load` relies on the cache never being writable by other
+/// accounts. Applies to every directory the recursive builder creates.
+fn create_dir_private(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = fs::DirBuilder::new();
+        b.recursive(true).mode(0o700);
+        b.create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+    }
+}
+
 /// Typed prepare failures. [`PrepareError::AlreadyPrepared`] is not a
 /// failure — re-running `prepare-model` on a prepared profile is idempotent.
 #[derive(Debug, thiserror::Error)]
@@ -121,7 +154,10 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
             path: final_dir,
         });
     }
-    fs::create_dir_all(cache_root)
+    for artifact in &manifest.artifacts {
+        validate_artifact_filename(&artifact.filename)?;
+    }
+    create_dir_private(cache_root)
         .map_err(|e| PortError::Backend(format!("create cache root: {e}")))?;
 
     // Unique per profile + process: concurrent prepares never share a staging
@@ -135,7 +171,7 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
         fs::remove_dir_all(&tmp)
             .map_err(|e| PortError::Backend(format!("clear stale tmp: {e}")))?;
     }
-    fs::create_dir(&tmp).map_err(|e| PortError::Backend(format!("create tmp: {e}")))?;
+    create_dir_private(&tmp).map_err(|e| PortError::Backend(format!("create tmp: {e}")))?;
 
     let api = Api::new().map_err(|e| PortError::Network(format!("hf-hub api: {e}")))?;
     let repo = api.repo(hf_hub::Repo::with_revision(

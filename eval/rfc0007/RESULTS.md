@@ -2,8 +2,10 @@
 
 Result of the §10 retrieval-quality evaluation, run via the candle eval
 driver (`crates/infra-embed/src/bin/embed_eval.rs`) against the labelled
-fixture (`fixture.json`). Full per-category numbers:
-`candidates.json`, `baselines.json`.
+fixture (`fixture.json`). The numbers below are the recorded results of that
+run; the one-shot runner scripts that produced them were removed after the
+decision (see the decision section), and the fixture + this document remain
+as the reproducible record.
 
 ## Method
 
@@ -76,9 +78,12 @@ the canonical manifest.
 
 ## Reproduce
 
+The fixture is checked in and regenerable:
+
 ```sh
 python3 generate_fixture.py          # fixture.json (deterministic)
-python3 run_baselines.py             # baselines.json/md
-cargo build -p infra-embed --bin embed_eval
-python3 run_candidates.py --bin ../../target/debug/embed_eval   # candidates.json
 ```
+
+Re-running the full evaluation requires rebuilding the one-shot harness
+(baseline + candidate runners) from the method description above; the
+recorded results are the reference for the gates.

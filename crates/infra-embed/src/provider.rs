@@ -42,11 +42,17 @@ impl EmbeddingProvider for CandleEmbeddingProvider {
     }
 
     async fn embed_query(&self, query: &str) -> PortResult<Vec<f32>> {
+        if query.trim().is_empty() {
+            return Err(ports::PortError::Backend(
+                "empty query cannot be embedded".to_string(),
+            ));
+        }
         let model = Arc::clone(&self.model);
         let query = query.to_string();
         tokio::task::spawn_blocking(move || {
             let mut rows = model.embed_batch(&[query], true)?;
-            Ok(rows.pop().unwrap_or_default())
+            rows.pop()
+                .ok_or_else(|| ports::PortError::Backend("embedding produced no rows".to_string()))
         })
         .await
         .map_err(|e| ports::PortError::Backend(format!("embed join: {e}")))?

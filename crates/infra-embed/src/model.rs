@@ -264,7 +264,18 @@ impl CandleModel {
                 best_len = largest_fit(self, remaining, &word_boundaries(remaining), budget)?;
             }
             if best_len == 0 {
-                best_len = byte_boundary(remaining, budget);
+                let mut end = byte_boundary(remaining, budget);
+                while end > 0 && self.token_count(&remaining[..end])? > budget {
+                    end = byte_boundary(&remaining[..end], end - 1);
+                }
+                if end == 0 {
+                    return Err(PortError::Backend(format!(
+                        "single token exceeds max_input_tokens={}: {:?}",
+                        budget,
+                        &remaining[..remaining.len().min(16)]
+                    )));
+                }
+                best_len = end;
             }
             inputs.push(remaining[..best_len].to_string());
             remaining = &remaining[best_len..];
