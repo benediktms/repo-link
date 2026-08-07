@@ -47,7 +47,7 @@ pub enum SearchError {
 
 /// Result of a vector-fill pass (RFC 0007 D6/D8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FillOutcome {
+pub enum FillOutcome {
     /// Every chunk has a vector.
     Complete,
     /// The batch cap was reached with work still outstanding.
@@ -82,24 +82,20 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
     /// Explicit `rebuild`: re-derive the sidecar lexical rows, then — when an
     /// embedder is attached — fill every chunk's vectors in guarded batches
     /// as part of the same command (RFC 0007 D10: rebuild "fills guarded
-    /// vectors in batches"). Returns (chunks written, vectors fully filled).
-    /// A fill failure degrades the semantic lane but leaves lexical search
-    /// intact, and is surfaced to the caller rather than swallowed.
-    pub async fn rebuild(&self) -> Result<(u64, bool), SearchError> {
+    /// vectors in batches"). Returns (chunks written, vector-fill outcome):
+    /// `None` when no embedder is attached, otherwise the fill outcome.
+    pub async fn rebuild(&self) -> Result<(u64, Option<FillOutcome>), SearchError> {
         let rows = self.source.load_reconcile_snapshot().await?;
         let targets: Vec<ChunkTarget> = rows.iter().flat_map(chunk_task).collect();
         let written = self.index.rebuild(&targets).await?;
-        let filled = match &self.embedder {
-            Some(embedder) => {
-                matches!(
-                    self.fill_semantic_vectors(&self.index, embedder.as_ref(), usize::MAX)
-                        .await,
-                    FillOutcome::Complete
-                )
-            }
-            None => false,
+        let fill = match &self.embedder {
+            Some(embedder) => Some(
+                self.fill_semantic_vectors(&self.index, embedder.as_ref(), usize::MAX)
+                    .await,
+            ),
+            None => None,
         };
-        Ok((written, filled))
+        Ok((written, fill))
     }
 
     pub async fn search(&self, req: &SearchRequest) -> Result<TaskSearchResponseDto, SearchError> {

@@ -42,6 +42,17 @@ impl ProfileManifest {
             max_input_tokens: self.max_input_tokens,
         }
     }
+
+    /// True when every manifest artifact is present at `cache_root/<id>`
+    /// and matches its pinned digest. A cheap, non-downloading, non-loading
+    /// probe for diagnostics (status) and idempotent prepare.
+    pub fn verify_cached(&self, cache_root: &Path) -> bool {
+        let dir = cache_root.join(&self.profile_id);
+        self.artifacts.iter().all(|a| {
+            let path = dir.join(&a.filename);
+            sha256_file(&path).map(|h| h == a.sha256).unwrap_or(false)
+        })
+    }
 }
 
 fn sha256_file(path: &Path) -> Result<String, PortError> {
@@ -117,7 +128,7 @@ pub fn prepare(manifest: &ProfileManifest, cache_root: &Path) -> PrepareResult<P
     // dir (one would delete the other's half-staged files).
     let tmp = cache_root.join(format!(
         ".tmp-prepare-{}-{}",
-        &manifest.profile_id[..8],
+        manifest.profile_id.get(..8).unwrap_or(&manifest.profile_id),
         std::process::id()
     ));
     if tmp.exists() {

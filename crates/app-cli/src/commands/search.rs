@@ -37,34 +37,35 @@ fn status_is_open(s: &str) -> Result<Option<bool>> {
     }
 }
 
-/// Build the pinned embedding provider when its prepared profile is present
-/// in the model cache (RFC 0007 D7); None when the model is not prepared, so
-/// the search reports `model_not_prepared` instead of failing.
-fn maybe_build_embedder() -> Result<Option<std::sync::Arc<dyn ports::EmbeddingProvider>>> {
+/// Build the pinned embedding provider when its prepared profile is cached
+/// (RFC 0007 D7); None when the model is not prepared or fails to load, so
+/// search reports `model_not_prepared` / degrades instead of failing.
+fn maybe_build_embedder() -> Option<std::sync::Arc<dyn ports::EmbeddingProvider>> {
     use std::sync::Arc;
     let manifest = infra_embed::profiles::profile();
-    let cache_root = infra_config::default_model_cache_root()
-        .map_err(|e| anyhow!("resolve model cache root: {e}"))?;
-    let dir = cache_root.join(&manifest.profile_id);
-    if !dir.exists() {
-        return Ok(None);
+    let cache_root = infra_config::default_model_cache_root().ok()?;
+    if !manifest.verify_cached(&cache_root) {
+        return None;
     }
+    let dir = cache_root.join(&manifest.profile_id);
     let config = manifest.embed_config();
-    let provider =
-        infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config)
-            .map_err(|e| anyhow!("load model: {e}"))?;
-    Ok(Some(Arc::new(provider)))
+    match infra_embed::provider::CandleEmbeddingProvider::new(&manifest.profile_id, &dir, config) {
+        Ok(provider) => Some(Arc::new(provider)),
+        Err(e) => {
+            tracing::warn!("embedding model failed to load; semantic lane unavailable: {e}");
+            None
+        }
+    }
 }
 
-/// True when the pinned profile's cache directory exists. A diagnostic
-/// probe: never loads weights, never errors on a corrupt model — status must
-/// report an unavailable component rather than fail (RFC 0007 D8).
+/// True when the pinned profile is cached and every artifact matches its
+/// digest (RFC 0007 D7). A diagnostic probe: hashes files, never loads
+/// weights, never errors on a corrupt model — status must report an
+/// unavailable component rather than fail (RFC 0007 D8).
 fn model_prepared() -> bool {
+    let manifest = infra_embed::profiles::profile();
     infra_config::default_model_cache_root()
-        .map(|root| {
-            root.join(infra_embed::profiles::profile().profile_id)
-                .exists()
-        })
+        .map(|root| manifest.verify_cached(&root))
         .unwrap_or(false)
 }
 
@@ -88,7 +89,7 @@ pub(crate) async fn task_search_dispatch(
 
     let index = SqliteTaskSearchIndex::new(&cfg.database_path);
     let mut service = TaskSearchService::new(svc.search_source.clone(), index);
-    if let Some(embedder) = maybe_build_embedder()? {
+    if let Some(embedder) = maybe_build_embedder() {
         service = service.with_embedder(embedder);
     }
     let resp = service
@@ -173,20 +174,19 @@ pub(crate) async fn search_index_dispatch(
         }
         SearchIndexCmd::Rebuild { .. } => {
             let mut service = TaskSearchService::new(svc.search_source.clone(), index);
-            if let Some(embedder) = maybe_build_embedder()? {
+            if let Some(embedder) = maybe_build_embedder() {
                 service = service.with_embedder(embedder);
             }
-            let (written, filled) = service.rebuild().await?;
+            let (written, fill) = service.rebuild().await?;
             render::search_index_maintenance(&SearchIndexMaintenanceDto {
                 command: "rebuild".into(),
                 chunks_written: Some(written),
-                error: if filled {
-                    None
-                } else {
-                    Some(
+                error: match fill {
+                    None | Some(application_search::FillOutcome::Complete) => None,
+                    _ => Some(
                         "semantic vectors failed to fill; run prepare-model and rebuild again"
                             .into(),
-                    )
+                    ),
                 },
             });
         }

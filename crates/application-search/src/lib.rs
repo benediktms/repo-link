@@ -15,4 +15,4 @@ mod service;
 
 pub use chunker::{CHUNK_FORMAT_VERSION, chunk_task};
 pub use query_mode::{QueryMode, classify, identifier_tokens};
-pub use service::{SearchError, SearchRequest, TaskSearchService};
+pub use service::{FillOutcome, SearchError, SearchRequest, TaskSearchService};
