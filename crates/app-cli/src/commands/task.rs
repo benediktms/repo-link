@@ -432,6 +432,14 @@ pub(crate) async fn task_dispatch(
             let summary = sync.link(&task_id, &canonical, &remote_id, relink).await?;
             render::sync(&summary);
         }
+        TaskCmd::Transfer { id, repo } => {
+            let binding_id = resolve_repo_handle_required(svc, &repo).await?;
+            let dst = svc.bindings.show(&binding_id).await?;
+            let task_id = svc.tasks.resolve_id(&id).await?;
+            let sync = build_sync_service(cfg, svc, "task transfer")?;
+            let summary = sync.transfer(&task_id, &dst.canonical_url).await?;
+            render::sync(&summary);
+        }
         TaskCmd::Relate {
             id,
             kind,

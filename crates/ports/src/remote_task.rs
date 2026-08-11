@@ -177,6 +177,26 @@ pub trait RemoteTaskProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Move the issue at `issue_node_id` into `dst_canonical_repo` — the
+    /// forward counterpart of [`Self::discover_move_target`], which only
+    /// observes a move somebody else made.
+    ///
+    /// Returns the destination issue's `(node_id, number)`. Both change: a
+    /// transferred issue is renumbered per-repo and reissued a node id, so a
+    /// caller that persists only one of them ends up with an unaddressable
+    /// remote. Same-owner only — a cross-org destination is rejected by the
+    /// provider, surfaced as a backend error rather than a typed variant.
+    /// Providers without a transfer concept inherit the `Unsupported` default.
+    async fn transfer_issue(
+        &self,
+        _issue_node_id: &str,
+        _dst_canonical_repo: &str,
+    ) -> PortResult<(String, u64)> {
+        Err(PortError::Backend(
+            "issue transfer not supported by this provider".into(),
+        ))
+    }
+
     /// List issues in `canonical_repo` whose `updatedAt` is at or after
     /// `since`. Backs the REST polling fallback used by binding-only
     /// (projectless) workspaces — see RFC 0001 §3 D4. Providers without

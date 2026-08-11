@@ -653,6 +653,25 @@ pub(crate) enum TaskCmd {
         #[arg(long, short = 'r')]
         relink: bool,
     },
+    /// Move a task's backing GitHub issue into another repo, driving GitHub's
+    /// `transferIssue` and re-pointing the task at the renumbered issue.
+    ///
+    /// Changes the FILING repo — where the issue lives — and leaves the logical
+    /// repo (code, worktrees, ID prefix) untouched; use `rl task edit --repo`
+    /// for that. The destination must already be attached to the task's
+    /// workspace, and must belong to the same owner: GitHub rejects a
+    /// cross-organisation transfer.
+    ///
+    /// Requires a `Synced` task, like `task link --relink`, so a pending local
+    /// edit can't be stranded on an issue number that no longer exists. Nothing
+    /// to transfer on a local-only task — promote it first.
+    Transfer {
+        id: String,
+        /// Destination repo binding, by UUID / prefix / name / alias (the same
+        /// handle forms as `rl repo show`).
+        #[arg(short = 'r', long)]
+        repo: String,
+    },
     /// Relate two tasks — the reciprocal edge is added to `--other`
     /// automatically (e.g. `blocks` ⇒ `blocked_by` on the other task).
     /// Self-relations and cycles in `blocked_by`/`parent_of` are rejected.

@@ -772,6 +772,113 @@ impl SyncService {
         ))
     }
 
+    /// `rl task transfer` (#71): move the backing issue into another repo and
+    /// re-point the task at its new home.
+    ///
+    /// This moves the **filing** axis (RFC 0002) — where the issue lives — and
+    /// leaves the logical `repo_id` alone, so a task whose code stays put keeps
+    /// its prefix and worktrees while its issue relocates. The recorded filing
+    /// repo is normally immutable, and this is the one sanctioned way to change
+    /// it: the issue genuinely moved, so the record follows.
+    ///
+    /// The counterpart to `task link --relink`, which reconciles a transfer the
+    /// user performed in the GitHub UI. Here `rl` drives the transfer, so no
+    /// redirect verification is needed — GitHub tells us the destination. The
+    /// `Synced` precondition is shared with `--relink`: the transfer rewrites
+    /// remote identity, so an unpushed local edit would be left addressed to an
+    /// issue number that no longer exists.
+    ///
+    /// Whether GitHub keeps a transferred issue's project-board membership is
+    /// unspecified, so this depends on neither answer: it drops
+    /// `project_item_id` and enqueues a fresh `AddItem`. Since
+    /// `addProjectV2ItemById` returns the existing item for an issue already on
+    /// the board, that re-add is a no-op if membership survived and a repair if
+    /// it did not.
+    pub async fn transfer(&self, task_id: &str, dst_canonical: &str) -> Result<SyncSummaryDto> {
+        let id: TaskId = task_id.parse()?;
+        let mut task = self.tasks.get(id).await?;
+        ensure_not_archived(&task)?;
+        let prev = task.sync;
+
+        let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
+
+        if task.sync != SyncState::Synced {
+            return Err(SyncError::Domain(domain_core::DomainError::validation(
+                format!(
+                    "transfer needs a synced task (current: {:?}); push or reconcile it first",
+                    task.sync
+                ),
+            )));
+        }
+
+        let binding = self
+            .bindings
+            .find_by_canonical_url(task.workspace_id, dst_canonical)
+            .await?
+            .ok_or_else(|| {
+                SyncError::Domain(domain_core::DomainError::validation(format!(
+                    "repo {dst_canonical} is not attached to this workspace; \
+                     run `rl repo attach <url>` first"
+                )))
+            })?;
+
+        let current_filing = self.filing_canonical_for(&task).await?;
+        if current_filing == dst_canonical {
+            return Ok(link_summary(&task, prev, "noop", None));
+        }
+
+        let issue_node_id = match remote.node_id.clone() {
+            Some(node_id) => node_id,
+            None => self
+                .provider
+                .fetch_remote(&current_filing, &remote.remote_id)
+                .await?
+                .node_id
+                .ok_or_else(|| {
+                    SyncError::Port(PortError::Backend(format!(
+                        "issue {current_filing}#{} has no GraphQL node id, so it cannot be transferred",
+                        remote.remote_id
+                    )))
+                })?,
+        };
+
+        let (new_node_id, new_number) = self
+            .provider
+            .transfer_issue(&issue_node_id, dst_canonical)
+            .await?;
+
+        let mut new_remote = RemoteRef::new(remote.provider.clone(), new_number.to_string());
+        new_remote.node_id = Some(new_node_id.clone());
+        task.remote = Some(new_remote);
+        task.force_set_filing_repo_id(Some(RepoId::from_uuid(binding.origin.id.as_uuid())));
+
+        task.project_item_id = None;
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let entries = match enqueue::project_for_workspace(&self.projects, &workspace).await? {
+            Some(project) => vec![OutboxEntry::new(
+                task.id,
+                domain_sync::OutboxMutation::AddItem {
+                    project_node_id: project.id.as_str().to_string(),
+                    issue_node_id: new_node_id,
+                },
+            )],
+            None => Vec::new(),
+        };
+
+        self.tasks
+            .save_with_outbox(&task, SnapshotSource::Link, &entries)
+            .await?;
+        Ok(link_summary(
+            &task,
+            prev,
+            "transferred",
+            Some(format!(
+                "issue moved from {current_filing}#{} to {dst_canonical}#{new_number}",
+                remote.remote_id
+            )),
+        ))
+    }
+
     /// `rl sync list-remote` (#3): discover remote issues with no local task.
     ///
     /// `repo_override` encodes the CLI's resolution precedence: `Some(repo)`
@@ -1417,6 +1524,7 @@ mod tests {
         created_comments: Mutex<Vec<String>>,
         move_target: Mutex<Option<(String, String)>>,
         fetch_moved: Mutex<Option<(String, String)>>,
+        transfer_calls: Mutex<Vec<(String, String)>>,
         sub_issues: Mutex<Vec<ports::RemoteChildIssue>>,
         blocked_by: Mutex<Vec<ports::RemoteChildIssue>>,
         parent: Mutex<Vec<ports::RemoteChildIssue>>,
@@ -1473,6 +1581,10 @@ mod tests {
         fn list_calls(&self) -> Vec<(String, Timestamp)> {
             self.list_calls.lock().unwrap().clone()
         }
+
+        fn transfer_calls(&self) -> Vec<(String, String)> {
+            self.transfer_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1493,6 +1605,18 @@ mod tests {
                 .get(canonical_repo)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn transfer_issue(
+            &self,
+            issue_node_id: &str,
+            dst_canonical_repo: &str,
+        ) -> PortResult<(String, u64)> {
+            self.transfer_calls
+                .lock()
+                .unwrap()
+                .push((issue_node_id.into(), dst_canonical_repo.into()));
+            Ok(("I_kwDOmoved7".into(), 7))
         }
 
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
@@ -4215,6 +4339,64 @@ mod tests {
         );
         // Baseline rewritten from the new remote → reconcile sees no diff.
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn transfer_repoints_filing_repo_and_renumbers_remote() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+        let before = tasks.get(task.id).await.unwrap();
+
+        let s = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "transferred");
+        assert_eq!(s.new_state, "synced", "a transfer does not dirty the task");
+
+        assert_eq!(
+            provider.transfer_calls(),
+            vec![("I_kwDOfake100".to_string(), "github.com/o2/r2".to_string())]
+        );
+
+        let after = tasks.get(task.id).await.unwrap();
+        let remote = after.remote.as_ref().unwrap();
+        assert_eq!(remote.remote_id, "7", "renumbered in the destination repo");
+        assert_eq!(remote.node_id.as_deref(), Some("I_kwDOmoved7"));
+
+        let dst = bindings
+            .find_by_canonical_url(workspace_id, "github.com/o2/r2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.filing_repo_id,
+            Some(RepoId::from_uuid(dst.origin.id.as_uuid()))
+        );
+        assert_eq!(
+            after.repo_id, before.repo_id,
+            "the logical repo (prefix, worktrees) stays where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_refuses_a_dirty_task() {
+        let (svc, tasks, bindings, task, _) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        attach_second_binding(&bindings, task.workspace_id, "github.com/o2/r2").await;
+
+        let mut dirty = tasks.get(task.id).await.unwrap();
+        dirty.set_title("edited but unpushed".into()).unwrap();
+        tasks.save(&dirty, SnapshotSource::LocalEdit).await.unwrap();
+        assert_eq!(dirty.sync, SyncState::DirtyLocal);
+
+        let err = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .expect_err("a dirty task must not be transferred");
+        assert!(err.to_string().contains("needs a synced task"), "{err}");
     }
 
     /// Mirrors `pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`

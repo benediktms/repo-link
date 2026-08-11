@@ -139,6 +139,21 @@ impl RemoteTaskProvider for GithubAdapter {
             .await
     }
 
+    /// Drive the move REST cannot express (#71). Accepts the destination as a
+    /// `github.com/<owner>/<repo>` canonical and resolves it to the repository
+    /// node id `transferIssue` wants, the same two-step
+    /// `convert_draft_to_issue` uses.
+    async fn transfer_issue(
+        &self,
+        issue_node_id: &str,
+        dst_canonical_repo: &str,
+    ) -> PortResult<(String, u64)> {
+        let repo_node_id = self.rest.resolve_repo_node_id(dst_canonical_repo).await?;
+        self.graphql
+            .transfer_issue(issue_node_id, &repo_node_id)
+            .await
+    }
+
     async fn list_changed_since(
         &self,
         canonical_repo: &str,
