@@ -163,6 +163,18 @@ mutation($input: UpdateIssueInput!) {
   }
 }"#;
 
+/// GraphQL `transferIssue` — move an issue to another repository (#71). REST
+/// has no transfer endpoint, so this is the only forward path; `rest.rs` only
+/// *detects* a transfer somebody else made. The response carries the
+/// destination issue's reissued node id and its new per-repo number, both of
+/// which the caller must persist.
+const TRANSFER_ISSUE: &str = r#"
+mutation($input: TransferIssueInput!) {
+  transferIssue(input: $input) {
+    issue { id number }
+  }
+}"#;
+
 const SET_SINGLE_SELECT_OPTION: &str = r#"
 mutation($input: UpdateProjectV2ItemFieldValueInput!) {
   updateProjectV2ItemFieldValue(input: $input) {
@@ -429,6 +441,29 @@ impl GraphqlClient {
             ))
         })?;
         Ok((node_id, number))
+    }
+
+    /// Move an issue into `repo_node_id` (#71). GitHub renumbers the issue in
+    /// its new home and reissues the node id, so both come back for the caller
+    /// to persist. A cross-org destination, a missing repo, or insufficient
+    /// permission all arrive as a GraphQL error from [`Self::run`].
+    pub(crate) async fn transfer_issue(
+        &self,
+        issue_node_id: &str,
+        repo_node_id: &str,
+    ) -> PortResult<(String, u64)> {
+        let data: TransferIssueData = self
+            .run(
+                TRANSFER_ISSUE,
+                json!({ "input": { "issueId": issue_node_id, "repositoryId": repo_node_id } }),
+            )
+            .await?;
+        let issue = data.transfer_issue.issue.ok_or_else(|| {
+            PortError::Backend(format!(
+                "transfer of issue {issue_node_id} returned no destination issue"
+            ))
+        })?;
+        Ok((issue.id, issue.number))
     }
 
     /// Set an item's single-select field to `option_id` (RFC 0006 D4). Field
@@ -879,6 +914,21 @@ struct ConvertIssueContent {
     id: Option<String>,
     #[serde(default)]
     number: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferIssueData {
+    transfer_issue: TransferIssueWrap,
+}
+#[derive(Deserialize)]
+struct TransferIssueWrap {
+    issue: Option<TransferredIssue>,
+}
+#[derive(Deserialize)]
+struct TransferredIssue {
+    id: String,
+    number: u64,
 }
 
 #[derive(Deserialize)]

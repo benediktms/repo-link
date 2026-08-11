@@ -195,5 +195,6 @@ pub(crate) fn build_sync_service(
         svc.projects_repo.clone(),
         provider,
         svc.org_issue_types_repo.clone(),
+        svc.outbox_repo.clone(),
     ))
 }

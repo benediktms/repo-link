@@ -15,8 +15,8 @@ use dto_shared::{
     SyncSummaryDto,
 };
 use ports::{
-    OrgIssueTypeRepository, PortError, ProjectRepository, RemoteTaskCreate, RemoteTaskProvider,
-    RepoBindingRepository, SyncedSource, TaskRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, OutboxRepository, PortError, ProjectRepository, RemoteTaskCreate,
+    RemoteTaskProvider, RepoBindingRepository, SyncedSource, TaskRepository, WorkspaceRepository,
 };
 
 use crate::error::{Result, SyncError};
@@ -56,6 +56,11 @@ pub struct SyncService {
     /// becomes issue-backed (#228 follow-up; mirrors
     /// `application-task::TaskService`'s edit-time trigger).
     org_issue_types: Arc<dyn OrgIssueTypeRepository>,
+    /// Read-only here: `transfer` refuses to move an issue while the task still
+    /// owes outbox mutations, because those entries carry the pre-transfer
+    /// issue identity in their payloads and per-task FIFO would drain them
+    /// against the source stub. Writes still ride `save_with_outbox`.
+    outbox: Arc<dyn OutboxRepository>,
     policy: SyncPolicy,
 }
 
@@ -67,6 +72,7 @@ impl SyncService {
         projects: Arc<dyn ProjectRepository>,
         provider: Arc<dyn RemoteTaskProvider>,
         org_issue_types: Arc<dyn OrgIssueTypeRepository>,
+        outbox: Arc<dyn OutboxRepository>,
     ) -> Self {
         Self {
             tasks,
@@ -75,6 +81,7 @@ impl SyncService {
             projects,
             provider,
             org_issue_types,
+            outbox,
             policy: SyncPolicy::ManualMerge,
         }
     }
@@ -772,6 +779,155 @@ impl SyncService {
         ))
     }
 
+    /// `rl task transfer` (#71): move the backing issue into another repo and
+    /// re-point the task at its new home.
+    ///
+    /// This moves the **filing** axis (RFC 0002) — where the issue lives — and
+    /// leaves the logical `repo_id` alone, so a task whose code stays put keeps
+    /// its prefix and worktrees while its issue relocates. The recorded filing
+    /// repo is normally immutable, and this is the one sanctioned way to change
+    /// it: the issue genuinely moved, so the record follows.
+    ///
+    /// The counterpart to `task link --relink`, which reconciles a transfer the
+    /// user performed in the GitHub UI. Here `rl` drives the transfer, so no
+    /// redirect verification is needed — GitHub tells us the destination. The
+    /// `Synced` precondition is shared with `--relink`: the transfer rewrites
+    /// remote identity, so an unpushed local edit would be left addressed to an
+    /// issue number that no longer exists.
+    ///
+    /// Whether GitHub keeps a transferred issue's project-board membership is
+    /// unspecified, so this depends on neither answer: it drops
+    /// `project_item_id` and enqueues a fresh `AddItem`. Since
+    /// `addProjectV2ItemById` returns the existing item for an issue already on
+    /// the board, that re-add is a no-op if membership survived and a repair if
+    /// it did not.
+    ///
+    /// Two further preconditions exist because `transferIssue` is not
+    /// idempotent and cannot be un-done locally:
+    ///
+    /// - **No pending outbox mutations.** `AddItem`, `SetIssueType` and the
+    ///   relation mutations apply the identity captured in their payload rather
+    ///   than re-deriving it from the live task, so per-task FIFO would drain
+    ///   them against the source stub. `Synced` alone does not exclude them —
+    ///   issue-type and relation edits never dirty a task.
+    /// - **The current remote must not already redirect.** A transfer whose
+    ///   local save failed leaves GitHub moved and the task stale; retrying
+    ///   would transfer the source stub a second time. Detecting the redirect
+    ///   turns that into a pointer at `task link --relink`, which is the
+    ///   existing repair for exactly this divergence.
+    pub async fn transfer(&self, task_id: &str, dst_canonical: &str) -> Result<SyncSummaryDto> {
+        let id: TaskId = task_id.parse()?;
+        let mut task = self.tasks.get(id).await?;
+        ensure_not_archived(&task)?;
+        let prev = task.sync;
+
+        let remote = task.remote.as_ref().ok_or(SyncError::NoRemote)?.clone();
+
+        if task.sync != SyncState::Synced {
+            return Err(SyncError::Domain(domain_core::DomainError::validation(
+                format!(
+                    "transfer needs a synced task (current: {:?}); push or reconcile it first",
+                    task.sync
+                ),
+            )));
+        }
+
+        let binding = self
+            .bindings
+            .find_by_canonical_url(task.workspace_id, dst_canonical)
+            .await?
+            .ok_or_else(|| {
+                SyncError::Domain(domain_core::DomainError::validation(format!(
+                    "repo {dst_canonical} is not attached to this workspace; \
+                     run `rl repo attach <url>` first"
+                )))
+            })?;
+
+        let current_filing = self.filing_canonical_for(&task).await?;
+        if current_filing == dst_canonical {
+            return Ok(link_summary(&task, prev, "noop", None));
+        }
+
+        let pending = self.outbox.list_pending(id).await?;
+        if !pending.is_empty() {
+            let kinds: Vec<&str> = pending.iter().map(|e| e.mutation.kind()).collect();
+            return Err(SyncError::Domain(domain_core::DomainError::validation(
+                format!(
+                    "task still owes {} outbox mutation(s) addressed to its current issue \
+                     ({}); let the daemon drain them before transferring",
+                    pending.len(),
+                    kinds.join(", ")
+                ),
+            )));
+        }
+
+        if let Some((to_canonical, to_remote_id)) = self
+            .provider
+            .discover_move_target(&current_filing, &remote.remote_id)
+            .await?
+        {
+            return Err(SyncError::Domain(domain_core::DomainError::validation(
+                format!(
+                    "issue {current_filing}#{} has already moved to \
+                     {to_canonical}#{to_remote_id}; reconcile with \
+                     `rl task link --relink` before transferring again",
+                    remote.remote_id
+                ),
+            )));
+        }
+
+        let issue_node_id = match remote.node_id.clone() {
+            Some(node_id) => node_id,
+            None => self
+                .provider
+                .fetch_remote(&current_filing, &remote.remote_id)
+                .await?
+                .node_id
+                .ok_or_else(|| {
+                    SyncError::Port(PortError::Backend(format!(
+                        "issue {current_filing}#{} has no GraphQL node id, so it cannot be transferred",
+                        remote.remote_id
+                    )))
+                })?,
+        };
+
+        let (new_node_id, new_number) = self
+            .provider
+            .transfer_issue(&issue_node_id, dst_canonical)
+            .await?;
+
+        let mut new_remote = RemoteRef::new(remote.provider.clone(), new_number.to_string());
+        new_remote.node_id = Some(new_node_id.clone());
+        task.remote = Some(new_remote);
+        task.force_set_filing_repo_id(Some(RepoId::from_uuid(binding.origin.id.as_uuid())));
+
+        task.project_item_id = None;
+        let workspace = self.workspaces.get(task.workspace_id).await?;
+        let entries = match enqueue::project_for_workspace(&self.projects, &workspace).await? {
+            Some(project) => vec![OutboxEntry::new(
+                task.id,
+                domain_sync::OutboxMutation::AddItem {
+                    project_node_id: project.id.as_str().to_string(),
+                    issue_node_id: new_node_id,
+                },
+            )],
+            None => Vec::new(),
+        };
+
+        self.tasks
+            .save_with_outbox(&task, SnapshotSource::Link, &entries)
+            .await?;
+        Ok(link_summary(
+            &task,
+            prev,
+            "transferred",
+            Some(format!(
+                "issue moved from {current_filing}#{} to {dst_canonical}#{new_number}",
+                remote.remote_id
+            )),
+        ))
+    }
+
     /// `rl sync list-remote` (#3): discover remote issues with no local task.
     ///
     /// `repo_override` encodes the CLI's resolution precedence: `Some(repo)`
@@ -1417,6 +1573,7 @@ mod tests {
         created_comments: Mutex<Vec<String>>,
         move_target: Mutex<Option<(String, String)>>,
         fetch_moved: Mutex<Option<(String, String)>>,
+        transfer_calls: Mutex<Vec<(String, String)>>,
         sub_issues: Mutex<Vec<ports::RemoteChildIssue>>,
         blocked_by: Mutex<Vec<ports::RemoteChildIssue>>,
         parent: Mutex<Vec<ports::RemoteChildIssue>>,
@@ -1473,6 +1630,10 @@ mod tests {
         fn list_calls(&self) -> Vec<(String, Timestamp)> {
             self.list_calls.lock().unwrap().clone()
         }
+
+        fn transfer_calls(&self) -> Vec<(String, String)> {
+            self.transfer_calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
@@ -1493,6 +1654,18 @@ mod tests {
                 .get(canonical_repo)
                 .cloned()
                 .unwrap_or_default())
+        }
+
+        async fn transfer_issue(
+            &self,
+            issue_node_id: &str,
+            dst_canonical_repo: &str,
+        ) -> PortResult<(String, u64)> {
+            self.transfer_calls
+                .lock()
+                .unwrap()
+                .push((issue_node_id.into(), dst_canonical_repo.into()));
+            Ok(("I_kwDOmoved7".into(), 7))
         }
 
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
@@ -1646,6 +1819,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         (svc, tasks, bindings, task, provider)
     }
@@ -1709,6 +1883,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            outbox.clone(),
         );
         (
             svc,
@@ -2254,6 +2429,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         (svc, tasks, task)
     }
@@ -2330,6 +2506,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             org_issue_types.clone(),
+            outbox.clone(),
         );
 
         svc.promote(&task.id.to_string()).await.unwrap();
@@ -2422,6 +2599,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             org_issue_types.clone(),
+            outbox.clone(),
         );
         (svc, tasks, outbox, org_issue_types, task)
     }
@@ -2511,6 +2689,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             org_issue_types.clone(),
+            outbox.clone(),
         );
 
         svc.promote(&task.id.to_string()).await.unwrap();
@@ -2638,6 +2817,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         svc.promote(&task.id.to_string()).await.unwrap();
 
@@ -2727,6 +2907,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         SagaFixture {
             svc,
@@ -2826,6 +3007,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         ListRemoteFixture {
             svc,
@@ -3813,6 +3995,7 @@ mod tests {
             Arc::new(InMemoryProjectRepository::new()),
             provider.clone(),
             Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
         );
         svc.promote(&task.id.to_string()).await.unwrap();
 
@@ -4215,6 +4398,236 @@ mod tests {
         );
         // Baseline rewritten from the new remote → reconcile sees no diff.
         assert_eq!(after.sync, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn transfer_repoints_filing_repo_and_renumbers_remote() {
+        let (svc, tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        let workspace_id = task.workspace_id;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+        let before = tasks.get(task.id).await.unwrap();
+
+        let s = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .unwrap();
+        assert_eq!(s.decision, "transferred");
+        assert_eq!(s.new_state, "synced", "a transfer does not dirty the task");
+
+        assert_eq!(
+            provider.transfer_calls(),
+            vec![("I_kwDOfake100".to_string(), "github.com/o2/r2".to_string())]
+        );
+
+        let after = tasks.get(task.id).await.unwrap();
+        let remote = after.remote.as_ref().unwrap();
+        assert_eq!(remote.remote_id, "7", "renumbered in the destination repo");
+        assert_eq!(remote.node_id.as_deref(), Some("I_kwDOmoved7"));
+
+        let dst = bindings
+            .find_by_canonical_url(workspace_id, "github.com/o2/r2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.filing_repo_id,
+            Some(RepoId::from_uuid(dst.origin.id.as_uuid()))
+        );
+        assert_eq!(
+            after.repo_id, before.repo_id,
+            "the logical repo (prefix, worktrees) stays where it was"
+        );
+    }
+
+    /// `setup_with_bindings`, plus a board on the workspace and a shared outbox,
+    /// so a transfer's `AddItem` re-attach can be inspected.
+    async fn setup_with_project_and_outbox() -> (
+        SyncService,
+        Arc<InMemoryTaskRepository>,
+        Arc<InMemoryRepoBindingRepository>,
+        Arc<InMemoryOutboxRepository>,
+        Task,
+    ) {
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::with_outbox(&outbox));
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let project = domain_project::Project::new(
+            domain_core::ProjectId::parse("PVT_kwHO_transfer").unwrap(),
+            "o".into(),
+            1,
+            "Board".into(),
+            "PVTSSF_f".into(),
+            vec![domain_project::FieldOption {
+                option_id: "o1".into(),
+                name: "Backlog".into(),
+                ordinal: 0,
+            }],
+            vec![domain_project::StatusMapping {
+                is_open: true,
+                option_id: "o1".into(),
+            }],
+            false,
+            Timestamp::now(),
+        )
+        .unwrap();
+        projects.save(&project).await.unwrap();
+
+        let mut workspace = Workspace::new(WorkspaceName::new("xfer-ws").unwrap(), None, true);
+        workspace.project_id = Some(project.id.clone());
+        let workspace_id = workspace.id;
+        workspaces.save(&workspace).await.unwrap();
+
+        let origin =
+            RepoOrigin::new("git@github.com:o/r.git".into(), "github.com/o/r".into()).unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace_id, origin.id, "github.com/o/r".into(), None).unwrap();
+        let repo_id = instance.id;
+        bindings.save_instance(&instance).await.unwrap();
+
+        let task = Task::new_draft(workspace_id, Some(repo_id), "ship it".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            projects,
+            provider,
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            outbox.clone(),
+        );
+        (svc, tasks, bindings, outbox, task)
+    }
+
+    #[tokio::test]
+    async fn transfer_reattaches_the_moved_issue_to_the_board() {
+        let (svc, tasks, bindings, outbox, task) = setup_with_project_and_outbox().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        attach_second_binding(&bindings, task.workspace_id, "github.com/o2/r2").await;
+
+        svc.transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().project_item_id,
+            None,
+            "the pre-transfer item id is dropped"
+        );
+        let queued: Vec<_> = outbox
+            .list_pending(task.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.mutation {
+                domain_sync::OutboxMutation::AddItem { issue_node_id, .. } => Some(issue_node_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec!["I_kwDOmoved7".to_string()],
+            "re-attach addresses the MOVED issue node, not the source"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_refuses_while_outbox_entries_are_pending() {
+        let (svc, _tasks, bindings, outbox, task) = setup_with_project_and_outbox().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        attach_second_binding(&bindings, task.workspace_id, "github.com/o2/r2").await;
+        outbox
+            .enqueue(&OutboxEntry::new(
+                task.id,
+                domain_sync::OutboxMutation::SetIssueType {
+                    issue_node_id: "I_kwDOfake100".into(),
+                    issue_type_id: Some("IT_bug".into()),
+                    local_issue_type: Some("Bug".into()),
+                    local_issue_type_recorded: true,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let err = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .expect_err("stale-identity entries would drain against the source stub");
+        assert!(err.to_string().contains("outbox mutation"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn transfer_refuses_when_the_issue_has_already_moved() {
+        let (svc, _tasks, bindings, task, provider) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        attach_second_binding(&bindings, task.workspace_id, "github.com/o2/r2").await;
+        provider.set_move_target("github.com/o2/r2", "7");
+
+        let err = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .expect_err("re-transferring the source stub must be refused");
+        assert!(err.to_string().contains("already moved"), "{err}");
+        assert!(err.to_string().contains("--relink"), "{err}");
+        assert!(
+            provider.transfer_calls().is_empty(),
+            "the guard runs before the mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_backfills_a_missing_node_id_over_rest() {
+        let (svc, tasks, bindings, _outbox, workspace_id, repo_id, filing, provider) =
+            setup_with_outbox().await;
+        let task = seed_promoted(&tasks, workspace_id, repo_id, filing, "100").await;
+        attach_second_binding(&bindings, workspace_id, "github.com/o2/r2").await;
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: Some("I_kwDObackfilled100".into()),
+            title: task.title.clone(),
+            body: task.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        });
+
+        svc.transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.transfer_calls(),
+            vec![(
+                "I_kwDObackfilled100".to_string(),
+                "github.com/o2/r2".to_string()
+            )],
+            "the fetched node id addresses the mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_refuses_a_dirty_task() {
+        let (svc, tasks, bindings, task, _) = setup_with_bindings().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+        attach_second_binding(&bindings, task.workspace_id, "github.com/o2/r2").await;
+
+        let mut dirty = tasks.get(task.id).await.unwrap();
+        dirty.set_title("edited but unpushed".into()).unwrap();
+        tasks.save(&dirty, SnapshotSource::LocalEdit).await.unwrap();
+        assert_eq!(dirty.sync, SyncState::DirtyLocal);
+
+        let err = svc
+            .transfer(&task.id.to_string(), "github.com/o2/r2")
+            .await
+            .expect_err("a dirty task must not be transferred");
+        assert!(err.to_string().contains("needs a synced task"), "{err}");
     }
 
     /// Mirrors `pull_copy_back_uses_the_same_inbound_set_as_remote_mirrors_baseline`
