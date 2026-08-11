@@ -68,6 +68,7 @@ pub(crate) async fn sync_dispatch(
         svc.projects_repo.clone(),
         provider,
         svc.org_issue_types_repo.clone(),
+        svc.outbox_repo.clone(),
     );
 
     // `list-remote` is a read-only discovery query with its own repo-resolution
