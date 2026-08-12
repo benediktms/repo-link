@@ -113,6 +113,16 @@ without an enforced order. **Invariants** that remain:
 - A task referenced in any `blocked_by` relation MUST exist
   (referential integrity, not a state invariant — the storage layer
   enforces this; the aggregate layer is the safety net).
+- The relation graph is **global**, not workspace-local. A relation
+  edge MAY join tasks in different workspaces (`task relate` already
+  resolves and stores both endpoints globally, and cross-workspace
+  parent/child rollups are tested behaviour). It follows that a
+  derived predicate over that graph — `is_blocked`, the transitive
+  readiness walk, `children` — MUST be evaluated against every task,
+  in any workspace. Workspace scope selects which tasks a view
+  *returns*, never which tasks its blocker graph *sees*: an accepted
+  edge that a workspace-scoped query cannot see would fail open and
+  report blocked work as ready.
 
 Everything else (e.g. "you can mark a `Blocked` task as `Done`
 directly") becomes a valid transition.
