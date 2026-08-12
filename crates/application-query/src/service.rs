@@ -13,8 +13,8 @@ use ports::{
 use crate::dto::{
     AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow,
     DriftCacheNotRefreshedNotice, DriftLiveUnavailableNotice, DriftPartiallyLiveNotice,
-    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyNode, ReadyTaskRow, ReadyView,
-    ReadyWorkspace, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
+    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyNode, ReadyView, ReadyWorkspace,
+    StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 use crate::error::Result;
 
@@ -86,24 +86,21 @@ impl QueryService {
         })
     }
 
+    /// Every task in every workspace, open and closed. The relation graph is
+    /// global (RFC 0004 D1), so a workspace-scoped view resolves blockers
+    /// against all of these and narrows only the rows it returns — filtering
+    /// this load by workspace instead makes an external blocker fail open.
+    async fn tasks_for_global_relation_graph(&self) -> Result<Vec<Task>> {
+        Ok(self.tasks.list(TaskFilter::default()).await?)
+    }
+
     pub async fn blocked_tasks(&self, workspace_id: &str) -> Result<Vec<BlockedTaskRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
-        // "Blocked" is no longer a stored status (RFC 0004 D1) — it's derived
-        // from `BlockedBy` relations. A blocker that is itself closed no longer
-        // blocks (consistent with `ready_tasks`/`assigned_to`), so load the
-        // whole workspace, note which tasks are open, and report an open task as
-        // blocked only when it has a `BlockedBy` edge to a still-open task.
-        let tasks = self
-            .tasks
-            .list(TaskFilter {
-                workspace_id: Some(id),
-                ..TaskFilter::default()
-            })
-            .await?;
-        let open_ids: HashSet<TaskId> =
-            tasks.iter().filter(|t| t.is_open()).map(|t| t.id).collect();
-        Ok(tasks
+        let all = self.tasks_for_global_relation_graph().await?;
+        let open_ids: HashSet<TaskId> = all.iter().filter(|t| t.is_open()).map(|t| t.id).collect();
+        Ok(all
             .iter()
+            .filter(|t| t.workspace_id == id)
             .filter(|t| t.is_open())
             .filter_map(|t| {
                 let blockers: Vec<String> = t
@@ -232,19 +229,9 @@ impl QueryService {
         use std::collections::HashMap;
 
         let id: WorkspaceId = workspace_id.parse()?;
-        // Load both open and closed (`is_open: None`) so a blocker's open/closed
-        // state can be evaluated; the assigned rows themselves are filtered to
-        // open tasks below.
-        let tasks = self
-            .tasks
-            .list(TaskFilter {
-                workspace_id: Some(id),
-                is_open: None,
-                ..TaskFilter::default()
-            })
-            .await?;
-
-        let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
+        let all = self.tasks_for_global_relation_graph().await?;
+        let by_id: HashMap<_, _> = all.iter().map(|t| (t.id, t)).collect();
+        let tasks: Vec<&Task> = all.iter().filter(|t| t.workspace_id == id).collect();
 
         // One workspace per query → resolve its project (if any) once and reuse
         // the cached-status semantics for every row (#236); local-only, no reads.
@@ -285,36 +272,6 @@ impl QueryService {
         Ok(rows)
     }
 
-    /// Tasks ready to work on right now: status ∈ {Open, InProgress}, sync
-    /// not in Conflict, and not transitively blocked by another non-done
-    /// task. Sorted by priority (P0 first), then `updated_at` asc.
-    pub async fn ready_tasks(&self, workspace_id: &str) -> Result<Vec<ReadyTaskRow>> {
-        use std::collections::HashMap;
-
-        let id: WorkspaceId = workspace_id.parse()?;
-        // Load both open and closed (`is_open: None`) so a blocker's open/closed
-        // state is available to the transitive-blocker traversal.
-        let tasks = self
-            .tasks
-            .list(TaskFilter {
-                workspace_id: Some(id),
-                is_open: None,
-                ..TaskFilter::default()
-            })
-            .await?;
-
-        let by_id: HashMap<_, _> = tasks.iter().map(|t| (t.id, t)).collect();
-
-        // One workspace per query → resolve its project (if any) once and reuse
-        // the cached-status semantics for every row (#236); local-only, no reads.
-        let project = self.resolve_workspace_project(id).await?;
-
-        Ok(select_ready(&by_id, &tasks)
-            .into_iter()
-            .map(|t| ready_row(t, project.as_ref()))
-            .collect())
-    }
-
     /// The ready frontier as a nested tree. `workspace_ids: None` spans every
     /// active workspace (the fallback when the cwd isn't a bound repo);
     /// `Some(ids)` restricts to those workspaces. `repo_ids` (binding ids of
@@ -334,10 +291,7 @@ impl QueryService {
     ) -> Result<ReadyView> {
         use std::collections::{HashMap, HashSet};
 
-        // Global id→task map: both the transitive-blocker walk and the parent
-        // lookup resolve against it, so a blocker or parent living in another
-        // workspace is still found.
-        let all = self.tasks.list(TaskFilter::default()).await?;
+        let all = self.tasks_for_global_relation_graph().await?;
         let by_id: HashMap<domain_core::TaskId, &domain_task::Task> =
             all.iter().map(|t| (t.id, t)).collect();
         let repo_filter: HashSet<String> = repo_ids.iter().cloned().collect();
@@ -374,10 +328,11 @@ impl QueryService {
             if ready_ids.is_empty() {
                 continue; // nothing ready in this workspace — omit it
             }
+            let project = self.resolve_workspace_project(ws.id).await?;
             out.push(ReadyWorkspace {
                 workspace_id: ws.id.to_string(),
                 workspace_name: ws.name.as_str().to_string(),
-                tree: build_ready_tree(&ws_tasks, &by_id, &ready_ids),
+                tree: build_ready_tree(&ws_tasks, &by_id, &ready_ids, project.as_ref()),
             });
         }
         Ok(ReadyView { workspaces: out })
@@ -726,9 +681,9 @@ fn enum_str<T: serde::Serialize>(t: &T) -> String {
 
 /// The ready subset of `ws_tasks`: open, not in conflict, and not
 /// transitively blocked. Sorted by priority (P0 first), then `updated_at` asc.
-/// `by_id` is the id→task map the blocker walk resolves against —
-/// per-workspace for [`QueryService::ready_tasks`], global for
-/// [`QueryService::ready_view`] so cross-workspace blockers count.
+/// `by_id` is the id→task map the blocker walk resolves against. Every caller
+/// passes the global map so a blocker in another workspace still counts;
+/// `ws_tasks` is what scopes the result to one workspace.
 fn select_ready<'a>(
     by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
     ws_tasks: impl IntoIterator<Item = &'a domain_task::Task>,
@@ -745,21 +700,6 @@ fn select_ready<'a>(
             .then_with(|| a.updated_at.cmp(&b.updated_at))
     });
     ready
-}
-
-/// The wire row for one ready task, with its workspace's cached board status
-/// resolved once per workspace.
-fn ready_row(t: &domain_task::Task, project: Option<&Project>) -> ReadyTaskRow {
-    ReadyTaskRow {
-        task_id: t.id.to_string(),
-        title: t.title.clone(),
-        status: enum_str(&t.lifecycle),
-        sync_state: enum_str(&t.sync),
-        priority: enum_str(&t.priority),
-        assignees: t.assignees.clone(),
-        issue_type: t.issue_type.as_ref().map(enum_str),
-        project_status: cached_project_status(project, t),
-    }
 }
 
 /// Reverse `ParentOf` index: child task id → its parent task, so parent lookup
@@ -804,6 +744,64 @@ fn parent_task<'a>(
     direct.or_else(|| reverse.get(&t.id).copied())
 }
 
+/// The read-only shape a single [`ReadyTreeCtx::node`] call resolves against:
+/// which tasks exist in this workspace, which of them are ready, the
+/// parent→children inversion, the kept set, the branch sort key, and the
+/// workspace's project for cached board status.
+struct ReadyTreeCtx<'a> {
+    id_of: &'a HashMap<TaskId, &'a Task>,
+    ready_ids: &'a HashSet<TaskId>,
+    children: &'a HashMap<TaskId, Vec<TaskId>>,
+    kept: &'a HashSet<TaskId>,
+    rank: &'a HashMap<TaskId, Priority>,
+    project: Option<&'a Project>,
+}
+
+impl ReadyTreeCtx<'_> {
+    /// One node and its kept descendants. `visiting` is the current build path:
+    /// the domain rejects parent/child cycles, so a re-entry only occurs on a
+    /// corrupt or legacy row — skipping it keeps the shape a tree instead of
+    /// recursing forever.
+    fn node(&self, id: TaskId, visiting: &mut HashSet<TaskId>) -> ReadyNode {
+        let task = self.id_of[&id];
+        let ready = self.ready_ids.contains(&id);
+        let mut kids: Vec<TaskId> = self
+            .children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|c| self.kept.contains(c) && !visiting.contains(c))
+            .collect();
+        kids.sort_by(|a, b| {
+            self.rank[a]
+                .cmp(&self.rank[b])
+                .then_with(|| self.id_of[a].title.cmp(&self.id_of[b].title))
+        });
+        visiting.insert(id);
+        let children = kids.into_iter().map(|c| self.node(c, visiting)).collect();
+        ReadyNode {
+            task_id: task.id.to_string(),
+            title: task.title.clone(),
+            ready,
+            status: ready.then(|| enum_str(&task.lifecycle)),
+            priority: ready.then(|| enum_str(&task.priority)),
+            assignees: if ready {
+                task.assignees.clone()
+            } else {
+                Vec::new()
+            },
+            issue_type: ready
+                .then(|| task.issue_type.as_ref().map(enum_str))
+                .flatten(),
+            project_status: ready
+                .then(|| cached_project_status(self.project, task))
+                .flatten(),
+            children,
+        }
+    }
+}
+
 /// Build the nested ready frontier for one workspace.
 ///
 /// Nodes are the ready tasks plus every in-workspace ancestor of a ready task
@@ -816,6 +814,7 @@ fn build_ready_tree<'a>(
     ws_tasks: &[&'a domain_task::Task],
     by_id: &std::collections::HashMap<domain_core::TaskId, &'a domain_task::Task>,
     ready_ids: &std::collections::HashSet<domain_core::TaskId>,
+    project: Option<&Project>,
 ) -> Vec<ReadyNode> {
     use std::collections::{HashMap, HashSet};
 
@@ -871,66 +870,18 @@ fn build_ready_tree<'a>(
         .collect();
     roots.sort_by(order);
 
-    fn node(
-        id: domain_core::TaskId,
-        id_of: &HashMap<domain_core::TaskId, &domain_task::Task>,
-        ready_ids: &HashSet<domain_core::TaskId>,
-        children: &HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
-        kept: &HashSet<domain_core::TaskId>,
-        rank: &HashMap<domain_core::TaskId, Priority>,
-        visiting: &mut HashSet<domain_core::TaskId>,
-    ) -> ReadyNode {
-        let task = id_of[&id];
-        let ready = ready_ids.contains(&id);
-        // Drop children already on the current build path: the domain rejects
-        // parent/child cycles, so a re-entry only occurs on a corrupt/legacy
-        // row — skipping it keeps the shape a tree without recursing forever.
-        let mut kids: Vec<domain_core::TaskId> = children
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|c| kept.contains(c) && !visiting.contains(c))
-            .collect();
-        kids.sort_by(|a, b| {
-            rank[a]
-                .cmp(&rank[b])
-                .then_with(|| id_of[a].title.cmp(&id_of[b].title))
-        });
-        visiting.insert(id);
-        let children = kids
-            .into_iter()
-            .map(|c| node(c, id_of, ready_ids, children, kept, rank, visiting))
-            .collect();
-        ReadyNode {
-            task_id: task.id.to_string(),
-            title: task.title.clone(),
-            ready,
-            status: ready.then(|| enum_str(&task.lifecycle)),
-            priority: ready.then(|| enum_str(&task.priority)),
-            assignees: if ready {
-                task.assignees.clone()
-            } else {
-                Vec::new()
-            },
-            children,
-        }
-    }
-
+    let ctx = ReadyTreeCtx {
+        id_of: &id_of,
+        ready_ids,
+        children: &children,
+        kept: &kept,
+        rank: &rank,
+        project,
+    };
     let mut visiting = HashSet::new();
     roots
         .into_iter()
-        .map(|id| {
-            node(
-                id,
-                &id_of,
-                ready_ids,
-                &children,
-                &kept,
-                &rank,
-                &mut visiting,
-            )
-        })
+        .map(|id| ctx.node(id, &mut visiting))
         .collect()
 }
 
@@ -1078,6 +1029,36 @@ mod tests {
     ) {
         let (svc, w, b, t, _p) = svc_with_projects();
         (svc, w, b, t)
+    }
+
+    /// The ready nodes of one workspace, flattened out of the `ready_view` tree
+    /// in tree order (container headings dropped — they are not ready).
+    async fn ready_nodes(svc: &QueryService, workspace_id: &WorkspaceId) -> Vec<ReadyNode> {
+        fn walk(nodes: &[ReadyNode], out: &mut Vec<ReadyNode>) {
+            for n in nodes {
+                if n.ready {
+                    out.push(n.clone());
+                }
+                walk(&n.children, out);
+            }
+        }
+        let view = svc
+            .ready_view(Some(&[workspace_id.to_string()]), &[])
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for ws in &view.workspaces {
+            walk(&ws.tree, &mut out);
+        }
+        out
+    }
+
+    async fn ready_titles(svc: &QueryService, workspace_id: &WorkspaceId) -> Vec<String> {
+        ready_nodes(svc, workspace_id)
+            .await
+            .into_iter()
+            .map(|n| n.title)
+            .collect()
     }
 
     /// Like [`svc`] but also hands back the project repo so the Stage-8
@@ -1328,7 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_tasks_excludes_blocked_and_archived() {
+    async fn ready_excludes_blocked_and_archived() {
         let (svc, ws, _bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
         let wid = workspace.id;
@@ -1358,13 +1339,12 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
-        let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
-        assert!(titles.contains(&"freed up"));
-        assert!(titles.contains(&"low pri"));
-        assert!(titles.contains(&"blocker a"));
-        assert!(!titles.contains(&"needs a"));
-        assert!(!titles.contains(&"blocker b"));
+        let titles = ready_titles(&svc, &wid).await;
+        assert!(titles.iter().any(|t| t == "freed up"));
+        assert!(titles.iter().any(|t| t == "low pri"));
+        assert!(titles.iter().any(|t| t == "blocker a"));
+        assert!(!titles.iter().any(|t| t == "needs a"));
+        assert!(!titles.iter().any(|t| t == "blocker b"));
         let freed_idx = titles.iter().position(|t| *t == "freed up").unwrap();
         let low_idx = titles.iter().position(|t| *t == "low pri").unwrap();
         assert!(freed_idx < low_idx);
@@ -1379,7 +1359,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_tasks_excludes_transitively_blocked() {
+    async fn ready_excludes_transitively_blocked() {
         // A → B(done) → C(open): the *direct* blocker B is resolved, so the old
         // one-hop check would wrongly mark A ready. The open tail C must keep A
         // out of the ready list.
@@ -1399,19 +1379,75 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let titles: Vec<String> = svc
-            .ready_tasks(&wid.to_string())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.title)
-            .collect();
+        let titles = ready_titles(&svc, &wid).await;
         assert!(titles.iter().any(|t| t == "c (open tail)"));
         assert!(!titles.iter().any(|t| t == "a (head)"));
     }
 
     #[tokio::test]
-    async fn ready_tasks_includes_fully_resolved_chain() {
+    async fn cross_workspace_blocker_is_honoured_by_workspace_scoped_views() {
+        let (svc, ws, _bs, ts) = svc();
+        let ws_a = Workspace::new(WorkspaceName::new("a").unwrap(), None, true);
+        let ws_b = Workspace::new(WorkspaceName::new("b").unwrap(), None, true);
+        let (a_id, b_id) = (ws_a.id, ws_b.id);
+        ws.save(&ws_a).await.unwrap();
+        ws.save(&ws_b).await.unwrap();
+
+        let external = Task::new_draft(b_id, None, "external blocker".into()).unwrap();
+
+        let mut blocked = Task::new_draft(a_id, None, "needs the other workspace".into()).unwrap();
+        blocked.assignees = vec!["benedikt".into()];
+        blocked.add_relation(domain_task::RelationKind::BlockedBy, external.id);
+
+        let mut middle = Task::new_draft(a_id, None, "resolved middle".into()).unwrap();
+        middle.add_relation(domain_task::RelationKind::BlockedBy, external.id);
+        let middle = completed(middle);
+        let mut head = Task::new_draft(a_id, None, "transitively blocked".into()).unwrap();
+        head.add_relation(domain_task::RelationKind::BlockedBy, middle.id);
+
+        for t in [&external, &blocked, &middle, &head] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let ready = ready_titles(&svc, &a_id).await;
+        assert!(!ready.iter().any(|t| t == "needs the other workspace"));
+        assert!(!ready.iter().any(|t| t == "transitively blocked"));
+        assert!(!ready.iter().any(|t| t == "external blocker"));
+
+        let blocked_rows = svc.blocked_tasks(&a_id.to_string()).await.unwrap();
+        let blocked_titles: Vec<&str> = blocked_rows.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(blocked_titles, vec!["needs the other workspace"]);
+        assert_eq!(blocked_rows[0].blocked_by, vec![external.id.to_string()]);
+
+        let mine = svc
+            .assigned_to(&a_id.to_string(), "benedikt")
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert!(mine[0].blocked);
+
+        let external = completed(external);
+        ts.save(&external, SnapshotSource::LocalEdit).await.unwrap();
+
+        let ready = ready_titles(&svc, &a_id).await;
+        assert!(ready.iter().any(|t| t == "needs the other workspace"));
+        assert!(ready.iter().any(|t| t == "transitively blocked"));
+        assert!(
+            svc.blocked_tasks(&a_id.to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !svc.assigned_to(&a_id.to_string(), "benedikt")
+                .await
+                .unwrap()[0]
+                .blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_includes_fully_resolved_chain() {
         // A → B(done) → C(done): every reachable blocker is resolved, so A is
         // ready.
         let (svc, ws, _bs, ts) = svc();
@@ -1430,18 +1466,12 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let titles: Vec<String> = svc
-            .ready_tasks(&wid.to_string())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| r.title)
-            .collect();
+        let titles = ready_titles(&svc, &wid).await;
         assert!(titles.iter().any(|t| t == "a"));
     }
 
     #[tokio::test]
-    async fn ready_tasks_handles_self_cycle() {
+    async fn ready_handles_self_cycle() {
         // A blocked by itself: must terminate and report A as blocked.
         let (svc, ws, _bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
@@ -1452,12 +1482,11 @@ mod tests {
         a.add_relation(domain_task::RelationKind::BlockedBy, a.id);
         ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
 
-        let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
-        assert!(rows.is_empty());
+        assert!(ready_titles(&svc, &wid).await.is_empty());
     }
 
     #[tokio::test]
-    async fn ready_tasks_handles_mutual_cycle() {
+    async fn ready_handles_mutual_cycle() {
         // A ↔ B (each blocks the other): must terminate with both blocked.
         let (svc, ws, _bs, ts) = svc();
         let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
@@ -1473,8 +1502,7 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let rows = svc.ready_tasks(&wid.to_string()).await.unwrap();
-        assert!(rows.is_empty());
+        assert!(ready_titles(&svc, &wid).await.is_empty());
     }
 
     #[tokio::test]
@@ -1539,13 +1567,13 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let ready = svc.ready_tasks(&wid.to_string()).await.unwrap();
-        let r_typed = ready.iter().find(|r| r.title == "typed + polled").unwrap();
+        let ready = ready_nodes(&svc, &wid).await;
+        let r_typed = ready.iter().find(|n| n.title == "typed + polled").unwrap();
         assert_eq!(r_typed.issue_type.as_deref(), Some("bug"));
         assert_eq!(r_typed.project_status.as_deref(), Some("Backlog"));
         let r_bare = ready
             .iter()
-            .find(|r| r.title == "untyped + unpolled")
+            .find(|n| n.title == "untyped + unpolled")
             .unwrap();
         assert_eq!(r_bare.issue_type, None);
         assert_eq!(r_bare.project_status, None);
@@ -1578,7 +1606,7 @@ mod tests {
         t.issue_type = Some(IssueType::Feature);
         ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
-        let ready = svc.ready_tasks(&wid.to_string()).await.unwrap();
+        let ready = ready_nodes(&svc, &wid).await;
         assert_eq!(ready[0].issue_type.as_deref(), Some("feature"));
         assert_eq!(ready[0].project_status, None);
 

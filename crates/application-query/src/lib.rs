@@ -17,8 +17,8 @@ mod service;
 pub use dto::{
     AssignedTaskRow, BlockedTaskRow, ChildTaskRow, ChildrenRollup, ContributorRow,
     DriftCacheNotRefreshedNotice, DriftLiveUnavailableNotice, DriftPartiallyLiveNotice,
-    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyNode, ReadyTaskRow, ReadyView,
-    ReadyWorkspace, StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
+    DriftReport, DriftRow, LiveRead, QueryNoticeDto, ReadyNode, ReadyView, ReadyWorkspace,
+    StaleWorktreeRow, UnsyncedTaskRow, WorkspaceOverview,
 };
 pub use error::{QueryError, Result};
 pub use service::QueryService;

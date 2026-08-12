@@ -72,25 +72,6 @@ pub struct ContributorRow {
     pub by_status: BTreeMap<String, usize>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadyTaskRow {
-    pub task_id: String,
-    pub title: String,
-    pub status: String,
-    pub sync_state: String,
-    pub priority: String,
-    pub assignees: Vec<String>,
-    /// Local issue type (RFC 0006, #236), e.g. `"bug"` / `"Story"`. `None` when
-    /// the task carries no type. Local-only — never a network read.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub issue_type: Option<String>,
-    /// CURRENT cached board status display name (e.g. `"Ready"`) — the same
-    /// cached-status resolution `drift` uses (`project_status_option_id` →
-    /// `Project::option_name_for`). `None` when projectless or not yet polled.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_status: Option<String>,
-}
-
 /// One node of a workspace's ready frontier tree. A node is a task: it is
 /// itself ready (`ready: true` — the actionable fields are populated), or it
 /// is a container heading (`ready: false` — an open/closed parent whose
@@ -111,6 +92,17 @@ pub struct ReadyNode {
     /// Assignees of a ready node. Empty for a pure container heading.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub assignees: Vec<String>,
+    /// Local issue type (RFC 0006, #236), e.g. `"bug"` / `"Story"`. `None` when
+    /// the task carries no type, or on a container heading. Local-only — never a
+    /// network read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
+    /// CURRENT cached board status display name (e.g. `"Ready"`) — the same
+    /// cached-status resolution `drift` uses (`project_status_option_id` →
+    /// `Project::option_name_for`). `None` when projectless, not yet polled, or
+    /// on a container heading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_status: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ReadyNode>,
 }
@@ -287,20 +279,6 @@ mod tests {
                     project_status: None,
                     project_status_expected: None,
                     last_refreshed_at: None,
-                })
-                .unwrap(),
-            ),
-            (
-                "ReadyTaskRow",
-                serde_json::to_value(ReadyTaskRow {
-                    task_id: "rpl-2".into(),
-                    title: "t".into(),
-                    status: "open".into(),
-                    sync_state: "local_only".into(),
-                    priority: "p3".into(),
-                    assignees: vec![],
-                    issue_type: None,
-                    project_status: None,
                 })
                 .unwrap(),
             ),
