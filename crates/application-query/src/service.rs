@@ -744,6 +744,64 @@ fn parent_task<'a>(
     direct.or_else(|| reverse.get(&t.id).copied())
 }
 
+/// The read-only shape a single [`ReadyTreeCtx::node`] call resolves against:
+/// which tasks exist in this workspace, which of them are ready, the
+/// parent→children inversion, the kept set, the branch sort key, and the
+/// workspace's project for cached board status.
+struct ReadyTreeCtx<'a> {
+    id_of: &'a HashMap<TaskId, &'a Task>,
+    ready_ids: &'a HashSet<TaskId>,
+    children: &'a HashMap<TaskId, Vec<TaskId>>,
+    kept: &'a HashSet<TaskId>,
+    rank: &'a HashMap<TaskId, Priority>,
+    project: Option<&'a Project>,
+}
+
+impl ReadyTreeCtx<'_> {
+    /// One node and its kept descendants. `visiting` is the current build path:
+    /// the domain rejects parent/child cycles, so a re-entry only occurs on a
+    /// corrupt or legacy row — skipping it keeps the shape a tree instead of
+    /// recursing forever.
+    fn node(&self, id: TaskId, visiting: &mut HashSet<TaskId>) -> ReadyNode {
+        let task = self.id_of[&id];
+        let ready = self.ready_ids.contains(&id);
+        let mut kids: Vec<TaskId> = self
+            .children
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|c| self.kept.contains(c) && !visiting.contains(c))
+            .collect();
+        kids.sort_by(|a, b| {
+            self.rank[a]
+                .cmp(&self.rank[b])
+                .then_with(|| self.id_of[a].title.cmp(&self.id_of[b].title))
+        });
+        visiting.insert(id);
+        let children = kids.into_iter().map(|c| self.node(c, visiting)).collect();
+        ReadyNode {
+            task_id: task.id.to_string(),
+            title: task.title.clone(),
+            ready,
+            status: ready.then(|| enum_str(&task.lifecycle)),
+            priority: ready.then(|| enum_str(&task.priority)),
+            assignees: if ready {
+                task.assignees.clone()
+            } else {
+                Vec::new()
+            },
+            issue_type: ready
+                .then(|| task.issue_type.as_ref().map(enum_str))
+                .flatten(),
+            project_status: ready
+                .then(|| cached_project_status(self.project, task))
+                .flatten(),
+            children,
+        }
+    }
+}
+
 /// Build the nested ready frontier for one workspace.
 ///
 /// Nodes are the ready tasks plus every in-workspace ancestor of a ready task
@@ -812,74 +870,18 @@ fn build_ready_tree<'a>(
         .collect();
     roots.sort_by(order);
 
-    fn node(
-        id: domain_core::TaskId,
-        id_of: &HashMap<domain_core::TaskId, &domain_task::Task>,
-        ready_ids: &HashSet<domain_core::TaskId>,
-        children: &HashMap<domain_core::TaskId, Vec<domain_core::TaskId>>,
-        kept: &HashSet<domain_core::TaskId>,
-        rank: &HashMap<domain_core::TaskId, Priority>,
-        project: Option<&Project>,
-        visiting: &mut HashSet<domain_core::TaskId>,
-    ) -> ReadyNode {
-        let task = id_of[&id];
-        let ready = ready_ids.contains(&id);
-        // Drop children already on the current build path: the domain rejects
-        // parent/child cycles, so a re-entry only occurs on a corrupt/legacy
-        // row — skipping it keeps the shape a tree without recursing forever.
-        let mut kids: Vec<domain_core::TaskId> = children
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .copied()
-            .filter(|c| kept.contains(c) && !visiting.contains(c))
-            .collect();
-        kids.sort_by(|a, b| {
-            rank[a]
-                .cmp(&rank[b])
-                .then_with(|| id_of[a].title.cmp(&id_of[b].title))
-        });
-        visiting.insert(id);
-        let children = kids
-            .into_iter()
-            .map(|c| node(c, id_of, ready_ids, children, kept, rank, project, visiting))
-            .collect();
-        ReadyNode {
-            task_id: task.id.to_string(),
-            title: task.title.clone(),
-            ready,
-            status: ready.then(|| enum_str(&task.lifecycle)),
-            priority: ready.then(|| enum_str(&task.priority)),
-            assignees: if ready {
-                task.assignees.clone()
-            } else {
-                Vec::new()
-            },
-            issue_type: ready
-                .then(|| task.issue_type.as_ref().map(enum_str))
-                .flatten(),
-            project_status: ready
-                .then(|| cached_project_status(project, task))
-                .flatten(),
-            children,
-        }
-    }
-
+    let ctx = ReadyTreeCtx {
+        id_of: &id_of,
+        ready_ids,
+        children: &children,
+        kept: &kept,
+        rank: &rank,
+        project,
+    };
     let mut visiting = HashSet::new();
     roots
         .into_iter()
-        .map(|id| {
-            node(
-                id,
-                &id_of,
-                ready_ids,
-                &children,
-                &kept,
-                &rank,
-                project,
-                &mut visiting,
-            )
-        })
+        .map(|id| ctx.node(id, &mut visiting))
         .collect()
 }
 
