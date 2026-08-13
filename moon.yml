@@ -1,0 +1,37 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+layer: 'application'
+
+env:
+  CARGO_TERM_COLOR: 'always'
+
+fileGroups:
+  sources:
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'crates/*/Cargo.toml'
+    - 'crates/*/src/**/*'
+    - 'crates/*/migrations/**/*'
+  tests:
+    - 'crates/*/tests/**/*'
+    - 'crates/*/examples/**/*'
+
+tasks:
+  fmt:
+    command: 'cargo fmt --all -- --check'
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+
+  lint:
+    command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
+
+  test:
+    command: 'cargo test --workspace --all-targets'
+    inputs:
+      - '@globs(sources)'
+      - '@globs(tests)'
