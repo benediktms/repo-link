@@ -13,6 +13,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every job checks out with fetch-depth: 0 — moon resolves changed files
+# against the PR base branch, and a shallow checkout leaves it with no `main`
+# ref, so it exits 128 before running cargo.
+
 jobs:
   fmt:
     name: fmt
@@ -21,10 +25,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - uses: moonrepo/setup-toolchain@v0.6.4
+        with:
+          moon-version: '2.4.6'
+      - run: moon run root:fmt
 
   clippy:
     name: clippy (${{ matrix.os }})
@@ -39,13 +47,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: clippy-${{ matrix.os }}
-      - run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+      - uses: moonrepo/setup-toolchain@v0.6.4
+        with:
+          moon-version: '2.4.6'
+      - run: moon run root:lint
 
   test:
     name: test (${{ matrix.os }})
@@ -58,8 +70,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
-      - run: cargo test --workspace --all-targets
+      - uses: moonrepo/setup-toolchain@v0.6.4
+        with:
+          moon-version: '2.4.6'
+      - run: moon run root:test

@@ -1,0 +1,40 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+layer: 'application'
+
+env:
+  CARGO_TERM_COLOR: 'always'
+
+fileGroups:
+  sources:
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+    - 'crates/*/Cargo.toml'
+    - 'crates/*/src/**/*'
+    - 'crates/*/migrations/**/*'
+  tests:
+    - 'crates/*/tests/**/*'
+    - 'crates/*/examples/**/*'
+    # app-cli's install_recipes_keep_platform_binary_names reads the justfile
+    # with include_str!, so editing it changes that test's result.
+    - 'justfile'
+
+tasks:
+  fmt:
+    command: 'cargo fmt --all -- --check'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+
+  lint:
+    command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'
+
+  test:
+    command: 'cargo test --workspace --all-targets'
+    inputs:
+      - '@group(sources)'
+      - '@group(tests)'

@@ -9,10 +9,45 @@ rl := "./target/release/rl"
 
 set windows-shell := ["powershell.exe", "-NoLogo", "-NoProfile", "-Command"]
 
-default: list
-
-list:
+default:
     @just --list
+
+# ── Checks ────────────────────────────────────────────────────────────────
+
+# check is the only moon recipe: it is the CI contract, so it takes no
+# narrowing arguments. lint and test call cargo directly because moon hashes
+# the workspace sources and not the argument — a cached moon run would answer
+# for the wrong crate.
+
+# Run fmt, lint, and test exactly as CI runs them
+[group('checks')]
+check:
+    moon run root:fmt root:lint root:test
+
+alias c := check
+
+# Auto-format all code
+[group('checks')]
+fmt:
+    cargo fmt --all
+
+alias f := fmt
+
+# Lint, warnings denied (e.g. just l -p domain-task)
+[group('checks')]
+lint *args="--workspace":
+    cargo clippy {{args}} --all-targets --no-deps -- -D warnings
+
+alias l := lint
+
+# Run tests (e.g. just t -p domain-task, just t --no-fail-fast)
+[group('checks')]
+test *args="--workspace --all-targets":
+    cargo test {{args}}
+
+alias t := test
+
+# ── Install ───────────────────────────────────────────────────────────────
 
 # install — idempotency notes:
 #   - `cargo build --release` is a no-op when the build is up to date.
@@ -28,12 +63,13 @@ list:
 # predates this feature.
 
 # Build, symlink into ~/.local/bin, and load the daemon unit.
+[group('install')]
 [unix]
 install:
     cargo build --release
     mkdir -p ~/.local/bin
-    ln -sf "$(pwd)/target/release/rl"  ~/.local/bin/rl
-    ln -sf "$(pwd)/target/release/rld" ~/.local/bin/rld
+    ln -sf "{{justfile_directory()}}/target/release/rl"  ~/.local/bin/rl
+    ln -sf "{{justfile_directory()}}/target/release/rld" ~/.local/bin/rld
     {{rl}} daemon install
 
 # Build, copy Windows executables into ~/.local/bin, and register the task.
@@ -44,6 +80,7 @@ install:
 # instead — that is the image the task runs and the one the copy overwrites,
 # and there is nothing to stop before the first install. The stop is issued
 # through the freshly built `rl.exe`, which the `cargo build` above guarantees.
+[group('install')]
 [windows]
 install:
     cargo build --release
@@ -62,6 +99,7 @@ install:
 # still useful.
 
 # Unload the unit, delete the manifest, remove the ~/.local/bin symlinks.
+[group('install')]
 [unix]
 uninstall:
     if [ -x {{rl}} ]; then {{rl}} daemon uninstall; \
@@ -73,16 +111,20 @@ uninstall:
 # extensionless installs. The daemon step must precede the deletions: it
 # terminates the running `rld.exe`, which would otherwise hold a lock on its
 # own file.
+[group('install')]
 [windows]
 uninstall:
     $rl = @(".\target\release\rl.exe", (Join-Path $env:USERPROFILE ".local\bin\rl.exe")) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1; if ($rl) { & $rl daemon uninstall } else { Write-Host "rl not built and not installed; skipping daemon uninstall" }
     $installed = @((Join-Path $env:USERPROFILE ".local\bin\rl.exe"), (Join-Path $env:USERPROFILE ".local\bin\rld.exe"), (Join-Path $env:USERPROFILE ".local\bin\rl"), (Join-Path $env:USERPROFILE ".local\bin\rld")); $installed | Where-Object { Test-Path -LiteralPath $_ } | Remove-Item -Force -ErrorAction Stop
+
+# ── Daemon ────────────────────────────────────────────────────────────────
 
 # daemon-restart — `stop` can legitimately fail when the unit was never
 # installed; `|| true` keeps the recipe useful mid-recovery so `start`
 # always runs.
 
 # Toggle the persistent unit off then on.
+[group('daemon')]
 [unix]
 daemon-restart:
     {{rl}} daemon stop  || true
@@ -91,6 +133,7 @@ daemon-restart:
 # No `|| true` counterpart: `rl daemon stop` on Windows already treats an
 # unregistered task as a no-op (`tolerate_missing_task` covers both `schtasks
 # /End` and `/Change /DISABLE`), so there is nothing for it to swallow.
+[group('daemon')]
 [windows]
 daemon-restart:
     .\target\release\rl.exe daemon stop
@@ -99,6 +142,7 @@ daemon-restart:
 # logs — convenience alias for the first-class CLI command.
 
 # Tail the daemon log file.
+[group('daemon')]
 logs:
     {{rl}} daemon logs --follow
 
@@ -106,6 +150,7 @@ logs:
 # prune enabled so the grace counter exercises locally.
 
 # Run rld in the foreground with dev-friendly flags.
+[group('daemon')]
 dev:
     cargo build
     ./target/debug/rld --interval-secs 10 --prune --log-format pretty
