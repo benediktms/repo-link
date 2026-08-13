@@ -16,22 +16,25 @@ fileGroups:
   tests:
     - 'crates/*/tests/**/*'
     - 'crates/*/examples/**/*'
+    # app-cli's install_recipes_keep_platform_binary_names reads the justfile
+    # with include_str!, so editing it changes that test's result.
+    - 'justfile'
 
 tasks:
   fmt:
     command: 'cargo fmt --all -- --check'
     inputs:
-      - '@globs(sources)'
-      - '@globs(tests)'
+      - '@group(sources)'
+      - '@group(tests)'
 
   lint:
     command: 'cargo clippy --workspace --all-targets --no-deps -- -D warnings'
     inputs:
-      - '@globs(sources)'
-      - '@globs(tests)'
+      - '@group(sources)'
+      - '@group(tests)'
 
   test:
     command: 'cargo test --workspace --all-targets'
     inputs:
-      - '@globs(sources)'
-      - '@globs(tests)'
+      - '@group(sources)'
+      - '@group(tests)'

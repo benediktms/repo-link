@@ -13,13 +13,15 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
+# Every job checks out with fetch-depth: 0 — moon resolves changed files
+# against the PR base branch, and a shallow checkout leaves it with no `main`
+# ref, so it exits 128 before running cargo.
+
 jobs:
   fmt:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      # moon resolves changed files against the PR base branch, so a shallow
-      # checkout leaves it with no `main` ref and it exits 128.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -42,8 +44,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      # moon resolves changed files against the PR base branch, so a shallow
-      # checkout leaves it with no `main` ref and it exits 128.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -67,8 +67,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      # moon resolves changed files against the PR base branch, so a shallow
-      # checkout leaves it with no `main` ref and it exits 128.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
