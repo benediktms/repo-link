@@ -778,8 +778,8 @@ pub(crate) enum SyncCmd {
         #[command(flatten)]
         t: TaskArg,
         /// Force local-wins: push a task stuck in Conflict, treating the local
-        /// content as the resolution (discards the remote divergence). Escape
-        /// hatch for an unresolved manual merge.
+        /// content as the resolution (discards the remote divergence). The one
+        /// way to make local content outrank GitHub.
         #[arg(long)]
         force: bool,
     },
@@ -787,9 +787,9 @@ pub(crate) enum SyncCmd {
     Pull {
         #[command(flatten)]
         t: TaskArg,
-        /// Force remote-wins: on a manual-merge conflict, accept the remote and
-        /// clear the conflict (discards the local divergence). Escape hatch for
-        /// an unresolved manual merge.
+        /// Also discard local edits the remote has not contradicted. A pull
+        /// already takes the remote whenever the two sides diverge; this adds
+        /// the "throw my pending edits away too" case.
         #[arg(long)]
         force: bool,
     },

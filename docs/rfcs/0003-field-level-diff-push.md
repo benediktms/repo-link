@@ -144,7 +144,7 @@ Labels touch all eight layers (a `Task` field, a `TaskSnapshot` column + migrati
 
 1. **Labels in or out of D1 scope** (D8). Recommendation is defer; the RFC owner decides.
 2. **`Some([])` semantics against octocrab / GitHub** — confirm an empty assignees array maps to an explicit clear, not an ignored field.
-3. **Daemon re-baseline + concurrent pull.** Today only push re-baselines. Having the drainer re-baseline on `UpdateRemote` success (D5) interacts with the `SyncPolicy::ManualMerge` conflict path; the conflict-window was not exercised.
+3. **Daemon re-baseline + concurrent pull.** Today only push re-baselines. Having the drainer re-baseline on `UpdateRemote` success (D5) interacts with the divergence path in `decide()`; the conflict-window was not exercised. (#290 replaced that path's `SyncPolicy::ManualMerge` arbitration with remote-wins.)
 4. **Direct-on-GitHub assignee edits.** Whether whole-set replacement can clobber them between syncs, and whether `decide()`'s ordering protects against it.
 5. **`ConflictKind::AssigneeMismatch`** exists in `domain-sync` but is currently unused by `decide()` (which routes on `SyncState` + a precomputed bool, not per-field). Whether to activate a field-level conflict model is open and likely out of scope here.
 

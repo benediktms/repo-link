@@ -16,8 +16,6 @@ pub enum SyncError {
     NoRepo,
     #[error("task has no remote reference; promote it first")]
     NoRemote,
-    #[error("manual merge required for task {0}")]
-    ManualMerge(String),
     #[error(
         "cannot promote: {repo} already has {count} untracked issues matching this task ({issues}); \
          attach the right one with `rl task link` or edit the task so it no longer matches"
