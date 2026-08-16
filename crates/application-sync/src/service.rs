@@ -502,6 +502,11 @@ impl SyncService {
         self.pull_inner(task_id, true).await
     }
 
+    /// Freshness is not content change (same semantics as `--refresh`): every
+    /// reconcile decision, `Noop` included, has seen the live remote, so
+    /// `last_refreshed_at` advances on all of them and only a failed fetch
+    /// skips the stamp. The whole-row saves below cannot clobber it — they
+    /// deliberately never write `synced_at`.
     async fn pull_inner(&self, task_id: &str, force_accept_remote: bool) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
@@ -522,13 +527,6 @@ impl SyncService {
             .provider
             .fetch_remote(&filing_canonical, &remote.remote_id)
             .await?;
-        // The remote was just observed — stamp the write-through freshness
-        // column before the reconcile decision. Freshness ≠ content change
-        // (same semantics as `--refresh`): a Noop pull, and even the
-        // manual-merge conflict that errors out below, still saw the live
-        // remote, so `last_refreshed_at` must advance. Only a failed fetch
-        // (early return above) skips the stamp. The whole-row saves further
-        // down can't clobber this: they deliberately never write `synced_at`.
         self.tasks
             .cache_synced_at(id, Timestamp::now(), SyncedSource::Pull)
             .await?;

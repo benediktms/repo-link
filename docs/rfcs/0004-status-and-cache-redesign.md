@@ -499,11 +499,11 @@ explain the gap.
   adopts it (open→closed defaults to `Completed`; the `NotPlanned` distinction
   needs the issue `state_reason`, which is not fetched inbound — a later
   follow-up). A local lifecycle edit vs. a remote flip is handled by the
-  existing generic `decide()` divergence path, so the unused
-  `ConflictKind::StatusMismatch` variant stays dormant — no per-kind conflict
-  plumbing is introduced. (Amended by #290: that path resolved to
-  `RequireManualMerge` when this was written; GitHub authority made it
-  `PullRemote`, and `SyncPolicy` is gone.)
+  existing generic `decide()` divergence path, so the
+  `ConflictKind::StatusMismatch` variant is deleted rather than wired up (D5,
+  Phase 5) — no per-kind conflict plumbing is introduced. (Amended by #290:
+  that path resolved to `RequireManualMerge` when this was written; GitHub
+  authority made it `PullRemote`, and `SyncPolicy` is gone.)
 - **The poller does a single `updated:>` floor without a per-task
   decision.** This is the status quo. Rejected: a remote move on
   one task forces the poller to re-fetch every task in the same
