@@ -21,8 +21,8 @@ use ports::{
 
 use crate::error::{Result, SyncError};
 use crate::summary::{
-    ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary,
-    summary_with_note, summary_with_note_and_messages,
+    ensure_not_archived, link_summary, provider_label, remote_mirrors_baseline, summary_with_note,
+    summary_with_note_and_messages,
 };
 
 /// Outcome of [`SyncService::refresh`] (`rl task show --refresh`, RFC 0004 D4).
@@ -37,6 +37,10 @@ pub enum RefreshOutcome {
     /// The remote was observed and `synced_at` was stamped.
     Stamped,
 }
+
+/// Look-back window for the promote orphan scan (see
+/// [`SyncService::find_promoted_orphan`]).
+const PROMOTE_ORPHAN_WINDOW_HOURS: i64 = 24;
 
 pub struct SyncService {
     tasks: Arc<dyn TaskRepository>,
@@ -98,6 +102,19 @@ impl SyncService {
     /// workspace default the chain collapses to the logical repo, so filing is
     /// unchanged from before RFC 0002. `previous_state` / `new_state` in the
     /// summary describe the **sync** state — lifecycle stays untouched.
+    ///
+    /// **Ordering is load-bearing (#282).** `Staged` and the resolved filing repo
+    /// are persisted *before* `create_remote`, so a crash between the remote call
+    /// and the final save leaves a durable record instead of a task that still
+    /// reads `LocalOnly` and a retry that files a duplicate. A retry — entry state
+    /// `Staged`, no remote — therefore runs [`Self::find_promoted_orphan`] first.
+    /// Moving the save after the create silently reinstates the duplicate.
+    ///
+    /// **Single-writer per task.** That guard recovers a *crashed* promote, not two
+    /// promotes racing: both would stage, both would scan an empty remote, and both
+    /// would create. Serializing concurrent writers is the optimistic-concurrency
+    /// work in #283, whose expected-version check fails the second staging write
+    /// before it ever reaches `create_remote`.
     pub async fn promote(&self, task_id: &str) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
@@ -141,16 +158,38 @@ impl SyncService {
         task.set_filing_repo_id(filing)?;
         let filing_canonical = self.filing_canonical_for(&task).await?;
 
-        let snap = self
-            .provider
-            .create_remote(RemoteTaskCreate {
-                canonical_repo: &filing_canonical,
-                title: &task.title,
-                body: &task.body,
-                assignees: &task.assignees,
-                labels: &[],
-            })
-            .await?;
+        let may_have_run = prev == SyncState::Staged;
+        if !may_have_run || filing_origin != recorded_origin {
+            self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
+        }
+
+        let adopted = if may_have_run {
+            self.find_promoted_orphan(&task, &filing_canonical, filing_origin)
+                .await?
+        } else {
+            None
+        };
+        let adopted_note = adopted.as_ref().map(|s| {
+            format!(
+                "adopted the existing untracked issue #{} in {filing_canonical} instead of \
+                 creating a new one (a previous promote reached GitHub but did not persist)",
+                s.remote_id
+            )
+        });
+        let snap = match adopted {
+            Some(snap) => snap,
+            None => {
+                self.provider
+                    .create_remote(RemoteTaskCreate {
+                        canonical_repo: &filing_canonical,
+                        title: &task.title,
+                        body: &task.body,
+                        assignees: &task.assignees,
+                        labels: &[],
+                    })
+                    .await?
+            }
+        };
 
         let mut remote_ref =
             RemoteRef::new(provider_label(&filing_canonical), snap.remote_id.clone());
@@ -264,7 +303,73 @@ impl SyncService {
         self.tasks
             .save_with_outbox(&task, SnapshotSource::Promote, &entries)
             .await?;
-        Ok(summary(&task, prev, SyncDecision::PushLocal))
+        Ok(summary_with_note(
+            &task,
+            prev,
+            SyncDecision::PushLocal,
+            adopted_note,
+        ))
+    }
+
+    /// Look for the issue a crashed promote already created for `task` (#282).
+    ///
+    /// The correlation key is title AND body against an issue the filing repo
+    /// carries but no local task mirrors. Body is what makes the match safe: a
+    /// coincidental title collision with an unrelated issue is plausible, a
+    /// collision on both fields is the orphan we filed. `assignees` stays out
+    /// of the key — GitHub silently drops a login it cannot assign.
+    ///
+    /// Returns `None` when nothing matches, so the caller creates as before.
+    ///
+    /// ponytail: a fixed look-back window bounds the listing; an orphan older
+    /// than that is recovered with `rl task link` instead. Widen the window
+    /// only if a real retry is ever found to fall outside it.
+    async fn find_promoted_orphan(
+        &self,
+        task: &Task,
+        filing_canonical: &str,
+        filing_origin: Option<RepoOriginId>,
+    ) -> Result<Option<ports::RemoteTaskSnapshot>> {
+        let Some(origin) = filing_origin else {
+            return Ok(None);
+        };
+        let since = Timestamp::from_utc(
+            Timestamp::now().into_inner() - chrono::Duration::hours(PROMOTE_ORPHAN_WINDOW_HOURS),
+        );
+        let matching: Vec<ports::RemoteTaskSnapshot> = self
+            .provider
+            .list_changed_since(filing_canonical, since)
+            .await?
+            .into_iter()
+            .filter(|s| s.title == task.title && s.body == task.body)
+            .collect();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+
+        let remote_ids: Vec<String> = matching.iter().map(|s| s.remote_id.clone()).collect();
+        let tracked = self
+            .tasks
+            .tracked_remote_ids(origin, &provider_label(filing_canonical), &remote_ids)
+            .await?;
+        let mut untracked: Vec<ports::RemoteTaskSnapshot> = matching
+            .into_iter()
+            .filter(|s| !tracked.contains(&s.remote_id))
+            .collect();
+
+        match untracked.len() {
+            0 => Ok(None),
+            1 => Ok(Some(untracked.remove(0))),
+            count => Err(SyncError::AmbiguousPromoteTarget {
+                repo: filing_canonical.to_string(),
+                count,
+                issues: untracked
+                    .iter()
+                    .map(|s| format!("#{}", s.remote_id))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
+        }
     }
 
     // TODO(online-sync-mode): the current model is "edit locally, daemon
@@ -1582,6 +1687,7 @@ mod tests {
         // list-remote tests can assert filing-first grouping + the window.
         list_returns: Mutex<HashMap<String, Vec<RemoteTaskSnapshot>>>,
         list_calls: Mutex<Vec<(String, Timestamp)>>,
+        create_fails: Mutex<bool>,
     }
 
     impl FakeProvider {
@@ -1669,6 +1775,9 @@ mod tests {
         }
 
         async fn create_remote(&self, cmd: RemoteTaskCreate<'_>) -> PortResult<RemoteTaskSnapshot> {
+            if *self.create_fails.lock().unwrap() {
+                return Err(ports::PortError::Backend("create failed".into()));
+            }
             *self.last_create.lock().unwrap() = Some(cmd.title.to_string());
             *self.last_create_canonical.lock().unwrap() = Some(cmd.canonical_repo.to_string());
             Ok(RemoteTaskSnapshot {
@@ -2315,6 +2424,243 @@ mod tests {
             saved.remote.unwrap().node_id.as_deref(),
             Some("I_kwDOfake100")
         );
+    }
+
+    /// Build the issue a crashed promote would have left behind: same title and
+    /// body as `task`, untracked by any local task.
+    fn orphan_snap(remote_id: &str, task: &Task) -> RemoteTaskSnapshot {
+        RemoteTaskSnapshot {
+            remote_id: remote_id.into(),
+            node_id: Some(format!("I_kwDOfake{remote_id}")),
+            title: task.title.clone(),
+            body: task.body.clone(),
+            closed: false,
+            updated_at: Timestamp::from_utc(Utc::now()),
+            assignees: vec![],
+            labels: vec![],
+        }
+    }
+
+    /// Put `task` in the state a promote that reached GitHub but never
+    /// persisted its result leaves behind: durably `Staged`, still no remote.
+    async fn stage(tasks: &InMemoryTaskRepository, task: &Task) -> Task {
+        let mut staged = task.clone();
+        staged.stage_for_sync().unwrap();
+        tasks
+            .save(&staged, SnapshotSource::LocalEdit)
+            .await
+            .unwrap();
+        staged
+    }
+
+    #[tokio::test]
+    async fn promote_stages_durably_before_calling_the_remote() {
+        // #282: the Staged transition must be committed BEFORE `create_remote`,
+        // so a crash after the create leaves a local record the retry can
+        // recognise. A failing create stands in for the crash: whatever the
+        // remote did, the task must already be off `LocalOnly` on disk.
+        let (svc, tasks, task, provider) = setup().await;
+        *provider.create_fails.lock().unwrap() = true;
+
+        svc.promote(&task.id.to_string()).await.unwrap_err();
+
+        let saved = tasks.get(task.id).await.unwrap();
+        assert_eq!(saved.sync, SyncState::Staged);
+        assert!(saved.remote.is_none());
+    }
+
+    #[tokio::test]
+    async fn promote_retry_adopts_the_orphan_instead_of_creating_a_duplicate() {
+        // #282: the previous attempt filed #77 and died before writing back.
+        // The retry must adopt #77, not file a second issue.
+        let (svc, tasks, task, provider) = setup().await;
+        let staged = stage(&tasks, &task).await;
+        provider.set_list_returns("github.com/o/r", vec![orphan_snap("77", &staged)]);
+
+        let s = svc.promote(&staged.id.to_string()).await.unwrap();
+
+        assert_eq!(s.remote.as_ref().unwrap().remote_id, "77");
+        assert!(
+            provider.last_create.lock().unwrap().is_none(),
+            "adoption must not call create_remote"
+        );
+        assert!(
+            s.note.unwrap().contains("#77"),
+            "the summary must name the adopted issue"
+        );
+        let saved = tasks.get(staged.id).await.unwrap();
+        assert_eq!(saved.sync, SyncState::Synced);
+        assert_eq!(
+            saved.remote.unwrap().node_id.as_deref(),
+            Some("I_kwDOfake77")
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_persists_a_filing_repo_resolved_for_an_already_staged_task() {
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("staged-ws").unwrap(), None, true);
+        let origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace.id, origin.id, "github.com/o/filing".into(), None).unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+        workspace.filing_repo_id = Some(domain_core::RepoId::from_uuid(origin.id.as_uuid()));
+        workspaces.save(&workspace).await.unwrap();
+
+        let mut task = Task::new_draft(workspace.id, None, "ship it".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        assert!(tasks.get(task.id).await.unwrap().filing_repo_id.is_none());
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
+            provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
+        );
+        *provider.create_fails.lock().unwrap() = true;
+
+        svc.promote(&task.id.to_string()).await.unwrap_err();
+
+        assert_eq!(
+            tasks
+                .get(task.id)
+                .await
+                .unwrap()
+                .filing_repo_id
+                .map(|r| r.as_uuid()),
+            Some(origin.id.as_uuid()),
+            "a filing repo resolved for an already-staged task must be persisted before the create"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_retry_scans_the_originally_resolved_filing_repo() {
+        // #282 review: the pre-create write persists the RESOLVED
+        // `filing_repo_id` alongside `Staged`, not just the sync state. That
+        // ordering is load-bearing — the recorded value wins the D2 chain
+        // (`resolve_filing_repo` = override.or(ws_default).or(logical)), so a
+        // workspace default changed after the crash cannot redirect recovery to
+        // a repo the orphan was never filed in.
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("filing-ws").unwrap(), None, true);
+        let bind = async |slug: &str| {
+            let origin = RepoOrigin::new(
+                format!("git@github.com:o/{slug}.git"),
+                format!("github.com/o/{slug}"),
+            )
+            .unwrap();
+            bindings.save_origin(&origin).await.unwrap();
+            let instance = RepoInstance::new(
+                workspace.id,
+                origin.id,
+                format!("github.com/o/{slug}"),
+                None,
+            )
+            .unwrap();
+            bindings.save_instance(&instance).await.unwrap();
+            origin.id
+        };
+        let first = bind("filing-a").await;
+        let second = bind("filing-b").await;
+        workspace.filing_repo_id = Some(domain_core::RepoId::from_uuid(first.as_uuid()));
+        workspaces.save(&workspace).await.unwrap();
+
+        let task = Task::new_draft(workspace.id, None, "ship it".into()).unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
+            provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
+        );
+
+        // The first promote reaches GitHub (filing `o/filing-a`) and dies.
+        *provider.create_fails.lock().unwrap() = true;
+        svc.promote(&task.id.to_string()).await.unwrap_err();
+        let crashed = tasks.get(task.id).await.unwrap();
+        assert_eq!(crashed.sync, SyncState::Staged);
+        assert_eq!(
+            crashed.filing_repo_id.map(|r| r.as_uuid()),
+            Some(first.as_uuid()),
+            "the pre-create write must persist the resolved filing repo, not only Staged"
+        );
+
+        // The workspace default moves on, and the orphan sits in the ORIGINAL repo.
+        workspace.filing_repo_id = Some(domain_core::RepoId::from_uuid(second.as_uuid()));
+        workspaces.save(&workspace).await.unwrap();
+        provider.set_list_returns("github.com/o/filing-a", vec![orphan_snap("77", &crashed)]);
+        *provider.create_fails.lock().unwrap() = false;
+
+        let s = svc.promote(&task.id.to_string()).await.unwrap();
+
+        assert_eq!(s.remote.as_ref().unwrap().remote_id, "77");
+        assert!(
+            provider.last_create.lock().unwrap().is_none(),
+            "recovery must adopt the orphan in o/filing-a, not file a second issue in o/filing-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_retry_errors_when_two_untracked_issues_match() {
+        // Two candidates carry the same title AND body, so repo-link cannot
+        // pick one. Refuse and name both rather than guess or duplicate.
+        let (svc, tasks, task, provider) = setup().await;
+        let staged = stage(&tasks, &task).await;
+        provider.set_list_returns(
+            "github.com/o/r",
+            vec![orphan_snap("77", &staged), orphan_snap("78", &staged)],
+        );
+
+        let err = svc.promote(&staged.id.to_string()).await.unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("#77") && msg.contains("#78"), "got: {msg}");
+        assert!(
+            provider.last_create.lock().unwrap().is_none(),
+            "an ambiguous match must not create"
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_retry_creates_when_nothing_matches() {
+        // A Staged task with no orphan on the remote promotes exactly as
+        // before — the scan is a guard, not a new precondition. A same-titled
+        // issue with a DIFFERENT body is not a match.
+        let (svc, tasks, task, provider) = setup().await;
+        let staged = stage(&tasks, &task).await;
+        let mut decoy = orphan_snap("77", &staged);
+        decoy.body = "some other issue that happens to share a title".into();
+        provider.set_list_returns("github.com/o/r", vec![decoy]);
+
+        let s = svc.promote(&staged.id.to_string()).await.unwrap();
+
+        assert_eq!(s.remote.as_ref().unwrap().remote_id, "100");
+        assert_eq!(
+            provider.last_create.lock().unwrap().as_deref(),
+            Some("ship it")
+        );
+        assert!(s.note.is_none(), "a plain create carries no adoption note");
     }
 
     #[tokio::test]
