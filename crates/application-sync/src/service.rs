@@ -159,7 +159,7 @@ impl SyncService {
         let filing_canonical = self.filing_canonical_for(&task).await?;
 
         let may_have_run = prev == SyncState::Staged;
-        if !may_have_run {
+        if !may_have_run || filing_origin != recorded_origin {
             self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
         }
 
@@ -2493,6 +2493,56 @@ mod tests {
         assert_eq!(
             saved.remote.unwrap().node_id.as_deref(),
             Some("I_kwDOfake77")
+        );
+    }
+
+    #[tokio::test]
+    async fn promote_persists_a_filing_repo_resolved_for_an_already_staged_task() {
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let bindings = Arc::new(InMemoryRepoBindingRepository::new());
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let provider = Arc::new(FakeProvider::default());
+
+        let mut workspace = Workspace::new(WorkspaceName::new("staged-ws").unwrap(), None, true);
+        let origin = RepoOrigin::new(
+            "git@github.com:o/filing.git".into(),
+            "github.com/o/filing".into(),
+        )
+        .unwrap();
+        bindings.save_origin(&origin).await.unwrap();
+        let instance =
+            RepoInstance::new(workspace.id, origin.id, "github.com/o/filing".into(), None).unwrap();
+        bindings.save_instance(&instance).await.unwrap();
+        workspace.filing_repo_id = Some(domain_core::RepoId::from_uuid(origin.id.as_uuid()));
+        workspaces.save(&workspace).await.unwrap();
+
+        let mut task = Task::new_draft(workspace.id, None, "ship it".into()).unwrap();
+        task.stage_for_sync().unwrap();
+        tasks.save(&task, SnapshotSource::LocalEdit).await.unwrap();
+        assert!(tasks.get(task.id).await.unwrap().filing_repo_id.is_none());
+
+        let svc = SyncService::new(
+            tasks.clone(),
+            bindings.clone(),
+            workspaces.clone(),
+            Arc::new(InMemoryProjectRepository::new()),
+            provider.clone(),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+            Arc::new(InMemoryOutboxRepository::new()),
+        );
+        *provider.create_fails.lock().unwrap() = true;
+
+        svc.promote(&task.id.to_string()).await.unwrap_err();
+
+        assert_eq!(
+            tasks
+                .get(task.id)
+                .await
+                .unwrap()
+                .filing_repo_id
+                .map(|r| r.as_uuid()),
+            Some(origin.id.as_uuid()),
+            "a filing repo resolved for an already-staged task must be persisted before the create"
         );
     }
 
