@@ -18,6 +18,15 @@ pub enum SyncError {
     NoRemote,
     #[error("manual merge required for task {0}")]
     ManualMerge(String),
+    #[error(
+        "cannot promote: {repo} already has {count} untracked issues matching this task ({issues}); \
+         attach the right one with `rl task link` or edit the task so it no longer matches"
+    )]
+    AmbiguousPromoteTarget {
+        repo: String,
+        count: usize,
+        issues: String,
+    },
     #[error("task is archived; unarchive before syncing")]
     Archived,
 }

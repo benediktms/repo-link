@@ -56,10 +56,6 @@ pub(crate) fn link_summary(
     }
 }
 
-pub(crate) fn summary(task: &Task, prev: SyncState, decision: SyncDecision) -> SyncSummaryDto {
-    summary_with_note(task, prev, decision, None)
-}
-
 pub(crate) fn summary_with_note(
     task: &Task,
     prev: SyncState,
