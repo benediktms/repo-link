@@ -137,6 +137,38 @@ pub(crate) fn inbound_mirrors_baseline(
         && remote_closed != baseline.lifecycle.is_open()
 }
 
+/// Which inbound mirror fields [`copy_inbound_mirror_from_snap`] is about to
+/// overwrite with a different value — the fields GitHub supersedes on this
+/// pull. Named for the pull summary (#290) so a discarded local proposal is
+/// never silent; the caller decides whether the local side actually had a
+/// proposal to lose.
+///
+/// The status axis is compared through [`remote_state_to_lifecycle`], the same
+/// function the copy uses, so a lifecycle the copy preserves (`Completed`
+/// against a closed remote) is never reported as superseded.
+pub(crate) fn superseded_inbound_fields(
+    task: &Task,
+    remote_title: &str,
+    remote_body: &str,
+    remote_assignees: &[String],
+    remote_closed: bool,
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    if task.title != remote_title {
+        fields.push("title");
+    }
+    if task.body != remote_body {
+        fields.push("body");
+    }
+    if task.lifecycle != remote_state_to_lifecycle(remote_closed, task.lifecycle) {
+        fields.push("status");
+    }
+    if !assignees_equal(&task.assignees, remote_assignees) {
+        fields.push("assignees");
+    }
+    fields
+}
+
 /// Copy the inbound mirror set (title, body, assignees, open/closed) from a
 /// remote snapshot onto a live `Task`. Single source of truth for the copy
 /// shape — both the pull path and the relink path call this so a future PR that

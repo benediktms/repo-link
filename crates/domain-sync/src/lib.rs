@@ -7,4 +7,4 @@ mod policy;
 
 pub use filing::resolve_filing_repo;
 pub use outbox::{OutboxEntry, OutboxMutation, OutboxStatus};
-pub use policy::{ConflictKind, SyncDecision, SyncPolicy, decide};
+pub use policy::{ConflictKind, SyncDecision, decide};

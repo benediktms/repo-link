@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use domain_core::{RepoId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
-use domain_sync::{OutboxEntry, SyncDecision, SyncPolicy, decide, resolve_filing_repo};
+use domain_sync::{OutboxEntry, SyncDecision, decide, resolve_filing_repo};
 use domain_task::{RelationKind, RemoteRef, SnapshotSource, SyncState, Task};
 use domain_workspace::Workspace;
 
@@ -65,7 +65,6 @@ pub struct SyncService {
     /// issue identity in their payloads and per-task FIFO would drain them
     /// against the source stub. Writes still ride `save_with_outbox`.
     outbox: Arc<dyn OutboxRepository>,
-    policy: SyncPolicy,
 }
 
 impl SyncService {
@@ -86,13 +85,7 @@ impl SyncService {
             provider,
             org_issue_types,
             outbox,
-            policy: SyncPolicy::ManualMerge,
         }
-    }
-
-    pub fn with_policy(mut self, policy: SyncPolicy) -> Self {
-        self.policy = policy;
-        self
     }
 
     /// Stage (if needed) and promote a `LocalOnly`/`Staged` task to a remote
@@ -491,18 +484,29 @@ impl SyncService {
         Ok(summary_with_note(&task, prev, decision, note))
     }
 
-    /// Pull the latest remote snapshot and reconcile.
+    /// Pull the latest remote snapshot and reconcile. Comments mirror on every
+    /// decision, the `Noop` one included — comment activity is a separate axis
+    /// from title/body drift.
     pub async fn pull(&self, task_id: &str) -> Result<SyncSummaryDto> {
         self.pull_inner(task_id, false).await
     }
 
-    /// Pull and, on a manual-merge conflict, automatically accept the remote
-    /// (remote-wins): overwrite local divergence, rebaseline, and clear the
-    /// conflict. The CLI `--force` escape hatch for a task stuck in Conflict.
+    /// Pull and additionally discard a local-only proposal the remote has not
+    /// contradicted. Ordinary divergence already resolves remote-wins (#290);
+    /// this is the CLI `--force` for "throw my local edits away and take what
+    /// GitHub has", which plain `pull` leaves alone as a pending push.
+    ///
+    /// Scoped to `DirtyLocal`. `Staged` also decides `PushLocal`, but a promote
+    /// is still in flight there and the remote is not yet its authority.
     pub async fn pull_accept_remote(&self, task_id: &str) -> Result<SyncSummaryDto> {
         self.pull_inner(task_id, true).await
     }
 
+    /// Freshness is not content change (same semantics as `--refresh`): every
+    /// reconcile decision, `Noop` included, has seen the live remote, so
+    /// `last_refreshed_at` advances on all of them and only a failed fetch
+    /// skips the stamp. The whole-row saves below cannot clobber it — they
+    /// deliberately never write `synced_at`.
     async fn pull_inner(&self, task_id: &str, force_accept_remote: bool) -> Result<SyncSummaryDto> {
         let id: TaskId = task_id.parse()?;
         let mut task = self.tasks.get(id).await?;
@@ -523,13 +527,6 @@ impl SyncService {
             .provider
             .fetch_remote(&filing_canonical, &remote.remote_id)
             .await?;
-        // The remote was just observed — stamp the write-through freshness
-        // column before the reconcile decision. Freshness ≠ content change
-        // (same semantics as `--refresh`): a Noop pull, and even the
-        // manual-merge conflict that errors out below, still saw the live
-        // remote, so `last_refreshed_at` must advance. Only a failed fetch
-        // (early return above) skips the stamp. The whole-row saves further
-        // down can't clobber this: they deliberately never write `synced_at`.
         self.tasks
             .cache_synced_at(id, Timestamp::now(), SyncedSource::Pull)
             .await?;
@@ -564,21 +561,29 @@ impl SyncService {
             .as_ref()
             .map(|b| !remote_mirrors_baseline(&snap, b))
             .unwrap_or(true);
-        let decision = decide(task.sync, remote_changed, self.policy);
+        let decision = match decide(task.sync, remote_changed) {
+            SyncDecision::PushLocal
+                if force_accept_remote && task.sync == SyncState::DirtyLocal =>
+            {
+                SyncDecision::PullRemote
+            }
+            other => other,
+        };
 
-        // A conflict still records the conflicted state below, but we defer the
-        // error so comment mirroring (orthogonal to title/body drift) still runs.
-        let mut manual_merge: Option<String> = None;
-        let mut force_note: Option<String> = None;
+        let mut note: Option<String> = None;
         match decision {
             SyncDecision::Noop => {}
             SyncDecision::PullRemote => {
                 // Capture local state *before* remote overwrites it — this is the
                 // undo target if the user wants to revert the pull.
                 self.tasks.save(&task, SnapshotSource::PrePull).await?;
-                // Transition to DirtyRemote so confirm_synced accepts the Pull
-                // source (it requires Staged | DirtyLocal | DirtyRemote).
-                task.mark_dirty_remote()?;
+                let superseded = crate::superseded_inbound_fields(
+                    &task,
+                    &snap.title,
+                    &snap.body,
+                    &snap.assignees,
+                    snap.closed,
+                );
                 // Direct field assignment (bypassing setter helpers that would
                 // re-trigger dirty detection against the OLD baseline). The
                 // inbound set now includes the open/closed bit (RFC 0004 D1):
@@ -593,8 +598,16 @@ impl SyncService {
                     &snap.assignees,
                     snap.closed,
                 );
-                task.confirm_synced(SnapshotSource::Pull)?;
+                task.adopt_aligned_state(SnapshotSource::Pull)?;
                 self.tasks.save(&task, SnapshotSource::Pull).await?;
+                if matches!(prev, SyncState::DirtyLocal | SyncState::Conflict)
+                    && !superseded.is_empty()
+                {
+                    note = Some(format!(
+                        "github superseded local changes to {}; recover them with `rl task rollback`",
+                        superseded.join(", ")
+                    ));
+                }
             }
             SyncDecision::PushLocal => {
                 // TODO(rwr/push-on-pull): a PushLocal decision returned from
@@ -602,39 +615,8 @@ impl SyncService {
                 // call `sync push` explicitly to flush it; we could fold
                 // that into pull when we want a one-shot reconcile.
             }
-            SyncDecision::RequireManualMerge => {
-                if force_accept_remote {
-                    // Accept remote as truth (remote-wins): capture the local
-                    // pre-pull state as the undo target, overwrite the mirrored
-                    // fields from the fetched snapshot, then rebaseline and
-                    // clear the divergence — including a task already stuck in
-                    // Conflict (the `confirm_conflict_resolved` path).
-                    self.tasks.save(&task, SnapshotSource::PrePull).await?;
-                    crate::copy_inbound_mirror_from_snap(
-                        &mut task,
-                        &snap.title,
-                        &snap.body,
-                        &snap.assignees,
-                        snap.closed,
-                    );
-                    task.confirm_conflict_resolved(SnapshotSource::Pull)?;
-                    self.tasks.save(&task, SnapshotSource::Pull).await?;
-                    force_note = Some(
-                        "forced accept-remote: local divergence discarded, conflict resolved (remote-wins)"
-                            .to_string(),
-                    );
-                } else {
-                    task.mark_conflicted()?;
-                    self.tasks.save(&task, SnapshotSource::LocalEdit).await?;
-                    manual_merge = Some(task_id.to_string());
-                }
-            }
         }
 
-        // Mirror comments regardless of the snapshot decision (even on Noop or a
-        // manual-merge conflict): comment activity is orthogonal to title/body
-        // drift, and `replace_comments` writes no snapshot, so this can't cause
-        // the cosmetic-refresh churn the field-level pull guards against.
         let comments = self
             .provider
             .fetch_comments(&filing_canonical, &remote.remote_id)
@@ -650,15 +632,6 @@ impl SyncService {
             self.tasks.cache_remote_node_id(id, nid).await?;
         }
 
-        // Bail on a content conflict BEFORE reconciling relations. Reconcile
-        // mutates and saves the local graph, but the merge path returns an Err
-        // with no summary to carry the resulting notices — so reconciling here
-        // would change the graph silently. Relations reconcile on the next clean
-        // pull, once the human has resolved the merge.
-        if let Some(tid) = manual_merge {
-            return Err(SyncError::ManualMerge(tid));
-        }
-
         // Inbound relation reconcile (#150): bring local parent/child + blocked_by
         // edges in line with the issue's GitHub sub-issues, dependencies, and
         // parent. Orthogonal to the title/body drift decision. Applied via a plain
@@ -671,7 +644,7 @@ impl SyncService {
             .await?;
 
         Ok(summary_with_note_and_messages(
-            &task, prev, decision, force_note, messages,
+            &task, prev, decision, note, messages,
         ))
     }
 
@@ -4516,13 +4489,15 @@ mod tests {
         assert_eq!(after.comments[0].body, "from remote");
     }
 
+    /// #290: a local proposal that raced a newer remote change resolves
+    /// remote-wins. The task converges instead of parking in `Conflict`, the
+    /// discarded proposal survives as a `PrePull` snapshot, and the summary
+    /// names the fields GitHub replaced.
     #[tokio::test]
-    async fn pull_mirrors_comments_even_on_manual_merge_conflict() {
+    async fn pull_supersedes_a_local_edit_that_raced_a_remote_change() {
         let (svc, tasks, task, provider) = setup().await;
         svc.promote(&task.id.to_string()).await.unwrap();
 
-        // Local edit → DirtyLocal, and a newer remote → remote_dirty. Under the
-        // default ManualMerge policy this resolves to RequireManualMerge.
         let mut t = tasks.get(task.id).await.unwrap();
         t.mark_dirty_local().unwrap();
         t.set_body("local edit".into());
@@ -4546,14 +4521,100 @@ mod tests {
             created_at: Timestamp::from_utc(Utc::now()),
         }]);
 
-        let err = svc.pull(&task.id.to_string()).await.unwrap_err();
-        assert!(matches!(err, SyncError::ManualMerge(_)));
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "pull_remote");
+        assert_eq!(s.new_state, "synced");
+        let note = s.note.expect("supersession must not be silent");
+        assert!(note.contains("title"), "note names the fields: {note}");
+        assert!(note.contains("body"), "note names the fields: {note}");
 
-        // The conflict still surfaces an error, but comments are mirrored anyway.
         let after = tasks.get(task.id).await.unwrap();
-        assert_eq!(after.sync, SyncState::Conflict);
-        assert_eq!(after.comments.len(), 1);
+        assert_eq!(after.sync, SyncState::Synced);
+        assert_eq!(after.title, "remote title");
+        assert_eq!(after.body, "remote body");
+        assert_eq!(after.comments.len(), 1, "comments still mirror");
         assert_eq!(after.comments[0].body, "ping");
+
+        let snaps = tasks.snapshots_handle();
+        let snaps = snaps.lock().unwrap();
+        assert!(
+            snaps
+                .get(&task.id)
+                .unwrap()
+                .iter()
+                .any(|s| s.source == SnapshotSource::PrePull && s.body == "local edit"),
+            "the discarded proposal stays recoverable via rollback"
+        );
+    }
+
+    /// A task already parked in `Conflict` — the state the old manual-merge
+    /// path left behind, and the state `(DirtyRemote, differs)` still produces
+    /// — converges on an ordinary pull, with no `--force`.
+    #[tokio::test]
+    async fn pull_converges_a_task_stuck_in_conflict() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_conflicted().unwrap();
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: "remote title".into(),
+            body: "remote body".into(),
+            closed: false,
+            updated_at: Timestamp::now(),
+            assignees: vec![],
+            labels: vec![],
+        });
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "pull_remote");
+
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Synced);
+        assert_eq!(after.title, "remote title");
+    }
+
+    /// A local edit the remote never contradicted stays a pending push on a
+    /// plain pull, and is discarded only when `--force` asks for it.
+    #[tokio::test]
+    async fn pull_keeps_an_uncontradicted_local_edit_unless_forced() {
+        let (svc, tasks, task, provider) = setup().await;
+        svc.promote(&task.id.to_string()).await.unwrap();
+
+        let baseline = tasks.get(task.id).await.unwrap();
+        provider.set_fetch(RemoteTaskSnapshot {
+            remote_id: "100".into(),
+            node_id: None,
+            title: baseline.title.clone(),
+            body: baseline.body.clone(),
+            closed: false,
+            updated_at: Timestamp::now(),
+            assignees: vec![],
+            labels: vec![],
+        });
+
+        let mut t = tasks.get(task.id).await.unwrap();
+        t.mark_dirty_local().unwrap();
+        t.set_body("local edit".into());
+        tasks.save(&t, SnapshotSource::LocalEdit).await.unwrap();
+
+        let s = svc.pull(&task.id.to_string()).await.unwrap();
+        assert_eq!(s.decision, "push_local");
+        assert_eq!(
+            tasks.get(task.id).await.unwrap().body,
+            "local edit",
+            "a plain pull never discards an uncontradicted proposal"
+        );
+
+        let forced = svc.pull_accept_remote(&task.id.to_string()).await.unwrap();
+        assert_eq!(forced.decision, "pull_remote");
+        let after = tasks.get(task.id).await.unwrap();
+        assert_eq!(after.sync, SyncState::Synced);
+        assert_eq!(after.body, baseline.body);
     }
 
     #[tokio::test]

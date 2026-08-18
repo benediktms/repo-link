@@ -432,33 +432,40 @@ impl Task {
         Ok(())
     }
 
-    /// Resolve a divergent task in favor of the current in-memory content and
-    /// mark it synced — the CLI escape hatch for a task stuck in `Conflict`
-    /// (RFC 0004 D1, there is no other path out of Conflict). The application
-    /// layer decides which side wins before calling: accept-remote overwrites
-    /// the mirrored fields from the fetched snapshot first; accept-local
-    /// pushes local content (or keeps it) first. The full current snapshot
-    /// becomes the new alignment baseline, so `source` must be an alignment
-    /// event (`Push` / `Pull` / `ConflictResolve`). There is no per-field
-    /// variant here — use [`Task::confirm_synced_fields`] after a PATCH.
-    pub fn confirm_conflict_resolved(&mut self, source: SnapshotSource) -> Result<()> {
+    /// Adopt the current in-memory content as the aligned state and mark the
+    /// task `Synced`. The application layer decides which side won before
+    /// calling: an inbound pull overwrites the mirrored fields from the fetched
+    /// snapshot first; the forced local-wins push keeps local content. The full
+    /// current snapshot becomes the new alignment baseline, so `source` must be
+    /// an alignment event (`Push` / `Pull` / `ConflictResolve`). There is no
+    /// per-field variant here — use [`Task::confirm_synced_fields`] after a PATCH.
+    ///
+    /// Legal from every remote-backed divergence state, `Synced` included: under
+    /// GitHub authority (#290) a pull converges whatever the local side thought,
+    /// so the pull path must not have to pre-transition into `DirtyRemote` to be
+    /// admitted. `Staged` is rejected — a promote is still in flight and owns the
+    /// baseline — and `LocalOnly` has no remote to adopt from.
+    pub fn adopt_aligned_state(&mut self, source: SnapshotSource) -> Result<()> {
         if !matches!(
             source,
             SnapshotSource::Push | SnapshotSource::Pull | SnapshotSource::ConflictResolve
         ) {
             return Err(DomainError::validation(format!(
-                "confirm_conflict_resolved source must be Push/Pull/ConflictResolve, got {source:?}"
+                "adopt_aligned_state source must be Push/Pull/ConflictResolve, got {source:?}"
             )));
         }
         match self.sync {
-            SyncState::Conflict | SyncState::DirtyLocal | SyncState::DirtyRemote => {
+            SyncState::Synced
+            | SyncState::Conflict
+            | SyncState::DirtyLocal
+            | SyncState::DirtyRemote => {
                 self.sync = SyncState::Synced;
                 self.touch();
                 self.synced_baseline = Some(self.snapshot_view(source));
                 Ok(())
             }
             other => Err(DomainError::transition(format!(
-                "cannot resolve conflict from sync={other:?}"
+                "cannot adopt an aligned state from sync={other:?}"
             ))),
         }
     }
@@ -2453,32 +2460,32 @@ mod tests {
              ({needle}) still appears in: {offenders:#?}"
         );
     }
-    /// The CLI escape hatch: a task stuck in `Conflict` can be pushed back to
-    /// `Synced` via `confirm_conflict_resolved` (accept-remote after the app
-    /// layer copies the fetched snapshot, or accept-local after a local-wins
-    /// push) by rebaselining the current content as the new alignment point.
+    /// A task stuck in `Conflict` returns to `Synced` via
+    /// `adopt_aligned_state` (accept-remote after the app layer copies the
+    /// fetched snapshot, or accept-local after a local-wins push) by
+    /// rebaselining the current content as the new alignment point.
     #[test]
-    fn confirm_conflict_resolved_exits_conflict() {
+    fn adopt_aligned_state_exits_conflict() {
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
         t.mark_conflicted().unwrap();
         assert_eq!(t.sync, SyncState::Conflict);
 
-        t.confirm_conflict_resolved(SnapshotSource::Pull).unwrap();
+        t.adopt_aligned_state(SnapshotSource::Pull).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
         assert!(t.synced_baseline.is_some(), "rebaselines current content");
     }
 
     #[test]
-    fn confirm_conflict_resolved_requires_an_alignment_source() {
+    fn adopt_aligned_state_requires_an_alignment_source() {
         let mut t = draft();
         t.stage_for_sync().unwrap();
         t.promote_to_remote(remote_ref()).unwrap();
         t.mark_conflicted().unwrap();
 
         let err = t
-            .confirm_conflict_resolved(SnapshotSource::LocalEdit)
+            .adopt_aligned_state(SnapshotSource::LocalEdit)
             .unwrap_err();
         assert!(
             err.to_string()
@@ -2487,17 +2494,33 @@ mod tests {
         assert_eq!(t.sync, SyncState::Conflict, "rejected source leaves state");
     }
 
+    /// A pull that finds newer remote content runs against a `Synced` task, so
+    /// the transition must admit `Synced` and re-baseline it (#290).
     #[test]
-    fn confirm_conflict_resolved_from_synced_is_rejected() {
+    fn adopt_aligned_state_rebaselines_a_synced_task() {
         let mut t = draft();
         t.stage_for_sync().unwrap();
-        // promote_to_remote lands the task Synced; no divergence to resolve.
         t.promote_to_remote(remote_ref()).unwrap();
         assert_eq!(t.sync, SyncState::Synced);
+
+        t.title = "from github".into();
+        t.adopt_aligned_state(SnapshotSource::Pull).unwrap();
+        assert_eq!(t.sync, SyncState::Synced);
+        assert_eq!(
+            t.synced_baseline.as_ref().unwrap().title,
+            "from github",
+            "the adopted content becomes the new baseline"
+        );
+    }
+
+    #[test]
+    fn adopt_aligned_state_from_staged_is_rejected() {
+        let mut t = draft();
+        t.stage_for_sync().unwrap();
+        assert_eq!(t.sync, SyncState::Staged);
         assert!(
-            t.confirm_conflict_resolved(SnapshotSource::ConflictResolve)
-                .is_err(),
-            "resolving a non-divergent task must error"
+            t.adopt_aligned_state(SnapshotSource::Pull).is_err(),
+            "a promote in flight owns the baseline"
         );
     }
 
