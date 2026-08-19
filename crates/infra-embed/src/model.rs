@@ -139,21 +139,56 @@ fn largest_fit(
 
 /// Pick the fastest available inference device (RFC 0007 D7): CUDA when the
 /// `cuda` feature is enabled and a GPU is present, Metal on macOS, else CPU.
-/// Every candidate falls back gracefully when its backend is absent.
+/// Every candidate falls back gracefully when its backend is absent, including
+/// when the backend reports absence by panicking (see [`probe_device`]).
 fn pick_device() -> Device {
     #[cfg(feature = "cuda")]
     {
-        if let Ok(d) = candle_core::Device::cuda_if_available(0) {
+        if let Some(d) = probe_device(|| candle_core::Device::cuda_if_available(0)) {
             return d;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        if let Ok(d) = candle_core::Device::metal_if_available(0) {
+        if let Some(d) = probe_device(|| candle_core::Device::metal_if_available(0)) {
             return d;
         }
     }
     Device::Cpu
+}
+
+/// Run one accelerator probe, treating an error *and* a panic inside the
+/// backend as "this device is not available". candle's Metal probe panics
+/// (`swap_remove index (is 0) should be < len (is 0)`) instead of returning
+/// `Err` when the system exposes no Metal device, which crashed every command
+/// that loads a model.
+///
+/// ponytail: the panic hook is process-global, so a probe silences the message
+/// of any panic racing it on another thread. Device selection runs once, before
+/// the command spawns work, so nothing races it today; give the probe its own
+/// hook only if that stops being true.
+#[cfg_attr(
+    not(any(feature = "cuda", target_os = "macos")),
+    allow(dead_code, reason = "no accelerator probe is compiled for this target")
+)]
+fn probe_device(
+    probe: impl FnOnce() -> candle_core::Result<Device> + std::panic::UnwindSafe,
+) -> Option<Device> {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(probe);
+    std::panic::set_hook(hook);
+    match outcome {
+        Ok(Ok(device)) => Some(device),
+        Ok(Err(e)) => {
+            tracing::debug!("accelerator probe unavailable: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("accelerator probe panicked; treating the device as unavailable");
+            None
+        }
+    }
 }
 
 /// Load a prepared model from a cache directory (RFC 0007 D7): expects
@@ -381,5 +416,30 @@ impl CandleModel {
         let normalized = pooled.broadcast_div(&norms)?;
 
         normalized.to_vec2::<f32>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a backend that panics while enumerating devices (candle's
+    /// Metal path when the system reports none) must degrade to the next
+    /// candidate, not abort the command.
+    #[test]
+    fn probe_device_treats_a_panicking_backend_as_absent() {
+        assert!(
+            probe_device(|| panic!("swap_remove index (is 0) should be < len (is 0)")).is_none()
+        );
+    }
+
+    #[test]
+    fn probe_device_treats_an_erroring_backend_as_absent() {
+        assert!(probe_device(|| candle_core::bail!("no device")).is_none());
+    }
+
+    #[test]
+    fn pick_device_returns_a_device_on_every_target() {
+        let _ = pick_device();
     }
 }

@@ -163,7 +163,13 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
 
         let mut semantic_available = false;
         let mut semantic_reason: Option<SemanticSkippedReasonDto> = None;
-        if let Some(embedder) = &self.embedder {
+        if mode == QueryMode::Exact {
+            semantic_reason = Some(if !lexical_available {
+                SemanticSkippedReasonDto::LexicalIndexUnavailable
+            } else {
+                SemanticSkippedReasonDto::ExactMode
+            });
+        } else if let Some(embedder) = &self.embedder {
             if !lexical_available {
                 semantic_reason = Some(SemanticSkippedReasonDto::LexicalIndexUnavailable);
             } else {
