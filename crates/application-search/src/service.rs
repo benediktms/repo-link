@@ -203,7 +203,14 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             });
         }
 
-        if semantic_available {
+        if semantic_available && read_only {
+            let coverage_complete =
+                matches!(self.index.missing_semantic_inputs(1).await, Ok(m) if m.is_empty());
+            if !coverage_complete {
+                semantic_available = false;
+                semantic_reason = Some(SemanticSkippedReasonDto::EmbeddingFailed);
+            }
+        } else if semantic_available {
             let embedder = self.embedder.as_ref().expect("checked above");
             // Bound the interactive path: at most one batch per search so a
             // rebuild-free query never stalls on a large missing set. The
@@ -266,20 +273,23 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             }
         }
 
-        self.assemble(
-            snapshot.as_ref(),
-            query,
-            mode,
-            lexical_available,
-            lexical_reason,
-            semantic_available,
-            semantic_reason,
-            &literal,
-            &lexical,
-            &semantic,
-            req.limit,
-        )
-        .await
+        let mut response = self
+            .assemble(
+                snapshot.as_ref(),
+                query,
+                mode,
+                lexical_available,
+                lexical_reason,
+                semantic_available,
+                semantic_reason,
+                &literal,
+                &lexical,
+                &semantic,
+                req.limit,
+            )
+            .await?;
+        response.sidecar_read_only = read_only.then_some(true);
+        Ok(response)
     }
 
     /// Fill every chunk missing a vector through the embedder, in guarded
@@ -463,6 +473,7 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             } else {
                 semantic_reason
             },
+            sidecar_read_only: None,
             results,
         })
     }

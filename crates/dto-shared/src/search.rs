@@ -123,6 +123,11 @@ pub struct TaskSearchResponseDto {
     /// — even when the successful lane returned no candidates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_skipped_reason: Option<SemanticSkippedReasonDto>,
+    /// Present and true when the sidecar opened read-only, so reconciliation
+    /// was skipped and the lexical lane answered from the last reconciled
+    /// content (RFC 0007 D8). Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_read_only: Option<bool>,
     pub results: Vec<SearchResultDto>,
 }
 
@@ -150,6 +155,10 @@ pub struct SearchIndexStatusDto {
     pub sidecar_size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_available: Option<bool>,
+    /// Present and true when the sidecar opened read-only: it answers a read,
+    /// and every maintenance command refuses with `permission_denied`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_read_only: Option<bool>,
 }
 
 /// Structured response for an explicit `search-index rebuild` or `clear`.

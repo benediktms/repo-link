@@ -140,6 +140,10 @@ impl SqliteTaskSearchIndex {
     /// When the environment denies that write, the read-only fallback serves
     /// the already initialized sidecar instead of reporting it unavailable
     /// (RFC 0007 D8).
+    ///
+    /// Only a denial falls back. A corrupt, exhausted, or otherwise broken
+    /// sidecar keeps its own reason, so it never masquerades as a read-only
+    /// one for the rest of the process.
     async fn open_readable(&self) -> Result<OpenSidecar, ReconcileFailure> {
         let mut guard = self.pool.lock().await;
         if let Some(open) = guard.as_ref() {
@@ -156,6 +160,9 @@ impl SqliteTaskSearchIndex {
             }
             Err(denied) => denied,
         };
+        if denied.reason != LexicalUnavailableReasonDto::PermissionDenied {
+            return Err(denied);
+        }
         let Some(pool) = self.connect_read_only().await else {
             return Err(denied);
         };
@@ -208,13 +215,13 @@ impl SqliteTaskSearchIndex {
             sqlx::query(&pragma)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| self.open_failure(e, "sidecar PRAGMA write failed"))?;
+                .map_err(|e| self.write_failure(e, "sidecar PRAGMA write failed"))?;
         }
         for stmt in SCHEMA_SQL {
             sqlx::query(stmt)
                 .execute(&mut *conn)
                 .await
-                .map_err(|e| self.open_failure(e, "sidecar schema setup failed"))?;
+                .map_err(|e| self.write_failure(e, "sidecar schema setup failed"))?;
         }
         // Seed the singleton metadata row if absent.
         sqlx::query(
@@ -225,7 +232,7 @@ impl SqliteTaskSearchIndex {
         .bind(SEARCH_CHUNK_FORMAT_VERSION)
         .execute(&mut *conn)
         .await
-        .map_err(|e| self.open_failure(e, "sidecar metadata seed failed"))?;
+        .map_err(|e| self.write_failure(e, "sidecar metadata seed failed"))?;
         drop(conn);
 
         Ok(pool)
@@ -238,8 +245,10 @@ impl SqliteTaskSearchIndex {
     /// the second rung. Neither rung sets `journal_mode`, because that PRAGMA
     /// writes the database header.
     ///
-    /// CAUTION: `immutable` makes SQLite ignore a `-wal` file. A read on that
-    /// rung can miss rows that a writer already committed to the WAL.
+    /// CAUTION: `immutable` makes SQLite ignore a `-wal` file, and SQLite
+    /// leaves the result undefined when that file holds a hot journal. The rung
+    /// therefore refuses a sidecar with a non-empty `-wal`, and the caller
+    /// reports the sidecar unavailable instead of serving an undefined read.
     ///
     /// The write path hardens the sidecar file, and this path can only verify
     /// it, so both enforce the same D5 policy. SQLite also opens the file on
@@ -255,7 +264,19 @@ impl SqliteTaskSearchIndex {
             return None;
         }
         let url = format!("sqlite://{}", self.sidecar_path.display());
+        let hot_wal = std::fs::metadata(PathBuf::from(format!(
+            "{}-wal",
+            self.sidecar_path.display()
+        )))
+        .is_ok_and(|m| m.len() > 0);
         for immutable in [false, true] {
+            if immutable && hot_wal {
+                tracing::warn!(
+                    sidecar = %self.sidecar_path.display(),
+                    "refusing an immutable read-only open: the sidecar has a non-empty WAL"
+                );
+                return None;
+            }
             let Ok(opts) = sqlx::sqlite::SqliteConnectOptions::from_str(&url) else {
                 return None;
             };
@@ -301,8 +322,26 @@ impl SqliteTaskSearchIndex {
     /// Classify and log one failed write open (RFC 0007 D8). The caller keeps
     /// only the reason, so the underlying error goes to the diagnostic log.
     fn open_failure(&self, e: impl std::fmt::Display, context: &'static str) -> ReconcileFailure {
+        self.classify(e, context, false)
+    }
+
+    /// The same, for a write that already has the sidecar open. SQLite reports
+    /// a `-wal` or `-shm` it may not create as an unopenable database file, so
+    /// past the open that message means a denial, not an absent sidecar.
+    fn write_failure(&self, e: impl std::fmt::Display, context: &'static str) -> ReconcileFailure {
+        self.classify(e, context, true)
+    }
+
+    fn classify(
+        &self,
+        e: impl std::fmt::Display,
+        context: &'static str,
+        past_open: bool,
+    ) -> ReconcileFailure {
         let msg = e.to_string();
-        let reason = if write_denied(&msg) {
+        let denied =
+            write_denied(&msg) || (past_open && msg.contains("unable to open database file"));
+        let reason = if denied {
             LexicalUnavailableReasonDto::PermissionDenied
         } else {
             LexicalUnavailableReasonDto::SidecarUnavailable
@@ -351,10 +390,14 @@ struct MetaRow {
 }
 
 /// The read-only half of the D5 sidecar path policy: reject a symlink, a
-/// world-writable parent, and a file that is not owner-only.
+/// world-writable parent, and a sidecar that others may write.
 ///
-/// Every step here is a read, so the read-only open path enforces the same
-/// policy as the write path (RFC 0007 D5).
+/// Every step here is a read, so the read-only open path enforces it too. The
+/// rule on the file mode is the integrity half only: a sidecar that others may
+/// *write* can feed content into search results, while one that others may
+/// *read* is already exposed, and refusing to read it protects nothing. The
+/// write path keeps the stricter owner-only rule, which `fix_owner_only`
+/// verifies on the opened file (RFC 0007 D5).
 #[cfg(unix)]
 fn check_path_policy(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -365,8 +408,8 @@ fn check_path_policy(path: &Path) -> std::io::Result<()> {
         if m.file_type().is_symlink() {
             return Err(std::io::Error::other("sidecar path is a symlink"));
         }
-        if m.permissions().mode() & 0o077 != 0 {
-            return Err(std::io::Error::other("sidecar mode is not owner-only"));
+        if m.permissions().mode() & 0o022 != 0 {
+            return Err(std::io::Error::other("sidecar is writable by others"));
         }
     }
     let parent = path
@@ -1424,6 +1467,86 @@ mod tests {
             "a restored permission must open writable again"
         );
         assert!(!index.metadata().await.unwrap().read_only);
+    }
+    /// A hot `-wal` blocks the `immutable` rung, because SQLite leaves such a
+    /// read undefined. The sidecar reports unavailable instead.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_wal_refuses_the_immutable_read_only_rung() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let a = tid(1);
+        let targets = vec![target(a, ChunkKind::Core, "Fix the retry loop")];
+        {
+            let index = SqliteTaskSearchIndex::new(&auth);
+            assert_eq!(index.rebuild(&targets).await.unwrap(), 1);
+        }
+
+        let sidecar = dir.path().join("repo-link.db.task-search.db");
+        let wal = dir.path().join("repo-link.db.task-search.db-wal");
+        let _ = std::fs::remove_file(dir.path().join("repo-link.db.task-search.db-shm"));
+        std::fs::write(&wal, vec![0u8; 64]).unwrap();
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(dir.path(), Permissions::from_mode(0o500)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(dir.path(), Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&sidecar, Permissions::from_mode(0o600)).unwrap();
+        };
+        let mode_bits_enforced = std::fs::File::create(dir.path().join("probe")).is_err();
+        if !mode_bits_enforced {
+            restore();
+            return;
+        }
+
+        let index = SqliteTaskSearchIndex::new(&auth);
+        let meta = index.metadata().await.unwrap();
+        assert!(
+            meta.available.is_none(),
+            "an undefined read must report the sidecar unavailable"
+        );
+        assert!(!meta.read_only);
+        assert!(index.stats().await.is_err());
+
+        restore();
+    }
+
+    /// A sidecar that others may read still opens read-only. The write path
+    /// keeps the owner-only rule; the read path only refuses one that others
+    /// may write.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn world_readable_sidecar_opens_read_only() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let a = tid(1);
+        let targets = vec![target(a, ChunkKind::Core, "Fix the retry loop")];
+        {
+            let index = SqliteTaskSearchIndex::new(&auth);
+            assert_eq!(index.rebuild(&targets).await.unwrap(), 1);
+        }
+
+        let sidecar = dir.path().join("repo-link.db.task-search.db");
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o444)).unwrap();
+        let mode_bits_enforced = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .is_err();
+        if !mode_bits_enforced {
+            return;
+        }
+
+        let index = SqliteTaskSearchIndex::new(&auth);
+        let stats = index.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1);
+        assert!(index.metadata().await.unwrap().read_only);
+
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o600)).unwrap();
     }
     /// A failed reconcile (storage-limit refusal) must roll back cleanly so
     /// the single-connection pool is not left inside an open transaction.

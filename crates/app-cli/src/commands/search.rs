@@ -144,10 +144,9 @@ pub(crate) async fn search_index_dispatch(
                 None => (false, Some(LexicalUnavailableReasonDto::SidecarUnavailable)),
             };
             let model_prepared = model_prepared();
-            let claimed = index
-                .metadata()
-                .await
-                .ok()
+            let meta = index.metadata().await.ok();
+            let read_only = meta.as_ref().is_some_and(|m| m.read_only);
+            let claimed = meta
                 .and_then(|m| m.available)
                 .and_then(|s| s.embedding_profile_id);
             let (sem_available, sem_reason) = if !lex_available {
@@ -157,7 +156,11 @@ pub(crate) async fn search_index_dispatch(
                 )
             } else if !model_prepared {
                 (false, Some(SemanticSkippedReasonDto::ModelNotPrepared))
-            } else if claimed.is_some_and(|p| p != infra_embed::profiles::profile().profile_id) {
+            } else if claimed
+                .as_ref()
+                .is_some_and(|p| *p != infra_embed::profiles::profile().profile_id)
+                || (read_only && claimed.is_none())
+            {
                 (false, Some(SemanticSkippedReasonDto::ProfileMismatch))
             } else {
                 (true, None)
@@ -172,6 +175,7 @@ pub(crate) async fn search_index_dispatch(
                 fts_integrity_ok: stats.as_ref().and_then(|s| s.fts_integrity_ok),
                 sidecar_size_bytes: stats.as_ref().map(|s| s.sidecar_size_bytes).unwrap_or(0),
                 sidecar_available: Some(sidecar_available),
+                sidecar_read_only: read_only.then_some(true),
             });
         }
         SearchIndexCmd::Rebuild { .. } => {
