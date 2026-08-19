@@ -646,6 +646,33 @@ winner is pinned as the single shipped profile.
   open failures leave task data untouched. Search returns raw literal results
   with `"lexical_available": false` and the D10 `sidecar_unavailable` or
   `permission_denied` reason; it never retries with broader file permissions.
+- **Read-only sidecar:** when the environment permits a read but denies a
+  write on an initialized, compatible sidecar — a filesystem sandbox, a
+  read-only mount — the literal and lexical lanes still run, against the last
+  reconciled content. Search skips reconciliation, so the projection can be
+  stale by whatever the authoritative database changed since, and both
+  responses carry `"sidecar_read_only": true` so a caller can tell a served
+  projection from a reconciled one. Every maintenance command refuses with
+  `permission_denied`, and the read path never widens file permissions to reach
+  a write. Further rules:
+  - Only a denied write falls back to a read. A corrupt, exhausted, or
+    otherwise broken sidecar keeps its own reason and never presents as a
+    read-only one.
+  - `search-index status` reports `"fts_integrity_ok": null`, because that
+    check writes.
+  - An unclaimed embedding profile reports `profile_mismatch` rather than
+    claiming it, and a claimed profile with incomplete vector coverage reports
+    `embedding_failed` without running an embedding batch that could not be
+    stored. Neither ranks against partial coverage.
+  - A sidecar with a non-empty `-wal` is unavailable rather than read: the
+    read-only rung that a locked directory permits is SQLite's `immutable`,
+    which ignores that file and leaves the result undefined.
+  - The read path enforces the integrity half of the D5 path policy — no
+    symlink, no world-writable parent, no sidecar that others may write — and
+    not the owner-only file mode, which governs the sidecar this binary
+    creates. A `0444` file delivered by a read-only mount is therefore
+    readable, while the write path still refuses to open a sidecar that others
+    may read.
 - **Reconciliation failure:** storage preflight refusal, `SQLITE_FULL`, failed
   FTS integrity, trigger failure, and any unexpected sidecar write error roll
   back the transaction. The query returns raw literal results with
@@ -803,11 +830,16 @@ Optional per-result lane fields are omitted when that lane did not contribute
 to that result. Top-level availability and reason fields follow a stricter
 machine contract:
 
-- `lexical_available` is true only when reconciliation and lexical retrieval
-  completed successfully. When false, `lexical_unavailable_reason` is required
+- `lexical_available` is true only when lexical retrieval completed
+  successfully, and when reconciliation either completed or was skipped because
+  the sidecar is read-only (D8). When false, `lexical_unavailable_reason` is required
   and is one of `sidecar_unavailable`, `permission_denied`,
   `schema_mismatch`, `index_corrupt`, `storage_limit`, or
   `reconciliation_failed`. It is omitted when lexical search succeeds.
+- `sidecar_read_only` is present and true only when the sidecar opened without
+  write access (D8). It is omitted otherwise. On `search` it marks a response
+  that skipped reconciliation; on `search-index status` it explains why every
+  maintenance command refuses.
 - `semantic_available` is true only when the active profile has complete
   corpus-vector coverage and semantic retrieval completed for this query. When
   false, `semantic_skipped_reason` is required and is one of
@@ -841,7 +873,9 @@ rl task search-index clear
 - `status` reports lexical/semantic availability; chunk, semantic-input, and
   vector counts; per-component text/vector/FTS/mapping bytes; sidecar, WAL, and
   model-cache bytes; configured warn/refuse budgets and filesystem headroom;
-  schema/chunk/profile identity; and FTS5 integrity.
+  schema/chunk/profile identity; and FTS5 integrity. `fts_integrity_ok` is
+  `null` when the check did not run: the FTS5 `integrity-check` command is an
+  `INSERT`, so a read-only sidecar cannot answer it.
 - `rebuild` explicitly transitions schema, chunk format, and—when prepared—the
   current binary's embedding profile. It holds the exclusive lifecycle lock,
   replaces compatible contents with FTS `delete-all` or recreates incompatible

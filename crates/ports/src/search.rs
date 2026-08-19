@@ -277,6 +277,10 @@ pub struct IndexMetadata {
     /// Present when the sidecar exists but the schema/chunk format is
     /// incompatible with this binary.
     pub schema_mismatch: Option<SchemaMismatch>,
+    /// The sidecar opened for reading only, because the environment denies a
+    /// write to it. Every maintenance operation refuses with
+    /// `PermissionDenied`, and a read serves the last reconciled content.
+    pub read_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -296,7 +300,9 @@ pub struct SchemaMismatch {
 pub struct IndexStats {
     pub chunk_count: u64,
     pub vector_count: u64,
-    pub fts_integrity_ok: bool,
+    /// None means the check did not run. The FTS5 `integrity-check` command is
+    /// an `INSERT` statement, so a read-only sidecar cannot run it.
+    pub fts_integrity_ok: Option<bool>,
     pub sidecar_size_bytes: u64,
     pub sidecar_available: bool,
 }
