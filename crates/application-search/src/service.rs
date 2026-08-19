@@ -126,9 +126,11 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
             lexical_reason = Some(LexicalUnavailableReasonDto::SchemaMismatch);
         }
 
+        let read_only = meta.as_ref().is_some_and(|m| m.read_only);
+
         // Begin reconcile only when the sidecar is usable. A source read
         // failure (authoritative DB) is a hard error and propagates.
-        if lexical_available {
+        if lexical_available && !read_only {
             let src_rows = self.source.load_reconcile_snapshot().await?;
             let targets: Vec<ChunkTarget> = src_rows.iter().flat_map(chunk_task).collect();
             let projected = projected_bytes(&targets);
@@ -181,6 +183,9 @@ impl<S: TaskSearchSourceRepository, I: TaskSearchIndex> TaskSearchService<S, I> 
                 match sidecar_profile {
                     Some(p) if p == profile_id => semantic_available = true,
                     Some(_) => semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch),
+                    None if read_only => {
+                        semantic_reason = Some(SemanticSkippedReasonDto::ProfileMismatch)
+                    }
                     None => match self.index.claim_empty_profile(&profile_id).await {
                         Ok(true) => semantic_available = true,
                         Ok(false) => {

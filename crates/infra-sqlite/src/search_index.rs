@@ -86,8 +86,17 @@ const SCHEMA_SQL: &[&str] = &[
 pub struct SqliteTaskSearchIndex {
     /// `<authoritative>.task-search.db` sibling path (RFC 0007 D5).
     sidecar_path: PathBuf,
-    /// Lazily-opened single-connection pool.
-    pool: Mutex<Option<SqlitePool>>,
+    /// Lazily-opened pool.
+    pool: Mutex<Option<OpenSidecar>>,
+}
+
+/// One opened sidecar pool, plus whether that pool can write.
+#[derive(Clone)]
+struct OpenSidecar {
+    pool: SqlitePool,
+    /// False when only the read-only fallback opened the sidecar. Every
+    /// maintenance operation refuses on such a pool (RFC 0007 D5/D8).
+    writable: bool,
 }
 
 impl SqliteTaskSearchIndex {
@@ -103,18 +112,70 @@ impl SqliteTaskSearchIndex {
         }
     }
 
-    /// Open the sidecar, enforcing PRAGMA-before-table ordering and an
-    /// owner-only file, then create the D5 schema. Idempotent.
-    async fn open(&self) -> Result<SqlitePool, ReconcileFailure> {
+    /// Open the sidecar for a write: enforce PRAGMA-before-table ordering and
+    /// an owner-only file, then create the D5 schema. Idempotent.
+    ///
+    /// A cached read-only pool refuses with `PermissionDenied` and no retry: it
+    /// exists only because the environment denied a write open.
+    async fn open_writable(&self) -> Result<SqlitePool, ReconcileFailure> {
         let mut guard = self.pool.lock().await;
-        if let Some(p) = guard.as_ref() {
-            return Ok(p.clone());
+        if let Some(open) = guard.as_ref() {
+            if open.writable {
+                return Ok(open.pool.clone());
+            }
+            return Err(ReconcileFailure {
+                reason: LexicalUnavailableReasonDto::PermissionDenied,
+            });
         }
-        // Trusted parent + owner-only sidecar file, before SQLite opens it
-        // (RFC 0007 D5 owner-only policy). Failure = sidecar unavailable.
-        fix_owner_only(&self.sidecar_path).map_err(|_| ReconcileFailure {
-            reason: LexicalUnavailableReasonDto::SidecarUnavailable,
-        })?;
+        let pool = self.init_writable().await?;
+        *guard = Some(OpenSidecar {
+            pool: pool.clone(),
+            writable: true,
+        });
+        Ok(pool)
+    }
+
+    /// Open the sidecar for a read. The writable open comes first, so a normal
+    /// environment still gets the D5 schema setup and the owner-only policy.
+    /// When the environment denies that write, the read-only fallback serves
+    /// the already initialized sidecar instead of reporting it unavailable
+    /// (RFC 0007 D8).
+    async fn open_readable(&self) -> Result<OpenSidecar, ReconcileFailure> {
+        let mut guard = self.pool.lock().await;
+        if let Some(open) = guard.as_ref() {
+            return Ok(open.clone());
+        }
+        let denied = match self.init_writable().await {
+            Ok(pool) => {
+                let open = OpenSidecar {
+                    pool,
+                    writable: true,
+                };
+                *guard = Some(open.clone());
+                return Ok(open);
+            }
+            Err(denied) => denied,
+        };
+        let Some(pool) = self.connect_read_only().await else {
+            return Err(denied);
+        };
+        let open = OpenSidecar {
+            pool,
+            writable: false,
+        };
+        *guard = Some(open.clone());
+        Ok(open)
+    }
+
+    /// The writable open itself, without the cache.
+    ///
+    /// SQLite falls back to a read-only handle for a file it may not write
+    /// instead of refusing the open, so a denied write surfaces at the first
+    /// PRAGMA rather than at the open. Every step therefore classifies its own
+    /// error.
+    async fn init_writable(&self) -> Result<SqlitePool, ReconcileFailure> {
+        fix_owner_only(&self.sidecar_path)
+            .map_err(|e| self.open_failure(e, "sidecar owner-only check failed"))?;
 
         let url = format!("sqlite://{}", self.sidecar_path.display());
         let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
@@ -132,11 +193,12 @@ impl SqliteTaskSearchIndex {
             .max_connections(2)
             .connect_with(opts)
             .await
-            .map_err(|_| ReconcileFailure {
-                reason: LexicalUnavailableReasonDto::SidecarUnavailable,
-            })?;
+            .map_err(|e| self.open_failure(e, "sidecar write open failed"))?;
 
-        let mut conn = pool.acquire().await.map_err(move_to_failure)?;
+        let mut conn = pool
+            .acquire()
+            .await
+            .map_err(|e| self.open_failure(e, "sidecar write open failed"))?;
         // PRAGMAs must precede table creation (RFC 0007 D5).
         for pragma in [
             format!("PRAGMA page_size = {PAGE_SIZE};"),
@@ -146,13 +208,13 @@ impl SqliteTaskSearchIndex {
             sqlx::query(&pragma)
                 .execute(&mut *conn)
                 .await
-                .map_err(move_to_failure)?;
+                .map_err(|e| self.open_failure(e, "sidecar PRAGMA write failed"))?;
         }
         for stmt in SCHEMA_SQL {
             sqlx::query(stmt)
                 .execute(&mut *conn)
                 .await
-                .map_err(move_to_failure)?;
+                .map_err(|e| self.open_failure(e, "sidecar schema setup failed"))?;
         }
         // Seed the singleton metadata row if absent.
         sqlx::query(
@@ -163,16 +225,102 @@ impl SqliteTaskSearchIndex {
         .bind(SEARCH_CHUNK_FORMAT_VERSION)
         .execute(&mut *conn)
         .await
-        .map_err(move_to_failure)?;
+        .map_err(|e| self.open_failure(e, "sidecar metadata seed failed"))?;
         drop(conn);
 
-        *guard = Some(pool.clone());
         Ok(pool)
     }
 
-    /// Read the singleton metadata row.
-    async fn read_meta(&self) -> Result<Option<MetaRow>, ReconcileFailure> {
-        let pool = self.open().await?;
+    /// The read-only fallback ladder.
+    ///
+    /// `SQLITE_OPEN_READONLY` needs a usable `-shm` file, and a WAL sidecar
+    /// cannot create one in a directory it may not write, so `immutable` is
+    /// the second rung. Neither rung sets `journal_mode`, because that PRAGMA
+    /// writes the database header.
+    ///
+    /// CAUTION: `immutable` makes SQLite ignore a `-wal` file. A read on that
+    /// rung can miss rows that a writer already committed to the WAL.
+    ///
+    /// The write path hardens the sidecar file, and this path can only verify
+    /// it, so both enforce the same D5 policy. SQLite also opens the file on
+    /// the first read rather than at the open, so each rung needs a real read
+    /// to prove it works.
+    async fn connect_read_only(&self) -> Option<SqlitePool> {
+        if let Err(e) = check_path_policy(&self.sidecar_path) {
+            tracing::warn!(
+                error = %e,
+                sidecar = %self.sidecar_path.display(),
+                "read-only sidecar open refused by the path policy"
+            );
+            return None;
+        }
+        let url = format!("sqlite://{}", self.sidecar_path.display());
+        for immutable in [false, true] {
+            let Ok(opts) = sqlx::sqlite::SqliteConnectOptions::from_str(&url) else {
+                return None;
+            };
+            let opts = opts
+                .create_if_missing(false)
+                .read_only(true)
+                .immutable(immutable)
+                .foreign_keys(true)
+                .busy_timeout(std::time::Duration::from_secs(10));
+            let Ok(pool) = SqlitePoolOptions::new()
+                .max_connections(2)
+                .connect_with(opts)
+                .await
+            else {
+                continue;
+            };
+            match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema")
+                .fetch_one(&pool)
+                .await
+            {
+                Ok(_) => {
+                    tracing::warn!(
+                        sidecar = %self.sidecar_path.display(),
+                        immutable,
+                        "opened the task-search sidecar read-only; index maintenance is unavailable"
+                    );
+                    return Some(pool);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        sidecar = %self.sidecar_path.display(),
+                        immutable,
+                        "read-only sidecar open rung failed"
+                    );
+                    pool.close().await;
+                }
+            }
+        }
+        None
+    }
+
+    /// Classify and log one failed write open (RFC 0007 D8). The caller keeps
+    /// only the reason, so the underlying error goes to the diagnostic log.
+    fn open_failure(&self, e: impl std::fmt::Display, context: &'static str) -> ReconcileFailure {
+        let msg = e.to_string();
+        let reason = if write_denied(&msg) {
+            LexicalUnavailableReasonDto::PermissionDenied
+        } else {
+            LexicalUnavailableReasonDto::SidecarUnavailable
+        };
+        tracing::warn!(
+            error = %msg,
+            sidecar = %self.sidecar_path.display(),
+            reason = ?reason,
+            "{context}"
+        );
+        ReconcileFailure { reason }
+    }
+
+    /// Read the singleton metadata row. The bool reports whether the sidecar
+    /// opened writable.
+    async fn read_meta(&self) -> Result<(bool, Option<MetaRow>), ReconcileFailure> {
+        let open = self.open_readable().await?;
+        let pool = open.pool;
         let row = sqlx::query(
             "SELECT singleton, schema_version, chunk_format_version, embedding_profile_id, \
                     validated_content_fingerprint \
@@ -181,7 +329,7 @@ impl SqliteTaskSearchIndex {
         .fetch_optional(&pool)
         .await
         .map_err(move_to_failure)?;
-        Ok(row.map(|r| MetaRow {
+        let meta = row.map(|r| MetaRow {
             schema_version: r.try_get("schema_version").unwrap_or(0),
             chunk_format_version: r.try_get("chunk_format_version").unwrap_or(0),
             // try_get::<String> on a NULL column returns Ok("") in sqlx —
@@ -190,7 +338,8 @@ impl SqliteTaskSearchIndex {
                 .try_get::<Option<String>, _>("embedding_profile_id")
                 .ok()
                 .flatten(),
-        }))
+        });
+        Ok((open.writable, meta))
     }
 }
 
@@ -201,19 +350,24 @@ struct MetaRow {
     embedding_profile_id: Option<String>,
 }
 
-/// Enforce the owner-only + trusted-parent policy for the sidecar file
-/// (RFC 0007 D5). Pre-creates the file with mode `0600` when absent on Unix
-/// and refuses when the parent is world-writable or not owned.
+/// The read-only half of the D5 sidecar path policy: reject a symlink, a
+/// world-writable parent, and a file that is not owner-only.
+///
+/// Every step here is a read, so the read-only open path enforces the same
+/// policy as the write path (RFC 0007 D5).
 #[cfg(unix)]
-fn fix_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn check_path_policy(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     // Reject a symlink anywhere in the sidecar path (no-follow, RFC 0007 D5).
-    if std::fs::symlink_metadata(path).is_ok()
-        && std::fs::symlink_metadata(path)?.file_type().is_symlink()
-    {
-        return Err(std::io::Error::other("sidecar path is a symlink"));
+    let existing = std::fs::symlink_metadata(path).ok();
+    if let Some(m) = &existing {
+        if m.file_type().is_symlink() {
+            return Err(std::io::Error::other("sidecar path is a symlink"));
+        }
+        if m.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("sidecar mode is not owner-only"));
+        }
     }
     let parent = path
         .parent()
@@ -223,6 +377,39 @@ fn fix_owner_only(path: &Path) -> std::io::Result<()> {
     // Refuse a world-writable parent or a parent owned by someone else.
     if pmode & 0o022 != 0 {
         return Err(std::io::Error::other("sidecar parent is world-writable"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_path_policy(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Enforce the owner-only + trusted-parent policy for the sidecar file
+/// (RFC 0007 D5). Pre-creates the file with mode `0600` when absent on Unix
+/// and refuses when the parent is world-writable or not owned.
+///
+/// The `-wal` and `-shm` files are covered too. SQLite creates them with the
+/// mode of the main file, so they hold the same task text, and a read-only
+/// session otherwise leaves a `-shm` that refuses every later write.
+#[cfg(unix)]
+fn fix_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    check_path_policy(path)?;
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", path.display()));
+        let Ok(m) = std::fs::symlink_metadata(&side) else {
+            continue;
+        };
+        if m.file_type().is_symlink() {
+            return Err(std::io::Error::other("sidecar journal path is a symlink"));
+        }
+        if m.permissions().mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o600))?;
+        }
     }
     let scratch = std::fs::OpenOptions::new()
         .write(true)
@@ -250,10 +437,44 @@ fn fix_owner_only(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn move_to_failure(_e: impl ToString) -> ReconcileFailure {
-    ReconcileFailure {
-        reason: LexicalUnavailableReasonDto::SidecarUnavailable,
-    }
+fn move_to_failure(e: impl ToString) -> ReconcileFailure {
+    let msg = e.to_string();
+    let reason = if write_denied(&msg) {
+        LexicalUnavailableReasonDto::PermissionDenied
+    } else {
+        LexicalUnavailableReasonDto::SidecarUnavailable
+    };
+    tracing::warn!(error = %msg, reason = ?reason, "task-search sidecar operation failed");
+    ReconcileFailure { reason }
+}
+
+/// Flatten a sidecar failure into a `PortError` with the stable D10 reason
+/// code. The port boundary carries a string, so the code goes in as
+/// snake_case rather than as a `Debug` dump of the struct.
+fn reason_code(f: ReconcileFailure) -> PortError {
+    let code = match f.reason {
+        LexicalUnavailableReasonDto::SidecarUnavailable => "sidecar_unavailable",
+        LexicalUnavailableReasonDto::PermissionDenied => "permission_denied",
+        LexicalUnavailableReasonDto::SchemaMismatch => "schema_mismatch",
+        LexicalUnavailableReasonDto::IndexCorrupt => "index_corrupt",
+        LexicalUnavailableReasonDto::StorageLimit => "storage_limit",
+        LexicalUnavailableReasonDto::ReconciliationFailed => "reconciliation_failed",
+    };
+    PortError::Backend(format!("task-search sidecar: {code}"))
+}
+
+/// Whether a failed operation was refused for a lack of write access.
+///
+/// ponytail: matched on the message. `sqlx` flattens the SQLite extended
+/// result code, and the same helper then covers both a `std::io::Error`
+/// ("Permission denied", "Read-only file system") and a SQLite error
+/// ("attempt to write a readonly database").
+fn write_denied(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("readonly")
+        || m.contains("read-only")
+        || m.contains("permission denied")
+        || m.contains("access is denied")
 }
 
 /// Storage preflight: refuse before growth when projected sidecar+WAL would
@@ -430,10 +651,7 @@ fn now_iso() -> String {
 #[async_trait]
 impl TaskSearchIndex for SqliteTaskSearchIndex {
     async fn begin_reconcile(&self) -> Result<Box<dyn ReconcileSession>, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_writable().await.map_err(reason_code)?;
         let mut conn = pool
             .acquire()
             .await
@@ -464,13 +682,14 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
     }
 
     async fn metadata(&self) -> Result<IndexMetadata, PortError> {
-        let meta = match self.read_meta().await {
+        let (writable, meta) = match self.read_meta().await {
             Ok(m) => m,
             Err(_) => {
                 // Open failure → sidecar unavailable (D8). Not a hard error.
                 return Ok(IndexMetadata {
                     available: None,
                     schema_mismatch: None,
+                    read_only: false,
                 });
             }
         };
@@ -479,6 +698,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             return Ok(IndexMetadata {
                 available: None,
                 schema_mismatch: Some(SchemaMismatch { incompatible: true }),
+                read_only: !writable,
             });
         };
         let incompatible = meta.schema_version != SEARCH_SCHEMA_VERSION
@@ -494,6 +714,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             } else {
                 None
             },
+            read_only: !writable,
         })
     }
 
@@ -502,10 +723,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
         match_expr: &str,
         eligible: &[TaskId],
     ) -> Result<Vec<LexicalRank>, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_readable().await.map_err(reason_code)?.pool;
         let rows = sqlx::query(
             "SELECT c.task_id AS task_id, c.kind AS kind, c.text AS text, \
                     bm25(task_search_fts, 10.0) AS score \
@@ -557,11 +775,9 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
     }
 
     async fn stats(&self) -> Result<IndexStats, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
-        let mut conn = pool
+        let open = self.open_readable().await.map_err(reason_code)?;
+        let mut conn = open
+            .pool
             .acquire()
             .await
             .map_err(|e| PortError::Backend(e.to_string()))?;
@@ -573,12 +789,18 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
             .fetch_one(&mut *conn)
             .await
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        let integrity = sqlx::query(
-            "INSERT INTO task_search_fts(task_search_fts, rank) VALUES('integrity-check', 1)",
-        )
-        .execute(&mut *conn)
-        .await
-        .is_ok();
+        let integrity = if open.writable {
+            Some(
+                sqlx::query(
+                    "INSERT INTO task_search_fts(task_search_fts, rank) VALUES('integrity-check', 1)",
+                )
+                .execute(&mut *conn)
+                .await
+                .is_ok(),
+            )
+        } else {
+            None
+        };
         let size = std::fs::metadata(&self.sidecar_path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -593,10 +815,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
     }
 
     async fn clear(&self) -> Result<(), PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_writable().await.map_err(reason_code)?;
         let mut conn = pool
             .acquire()
             .await
@@ -619,10 +838,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
     }
 
     async fn rebuild(&self, targets: &[ChunkTarget]) -> Result<u64, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_writable().await.map_err(reason_code)?;
         let mut conn = pool
             .acquire()
             .await
@@ -675,10 +891,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
     }
 
     async fn claim_empty_profile(&self, expected: &str) -> Result<bool, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_writable().await.map_err(reason_code)?;
         let mut conn = pool
             .acquire()
             .await
@@ -707,10 +920,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
         &self,
         limit: u32,
     ) -> Result<Vec<MissingSemanticInput>, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_readable().await.map_err(reason_code)?.pool;
         let rows = sqlx::query(
             "SELECT c.id AS id, c.task_id AS task_id, c.kind AS kind, \
                     c.content_hash AS content_hash, c.text AS text \
@@ -760,10 +970,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
         if rows.is_empty() {
             return Ok(0);
         }
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_writable().await.map_err(reason_code)?;
         let mut conn = pool
             .acquire()
             .await
@@ -845,10 +1052,7 @@ impl TaskSearchIndex for SqliteTaskSearchIndex {
         query_vector: &[f32],
         eligible: &[TaskId],
     ) -> Result<Vec<SemanticRank>, PortError> {
-        let pool = self
-            .open()
-            .await
-            .map_err(|f| PortError::Backend(format!("{f:?}")))?;
+        let pool = self.open_readable().await.map_err(reason_code)?.pool;
         // Filter eligible tasks in SQL so I/O is O(eligible), not O(vectors).
         // Chunk the IN list to stay under SQLite's variable limit.
         const MAX_IN: usize = 500;
@@ -1083,14 +1287,143 @@ mod tests {
         index.clear().await.unwrap();
         let stats = index.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 0, "clear empties the sidecar");
-        assert!(stats.fts_integrity_ok, "clear leaves a consistent index");
+        assert_eq!(
+            stats.fts_integrity_ok,
+            Some(true),
+            "clear leaves a consistent index"
+        );
 
         // Rebuild restores.
         let written = index.rebuild(&targets).await.unwrap();
         assert_eq!(written, targets.len() as u64);
         let stats = index.stats().await.unwrap();
         assert_eq!(stats.chunk_count, targets.len() as u64);
-        assert!(stats.fts_integrity_ok);
+        assert_eq!(stats.fts_integrity_ok, Some(true));
+    }
+    /// A readable but non-writable sidecar still answers `stats`,
+    /// `metadata`, and `search_lexical`, and refuses maintenance with
+    /// `permission_denied` (RFC 0007 D8).
+    ///
+    /// `rebuild` ends with `wal_checkpoint(TRUNCATE)`, and the journal files
+    /// then go, so the sidecar is the cleanly closed file that the report
+    /// describes and both rungs of the ladder read the same content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_sidecar_serves_status_and_lexical_search() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let a = tid(1);
+        let b = tid(2);
+        let targets = vec![
+            target(a, ChunkKind::Core, "Fix the retry loop"),
+            target(b, ChunkKind::Core, "Add retry backoff"),
+        ];
+
+        {
+            let index = SqliteTaskSearchIndex::new(&auth);
+            assert_eq!(index.rebuild(&targets).await.unwrap(), 2);
+        }
+
+        let sidecar = dir.path().join("repo-link.db.task-search.db");
+        let _ = std::fs::remove_file(dir.path().join("repo-link.db.task-search.db-wal"));
+        let _ = std::fs::remove_file(dir.path().join("repo-link.db.task-search.db-shm"));
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(dir.path(), Permissions::from_mode(0o500)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(dir.path(), Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&sidecar, Permissions::from_mode(0o600)).unwrap();
+        };
+        let mode_bits_enforced = std::fs::File::create(dir.path().join("probe")).is_err();
+        if !mode_bits_enforced {
+            restore();
+            return;
+        }
+
+        let index = SqliteTaskSearchIndex::new(&auth);
+
+        let stats = index.stats().await.unwrap();
+        assert_eq!(
+            stats.chunk_count, 2,
+            "a read-only sidecar still reports its rows"
+        );
+        assert!(stats.sidecar_available);
+        assert_eq!(
+            stats.fts_integrity_ok, None,
+            "the FTS integrity check writes, so it cannot run"
+        );
+
+        let meta = index.metadata().await.unwrap();
+        assert!(meta.available.is_some(), "the D5 schema stays readable");
+        assert!(meta.read_only, "metadata reports the read-only open");
+        assert!(meta.schema_mismatch.is_none());
+
+        let ranks = index.search_lexical("retry", &[a, b]).await.unwrap();
+        assert_eq!(
+            ranks.len(),
+            2,
+            "lexical search answers without write access"
+        );
+
+        let err = index.rebuild(&targets).await.unwrap_err();
+        let PortError::Backend(msg) = err else {
+            restore();
+            panic!("rebuild must fail with a backend error");
+        };
+        assert!(
+            msg.contains("permission_denied"),
+            "maintenance reports permission_denied, got {msg}"
+        );
+
+        restore();
+    }
+    /// A read-only session must not wedge a later write. SQLite creates the
+    /// `-shm` file with the mode of the main file, so the read-only open
+    /// leaves a non-writable side file behind.
+    ///
+    /// Only the file loses its write bit here. The directory keeps it, so
+    /// SQLite can still create the `-shm` that a read-only open needs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_open_does_not_wedge_a_later_write() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let auth = dir.path().join("repo-link.db");
+        let a = tid(1);
+        let targets = vec![target(a, ChunkKind::Core, "Fix the retry loop")];
+        {
+            let index = SqliteTaskSearchIndex::new(&auth);
+            assert_eq!(index.rebuild(&targets).await.unwrap(), 1);
+        }
+
+        let sidecar = dir.path().join("repo-link.db.task-search.db");
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o400)).unwrap();
+        let mode_bits_enforced = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar)
+            .is_err();
+        if !mode_bits_enforced {
+            return;
+        }
+        {
+            let index = SqliteTaskSearchIndex::new(&auth);
+            assert!(index.metadata().await.unwrap().read_only);
+        }
+
+        std::fs::set_permissions(&sidecar, Permissions::from_mode(0o600)).unwrap();
+        let index = SqliteTaskSearchIndex::new(&auth);
+        let stats = index.stats().await.unwrap();
+        assert_eq!(stats.chunk_count, 1);
+        assert_eq!(
+            stats.fts_integrity_ok,
+            Some(true),
+            "a restored permission must open writable again"
+        );
+        assert!(!index.metadata().await.unwrap().read_only);
     }
     /// A failed reconcile (storage-limit refusal) must roll back cleanly so
     /// the single-connection pool is not left inside an open transaction.
@@ -1122,7 +1455,7 @@ mod tests {
         sess2.commit(&[1u8; 32]).await.unwrap();
         let stats = index.stats().await.unwrap();
         assert_eq!(stats.chunk_count, 1);
-        assert!(stats.fts_integrity_ok);
+        assert_eq!(stats.fts_integrity_ok, Some(true));
     }
 
     /// Unclaimed profile reads as `None`, not an empty string (sqlx decodes

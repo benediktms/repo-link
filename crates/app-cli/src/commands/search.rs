@@ -169,7 +169,7 @@ pub(crate) async fn search_index_dispatch(
                 semantic_skipped_reason: sem_reason,
                 chunk_count: stats.as_ref().map(|s| s.chunk_count).unwrap_or(0),
                 vector_count: stats.as_ref().map(|s| s.vector_count).unwrap_or(0),
-                fts_integrity_ok: stats.as_ref().map(|s| s.fts_integrity_ok).unwrap_or(false),
+                fts_integrity_ok: stats.as_ref().and_then(|s| s.fts_integrity_ok),
                 sidecar_size_bytes: stats.as_ref().map(|s| s.sidecar_size_bytes).unwrap_or(0),
                 sidecar_available: Some(sidecar_available),
             });

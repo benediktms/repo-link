@@ -142,8 +142,10 @@ pub struct SearchIndexStatusDto {
     pub semantic_skipped_reason: Option<SemanticSkippedReasonDto>,
     pub chunk_count: u64,
     pub vector_count: u64,
-    /// Whether the sidecar FTS5 index passed `integrity-check`.
-    pub fts_integrity_ok: bool,
+    /// Whether the sidecar FTS5 index passed `integrity-check`. `null` means
+    /// the check did not run: the command writes, so a read-only sidecar
+    /// cannot answer it.
+    pub fts_integrity_ok: Option<bool>,
     /// Sidecar database file size in bytes (main DB after checkpoint).
     pub sidecar_size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
