@@ -157,16 +157,20 @@ fn pick_device() -> Device {
     Device::Cpu
 }
 
+/// Guards the process-global panic hook while a probe runs, so two concurrent
+/// probes cannot leave the silencing hook installed for the rest of the process.
+static PROBE_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run one accelerator probe, treating an error *and* a panic inside the
 /// backend as "this device is not available". candle's Metal probe panics
 /// (`swap_remove index (is 0) should be < len (is 0)`) instead of returning
 /// `Err` when the system exposes no Metal device, which crashed every command
 /// that loads a model.
 ///
-/// ponytail: the panic hook is process-global, so a probe silences the message
-/// of any panic racing it on another thread. Device selection runs once, before
-/// the command spawns work, so nothing races it today; give the probe its own
-/// hook only if that stops being true.
+/// The probe silences the panic hook so a fallback prints no backtrace over the
+/// command's own output. That hook is process-global, so a probe holds
+/// [`PROBE_HOOK`] across the swap and takes the lock back after a poisoning
+/// panic: an unrestored hook would swallow every later panic message.
 #[cfg_attr(
     not(any(feature = "cuda", target_os = "macos")),
     allow(dead_code, reason = "no accelerator probe is compiled for this target")
@@ -174,6 +178,7 @@ fn pick_device() -> Device {
 fn probe_device(
     probe: impl FnOnce() -> candle_core::Result<Device> + std::panic::UnwindSafe,
 ) -> Option<Device> {
+    let _guard = PROBE_HOOK.lock().unwrap_or_else(|e| e.into_inner());
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let outcome = std::panic::catch_unwind(probe);

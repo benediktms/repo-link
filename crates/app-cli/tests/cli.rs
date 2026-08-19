@@ -5757,9 +5757,14 @@ fn task_search_exact_skips_the_semantic_lane() {
         &["task", "search", "--exact", "ScriptableObject"],
     );
     assert_eq!(resp["query_mode"], "exact");
+    assert_eq!(resp["lexical_available"], true);
     assert_eq!(resp["semantic_available"], false);
     assert_eq!(resp["semantic_skipped_reason"], "exact_mode");
     let results = resp["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["title"], "ScriptableObject overrides");
+    assert!(
+        results[0]["matched"]["lexical_rank"].is_u64(),
+        "the lexical lane must rank the hit without an embedder: {resp}"
+    );
 }
