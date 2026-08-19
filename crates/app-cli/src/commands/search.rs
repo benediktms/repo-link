@@ -89,7 +89,9 @@ pub(crate) async fn task_search_dispatch(
 
     let index = SqliteTaskSearchIndex::new(&cfg.database_path);
     let mut service = TaskSearchService::new(svc.search_source.clone(), index);
-    if let Some(embedder) = maybe_build_embedder() {
+    if !args.exact
+        && let Some(embedder) = maybe_build_embedder()
+    {
         service = service.with_embedder(embedder);
     }
     let resp = service

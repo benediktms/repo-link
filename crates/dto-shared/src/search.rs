@@ -42,6 +42,9 @@ pub enum LexicalUnavailableReasonDto {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticSkippedReasonDto {
     LexicalIndexUnavailable,
+    /// `--exact` selected exact mode, which is a literal-match guarantee and
+    /// never consults the semantic lane or loads a model (RFC 0007 D4).
+    ExactMode,
     ModelNotPrepared,
     ProfileMismatch,
     ModelCacheMissing,

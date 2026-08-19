@@ -293,7 +293,10 @@ pretending BM25 and cosine scores share a calibrated numeric scale. The
 literal lane participates by mode:
 
 - **exact mode:** tasks containing the complete query as a substring sort ahead
-  of all other tasks, then by fused rank.
+  of all other tasks, then by fused rank. The semantic lane does not run: the
+  user signalled a literal guarantee, so exact search never loads a model or
+  probes an accelerator, and JSON reports
+  `"semantic_skipped_reason": "exact_mode"`.
 - **identifier mode:** tasks containing the full query — or, failing that,
   every identifier-shaped token — as substrings sort ahead of all other
   tasks, then by fused rank. Exact lookup keeps its hard guarantee exactly
@@ -808,13 +811,14 @@ machine contract:
 - `semantic_available` is true only when the active profile has complete
   corpus-vector coverage and semantic retrieval completed for this query. When
   false, `semantic_skipped_reason` is required and is one of
-  `lexical_index_unavailable`, `model_not_prepared`, `profile_mismatch`,
-  `model_cache_missing`, `query_too_long`, `storage_limit`, or
-  `embedding_failed`. It is omitted when semantic retrieval succeeds, even
-  when that successful lane returns no candidates.
+  `lexical_index_unavailable`, `exact_mode`, `model_not_prepared`,
+  `profile_mismatch`, `model_cache_missing`, `query_too_long`,
+  `storage_limit`, or `embedding_failed`. It is omitted when semantic
+  retrieval succeeds, even when that successful lane returns no candidates.
 - When several semantic prerequisites fail, the emitted reason is the first in
-  this order: lexical index unavailable, model not prepared, profile mismatch,
-  cache missing, query too long, storage limit, embedding failure. Human
+  this order: lexical index unavailable, exact mode, model not prepared,
+  profile mismatch, cache missing, query too long, storage limit, embedding
+  failure. Human
   diagnostics and remediation remain on stderr; raw SQLite, filesystem, and
   model error strings never replace the stable JSON enum.
 

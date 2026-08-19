@@ -5728,3 +5728,43 @@ fn repo_attach_without_token_still_succeeds_and_populates_nothing() {
         "no token available; the registry must stay unpopulated, got: {stored:?}"
     );
 }
+
+/// `--exact` is a literal guarantee (RFC 0007 D4): it returns literal hits
+/// without touching an embedder — no model load, no accelerator probe — and
+/// says so in `semantic_skipped_reason`.
+#[test]
+fn task_search_exact_skips_the_semantic_lane() {
+    let dir = TempDir::new().unwrap();
+    let ws = run_json(
+        &mut bin("repo-link", &dir),
+        &["workspace", "create", "w", "--local-only"],
+    );
+    let workspace = ws["id"].as_str().unwrap().to_string();
+    run_json(
+        &mut bin("repo-link", &dir),
+        &[
+            "task",
+            "create",
+            "--workspace",
+            &workspace,
+            "--title",
+            "ScriptableObject overrides",
+        ],
+    );
+
+    let resp = run_json(
+        &mut bin("repo-link", &dir),
+        &["task", "search", "--exact", "ScriptableObject"],
+    );
+    assert_eq!(resp["query_mode"], "exact");
+    assert_eq!(resp["lexical_available"], true);
+    assert_eq!(resp["semantic_available"], false);
+    assert_eq!(resp["semantic_skipped_reason"], "exact_mode");
+    let results = resp["results"].as_array().expect("results");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["title"], "ScriptableObject overrides");
+    assert!(
+        results[0]["matched"]["lexical_rank"].is_u64(),
+        "the lexical lane must rank the hit without an embedder: {resp}"
+    );
+}
