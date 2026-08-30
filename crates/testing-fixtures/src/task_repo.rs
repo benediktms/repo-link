@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use domain_core::{RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
-use domain_task::{SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot};
+use domain_task::{Priority, SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot};
 use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
 
 use crate::InMemoryOutboxRepository;
@@ -28,6 +28,10 @@ pub struct InMemoryTaskRepository {
     /// assert the per-site freshness `source` (the RFC 0004 D3 tripwire: the
     /// poller must stamp `Polled`). Append-only.
     synced_stamps: Mutex<Vec<(TaskId, SyncedSource)>>,
+    /// Records every `apply_polled_priority(task_id, priority)` call, so a test
+    /// can assert that a steady-state re-poll writes nothing at all rather than
+    /// re-writing the same value (#292). Append-only.
+    polled_priorities: Mutex<Vec<(TaskId, Priority)>>,
 }
 
 impl InMemoryTaskRepository {
@@ -38,6 +42,7 @@ impl InMemoryTaskRepository {
             comments: Mutex::new(HashMap::new()),
             outbox: None,
             synced_stamps: Mutex::new(Vec::new()),
+            polled_priorities: Mutex::new(Vec::new()),
         }
     }
 
@@ -54,6 +59,7 @@ impl InMemoryTaskRepository {
             comments: Mutex::new(HashMap::new()),
             outbox: Some(outbox.store_handle()),
             synced_stamps: Mutex::new(Vec::new()),
+            polled_priorities: Mutex::new(Vec::new()),
         }
     }
 
@@ -65,6 +71,12 @@ impl InMemoryTaskRepository {
     /// first. Lets a test assert which tasks were stamped and with what source.
     pub fn synced_stamps(&self) -> Vec<(TaskId, SyncedSource)> {
         self.synced_stamps.lock().unwrap().clone()
+    }
+
+    /// The `(task_id, priority)` of every `apply_polled_priority` call so far,
+    /// oldest first. An empty vec is the "the poll wrote nothing" assertion.
+    pub fn polled_priorities(&self) -> Vec<(TaskId, Priority)> {
+        self.polled_priorities.lock().unwrap().clone()
     }
 }
 
@@ -448,6 +460,20 @@ impl TaskRepository for InMemoryTaskRepository {
         // bump, no `sync` change. An absent id is a benign no-op.
         if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
             task.project_status_option_id = option_id;
+        }
+        Ok(())
+    }
+
+    async fn apply_polled_priority(&self, task_id: TaskId, priority: Priority) -> PortResult<()> {
+        // Targeted single-column write (#292): mutate ONLY `priority` under the
+        // existing lock — no snapshot, no version bump, no `sync` change. An
+        // absent id is a benign no-op.
+        self.polled_priorities
+            .lock()
+            .unwrap()
+            .push((task_id, priority));
+        if let Some(task) = self.inner.lock().unwrap().get_mut(&task_id) {
+            task.priority = priority;
         }
         Ok(())
     }

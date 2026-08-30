@@ -128,7 +128,29 @@ impl TaskService {
         // project → option name` with NO network: `resolve_project` reads the
         // local project repo, `option_name_for` reads the cached option list.
         dto.project_status = self.resolve_cached_project_status(t).await?;
+        // Make the Priority authority explicit (#292): a board carrying a
+        // Priority field owns the value and the poller writes it back, while a
+        // projectless task — or a board without the field — keeps priority
+        // purely local. Same local-only, network-free resolution as above.
+        dto.priority_from_board = self.priority_is_board_owned(t).await?;
         Ok(dto)
+    }
+
+    /// Whether the board owns this task's `priority` (#292). True only for a
+    /// task actually on a board (`project_item_id`) whose project carries a
+    /// Priority single-select — the two conditions the poller's inbound apply
+    /// requires. Everything else keeps priority purely local, so the check
+    /// short-circuits before touching the workspace/project repos. Local reads
+    /// only; `rl task show` stays offline.
+    async fn priority_is_board_owned(&self, t: &Task) -> Result<bool> {
+        if t.project_item_id.is_none() {
+            return Ok(false);
+        }
+        Ok(
+            enqueue::resolve_project(&self.workspaces, &self.projects, t)
+                .await?
+                .is_some_and(|p| p.priority_field().is_some()),
+        )
     }
 
     /// Resolve the task's cached `project_status_option_id` to its display

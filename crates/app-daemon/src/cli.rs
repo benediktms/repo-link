@@ -136,6 +136,7 @@ pub async fn run_cli() -> anyhow::Result<()> {
                 projects_repo,
                 tasks_repo.clone(),
                 remote_projects,
+                outbox_repo.clone(),
             ));
             (Some(drainer), Some(poller), Some(outbox_repo))
         }
