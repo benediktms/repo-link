@@ -1905,6 +1905,7 @@ mod tests {
             proj_repo.clone(),
             task_repo.clone(),
             remote_projects,
+            outbox.clone(),
         ));
         let daemon = Arc::new(Daemon::new(
             workspaces,
@@ -1979,6 +1980,7 @@ mod tests {
             proj_repo.clone(),
             task_repo.clone(),
             remote_projects,
+            outbox.clone(),
         ));
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
         let daemon = Arc::new(Daemon::new(
@@ -2036,6 +2038,7 @@ mod tests {
             proj_repo.clone(),
             task_repo.clone(),
             remote_projects,
+            outbox.clone(),
         ));
         let outbox_dyn: Arc<dyn OutboxRepository> = outbox.clone();
         let daemon = Arc::new(Daemon::new(

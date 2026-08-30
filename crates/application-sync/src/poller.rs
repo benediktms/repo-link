@@ -65,14 +65,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use domain_core::{ProjectId, Timestamp, WorkspaceId};
+use domain_core::{ProjectId, TaskId, Timestamp, WorkspaceId};
 use domain_project::Project;
+use domain_sync::OutboxMutation;
 use domain_task::{SyncState, Task};
 #[cfg(doc)]
 use ports::PollPage;
 use ports::{
-    ProjectRepository, RemoteProjectItem, RemoteProjectProvider, SyncedSource, TaskFilter,
-    TaskRepository,
+    OutboxRepository, ProjectRepository, RemoteProjectItem, RemoteProjectProvider, SyncedSource,
+    TaskFilter, TaskRepository,
 };
 use tracing::{Instrument, debug, info, info_span, warn};
 
@@ -129,6 +130,9 @@ pub struct ProjectPoller {
     projects: Arc<dyn ProjectRepository>,
     tasks: Arc<dyn TaskRepository>,
     remote_projects: Arc<dyn RemoteProjectProvider>,
+    /// Read-only here: consulted so an inbound board Priority never overwrites
+    /// a local edit the drainer has yet to push (see [`Self::reconcile_priority`]).
+    outbox: Arc<dyn OutboxRepository>,
     /// Per-project poll watermark (`since`). Process-local: a daemon restart
     /// forgets it and re-polls from epoch once, which is the safe direction
     /// (re-reading is idempotent; the reconcile is a no-op when nothing
@@ -141,11 +145,13 @@ impl ProjectPoller {
         projects: Arc<dyn ProjectRepository>,
         tasks: Arc<dyn TaskRepository>,
         remote_projects: Arc<dyn RemoteProjectProvider>,
+        outbox: Arc<dyn OutboxRepository>,
     ) -> Self {
         Self {
             projects,
             tasks,
             remote_projects,
+            outbox,
             watermarks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -475,11 +481,29 @@ impl ProjectPoller {
     /// would also enqueue the outbound `SetProjectPriority` projection and echo
     /// the board's own value back at it every pass.
     ///
-    /// Idempotent: writes only when the mapped priority differs from the
-    /// indexed task's, so a steady-state re-poll does nothing. A successful
-    /// write also updates `task` — the caller's per-pass index copy, scratch
-    /// only — so a duplicate item id later in the same pass compares against
-    /// the just-written value and stays idempotent too.
+    /// Agreement is decided on the OPTION, not on the mapped priority: the
+    /// D3 clamp maps several local priorities onto one option when the board
+    /// has fewer than four (`Pk → option[min(k, N-1)]`), so a task at P3 on a
+    /// three-option board already shows the board's own value. Inverting the
+    /// option first would resolve that shared option to P2 and silently demote
+    /// the task. Comparing `local priority → option` against the board's option
+    /// says only what the board actually asserts, and the inverse lookup is
+    /// reached only once the two genuinely disagree.
+    ///
+    /// A pending outbound `SetProjectPriority` wins over the board. The drainer
+    /// sends the option captured at enqueue time without rereading the task, so
+    /// applying an inbound value on top would overwrite an unpushed local edit
+    /// that is about to overwrite the board right back. This mirrors the
+    /// content-drift check above, which likewise refuses to touch a task with
+    /// unpushed local intent. Only `pending` entries block: an `inflight` one is
+    /// already mid-send, so the board is about to carry the local value and the
+    /// next pass converges on it.
+    ///
+    /// Idempotent: writes only when board and task genuinely disagree, so a
+    /// steady-state re-poll does nothing. A successful write also updates
+    /// `task` — the caller's per-pass index copy, scratch only — so a duplicate
+    /// item id later in the same pass compares against the just-written value
+    /// and stays idempotent too.
     async fn reconcile_priority(
         &self,
         task: &mut Task,
@@ -492,6 +516,9 @@ impl ProjectPoller {
         let Some(option_id) = item.single_select_options.get(field_id) else {
             return;
         };
+        if project.resolved_priority_option_id_for(task.priority) == Some(option_id.as_str()) {
+            return;
+        }
         let Some(priority) = project.priority_for_option_id(option_id) else {
             debug!(
                 item = %item.item_node_id,
@@ -500,7 +527,12 @@ impl ProjectPoller {
             );
             return;
         };
-        if task.priority == priority {
+        if self.has_pending_priority_push(task.id).await {
+            debug!(
+                item = %item.item_node_id,
+                task = %task.id,
+                "task owes an unpushed board priority; leaving local priority untouched"
+            );
             return;
         }
         if let Err(e) = self.tasks.apply_polled_priority(task.id, priority).await {
@@ -518,6 +550,23 @@ impl ProjectPoller {
                 priority = ?priority,
                 "applied polled board priority via targeted column update"
             );
+        }
+    }
+
+    /// Whether the task has a `pending` outbound `SetProjectPriority` the
+    /// drainer has yet to send. A read failure answers `true` — the safe
+    /// direction, since leaving the local priority alone for one pass costs
+    /// nothing and the next pass re-decides, whereas guessing `false` would
+    /// discard the local edit this guard exists to protect.
+    async fn has_pending_priority_push(&self, task_id: TaskId) -> bool {
+        match self.outbox.list_pending(task_id).await {
+            Ok(entries) => entries
+                .iter()
+                .any(|e| matches!(e.mutation, OutboxMutation::SetProjectPriority { .. })),
+            Err(e) => {
+                warn!(task = %task_id, error = %e, "could not read pending outbox entries; skipping the priority apply this cycle");
+                true
+            }
         }
     }
 
@@ -574,13 +623,14 @@ impl ProjectPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain_core::{TaskId, WorkspaceId};
+    use domain_core::WorkspaceId;
     use domain_project::{FieldOption, ProjectField, ProjectFieldKind, derive_priority_mappings};
+    use domain_sync::OutboxEntry;
     use domain_task::{Priority, RemoteRef, SnapshotSource, SyncState, Task};
     use ports::ProjectRepository;
     use testing_fixtures::{
-        InMemoryProjectRepository, InMemoryRemoteProjectProvider, InMemoryTaskRepository,
-        ProjectCall,
+        InMemoryOutboxRepository, InMemoryProjectRepository, InMemoryRemoteProjectProvider,
+        InMemoryTaskRepository, ProjectCall,
     };
 
     fn project(node_id: &str) -> Project {
@@ -627,10 +677,26 @@ mod tests {
         tasks: Arc<InMemoryTaskRepository>,
         remote: Arc<InMemoryRemoteProjectProvider>,
     ) -> ProjectPoller {
+        poller_with_outbox(
+            projects,
+            tasks,
+            remote,
+            Arc::new(InMemoryOutboxRepository::new()),
+        )
+        .await
+    }
+
+    async fn poller_with_outbox(
+        projects: Arc<InMemoryProjectRepository>,
+        tasks: Arc<InMemoryTaskRepository>,
+        remote: Arc<InMemoryRemoteProjectProvider>,
+        outbox: Arc<InMemoryOutboxRepository>,
+    ) -> ProjectPoller {
         let p: Arc<dyn ProjectRepository> = projects;
         let t: Arc<dyn TaskRepository> = tasks;
         let r: Arc<dyn RemoteProjectProvider> = remote;
-        ProjectPoller::new(p, t, r)
+        let o: Arc<dyn OutboxRepository> = outbox;
+        ProjectPoller::new(p, t, r, o)
     }
 
     /// Build + save a project-backed (issue-backed, project_item_id) mirror task
@@ -657,7 +723,13 @@ mod tests {
     /// `o_p0`..`o_p3` — the shape `derive_priority_mappings` produces at link
     /// time.
     fn project_with_priority(node_id: &str) -> Project {
-        let options: Vec<FieldOption> = ["o_p0", "o_p1", "o_p2", "o_p3"]
+        project_with_priority_options(node_id, 4)
+    }
+
+    /// As [`project_with_priority`] but with `n` options, so a test can exercise
+    /// the D3 clamp's collapse on a board narrower than P0..P3.
+    fn project_with_priority_options(node_id: &str, n: usize) -> Project {
+        let options: Vec<FieldOption> = ["o_p0", "o_p1", "o_p2", "o_p3"][..n]
             .iter()
             .enumerate()
             .map(|(i, id)| FieldOption {
@@ -799,6 +871,80 @@ mod tests {
         );
 
         poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        assert!(tasks.polled_priorities().is_empty());
+    }
+
+    /// The D3 clamp collapses P2 and P3 onto one option on a three-option
+    /// board. A task at P3 whose card shows that shared option already agrees
+    /// with the board, so nothing may be written — inverting the option first
+    /// would resolve it to P2 and silently demote the task.
+    #[tokio::test]
+    async fn poll_does_not_demote_on_a_collapsed_priority_mapping() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        // Three options: P0→o_p0, P1→o_p1, P2 and P3 both→o_p2 (min(k, N-1)).
+        projects
+            .save(&project_with_priority_options("PVT_clamp", 3))
+            .await
+            .unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_clamp", "PVTI_1").await;
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        remote.set_poll_items(
+            "PVT_clamp",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_p2")],
+        );
+
+        poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        assert!(tasks.polled_priorities().is_empty());
+    }
+
+    /// A queued `SetProjectPriority` is an unpushed local edit. The drainer
+    /// sends the option it captured without rereading the task, so an inbound
+    /// apply on top would discard that edit; the board waits its turn.
+    #[tokio::test]
+    async fn poll_defers_to_a_pending_outbound_priority_push() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+        let outbox = Arc::new(InMemoryOutboxRepository::new());
+
+        projects
+            .save(&project_with_priority("PVT_pending"))
+            .await
+            .unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_pending", "PVTI_1").await;
+        outbox
+            .enqueue(&OutboxEntry::new(
+                id,
+                OutboxMutation::SetProjectPriority {
+                    project_node_id: "PVT_pending".into(),
+                    item_node_id: "PVTI_1".into(),
+                    priority_field_id: "PVTSSF_prio".into(),
+                    option_id: "o_p1".into(),
+                },
+            ))
+            .await
+            .unwrap();
+        remote.set_poll_items(
+            "PVT_pending",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_p0")],
+        );
+
+        poller_with_outbox(projects, tasks.clone(), remote, outbox)
             .await
             .poll_once()
             .await
