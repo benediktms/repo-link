@@ -1162,11 +1162,9 @@ fn decode_vector(blob: &[u8], dims: usize) -> Result<Vec<f32>, String> {
     if blob.len() != dims * 4 {
         return Err(format!("vector blob len {} != {dims} dims", blob.len()));
     }
-    let mut out = Vec::with_capacity(dims);
-    for chunk in blob.chunks_exact(4) {
-        out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    Ok(out)
+    let (chunks, rest) = blob.as_chunks::<4>();
+    debug_assert!(rest.is_empty(), "length guard above rules out a remainder");
+    Ok(chunks.iter().copied().map(f32::from_le_bytes).collect())
 }
 
 /// Reject a chunk whose stored segments are not `0..n` without gaps.
