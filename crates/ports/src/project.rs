@@ -61,6 +61,16 @@ pub struct RemoteProjectItem {
     pub body: String,
     pub closed: bool,
     pub status_option_id: Option<String>,
+    /// Every single-select value the item carries, keyed by *field* node id
+    /// (`PVTSSF_…`) → *option* node id. The poll query already fetches the
+    /// item's whole `fieldValues` connection to find the Status option, so the
+    /// rest come for free; keeping them lets the caller read a second field
+    /// (Priority, #292) without a second round trip or a wider provider
+    /// signature. `status_option_id` above is this map's Status entry,
+    /// retained because every existing caller wants exactly that one.
+    ///
+    /// Fields with no value set on this item are simply absent.
+    pub single_select_options: HashMap<String, String>,
     pub updated_at: Timestamp,
 }
 

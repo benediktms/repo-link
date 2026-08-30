@@ -299,6 +299,25 @@ pub trait TaskRepository: Send + Sync {
     /// `node_id` on a row that has no remote. A zero-row match (task absent OR
     /// remote-less) is therefore benign.
     async fn cache_remote_node_id(&self, task_id: TaskId, node_id: String) -> PortResult<()>;
+    /// Apply a board-observed `priority` to one task — a targeted
+    /// single-column write in the same family as
+    /// [`cache_project_status`](Self::cache_project_status) (#292, the inbound
+    /// half of RFC 0006 D3). It must NOT touch any other column, append a
+    /// snapshot, bump the `version`, or change `sync_state`: board Priority is
+    /// its own axis, orthogonal to the issue-mirror content that dirty
+    /// detection keys on.
+    ///
+    /// Deliberately off the aggregate `save_with_outbox` path so applying an
+    /// inbound value cannot enqueue the outbound `SetProjectPriority`
+    /// projection that a local `task edit` owes — that would echo the board's
+    /// own value straight back at it every poll.
+    ///
+    /// A zero-row match (task absent) is a benign no-op — return `Ok`.
+    async fn apply_polled_priority(
+        &self,
+        task_id: TaskId,
+        priority: domain_task::Priority,
+    ) -> PortResult<()>;
     /// Clear native-Type projection intent iff the task still wants
     /// `expected`. The compare-and-clear prevents an older successful outbox
     /// entry from erasing a newer local type edit.

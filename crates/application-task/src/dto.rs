@@ -85,6 +85,10 @@ pub fn task_to_dto(t: &Task, prefix: Option<&str>) -> TaskDto {
         // doesn't have). Default to None here so the pure conversion stays
         // network- and repo-free. CACHED only — never a network call.
         project_status: None,
+        // Same story as `project_status`: whether the board carries a Priority
+        // field needs a project handle this pure fn doesn't have, so
+        // `TaskService::task_dto` overlays it.
+        priority_from_board: false,
         // The `blocked_by` UUIDs are upgraded to composite display IDs in
         // `TaskService::task_dto` (same as `relations`), which has the binding
         // handle this pure fn lacks. Seed with UUIDs here.

@@ -203,6 +203,18 @@ impl Project {
             .map(|m| m.option_id.as_str())
     }
 
+    /// The inverse of [`Self::resolved_priority_option_id_for`]: resolve a
+    /// board option back to the local [`Priority`] it is mapped to (#292, the
+    /// inbound half of RFC 0006 D3). `None` when the option belongs to some
+    /// other field, or to a Priority option nobody mapped — an unmapped board
+    /// value must leave the local priority alone rather than guess at it.
+    pub fn priority_for_option_id(&self, option_id: &str) -> Option<Priority> {
+        self.priority_mappings
+            .iter()
+            .find(|m| m.option_id == option_id)
+            .map(|m| m.priority)
+    }
+
     /// The project's custom `Type`-kind field, if EXACTLY one is present
     /// (RFC 0006 #238). Returns `None` for zero (no custom Type field — the
     /// native issue-type rail applies) AND for two-or-more (ambiguous: a board

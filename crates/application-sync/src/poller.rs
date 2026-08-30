@@ -66,6 +66,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use domain_core::{ProjectId, Timestamp, WorkspaceId};
+use domain_project::Project;
 use domain_task::{SyncState, Task};
 #[cfg(doc)]
 use ports::PollPage;
@@ -234,7 +235,7 @@ impl ProjectPoller {
                 if item.updated_at.into_inner() <= since.into_inner() {
                     continue;
                 }
-                self.reconcile_item(&mut by_item_id, item, &mut report)
+                self.reconcile_item(&mut by_item_id, project, item, &mut report)
                     .await;
             }
 
@@ -348,6 +349,7 @@ impl ProjectPoller {
     async fn reconcile_item(
         &self,
         by_item_id: &mut HashMap<String, Task>,
+        project: &Project,
         item: &RemoteProjectItem,
         report: &mut PollReport,
     ) {
@@ -417,6 +419,8 @@ impl ProjectPoller {
             ),
         }
 
+        self.reconcile_priority(task, project, item).await;
+
         // Cheap no-op skip: the polled value already matches what's cached on
         // the indexed task, so steady-state re-polls do no writes at all.
         if task.project_status_option_id == item.status_option_id {
@@ -450,6 +454,69 @@ impl ProjectPoller {
                 task = %task.id,
                 status_option = ?item.status_option_id,
                 "cached polled project status via targeted column update"
+            );
+        }
+    }
+
+    /// Apply the board's Priority column back onto the task (#292 — the
+    /// inbound half of RFC 0006 D3, whose outbound projection already ships).
+    ///
+    /// Only boards that actually carry a Priority single-select participate:
+    /// with no remote representation of priority, the local value is the only
+    /// value and stays locally authoritative, so a board without the field
+    /// leaves it untouched rather than clearing it. Likewise an option nobody
+    /// mapped to a local `Priority`, and an item with the field unset — the
+    /// board is authoritative about what it says, not about what it omits.
+    ///
+    /// Persisted with the targeted single-column
+    /// [`TaskRepository::apply_polled_priority`] for the same reason as the
+    /// status cache: the per-pass index is a stale snapshot, so a whole-row
+    /// save would clobber a concurrent CLI edit. Going through the aggregate
+    /// would also enqueue the outbound `SetProjectPriority` projection and echo
+    /// the board's own value back at it every pass.
+    ///
+    /// Idempotent: writes only when the mapped priority differs from the
+    /// indexed task's, so a steady-state re-poll does nothing. A successful
+    /// write also updates `task` — the caller's per-pass index copy, scratch
+    /// only — so a duplicate item id later in the same pass compares against
+    /// the just-written value and stays idempotent too.
+    async fn reconcile_priority(
+        &self,
+        task: &mut Task,
+        project: &Project,
+        item: &RemoteProjectItem,
+    ) {
+        let Some(field_id) = project.priority_field_id() else {
+            return;
+        };
+        let Some(option_id) = item.single_select_options.get(field_id) else {
+            return;
+        };
+        let Some(priority) = project.priority_for_option_id(option_id) else {
+            debug!(
+                item = %item.item_node_id,
+                option = %option_id,
+                "board Priority option is unmapped; leaving local priority untouched"
+            );
+            return;
+        };
+        if task.priority == priority {
+            return;
+        }
+        if let Err(e) = self.tasks.apply_polled_priority(task.id, priority).await {
+            warn!(
+                item = %item.item_node_id,
+                task = %task.id,
+                error = %e,
+                "failed to apply polled board priority; will retry next cycle"
+            );
+        } else {
+            task.priority = priority;
+            debug!(
+                item = %item.item_node_id,
+                task = %task.id,
+                priority = ?priority,
+                "applied polled board priority via targeted column update"
             );
         }
     }
@@ -508,8 +575,8 @@ impl ProjectPoller {
 mod tests {
     use super::*;
     use domain_core::{TaskId, WorkspaceId};
-    use domain_project::Project;
-    use domain_task::{RemoteRef, SnapshotSource, SyncState, Task};
+    use domain_project::{FieldOption, ProjectField, ProjectFieldKind, derive_priority_mappings};
+    use domain_task::{Priority, RemoteRef, SnapshotSource, SyncState, Task};
     use ports::ProjectRepository;
     use testing_fixtures::{
         InMemoryProjectRepository, InMemoryRemoteProjectProvider, InMemoryTaskRepository,
@@ -541,8 +608,18 @@ mod tests {
             body: "body".into(),
             closed: false,
             status_option_id: status_option_id.map(str::to_owned),
+            single_select_options: HashMap::new(),
             updated_at: Timestamp::now(),
         }
+    }
+
+    /// [`item`] plus a value on some other single-select field — the shape the
+    /// board's Priority column arrives in.
+    fn item_with_field(item_node_id: &str, field_id: &str, option_id: &str) -> RemoteProjectItem {
+        let mut it = item(item_node_id, None);
+        it.single_select_options
+            .insert(field_id.into(), option_id.into());
+        it
     }
 
     async fn poller(
@@ -574,6 +651,161 @@ mod tests {
         projects.link_workspace(task.workspace_id, ProjectId::parse(project_id).unwrap());
         tasks.save(&task, SnapshotSource::Promote).await.unwrap();
         id
+    }
+
+    /// A board carrying a Priority single-select, with P0..P3 mapped to
+    /// `o_p0`..`o_p3` — the shape `derive_priority_mappings` produces at link
+    /// time.
+    fn project_with_priority(node_id: &str) -> Project {
+        let options: Vec<FieldOption> = ["o_p0", "o_p1", "o_p2", "o_p3"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| FieldOption {
+                option_id: (*id).into(),
+                name: format!("P{i}"),
+                ordinal: i as u32,
+            })
+            .collect();
+        let mappings = derive_priority_mappings(&options);
+        Project::from_fields(
+            ProjectId::parse(node_id).unwrap(),
+            "acme".into(),
+            1,
+            "Board".into(),
+            vec![
+                ProjectField {
+                    field_id: "PVTSSF_field".into(),
+                    name: "Status".into(),
+                    kind: ProjectFieldKind::Status,
+                    options: vec![],
+                },
+                ProjectField {
+                    field_id: "PVTSSF_prio".into(),
+                    name: "Priority".into(),
+                    kind: ProjectFieldKind::Priority,
+                    options,
+                },
+            ],
+            vec![],
+            mappings,
+            false,
+            Timestamp::now(),
+        )
+        .unwrap()
+    }
+
+    /// #292: a board Priority that outranks the local value wins — the board is
+    /// authoritative for the field it carries.
+    #[tokio::test]
+    async fn poll_applies_board_priority_to_the_task() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects
+            .save(&project_with_priority("PVT_prio"))
+            .await
+            .unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_prio", "PVTI_1").await;
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        remote.set_poll_items(
+            "PVT_prio",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_p0")],
+        );
+
+        poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P0);
+        assert_eq!(tasks.polled_priorities(), vec![(id, Priority::P0)]);
+    }
+
+    /// A board with no Priority field has no remote representation of the
+    /// value, so the local one stays authoritative — never cleared, never
+    /// defaulted.
+    #[tokio::test]
+    async fn poll_leaves_priority_alone_when_the_board_has_no_priority_field() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects.save(&project("PVT_noprio")).await.unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_noprio", "PVTI_1").await;
+        // The item even carries a value on some other single-select — without a
+        // Priority field on the board, nothing may read it as one.
+        remote.set_poll_items(
+            "PVT_noprio",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_p0")],
+        );
+
+        poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        assert!(tasks.polled_priorities().is_empty());
+    }
+
+    /// Steady state: a board value equal to the local one writes nothing at
+    /// all, so re-polling an unchanged board costs no writes.
+    #[tokio::test]
+    async fn poll_does_not_write_when_board_priority_already_matches() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects
+            .save(&project_with_priority("PVT_same"))
+            .await
+            .unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_same", "PVTI_1").await;
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        remote.set_poll_items(
+            "PVT_same",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_p3")],
+        );
+
+        poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        assert!(tasks.polled_priorities().is_empty());
+    }
+
+    /// An option nobody mapped (a board option outside the derived P0..P3 set)
+    /// is not a guess to make — the local value stands.
+    #[tokio::test]
+    async fn poll_ignores_an_unmapped_priority_option() {
+        let projects = Arc::new(InMemoryProjectRepository::new());
+        let tasks = Arc::new(InMemoryTaskRepository::new());
+        let remote = Arc::new(InMemoryRemoteProjectProvider::new());
+
+        projects
+            .save(&project_with_priority("PVT_unmapped"))
+            .await
+            .unwrap();
+        let id = project_backed_task(&tasks, &projects, "PVT_unmapped", "PVTI_1").await;
+        remote.set_poll_items(
+            "PVT_unmapped",
+            vec![item_with_field("PVTI_1", "PVTSSF_prio", "o_someday")],
+        );
+
+        poller(projects, tasks.clone(), remote)
+            .await
+            .poll_once()
+            .await
+            .unwrap();
+
+        assert_eq!(tasks.get(id).await.unwrap().priority, Priority::P3);
+        assert!(tasks.polled_priorities().is_empty());
     }
 
     /// RFC 0004 D3: a complete poll stamps `synced_at` (source `Polled`) for the

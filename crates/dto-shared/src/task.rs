@@ -67,6 +67,14 @@ pub struct TaskDto {
     /// Additive; defaults to null for older consumers.
     #[serde(default)]
     pub project_status: Option<String>,
+    /// `true` when the task's board carries a Priority single-select, so the
+    /// board is authoritative for `priority` and the poller writes it back
+    /// (#292). Absent — the common case — means no remote representation
+    /// exists, and the local `priority` is the only value there is. OMITTED
+    /// from the JSON when false, so existing consumers and golden output are
+    /// unaffected. Additive.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority_from_board: bool,
     /// Composite display IDs (`prefix-hash`) of the tasks this one is
     /// `blocked_by` — the derived "blocked" view (RFC 0004 D1/D2; "blocked" is
     /// no longer a stored state). Empty when nothing blocks it. Mirrors the

@@ -699,14 +699,20 @@ impl GraphqlClient {
 /// board) so the caller skips them rather than erroring.
 fn map_poll_item(node: ItemNode, status_field_id: &str) -> PortResult<Option<RemoteProjectItem>> {
     let updated_at = parse_ts(&node.updated_at)?;
-    // Read the option from the project's *chosen* Status field (matched by id),
-    // not by the literal name "Status" — boards may name the field anything.
-    let status_option_id = node
+    // Index every single-select value by its field id. Non-single-select
+    // members of the connection carry neither, so they drop out here.
+    let single_select_options: HashMap<String, String> = node
         .field_values
         .nodes
         .into_iter()
-        .find(|v| v.field.as_ref().and_then(|f| f.id.as_deref()) == Some(status_field_id))
-        .and_then(|v| v.option_id);
+        .filter_map(|v| {
+            let field_id = v.field.and_then(|f| f.id)?;
+            Some((field_id, v.option_id?))
+        })
+        .collect();
+    // Read the option from the project's *chosen* Status field (matched by id),
+    // not by the literal name "Status" — boards may name the field anything.
+    let status_option_id = single_select_options.get(status_field_id).cloned();
     let Some(content) = node.content else {
         return Ok(None);
     };
@@ -722,6 +728,7 @@ fn map_poll_item(node: ItemNode, status_field_id: &str) -> PortResult<Option<Rem
             body: content.body.unwrap_or_default(),
             closed: content.state.as_deref() == Some("CLOSED"),
             status_option_id,
+            single_select_options,
             updated_at,
         },
         "DraftIssue" => RemoteProjectItem {
@@ -734,6 +741,7 @@ fn map_poll_item(node: ItemNode, status_field_id: &str) -> PortResult<Option<Rem
             // Drafts have no open/closed lifecycle of their own.
             closed: false,
             status_option_id,
+            single_select_options,
             updated_at,
         },
         _ => return Ok(None),

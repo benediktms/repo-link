@@ -460,6 +460,24 @@ impl TaskRepository for SqliteTaskRepository {
         Ok(())
     }
 
+    async fn apply_polled_priority(
+        &self,
+        task_id: TaskId,
+        priority: domain_task::Priority,
+    ) -> PortResult<()> {
+        // Targeted single-column write (#292), same rules as
+        // `cache_project_status`: no version bump, no snapshot, no `sync_state`
+        // change, and no whole-row overwrite that could clobber a concurrent
+        // CLI edit to title/body/status. A zero-row match is a benign no-op.
+        sqlx::query("UPDATE tasks SET priority = ? WHERE id = ?")
+            .bind(enum_to_str(&priority)?)
+            .bind(task_id.to_string())
+            .execute(&self.db.writes)
+            .await
+            .map_err(map_sqlx_err)?;
+        Ok(())
+    }
+
     async fn mark_remote_dirty(&self, task_id: TaskId) -> PortResult<()> {
         // Targeted, CONDITIONAL single-column write (#208): flip Synced →
         // DirtyRemote only. The `WHERE sync_state = synced` guard means a
