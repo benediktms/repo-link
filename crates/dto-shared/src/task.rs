@@ -184,11 +184,44 @@ pub struct RemoveTaskRelationCmd {
     pub other: String,
 }
 
+/// The filter and sort surface shared by every task-listing command. Every
+/// field is additive and defaulted, so an older caller that sets only
+/// `workspace_id` behaves exactly as before.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListTasksQuery {
+    /// Workspace handle: a UUID or a workspace name.
     pub workspace_id: Option<String>,
+    /// Logical repo binding handle: a UUID, prefix, name, or alias.
     pub repo_id: Option<String>,
     /// Lifecycle filter (RFC 0004 D1): `"open"` / `"closed"`, or `None` for all.
     pub status: Option<String>,
     pub sync_state: Option<String>,
+    /// Keep only these priorities (`"p0"`..`"p3"`). Empty = every priority.
+    #[serde(default)]
+    pub priorities: Vec<String>,
+    /// Keep only tasks carrying this assignee, matched as a whole entry.
+    #[serde(default)]
+    pub assignee: Option<String>,
+    /// Keep only tasks with this issue type (RFC 0006 D7), compared verbatim.
+    #[serde(default)]
+    pub issue_type: Option<String>,
+    #[serde(default)]
+    pub created_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_before: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_after: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub updated_before: Option<DateTime<Utc>>,
+    /// Sort key: `created_at` / `updated_at` / `priority` / `title` /
+    /// `status` / `sync_state` / `synced_at`. `None` keeps creation order.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Sort direction: `asc` (the default) or `desc`.
+    #[serde(default)]
+    pub order: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }

@@ -14,8 +14,8 @@ use dto_shared::{
     TaskDto, UpdateTaskCmd,
 };
 use ports::{
-    OrgIssueTypeRepository, PortError, ProjectRepository, RepoBindingRepository, TaskFilter,
-    TaskRepository, TaskSnapshotRepository, WorkspaceRepository,
+    OrgIssueTypeRepository, PortError, ProjectRepository, RepoBindingRepository, SortDirection,
+    TaskFilter, TaskRepository, TaskSnapshotRepository, TaskSort, TaskSortKey, WorkspaceRepository,
 };
 
 use crate::dto::{assemble_task_display_id, parse_enum, task_to_dto};
@@ -746,41 +746,40 @@ impl TaskService {
         self.task_dto(&t).await
     }
 
+    /// Resolve a workspace handle — a UUID or a workspace name — to its id, so
+    /// `rl task list -w my-workspace` works wherever `-w <uuid>` does. Mirrors
+    /// `WorkspaceService`'s own resolver: a UUID that names no workspace falls
+    /// through to the name lookup rather than erroring early. Only a
+    /// `NotFound` falls through — a storage failure is reported as itself,
+    /// never as an absent workspace.
+    async fn resolve_workspace_id(&self, handle: &str) -> Result<WorkspaceId> {
+        if let Ok(id) = handle.parse::<WorkspaceId>() {
+            match self.workspaces.get(id).await {
+                Ok(_) => return Ok(id),
+                Err(PortError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.workspaces
+            .find_by_name(handle)
+            .await?
+            .map(|w| w.id)
+            .ok_or_else(|| ServiceError::BadId(format!("unknown workspace '{handle}'")))
+    }
+
+    /// List tasks under a filter, ordered as the caller asked.
+    ///
+    /// Every predicate and the ordering are pushed into the store, so a
+    /// `--limit` reads a page rather than the whole table. `workspace_id`
+    /// accepts a UUID or a workspace name; `repo_id` is a resolved binding id
+    /// (the CLI resolves prefixes and aliases before calling).
     pub async fn list(&self, query: ListTasksQuery) -> Result<Vec<TaskDto>> {
         let filter = TaskFilter {
-            workspace_id: query
-                .workspace_id
-                .as_deref()
-                .map(|s| s.parse::<WorkspaceId>())
-                .transpose()?,
-            repo_id: query
-                .repo_id
-                .as_deref()
-                .map(|s| s.parse::<RepoId>())
-                .transpose()?,
-            // Default to open-only when no `--status` is given, so `rl task
-            // list` shows actionable work and doesn't bury it under completed
-            // and dropped (not_planned) tasks. `--status all` opts back into
-            // every lifecycle; `open`/`closed` filter explicitly.
-            is_open: match query.status.as_deref() {
-                None | Some("open") => Some(true),
-                Some("closed") => Some(false),
-                Some("all") => None,
-                Some(other) => {
-                    return Err(ServiceError::BadEnum {
-                        field: "status",
-                        value: other.to_string(),
-                    });
-                }
+            workspace_id: match query.workspace_id.as_deref() {
+                Some(handle) => Some(self.resolve_workspace_id(handle).await?),
+                None => None,
             },
-            sync_state: query
-                .sync_state
-                .as_deref()
-                .map(|s| parse_enum::<SyncState>("sync_state", s))
-                .transpose()?,
-            // Poller-only knobs (stale-scan / active-gate / limit) stay off for
-            // the user-facing `rl task list`.
-            ..TaskFilter::default()
+            ..task_filter_from_query(&query)?
         };
         let rows = self.repo.list(filter).await?;
         // One binding lookup per task — fine at current scales (dozens
@@ -1475,6 +1474,80 @@ fn cycle_axis(
     }
 }
 
+/// Turn the CLI's `--sort` / `--order` strings into a [`TaskSort`]. `None` for
+/// `sort` means "no explicit order", which leaves the store's default (creation
+/// order) in place; an `--order` with no `--sort` is accepted and ignored,
+/// because there is nothing to reverse.
+fn parse_sort(sort: Option<&str>, order: Option<&str>) -> Result<Option<TaskSort>> {
+    let Some(sort) = sort else { return Ok(None) };
+    let key: TaskSortKey = sort.parse().map_err(|_| ServiceError::BadEnum {
+        field: "sort",
+        value: sort.to_string(),
+    })?;
+    let direction = match order {
+        Some(o) => o.parse().map_err(|_| ServiceError::BadEnum {
+            field: "order",
+            value: o.to_string(),
+        })?,
+        None => SortDirection::default(),
+    };
+    Ok(Some(TaskSort { key, direction }))
+}
+
+/// Translate the string-shaped [`ListTasksQuery`] into the typed port filter —
+/// the one place `--priority p0`, `--sort updated_at`, `--created-after` and
+/// friends become predicates the store can apply.
+///
+/// `workspace_id` is deliberately NOT read here: a workspace handle may be a
+/// name, which needs a store lookup, so every caller resolves its own workspace
+/// scope and sets that field on the result.
+pub fn task_filter_from_query(query: &ListTasksQuery) -> Result<TaskFilter> {
+    Ok(TaskFilter {
+        repo_id: query
+            .repo_id
+            .as_deref()
+            .map(|s| s.parse::<RepoId>())
+            .transpose()?,
+        // Default to open-only when no `--status` is given, so `rl task
+        // list` shows actionable work and doesn't bury it under completed
+        // and dropped (not_planned) tasks. `--status all` opts back into
+        // every lifecycle; `open`/`closed` filter explicitly.
+        is_open: match query.status.as_deref() {
+            None | Some("open") => Some(true),
+            Some("closed") => Some(false),
+            Some("all") => None,
+            Some(other) => {
+                return Err(ServiceError::BadEnum {
+                    field: "status",
+                    value: other.to_string(),
+                });
+            }
+        },
+        sync_state: query
+            .sync_state
+            .as_deref()
+            .map(|s| parse_enum::<SyncState>("sync_state", s))
+            .transpose()?,
+        priorities: query
+            .priorities
+            .iter()
+            .map(|p| parse_enum::<Priority>("priority", p))
+            .collect::<Result<Vec<_>>>()?,
+        assignee: query.assignee.clone(),
+        issue_type: query.issue_type.clone(),
+        created_after: query.created_after.map(Timestamp::from_utc),
+        created_before: query.created_before.map(Timestamp::from_utc),
+        updated_after: query.updated_after.map(Timestamp::from_utc),
+        updated_before: query.updated_before.map(Timestamp::from_utc),
+        sort: parse_sort(query.sort.as_deref(), query.order.as_deref())?,
+        limit: query.limit,
+        offset: query.offset,
+        // Poller-only knobs (stale-scan / active-gate) stay off for the
+        // user-facing `rl task list`.
+        ..TaskFilter::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1613,118 @@ mod tests {
 
     fn ws_id() -> String {
         WorkspaceId::new().to_string()
+    }
+
+    /// Like `svc()` but hands back the workspace port, so a test can plant a
+    /// named workspace and address it by name.
+    fn svc_with_workspaces() -> (TaskService, Arc<InMemoryWorkspaceRepository>) {
+        let repo = Arc::new(InMemoryTaskRepository::new());
+        let snaps: Arc<dyn TaskSnapshotRepository> =
+            Arc::new(InMemoryTaskSnapshotRepository::linked_to(&repo));
+        let workspaces = Arc::new(InMemoryWorkspaceRepository::new());
+        let svc = TaskService::new(
+            repo,
+            snaps,
+            Arc::new(InMemoryRepoBindingRepository::new()),
+            workspaces.clone() as Arc<dyn WorkspaceRepository>,
+            Arc::new(InMemoryProjectRepository::new()),
+            Arc::new(InMemoryOrgIssueTypeRepository::new()),
+        );
+        (svc, workspaces)
+    }
+
+    #[tokio::test]
+    async fn list_accepts_a_workspace_name_as_well_as_a_uuid() {
+        use domain_workspace::{Workspace, WorkspaceName};
+
+        let (svc, workspaces) = svc_with_workspaces();
+        let w = Workspace::new(WorkspaceName::new("platform").unwrap(), None, true);
+        workspaces.save(&w).await.unwrap();
+        svc.create(CreateTaskCmd {
+            workspace_id: w.id.to_string(),
+            repo_id: None,
+            title: "a".into(),
+            body: None,
+            priority: None,
+            filing_repo_override: None,
+        })
+        .await
+        .unwrap();
+
+        let by_name = svc
+            .list(ListTasksQuery {
+                workspace_id: Some("platform".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let by_uuid = svc
+            .list(ListTasksQuery {
+                workspace_id: Some(w.id.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name, by_uuid);
+
+        let err = svc
+            .list(ListTasksQuery {
+                workspace_id: Some("nope".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::BadId(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn filter_conversion_maps_every_flag_and_rejects_a_bad_sort() {
+        let query = ListTasksQuery {
+            status: Some("all".into()),
+            priorities: vec!["p0".into(), "p2".into()],
+            assignee: Some("alice".into()),
+            issue_type: Some("bug".into()),
+            sort: Some("updated".into()),
+            order: Some("desc".into()),
+            limit: Some(10),
+            offset: Some(5),
+            ..Default::default()
+        };
+        let filter = task_filter_from_query(&query).unwrap();
+        assert_eq!(filter.is_open, None);
+        assert_eq!(filter.priorities, vec![Priority::P0, Priority::P2]);
+        assert_eq!(filter.assignee.as_deref(), Some("alice"));
+        assert_eq!(filter.issue_type.as_deref(), Some("bug"));
+        assert_eq!(
+            filter.sort,
+            Some(TaskSort {
+                key: TaskSortKey::UpdatedAt,
+                direction: SortDirection::Desc,
+            })
+        );
+        assert_eq!((filter.limit, filter.offset), (Some(10), Some(5)));
+
+        // An unknown key is refused rather than silently ignored — a caller
+        // that mistypes `--sort updatd` must not get creation order back.
+        let bad = task_filter_from_query(&ListTasksQuery {
+            sort: Some("updatd".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(bad, ServiceError::BadEnum { field: "sort", .. }),
+            "got {bad:?}"
+        );
+
+        // `--order` without `--sort` has nothing to reverse, and is ignored
+        // rather than treated as an error.
+        let no_sort = task_filter_from_query(&ListTasksQuery {
+            order: Some("desc".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(no_sort.sort, None);
     }
 
     #[tokio::test]

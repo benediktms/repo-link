@@ -5,7 +5,10 @@ use async_trait::async_trait;
 use domain_core::{RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_sync::OutboxEntry;
 use domain_task::{Priority, SnapshotSource, SyncState, Task, TaskComment, TaskSnapshot};
-use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
+use ports::{
+    PortError, PortResult, RemoteComment, SortDirection, SyncedSource, TaskFilter, TaskRepository,
+    TaskSortKey,
+};
 
 use crate::InMemoryOutboxRepository;
 use crate::outbox_repo::{OutboxStore, push_deduped};
@@ -127,6 +130,14 @@ impl InMemoryTaskRepository {
     }
 }
 
+/// A lifecycle / sync-state ordering key. The SQL adapter orders by the stored
+/// snake_case string; `Debug` differs only in case, which leaves the relative
+/// order of the variants identical — enough for a double, and it keeps this
+/// crate free of a serde dependency.
+fn order_key<T: std::fmt::Debug>(t: &T) -> String {
+    format!("{t:?}")
+}
+
 #[async_trait]
 impl TaskRepository for InMemoryTaskRepository {
     async fn save(&self, task: &Task, source: SnapshotSource) -> PortResult<()> {
@@ -245,6 +256,31 @@ impl TaskRepository for InMemoryTaskRepository {
                 Some(ts) => t.synced_at.is_none_or(|s| s < ts),
                 None => true,
             })
+            .filter(|t| filter.priorities.is_empty() || filter.priorities.contains(&t.priority))
+            .filter(|t| match &filter.assignee {
+                Some(a) => t.assignees.iter().any(|x| x == a),
+                None => true,
+            })
+            .filter(|t| match &filter.issue_type {
+                Some(want) => t.issue_type.as_ref().map(|it| it.to_string()) == Some(want.clone()),
+                None => true,
+            })
+            .filter(|t| match filter.created_after {
+                Some(ts) => t.created_at >= ts,
+                None => true,
+            })
+            .filter(|t| match filter.created_before {
+                Some(ts) => t.created_at < ts,
+                None => true,
+            })
+            .filter(|t| match filter.updated_after {
+                Some(ts) => t.updated_at >= ts,
+                None => true,
+            })
+            .filter(|t| match filter.updated_before {
+                Some(ts) => t.updated_at < ts,
+                None => true,
+            })
             // NOTE: `pollable_workspaces_only` is a no-op here — the in-memory
             // task repo has no workspace status/project data, so test tasks are
             // treated as pollable. The gate clause (active + project-attached)
@@ -257,12 +293,36 @@ impl TaskRepository for InMemoryTaskRepository {
                 task
             })
             .collect();
-        // Stale-scan mode orders oldest-observed first (None before Some);
-        // otherwise creation order.
-        if filter.synced_at_lt.is_some() {
-            rows.sort_by_key(|t| (t.synced_at.is_some(), t.synced_at));
-        } else {
-            rows.sort_by_key(|t| t.created_at);
+        // An explicit sort wins; then stale-scan mode (oldest-observed first,
+        // None before Some); otherwise creation order. `id` is the tie-breaker
+        // everywhere, matching the SQL adapter so paging is stable in both.
+        match filter.sort {
+            Some(sort) => {
+                let key_cmp = |a: &Task, b: &Task| match sort.key {
+                    TaskSortKey::CreatedAt => a.created_at.cmp(&b.created_at),
+                    TaskSortKey::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+                    TaskSortKey::Priority => a.priority.cmp(&b.priority),
+                    TaskSortKey::Title => a.title.cmp(&b.title),
+                    TaskSortKey::Lifecycle => order_key(&a.lifecycle).cmp(&order_key(&b.lifecycle)),
+                    TaskSortKey::SyncState => order_key(&a.sync).cmp(&order_key(&b.sync)),
+                    TaskSortKey::SyncedAt => (a.synced_at.is_some(), a.synced_at)
+                        .cmp(&(b.synced_at.is_some(), b.synced_at)),
+                };
+                rows.sort_by(|a, b| {
+                    let by_key = match sort.direction {
+                        SortDirection::Asc => key_cmp(a, b),
+                        SortDirection::Desc => key_cmp(b, a),
+                    };
+                    by_key.then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+                });
+            }
+            None if filter.synced_at_lt.is_some() => {
+                rows.sort_by_key(|t| (t.synced_at.is_some(), t.synced_at, t.id.to_string()));
+            }
+            None => rows.sort_by_key(|t| (t.created_at, t.id.to_string())),
+        }
+        if let Some(offset) = filter.offset {
+            rows.drain(..offset.min(rows.len()));
         }
         if let Some(limit) = filter.limit {
             rows.truncate(limit);

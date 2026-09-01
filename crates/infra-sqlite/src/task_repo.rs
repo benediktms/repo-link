@@ -6,7 +6,10 @@ use domain_task::{
     IssueType, Lifecycle, Priority, RelationKind, RemoteRef, SnapshotSource, SyncState, Task,
     TaskComment, TaskRelation, TaskSnapshot,
 };
-use ports::{PortError, PortResult, RemoteComment, SyncedSource, TaskFilter, TaskRepository};
+use ports::{
+    PortError, PortResult, RemoteComment, SortDirection, SyncedSource, TaskFilter, TaskRepository,
+    TaskSortKey,
+};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::Db;
@@ -33,6 +36,21 @@ impl SqliteTaskRepository {
 // the lifecycle axis is read from `lifecycle` (RFC 0004 D1). `synced_at` is the
 // RFC 0004 D3 write-through cache column.
 pub(crate) const TASK_COLS: &str = "id, workspace_id, repo_instance_id, title, body, status, sync_state, priority, assignees_json, remote_provider, remote_id, created_at, updated_at, hash, project_item_id, remote_node_id, project_status_option_id, filing_repo_id, lifecycle, synced_at, issue_type, issue_type_pending";
+
+/// The one place a [`TaskSortKey`] becomes a column name. Ordering is
+/// caller-driven but never caller-named: the enum is closed, so no input of
+/// any shape can reach the `ORDER BY` clause as text.
+fn sort_column(key: TaskSortKey) -> &'static str {
+    match key {
+        TaskSortKey::CreatedAt => "created_at",
+        TaskSortKey::UpdatedAt => "updated_at",
+        TaskSortKey::Priority => "priority",
+        TaskSortKey::Title => "title",
+        TaskSortKey::Lifecycle => "lifecycle",
+        TaskSortKey::SyncState => "sync_state",
+        TaskSortKey::SyncedAt => "synced_at",
+    }
+}
 
 #[async_trait]
 impl TaskRepository for SqliteTaskRepository {
@@ -200,16 +218,73 @@ impl TaskRepository for SqliteTaskRepository {
                 .push_bind(ts.into_inner())
                 .push(")");
         }
-        // In stale-scan mode order oldest-observed first (SQLite sorts NULLs
-        // first in ASC — exactly the "never observed first" we want under the
-        // LIMIT); otherwise keep the default creation order.
-        if filter.synced_at_lt.is_some() {
-            qb.push(" ORDER BY tasks.synced_at ASC");
-        } else {
-            qb.push(" ORDER BY tasks.created_at");
+        if !filter.priorities.is_empty() {
+            qb.push(" AND tasks.priority IN (");
+            let mut sep = qb.separated(", ");
+            for p in &filter.priorities {
+                sep.push_bind(enum_to_str(p)?);
+            }
+            qb.push(")");
+        }
+        if let Some(assignee) = &filter.assignee {
+            // `assignees_json` is a JSON array, so membership is an exact
+            // element match via json_each — never a LIKE over the raw text,
+            // which would match `alice` inside `alice-bot`.
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM json_each(tasks.assignees_json) WHERE json_each.value = ",
+            )
+            .push_bind(assignee.clone())
+            .push(")");
+        }
+        if let Some(it) = &filter.issue_type {
+            qb.push(" AND tasks.issue_type = ").push_bind(it.clone());
+        }
+        for (column, bound, inclusive) in [
+            ("created_at", filter.created_after, true),
+            ("created_at", filter.created_before, false),
+            ("updated_at", filter.updated_after, true),
+            ("updated_at", filter.updated_before, false),
+        ] {
+            if let Some(ts) = bound {
+                let op = if inclusive { " >= " } else { " < " };
+                qb.push(format!(" AND tasks.{column}{op}"))
+                    .push_bind(ts.into_inner());
+            }
+        }
+        // An explicit sort wins over the stale-scan order; without either, keep
+        // the historical creation order. `tasks.id` is a final tie-breaker so
+        // paging with `offset` can't repeat or skip a row when the sort key
+        // ties.
+        match filter.sort {
+            Some(sort) => {
+                let direction = match sort.direction {
+                    SortDirection::Asc => "ASC",
+                    SortDirection::Desc => "DESC",
+                };
+                qb.push(format!(
+                    " ORDER BY tasks.{} {direction}, tasks.id ASC",
+                    sort_column(sort.key)
+                ));
+            }
+            None if filter.synced_at_lt.is_some() => {
+                // SQLite sorts NULLs first in ASC — exactly the "never
+                // observed first" the stale-scan wants under its LIMIT.
+                qb.push(" ORDER BY tasks.synced_at ASC, tasks.id ASC");
+            }
+            None => {
+                qb.push(" ORDER BY tasks.created_at, tasks.id ASC");
+            }
         }
         if let Some(limit) = filter.limit {
             qb.push(" LIMIT ").push_bind(limit as i64);
+        }
+        if let Some(offset) = filter.offset {
+            // SQLite rejects OFFSET without LIMIT, so an offset with no cap
+            // gets the no-op `LIMIT -1`.
+            if filter.limit.is_none() {
+                qb.push(" LIMIT -1");
+            }
+            qb.push(" OFFSET ").push_bind(offset as i64);
         }
 
         let rows = qb

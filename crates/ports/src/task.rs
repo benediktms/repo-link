@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use domain_core::{RepoId, RepoInstanceId, RepoOriginId, TaskId, Timestamp, WorkspaceId};
 use domain_repo::{RepoBindingView, RepoInstance, RepoOrigin};
 use domain_sync::OutboxEntry;
-use domain_task::{SnapshotSource, SyncState, Task, TaskSnapshot};
+use domain_task::{Priority, SnapshotSource, SyncState, Task, TaskSnapshot};
 use domain_workspace::Workspace;
 
 use crate::error::PortResult;
@@ -88,6 +88,137 @@ pub struct TaskFilter {
     /// site). `None` = unbounded. Pairs with `synced_at_lt`'s ordering so the
     /// cap defers the freshest, not an arbitrary slice.
     pub limit: Option<usize>,
+    /// Skip this many rows before the first returned one — the paging
+    /// companion to [`limit`](Self::limit). Only meaningful alongside a
+    /// deterministic order, which [`sort`](Self::sort) guarantees.
+    pub offset: Option<usize>,
+    /// Keep only tasks whose priority is one of these. Empty = no priority
+    /// filter. A set rather than a single value so `--priority p0 --priority
+    /// p1` is one query instead of two.
+    pub priorities: Vec<Priority>,
+    /// Keep only tasks carrying this assignee. Matched against the stored
+    /// assignee list, not a substring of it.
+    pub assignee: Option<String>,
+    /// Keep only tasks whose issue type equals this canonical string
+    /// (`"bug"`, `"Epic"`). Compared verbatim — the type axis is open (RFC
+    /// 0006 D7), so there is no enum to validate against.
+    pub issue_type: Option<String>,
+    /// Keep only tasks created at or after this instant (inclusive).
+    pub created_after: Option<Timestamp>,
+    /// Keep only tasks created strictly before this instant.
+    pub created_before: Option<Timestamp>,
+    /// Keep only tasks last modified at or after this instant (inclusive).
+    pub updated_after: Option<Timestamp>,
+    /// Keep only tasks last modified strictly before this instant.
+    pub updated_before: Option<Timestamp>,
+    /// Row order. `None` keeps the historical default (creation order, or
+    /// stalest-first when [`synced_at_lt`](Self::synced_at_lt) is set). An
+    /// explicit sort wins over the stale-scan order.
+    ///
+    /// A closed enum rather than a column name: the adapter maps each variant
+    /// to a column, so a caller can never inject SQL through the order clause.
+    pub sort: Option<TaskSort>,
+}
+
+/// A sortable task property. Every variant maps to one indexed column in the
+/// adapter — the whitelist that keeps ordering caller-driven without letting a
+/// caller name a column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskSortKey {
+    CreatedAt,
+    UpdatedAt,
+    /// Best priority first under `Asc`: the stored form is `p0`..`p3`, so
+    /// lexicographic order already matches semantic order.
+    Priority,
+    Title,
+    /// The open/closed lifecycle, ordered by its stored string.
+    Lifecycle,
+    SyncState,
+    /// When the remote was last observed (RFC 0004 D3). NULLs sort first under
+    /// `Asc`, so never-observed tasks lead.
+    SyncedAt,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortDirection {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// One ordering instruction: a whitelisted key plus a direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskSort {
+    pub key: TaskSortKey,
+    pub direction: SortDirection,
+}
+
+/// Returned when a caller names a sort key or direction that does not exist.
+/// Carries the accepted values so the CLI can print them without keeping its
+/// own copy of the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SortParseError {
+    pub field: &'static str,
+    pub value: String,
+    pub accepted: &'static str,
+}
+
+impl std::fmt::Display for SortParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid {}: {:?} (expected one of: {})",
+            self.field, self.value, self.accepted
+        )
+    }
+}
+
+impl std::error::Error for SortParseError {}
+
+impl TaskSortKey {
+    /// Every accepted spelling, for error messages and CLI help.
+    pub const ACCEPTED: &'static str = "created_at (created), updated_at (updated), priority, \
+         title, status (lifecycle), sync_state (sync), synced_at (refreshed, last_refreshed_at)";
+}
+
+impl std::str::FromStr for TaskSortKey {
+    type Err = SortParseError;
+
+    /// Accepts the canonical column-ish names, plus the two aliases a user is
+    /// likely to type: `created` / `updated` for the timestamps, and `status`
+    /// for the lifecycle (the name every other CLI surface uses for it).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "created" | "created_at" => Ok(Self::CreatedAt),
+            "updated" | "updated_at" => Ok(Self::UpdatedAt),
+            "priority" => Ok(Self::Priority),
+            "title" => Ok(Self::Title),
+            "status" | "lifecycle" => Ok(Self::Lifecycle),
+            "sync_state" | "sync" => Ok(Self::SyncState),
+            "synced_at" | "refreshed" | "last_refreshed_at" => Ok(Self::SyncedAt),
+            other => Err(SortParseError {
+                field: "sort",
+                value: other.to_string(),
+                accepted: Self::ACCEPTED,
+            }),
+        }
+    }
+}
+
+impl std::str::FromStr for SortDirection {
+    type Err = SortParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "asc" | "ascending" => Ok(Self::Asc),
+            "desc" | "descending" => Ok(Self::Desc),
+            other => Err(SortParseError {
+                field: "order",
+                value: other.to_string(),
+                accepted: "asc, desc",
+            }),
+        }
+    }
 }
 
 #[async_trait]

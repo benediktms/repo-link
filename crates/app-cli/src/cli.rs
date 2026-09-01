@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::daemon;
@@ -36,6 +37,72 @@ pub(crate) struct WorkspaceArg {
     /// asks for `--workspace`.
     #[arg(short = 'w', long)]
     pub(crate) workspace: Option<String>,
+}
+
+/// Shared filter and sort flags for every command that lists tasks. Flattened
+/// into `task list` and the `query` views so one vocabulary works everywhere;
+/// each predicate and the ordering are applied by the store, not in memory.
+#[derive(Args, Debug, Default)]
+pub(crate) struct TaskFilterArgs {
+    /// Filter by logical repo binding (UUID / prefix / name / alias).
+    #[arg(short = 'r', long)]
+    pub(crate) repo: Option<String>,
+    /// Filter by priority. Repeat the flag to accept several (`--priority p0
+    /// --priority p1`).
+    #[arg(long = "priority")]
+    pub(crate) priorities: Vec<String>,
+    /// Filter by assignee. Matches a whole entry in the task's assignee list,
+    /// never a substring of one.
+    #[arg(long)]
+    pub(crate) assignee: Option<String>,
+    /// Filter by issue type (`bug`, `feature`, or any custom type), compared
+    /// verbatim.
+    #[arg(long = "type")]
+    pub(crate) issue_type: Option<String>,
+    /// Keep tasks created at or after this instant. Accepts `YYYY-MM-DD` (UTC
+    /// midnight) or a full RFC 3339 timestamp.
+    #[arg(long, value_parser = parse_time_bound)]
+    pub(crate) created_after: Option<DateTime<Utc>>,
+    /// Keep tasks created strictly before this instant.
+    #[arg(long, value_parser = parse_time_bound)]
+    pub(crate) created_before: Option<DateTime<Utc>>,
+    /// Keep tasks last modified at or after this instant.
+    #[arg(long, value_parser = parse_time_bound)]
+    pub(crate) updated_after: Option<DateTime<Utc>>,
+    /// Keep tasks last modified strictly before this instant.
+    #[arg(long, value_parser = parse_time_bound)]
+    pub(crate) updated_before: Option<DateTime<Utc>>,
+    /// Sort key: `created_at`, `updated_at`, `priority`, `title`, `status`,
+    /// `sync_state`, or `synced_at`. Omitted, rows come back in creation
+    /// order.
+    #[arg(long)]
+    pub(crate) sort: Option<String>,
+    /// Sort direction: `asc` (default) or `desc`. Ignored without `--sort`.
+    #[arg(long)]
+    pub(crate) order: Option<String>,
+    /// Return at most this many tasks.
+    #[arg(long)]
+    pub(crate) limit: Option<usize>,
+    /// Skip this many tasks before the first returned one. Pair it with
+    /// `--sort` so the page boundary is stable.
+    #[arg(long)]
+    pub(crate) offset: Option<usize>,
+}
+
+/// Parse a `--created-after`-style bound: a bare `YYYY-MM-DD` date, read as
+/// midnight UTC, or a full RFC 3339 timestamp. A bare date is what a person
+/// types; the full form is what a script passes back in.
+fn parse_time_bound(raw: &str) -> Result<DateTime<Utc>, String> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(|d| {
+            d.and_hms_opt(0, 0, 0)
+                .expect("midnight is a valid time")
+                .and_utc()
+        })
+        .map_err(|_| format!("expected YYYY-MM-DD or an RFC 3339 timestamp, got {raw:?}"))
 }
 
 #[derive(Args, Debug)]
@@ -557,7 +624,11 @@ pub(crate) enum TaskCmd {
         #[arg(long = "clear-type", conflicts_with = "issue_type")]
         clear_type: bool,
     },
+    /// List tasks, filtered and sorted by the store.
+    ///
+    /// Defaults to open tasks in every workspace, in creation order.
     List {
+        /// Workspace UUID or name. Omitted: every workspace.
         #[arg(short = 'w', long)]
         workspace: Option<String>,
         /// Filter by lifecycle status (`open` / `closed` / `all`). Defaults to
@@ -567,6 +638,8 @@ pub(crate) enum TaskCmd {
         /// Filter by sync state (`local_only` / `staged` / `synced` / `dirty_local` / `dirty_remote` / `conflict`).
         #[arg(long)]
         sync_state: Option<String>,
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
     /// Search current task content (RFC 0007): exact / identifier / natural
     /// retrieval over title, body, and comments. No model required.
@@ -704,21 +777,33 @@ pub(crate) enum QueryCmd {
         #[command(flatten)]
         ws: WorkspaceArg,
     },
+    /// Open tasks with at least one still-open blocker.
     Blocked {
         #[command(flatten)]
         ws: WorkspaceArg,
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
     Stale {
         #[command(flatten)]
         ws: WorkspaceArg,
     },
+    /// Tasks that owe the remote a push: a dirty sync axis, or pending local
+    /// comments. Spans open and closed tasks.
     Unsynced {
         #[command(flatten)]
         ws: WorkspaceArg,
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
+    /// Tasks grouped by assignee, with per-lifecycle counts, busiest first.
     Contributors {
         #[command(flatten)]
         ws: WorkspaceArg,
+        /// Narrow which tasks are counted. `--sort` / `--limit` / `--offset`
+        /// do not apply: rows come out busiest-first.
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
     Drift {
         #[command(flatten)]
@@ -746,6 +831,10 @@ pub(crate) enum QueryCmd {
         /// Errors when the checkout isn't bound to a workspace.
         #[arg(long)]
         local: bool,
+        /// Narrow the frontier. `--sort` does not apply: the tree's own
+        /// priority-then-title order carries it.
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
     /// Open tasks assigned to a user. Defaults to the cached GitHub login
     /// (so it round-trips with `task claim`), then git config user.name,
@@ -753,13 +842,15 @@ pub(crate) enum QueryCmd {
     Mine {
         #[command(flatten)]
         ws: WorkspaceArg,
-        // No `env = "REPO_LINK_USER"` here: binding the env var to the arg
-        // makes clap pre-fill `assignee`, which collapses the explicit-flag
-        // and env-var precedence steps into one and makes the git user.name
-        // step unreachable whenever REPO_LINK_USER is set. The full chain is
+        // The assignee comes from the shared filter's `--assignee`, so there is
+        // one spelling of the flag across every task view. Deliberately no
+        // `env = "REPO_LINK_USER"` on it: binding the env var to the arg makes
+        // clap pre-fill the value, which collapses the explicit-flag and
+        // env-var precedence steps into one and makes the git user.name step
+        // unreachable whenever REPO_LINK_USER is set. The full chain is
         // resolved in `query_dispatch` instead.
-        #[arg(long)]
-        assignee: Option<String>,
+        #[command(flatten)]
+        filter: TaskFilterArgs,
     },
     /// Completion rollup of a parent task's children (done/total + per-child
     /// detail). Accepts a UUID, bare hash, or `prefix-hash` composite.

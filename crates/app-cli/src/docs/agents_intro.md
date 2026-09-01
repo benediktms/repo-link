@@ -39,6 +39,18 @@ rl query ready --local             # only this repo's own ready tasks
 
 `query ready` accounts for transitive blockers and local-only tasks that GitHub cannot show, and returns the ready tasks as a nested parent→child tree ordered by priority — recurse it rather than reading it as a flat list. Its entries carry the bare `task_id` UUID; titles are not unique, so do not try to recover a friendly `id` by matching them against another listing.
 
+### Listing and narrowing
+
+When the request is a set of tasks rather than one task or the next task, list with the filter and sort flags instead of piping JSON through `jq`:
+
+```bash
+rl task list --priority p0 --sort updated_at --order desc      # hottest urgent work
+rl task list --assignee <login> --status all --limit 20        # one person's whole load
+rl query mine --priority p0                                    # the same filters work on the query views
+```
+
+`task list` and the `query` views share one vocabulary: `--priority` (repeatable), `--assignee`, `--type`, `--repo`, `--created-after` / `--created-before` / `--updated-after` / `--updated-before`, `--sort` with `--order`, and `--limit` / `--offset`. On `task list` the store applies all of it, so a `--limit` reads a page rather than the whole table. Two views take the predicates but not the order or the page: `query ready`, whose parent→child tree carries its own order, and `query contributors`, which is always busiest-first and counts every matching task.
+
 ### Working with a tracked task
 
 Inspect the task before changing it:

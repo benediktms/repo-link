@@ -9,9 +9,9 @@ use dto_shared::{
     UpdateTaskCmd,
 };
 use infra_config::RepoLinkConfig;
-use ports::PortError;
+use ports::{PortError, TaskFilter};
 
-use crate::cli::{TaskCmd, WorkspaceArg};
+use crate::cli::{TaskCmd, TaskFilterArgs, WorkspaceArg};
 use crate::commands::repo::{cwd_canonical, resolve_repo_handle, resolve_repo_handle_required};
 use crate::commands::sync::parse_issue_url;
 use crate::render;
@@ -380,16 +380,10 @@ pub(crate) async fn task_dispatch(
             workspace,
             status,
             sync_state,
+            filter,
         } => {
-            let rows = svc
-                .tasks
-                .list(ListTasksQuery {
-                    workspace_id: workspace,
-                    repo_id: None,
-                    status,
-                    sync_state,
-                })
-                .await?;
+            let query = list_query(svc, workspace, status, sync_state, filter).await?;
+            let rows = svc.tasks.list(query).await?;
             render::tasks(&rows);
         }
         TaskCmd::Stage { tasks } => {
@@ -623,4 +617,43 @@ async fn cwd_repo_in_workspace(svc: &Services, workspace_id: &str) -> Result<Opt
         .into_iter()
         .find(|m| m.workspace.id == workspace_id)
         .map(|m| m.binding.id))
+}
+
+/// Build a [`ListTasksQuery`] from the shared filter flags, resolving the
+/// `--repo` handle (UUID / prefix / name / alias) the same way `task create`
+/// does. The workspace handle is left as typed — `TaskService` accepts a name
+/// or a UUID there.
+pub(crate) async fn list_query(
+    svc: &Services,
+    workspace: Option<String>,
+    status: Option<String>,
+    sync_state: Option<String>,
+    filter: TaskFilterArgs,
+) -> Result<ListTasksQuery> {
+    Ok(ListTasksQuery {
+        workspace_id: workspace,
+        repo_id: resolve_repo_handle(svc, filter.repo).await?,
+        status,
+        sync_state,
+        priorities: filter.priorities,
+        assignee: filter.assignee,
+        issue_type: filter.issue_type,
+        created_after: filter.created_after,
+        created_before: filter.created_before,
+        updated_after: filter.updated_after,
+        updated_before: filter.updated_before,
+        sort: filter.sort,
+        order: filter.order,
+        limit: filter.limit,
+        offset: filter.offset,
+    })
+}
+
+/// Build a [`ports::TaskFilter`] from the shared filter flags, for the `rl
+/// query` views. Each view then layers on the scope it owns (its workspace,
+/// and whether it is open-only), so `status` is left unset here — `"all"`
+/// yields no lifecycle predicate.
+pub(crate) async fn query_filter(svc: &Services, filter: TaskFilterArgs) -> Result<TaskFilter> {
+    let query = list_query(svc, None, Some("all".to_string()), None, filter).await?;
+    application_task::task_filter_from_query(&query).map_err(|e| anyhow!("{e}"))
 }
