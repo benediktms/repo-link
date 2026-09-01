@@ -115,25 +115,29 @@ impl QueryService {
             .list(TaskFilter {
                 workspace_id: Some(id),
                 is_open: Some(true),
+                limit: None,
+                offset: None,
                 ..filter.clone()
             })
             .await?;
-        Ok(rows
-            .iter()
-            .filter_map(|t| {
-                let blockers: Vec<String> = t
-                    .blocked_by()
-                    .filter(|b| open_ids.contains(b))
-                    .map(|id| id.to_string())
-                    .collect();
-                (!blockers.is_empty()).then(|| BlockedTaskRow {
-                    task_id: t.id.to_string(),
-                    title: t.title.clone(),
-                    priority: enum_str(&t.priority),
-                    blocked_by: blockers,
+        Ok(paginate(
+            rows.iter()
+                .filter_map(|t| {
+                    let blockers: Vec<String> = t
+                        .blocked_by()
+                        .filter(|b| open_ids.contains(b))
+                        .map(|id| id.to_string())
+                        .collect();
+                    (!blockers.is_empty()).then(|| BlockedTaskRow {
+                        task_id: t.id.to_string(),
+                        title: t.title.clone(),
+                        priority: enum_str(&t.priority),
+                        blocked_by: blockers,
+                    })
                 })
-            })
-            .collect())
+                .collect(),
+            filter,
+        ))
     }
 
     /// Completion rollup for a parent task's children.
@@ -262,6 +266,8 @@ impl QueryService {
                 workspace_id: Some(id),
                 is_open: Some(true),
                 assignee: Some(assignee.to_string()),
+                limit: None,
+                offset: None,
                 ..filter.clone()
             })
             .await?;
@@ -305,7 +311,7 @@ impl QueryService {
                     .then_with(|| a.priority.cmp(&b.priority))
             });
         }
-        Ok(rows)
+        Ok(paginate(rows, filter))
     }
 
     /// The ready frontier as a nested tree. `workspace_ids: None` spans every
@@ -321,10 +327,12 @@ impl QueryService {
     /// shape. Every level is ordered by priority (best task first), then
     /// title. Workspaces with nothing ready are omitted.
     ///
-    /// `filter` narrows the candidate tasks. Its ordering does NOT apply: the
-    /// tree's shape carries the order, so levels stay priority-then-title. A
-    /// parent excluded by the filter simply stops appearing as a heading; the
-    /// blocker walk still sees it, so nothing becomes falsely ready.
+    /// `filter` narrows the candidate tasks. Its ordering and its paging do
+    /// NOT apply: the tree's shape carries the order, so levels stay
+    /// priority-then-title, and a page of a nested tree has no meaning — a
+    /// `--limit` would cut children away from their parent. A parent excluded
+    /// by the filter simply stops appearing as a heading; the blocker walk
+    /// still sees it, so nothing becomes falsely ready.
     pub async fn ready_view(
         &self,
         workspace_ids: Option<&[String]>,
@@ -349,6 +357,8 @@ impl QueryService {
             .tasks
             .list(TaskFilter {
                 workspace_id: None,
+                limit: None,
+                offset: None,
                 ..filter.clone()
             })
             .await?;
@@ -724,31 +734,52 @@ impl QueryService {
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
+                limit: None,
+                offset: None,
                 ..filter.clone()
             })
             .await?;
         // `list` skips comments, so fetch pending counts separately. A task is
         // unsynced if its snapshot axis is dirty OR it owes outbound comments.
         let pending = self.tasks.pending_comment_counts(id).await?;
-        Ok(tasks
-            .iter()
-            .filter_map(|t| {
-                let pending_comments = pending.get(&t.id).copied().unwrap_or(0);
-                if !is_unsynced(t.sync) && pending_comments == 0 {
-                    return None;
-                }
-                Some(UnsyncedTaskRow {
-                    task_id: t.id.to_string(),
-                    title: t.title.clone(),
-                    sync_state: enum_str(&t.sync),
-                    pending_comments,
+        Ok(paginate(
+            tasks
+                .iter()
+                .filter_map(|t| {
+                    let pending_comments = pending.get(&t.id).copied().unwrap_or(0);
+                    if !is_unsynced(t.sync) && pending_comments == 0 {
+                        return None;
+                    }
+                    Some(UnsyncedTaskRow {
+                        task_id: t.id.to_string(),
+                        title: t.title.clone(),
+                        sync_state: enum_str(&t.sync),
+                        pending_comments,
+                    })
                 })
-            })
-            .collect())
+                .collect(),
+            filter,
+        ))
     }
 }
 
 // ---------- Helpers -------------------------------------------------------
+
+/// Apply the caller's `--limit` / `--offset` to a view's finished rows.
+///
+/// A view that filters or reorders in Rust must NOT push paging into the
+/// store: the store would take its page before those steps run, so
+/// `query blocked --limit 1` could return nothing while a blocked task sits
+/// further down the table.
+fn paginate<T>(mut rows: Vec<T>, filter: &TaskFilter) -> Vec<T> {
+    if let Some(offset) = filter.offset {
+        rows.drain(..offset.min(rows.len()));
+    }
+    if let Some(limit) = filter.limit {
+        rows.truncate(limit);
+    }
+    rows
+}
 
 fn enum_str<T: serde::Serialize>(t: &T) -> String {
     serde_json::to_value(t)
@@ -1255,6 +1286,35 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].blocked_by, vec![other.id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn blocked_view_pages_the_blocked_rows_not_the_candidates() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let unblocked_first_in_creation_order = Task::new_draft(wid, None, "free".into()).unwrap();
+        let blocker = Task::new_draft(wid, None, "blocker".into()).unwrap();
+        let mut blocked = Task::new_draft(wid, None, "the work".into()).unwrap();
+        blocked.add_relation(domain_task::RelationKind::BlockedBy, blocker.id);
+        for t in [&unblocked_first_in_creation_order, &blocker, &blocked] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let rows = svc
+            .blocked_tasks(
+                &wid.to_string(),
+                &TaskFilter {
+                    limit: Some(1),
+                    ..TaskFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, blocked.id.to_string());
     }
 
     #[tokio::test]

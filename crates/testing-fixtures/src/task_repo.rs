@@ -298,36 +298,23 @@ impl TaskRepository for InMemoryTaskRepository {
         // everywhere, matching the SQL adapter so paging is stable in both.
         match filter.sort {
             Some(sort) => {
-                match sort.key {
-                    TaskSortKey::CreatedAt => {
-                        rows.sort_by_key(|t| (t.created_at, t.id.to_string()))
-                    }
-                    TaskSortKey::UpdatedAt => {
-                        rows.sort_by_key(|t| (t.updated_at, t.id.to_string()))
-                    }
-                    TaskSortKey::Priority => rows.sort_by_key(|t| (t.priority, t.id.to_string())),
-                    TaskSortKey::Title => rows.sort_by(|a, b| {
-                        a.title
-                            .cmp(&b.title)
-                            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
-                    }),
-                    TaskSortKey::Lifecycle => rows.sort_by(|a, b| {
-                        order_key(&a.lifecycle)
-                            .cmp(&order_key(&b.lifecycle))
-                            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
-                    }),
-                    TaskSortKey::SyncState => rows.sort_by(|a, b| {
-                        order_key(&a.sync)
-                            .cmp(&order_key(&b.sync))
-                            .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
-                    }),
-                    TaskSortKey::SyncedAt => {
-                        rows.sort_by_key(|t| (t.synced_at.is_some(), t.synced_at, t.id.to_string()))
-                    }
-                }
-                if sort.direction == SortDirection::Desc {
-                    rows.reverse();
-                }
+                let key_cmp = |a: &Task, b: &Task| match sort.key {
+                    TaskSortKey::CreatedAt => a.created_at.cmp(&b.created_at),
+                    TaskSortKey::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+                    TaskSortKey::Priority => a.priority.cmp(&b.priority),
+                    TaskSortKey::Title => a.title.cmp(&b.title),
+                    TaskSortKey::Lifecycle => order_key(&a.lifecycle).cmp(&order_key(&b.lifecycle)),
+                    TaskSortKey::SyncState => order_key(&a.sync).cmp(&order_key(&b.sync)),
+                    TaskSortKey::SyncedAt => (a.synced_at.is_some(), a.synced_at)
+                        .cmp(&(b.synced_at.is_some(), b.synced_at)),
+                };
+                rows.sort_by(|a, b| {
+                    let by_key = match sort.direction {
+                        SortDirection::Asc => key_cmp(a, b),
+                        SortDirection::Desc => key_cmp(b, a),
+                    };
+                    by_key.then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+                });
             }
             None if filter.synced_at_lt.is_some() => {
                 rows.sort_by_key(|t| (t.synced_at.is_some(), t.synced_at, t.id.to_string()));

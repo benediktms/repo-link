@@ -177,8 +177,8 @@ impl std::error::Error for SortParseError {}
 
 impl TaskSortKey {
     /// Every accepted spelling, for error messages and CLI help.
-    pub const ACCEPTED: &'static str =
-        "created_at, updated_at, priority, title, status, sync_state, synced_at";
+    pub const ACCEPTED: &'static str = "created_at (created), updated_at (updated), priority, \
+         title, status (lifecycle), sync_state (sync), synced_at (refreshed, last_refreshed_at)";
 }
 
 impl std::str::FromStr for TaskSortKey {

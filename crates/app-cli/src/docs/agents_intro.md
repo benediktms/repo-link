@@ -49,7 +49,7 @@ rl task list --assignee <login> --status all --limit 20        # one person's wh
 rl query mine --priority p0                                    # the same filters work on the query views
 ```
 
-`task list` and the `query` views share one vocabulary: `--priority` (repeatable), `--assignee`, `--type`, `--repo`, `--created-after` / `--created-before` / `--updated-after` / `--updated-before`, `--sort` with `--order`, and `--limit` / `--offset`. The store applies all of it, so a `--limit` reads a page rather than the whole table. `--sort` does not reorder `query ready`, whose parent→child tree carries its own order.
+`task list` and the `query` views share one vocabulary: `--priority` (repeatable), `--assignee`, `--type`, `--repo`, `--created-after` / `--created-before` / `--updated-after` / `--updated-before`, `--sort` with `--order`, and `--limit` / `--offset`. On `task list` the store applies all of it, so a `--limit` reads a page rather than the whole table. Two views take the predicates but not the order or the page: `query ready`, whose parent→child tree carries its own order, and `query contributors`, which is always busiest-first and counts every matching task.
 
 ### Working with a tracked task
 

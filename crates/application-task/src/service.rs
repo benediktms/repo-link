@@ -749,12 +749,16 @@ impl TaskService {
     /// Resolve a workspace handle — a UUID or a workspace name — to its id, so
     /// `rl task list -w my-workspace` works wherever `-w <uuid>` does. Mirrors
     /// `WorkspaceService`'s own resolver: a UUID that names no workspace falls
-    /// through to the name lookup rather than erroring early.
+    /// through to the name lookup rather than erroring early. Only a
+    /// `NotFound` falls through — a storage failure is reported as itself,
+    /// never as an absent workspace.
     async fn resolve_workspace_id(&self, handle: &str) -> Result<WorkspaceId> {
-        if let Ok(id) = handle.parse::<WorkspaceId>()
-            && self.workspaces.get(id).await.is_ok()
-        {
-            return Ok(id);
+        if let Ok(id) = handle.parse::<WorkspaceId>() {
+            match self.workspaces.get(id).await {
+                Ok(_) => return Ok(id),
+                Err(PortError::NotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         self.workspaces
             .find_by_name(handle)
