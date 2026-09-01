@@ -6,4 +6,4 @@ mod service;
 
 pub use dto::task_to_dto;
 pub use error::{Result, ServiceError};
-pub use service::TaskService;
+pub use service::{TaskService, task_filter_from_query};

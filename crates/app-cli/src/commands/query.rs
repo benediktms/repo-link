@@ -6,7 +6,7 @@ use infra_config::RepoLinkConfig;
 
 use crate::cli::{QueryCmd, WorkspaceArg};
 use crate::commands::repo::{resolve_ready_scope, resolve_workspace};
-use crate::commands::task::git_user_name;
+use crate::commands::task::{git_user_name, query_filter};
 use crate::render;
 use crate::services::{Services, build_github_provider};
 
@@ -25,9 +25,11 @@ pub(crate) async fn query_dispatch(
         }
         QueryCmd::Blocked {
             ws: WorkspaceArg { workspace },
+            filter,
         } => {
+            let filter = query_filter(svc, filter).await?;
             let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.blocked_tasks(&workspace).await?;
+            let v = svc.query.blocked_tasks(&workspace, &filter).await?;
             render::blocked(&v);
         }
         QueryCmd::Stale {
@@ -39,16 +41,20 @@ pub(crate) async fn query_dispatch(
         }
         QueryCmd::Unsynced {
             ws: WorkspaceArg { workspace },
+            filter,
         } => {
+            let filter = query_filter(svc, filter).await?;
             let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.unsynced_tasks(&workspace).await?;
+            let v = svc.query.unsynced_tasks(&workspace, &filter).await?;
             render::unsynced(&v);
         }
         QueryCmd::Contributors {
             ws: WorkspaceArg { workspace },
+            filter,
         } => {
+            let filter = query_filter(svc, filter).await?;
             let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.contributors(&workspace).await?;
+            let v = svc.query.contributors(&workspace, &filter).await?;
             render::contributors(&v);
         }
         QueryCmd::Drift {
@@ -90,7 +96,12 @@ pub(crate) async fn query_dispatch(
             let report = svc.query.drift_report(&workspace, live).await?;
             render::drift(&report);
         }
-        QueryCmd::Ready { workspace, local } => {
+        QueryCmd::Ready {
+            workspace,
+            local,
+            filter,
+        } => {
+            let filter = query_filter(svc, filter).await?;
             // `ready` spans the workspaces the cwd repo is attached to (or the
             // `--workspace` filter), falling back to all active workspaces when
             // the cwd isn't a bound repo; `--local` narrows it to the local
@@ -98,14 +109,15 @@ pub(crate) async fn query_dispatch(
             let (workspace_ids, repo_ids) = resolve_ready_scope(svc, workspace, local).await?;
             let v = svc
                 .query
-                .ready_view(workspace_ids.as_deref(), &repo_ids)
+                .ready_view(workspace_ids.as_deref(), &repo_ids, &filter)
                 .await?;
             render::ready(&v);
         }
         QueryCmd::Mine {
             ws: WorkspaceArg { workspace },
-            assignee,
+            filter,
         } => {
+            let assignee = filter.assignee.clone();
             // Resolution chain — see `resolve_mine_assignee`. The cached
             // GitHub login comes ahead of the git committer identity so a
             // bare `query mine` round-trips with `task claim` (which assigns
@@ -125,8 +137,12 @@ pub(crate) async fn query_dispatch(
                      `git config user.name`, or set REPO_LINK_USER / USER"
                 )
             })?;
+            let filter = query_filter(svc, filter).await?;
             let workspace = resolve_workspace(svc, workspace).await?;
-            let v = svc.query.assigned_to(&workspace, &assignee).await?;
+            let v = svc
+                .query
+                .assigned_to(&workspace, &assignee, &filter)
+                .await?;
             render::assigned(&v);
         }
         QueryCmd::Children { id } => {

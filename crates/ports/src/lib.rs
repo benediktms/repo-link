@@ -32,6 +32,6 @@ pub use search::{
     TaskSearchResultSnapshot, TaskSearchSourceRepository, TaskTextRow,
 };
 pub use task::{
-    RepoBindingRepository, SyncedSource, TaskFilter, TaskRepository, TaskSnapshotRepository,
-    WorkspaceRepository,
+    RepoBindingRepository, SortDirection, SortParseError, SyncedSource, TaskFilter, TaskRepository,
+    TaskSnapshotRepository, TaskSort, TaskSortKey, WorkspaceRepository,
 };

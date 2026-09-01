@@ -94,14 +94,32 @@ impl QueryService {
         Ok(self.tasks.list(TaskFilter::default()).await?)
     }
 
-    pub async fn blocked_tasks(&self, workspace_id: &str) -> Result<Vec<BlockedTaskRow>> {
+    /// Open tasks in a workspace with at least one still-open blocker.
+    ///
+    /// `filter` carries the caller's own predicates and ordering (`--priority`,
+    /// `--sort`, …); this view supplies the two it owns — the workspace scope
+    /// and open-only — and they win over anything the caller set, because a
+    /// closed task cannot be blocked. The blocker walk resolves against the
+    /// GLOBAL task graph, which is loaded unfiltered: narrowing that load would
+    /// make a blocker the filter excludes look resolved.
+    pub async fn blocked_tasks(
+        &self,
+        workspace_id: &str,
+        filter: &TaskFilter,
+    ) -> Result<Vec<BlockedTaskRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let all = self.tasks_for_global_relation_graph().await?;
         let open_ids: HashSet<TaskId> = all.iter().filter(|t| t.is_open()).map(|t| t.id).collect();
-        Ok(all
+        let rows = self
+            .tasks
+            .list(TaskFilter {
+                workspace_id: Some(id),
+                is_open: Some(true),
+                ..filter.clone()
+            })
+            .await?;
+        Ok(rows
             .iter()
-            .filter(|t| t.workspace_id == id)
-            .filter(|t| t.is_open())
             .filter_map(|t| {
                 let blockers: Vec<String> = t
                     .blocked_by()
@@ -221,17 +239,32 @@ impl QueryService {
 
     /// Tasks assigned to `assignee` that aren't archived. Sorted unblocked-
     /// first, then by priority.
+    /// Open tasks in a workspace assigned to `assignee`.
+    ///
+    /// `filter` supplies the caller's predicates and ordering; the workspace
+    /// scope, the assignee, and open-only belong to this view and override it.
+    /// As in [`Self::blocked_tasks`], the relation graph behind the `blocked`
+    /// flag is loaded unfiltered.
     pub async fn assigned_to(
         &self,
         workspace_id: &str,
         assignee: &str,
+        filter: &TaskFilter,
     ) -> Result<Vec<AssignedTaskRow>> {
         use std::collections::HashMap;
 
         let id: WorkspaceId = workspace_id.parse()?;
         let all = self.tasks_for_global_relation_graph().await?;
         let by_id: HashMap<_, _> = all.iter().map(|t| (t.id, t)).collect();
-        let tasks: Vec<&Task> = all.iter().filter(|t| t.workspace_id == id).collect();
+        let tasks: Vec<Task> = self
+            .tasks
+            .list(TaskFilter {
+                workspace_id: Some(id),
+                is_open: Some(true),
+                assignee: Some(assignee.to_string()),
+                ..filter.clone()
+            })
+            .await?;
 
         // One workspace per query → resolve its project (if any) once and reuse
         // the cached-status semantics for every row (#236); local-only, no reads.
@@ -239,8 +272,6 @@ impl QueryService {
 
         let mut rows: Vec<AssignedTaskRow> = tasks
             .iter()
-            .filter(|t| t.is_open())
-            .filter(|t| t.assignees.iter().any(|a| a == assignee))
             .map(|t| {
                 // A task is blocked when it has a `BlockedBy` edge to a blocker
                 // that is still open (a closed blocker no longer blocks).
@@ -264,11 +295,16 @@ impl QueryService {
             })
             .collect();
 
-        rows.sort_by(|a, b| {
-            a.blocked
-                .cmp(&b.blocked)
-                .then_with(|| a.priority.cmp(&b.priority))
-        });
+        // An explicit `--sort` already ordered the rows in the store; the
+        // blocked-last, best-priority-first default only applies when the
+        // caller asked for no order of their own.
+        if filter.sort.is_none() {
+            rows.sort_by(|a, b| {
+                a.blocked
+                    .cmp(&b.blocked)
+                    .then_with(|| a.priority.cmp(&b.priority))
+            });
+        }
         Ok(rows)
     }
 
@@ -284,10 +320,16 @@ impl QueryService {
     /// not itself ready appears as a container heading so the tree keeps its
     /// shape. Every level is ordered by priority (best task first), then
     /// title. Workspaces with nothing ready are omitted.
+    ///
+    /// `filter` narrows the candidate tasks. Its ordering does NOT apply: the
+    /// tree's shape carries the order, so levels stay priority-then-title. A
+    /// parent excluded by the filter simply stops appearing as a heading; the
+    /// blocker walk still sees it, so nothing becomes falsely ready.
     pub async fn ready_view(
         &self,
         workspace_ids: Option<&[String]>,
         repo_ids: &[String],
+        filter: &TaskFilter,
     ) -> Result<ReadyView> {
         use std::collections::{HashMap, HashSet};
 
@@ -295,6 +337,21 @@ impl QueryService {
         let by_id: HashMap<domain_core::TaskId, &domain_task::Task> =
             all.iter().map(|t| (t.id, t)).collect();
         let repo_filter: HashSet<String> = repo_ids.iter().cloned().collect();
+        // The candidate rows, narrowed by the store. The tree is built from
+        // these; `by_id` above stays the unfiltered graph so the blocker walk
+        // still sees a blocker the filter excluded.
+        //
+        // Lifecycle is deliberately NOT forced open-only here: a closed parent
+        // still appears as a container heading, so dropping closed tasks from
+        // the candidates would flatten the tree. `select_ready` applies the
+        // open-only rule to the frontier itself.
+        let candidates = self
+            .tasks
+            .list(TaskFilter {
+                workspace_id: None,
+                ..filter.clone()
+            })
+            .await?;
 
         let workspaces = match workspace_ids {
             Some(ids) => {
@@ -309,7 +366,7 @@ impl QueryService {
 
         let mut out = Vec::new();
         for ws in workspaces {
-            let ws_tasks: Vec<&domain_task::Task> = all
+            let ws_tasks: Vec<&domain_task::Task> = candidates
                 .iter()
                 .filter(|t| t.workspace_id == ws.id)
                 .filter(|t| {
@@ -341,14 +398,25 @@ impl QueryService {
     /// Group non-archived tasks by assignee with lifecycle-status counts.
     /// Tasks with no assignee land under "(unassigned)". "Archived" now folds
     /// into the `NotPlanned` lifecycle, which is filtered out below.
-    pub async fn contributors(&self, workspace_id: &str) -> Result<Vec<ContributorRow>> {
+    ///
+    /// `filter` narrows which tasks are counted (`--priority p0` gives a
+    /// per-contributor P0 load, say). Its ordering is ignored: rows come out
+    /// busiest-first, which is the point of the view.
+    pub async fn contributors(
+        &self,
+        workspace_id: &str,
+        filter: &TaskFilter,
+    ) -> Result<Vec<ContributorRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
                 is_open: None,
-                ..TaskFilter::default()
+                sort: None,
+                limit: None,
+                offset: None,
+                ..filter.clone()
             })
             .await?;
 
@@ -640,13 +708,23 @@ impl QueryService {
         Ok(Some(self.projects.get(project_id).await?))
     }
 
-    pub async fn unsynced_tasks(&self, workspace_id: &str) -> Result<Vec<UnsyncedTaskRow>> {
+    /// Tasks in a workspace that owe the remote something — a dirty snapshot
+    /// axis, or pending local comments.
+    ///
+    /// `filter` supplies the caller's predicates and ordering. This view owns
+    /// only the workspace scope: unlike `blocked` and `mine` it spans both open
+    /// and closed tasks, because a closed task can still owe a push.
+    pub async fn unsynced_tasks(
+        &self,
+        workspace_id: &str,
+        filter: &TaskFilter,
+    ) -> Result<Vec<UnsyncedTaskRow>> {
         let id: WorkspaceId = workspace_id.parse()?;
         let tasks = self
             .tasks
             .list(TaskFilter {
                 workspace_id: Some(id),
-                ..TaskFilter::default()
+                ..filter.clone()
             })
             .await?;
         // `list` skips comments, so fetch pending counts separately. A task is
@@ -1043,7 +1121,11 @@ mod tests {
             }
         }
         let view = svc
-            .ready_view(Some(&[workspace_id.to_string()]), &[])
+            .ready_view(
+                Some(&[workspace_id.to_string()]),
+                &[],
+                &TaskFilter::default(),
+            )
             .await
             .unwrap();
         let mut out = Vec::new();
@@ -1133,7 +1215,7 @@ mod tests {
 
         // No outbound work yet → absent from unsynced.
         assert!(
-            svc.unsynced_tasks(&workspace_id.to_string())
+            svc.unsynced_tasks(&workspace_id.to_string(), &TaskFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
@@ -1143,7 +1225,10 @@ mod tests {
         ts.add_pending_comment(t.id, "me", "ping", domain_core::Timestamp::now())
             .await
             .unwrap();
-        let rows = svc.unsynced_tasks(&workspace_id.to_string()).await.unwrap();
+        let rows = svc
+            .unsynced_tasks(&workspace_id.to_string(), &TaskFilter::default())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].sync_state, "synced");
         assert_eq!(rows[0].pending_comments, 1);
@@ -1164,7 +1249,10 @@ mod tests {
         ts.save(&other, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&blocked, SnapshotSource::LocalEdit).await.unwrap();
 
-        let rows = svc.blocked_tasks(&wid.to_string()).await.unwrap();
+        let rows = svc
+            .blocked_tasks(&wid.to_string(), &TaskFilter::default())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].blocked_by, vec![other.id.to_string()]);
     }
@@ -1297,7 +1385,10 @@ mod tests {
         ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&c, SnapshotSource::LocalEdit).await.unwrap();
 
-        let rows = svc.contributors(&wid.to_string()).await.unwrap();
+        let rows = svc
+            .contributors(&wid.to_string(), &TaskFilter::default())
+            .await
+            .unwrap();
         let alice = rows.iter().find(|r| r.assignee == "alice").unwrap();
         assert_eq!(alice.total, 2);
         assert_eq!(alice.by_status.get("open"), Some(&2));
@@ -1414,13 +1505,16 @@ mod tests {
         assert!(!ready.iter().any(|t| t == "transitively blocked"));
         assert!(!ready.iter().any(|t| t == "external blocker"));
 
-        let blocked_rows = svc.blocked_tasks(&a_id.to_string()).await.unwrap();
+        let blocked_rows = svc
+            .blocked_tasks(&a_id.to_string(), &TaskFilter::default())
+            .await
+            .unwrap();
         let blocked_titles: Vec<&str> = blocked_rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(blocked_titles, vec!["needs the other workspace"]);
         assert_eq!(blocked_rows[0].blocked_by, vec![external.id.to_string()]);
 
         let mine = svc
-            .assigned_to(&a_id.to_string(), "benedikt")
+            .assigned_to(&a_id.to_string(), "benedikt", &TaskFilter::default())
             .await
             .unwrap();
         assert_eq!(mine.len(), 1);
@@ -1433,13 +1527,13 @@ mod tests {
         assert!(ready.iter().any(|t| t == "needs the other workspace"));
         assert!(ready.iter().any(|t| t == "transitively blocked"));
         assert!(
-            svc.blocked_tasks(&a_id.to_string())
+            svc.blocked_tasks(&a_id.to_string(), &TaskFilter::default())
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            !svc.assigned_to(&a_id.to_string(), "benedikt")
+            !svc.assigned_to(&a_id.to_string(), "benedikt", &TaskFilter::default())
                 .await
                 .unwrap()[0]
                 .blocked
@@ -1534,11 +1628,86 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let rows = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
+        let rows = svc
+            .assigned_to(&wid.to_string(), "benedikt", &TaskFilter::default())
+            .await
+            .unwrap();
         let titles: Vec<&str> = rows.iter().map(|r| r.title.as_str()).collect();
         assert_eq!(titles, vec!["open", "blocked"]);
         assert!(!rows[0].blocked);
         assert!(rows[1].blocked);
+    }
+
+    /// The shared filter reaches the read-models: `mine` honours a caller's
+    /// `--priority` narrowing, and an explicit `--sort` replaces the view's own
+    /// blocked-last default instead of being re-sorted on top of it.
+    #[tokio::test]
+    async fn assigned_to_honours_the_caller_filter_and_sort() {
+        let (svc, ws, _bs, ts) = svc();
+        let workspace = Workspace::new(WorkspaceName::new("w").unwrap(), None, true);
+        let wid = workspace.id;
+        ws.save(&workspace).await.unwrap();
+
+        let blocker = Task::new_draft(wid, None, "the gate".into()).unwrap();
+        let mut urgent = Task::new_draft(wid, None, "alpha".into()).unwrap();
+        urgent.assignees = vec!["benedikt".into()];
+        urgent.priority = Priority::P0;
+        urgent.add_relation(RelationKind::BlockedBy, blocker.id);
+        let mut later = Task::new_draft(wid, None, "zulu".into()).unwrap();
+        later.assignees = vec!["benedikt".into()];
+        later.priority = Priority::P3;
+
+        for t in [&blocker, &urgent, &later] {
+            ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
+        }
+
+        let only_p0 = svc
+            .assigned_to(
+                &wid.to_string(),
+                "benedikt",
+                &TaskFilter {
+                    priorities: vec![Priority::P0],
+                    ..TaskFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        let titles: Vec<&str> = only_p0.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles, vec!["alpha"]);
+
+        // Default order puts the unblocked task first. An explicit title sort
+        // must win, blocked or not.
+        let default_order = svc
+            .assigned_to(&wid.to_string(), "benedikt", &TaskFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_order
+                .iter()
+                .map(|r| r.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zulu", "alpha"],
+            "the unblocked task leads by default"
+        );
+        let sorted = svc
+            .assigned_to(
+                &wid.to_string(),
+                "benedikt",
+                &TaskFilter {
+                    sort: Some(ports::TaskSort {
+                        key: ports::TaskSortKey::Title,
+                        direction: ports::SortDirection::Asc,
+                    }),
+                    ..TaskFilter::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zulu"],
+            "title order, not blocked-last order"
+        );
     }
 
     /// #236: the lean `ready`/`mine` rows surface the local `issue_type` and the
@@ -1578,7 +1747,10 @@ mod tests {
         assert_eq!(r_bare.issue_type, None);
         assert_eq!(r_bare.project_status, None);
 
-        let mine = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
+        let mine = svc
+            .assigned_to(&wid.to_string(), "benedikt", &TaskFilter::default())
+            .await
+            .unwrap();
         let m_typed = mine.iter().find(|r| r.title == "typed + polled").unwrap();
         assert_eq!(m_typed.issue_type.as_deref(), Some("bug"));
         assert_eq!(m_typed.project_status.as_deref(), Some("Backlog"));
@@ -1610,7 +1782,10 @@ mod tests {
         assert_eq!(ready[0].issue_type.as_deref(), Some("feature"));
         assert_eq!(ready[0].project_status, None);
 
-        let mine = svc.assigned_to(&wid.to_string(), "benedikt").await.unwrap();
+        let mine = svc
+            .assigned_to(&wid.to_string(), "benedikt", &TaskFilter::default())
+            .await
+            .unwrap();
         assert_eq!(mine[0].issue_type.as_deref(), Some("feature"));
         assert_eq!(mine[0].project_status, None);
     }
@@ -1643,7 +1818,11 @@ mod tests {
         }
 
         let view = svc
-            .ready_view(Some(&[w1_id.to_string(), w2_id.to_string()]), &[])
+            .ready_view(
+                Some(&[w1_id.to_string(), w2_id.to_string()]),
+                &[],
+                &TaskFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(view.workspaces.len(), 2);
@@ -1705,7 +1884,7 @@ mod tests {
         }
 
         let view = svc
-            .ready_view(Some(&[w2_id.to_string()]), &[])
+            .ready_view(Some(&[w2_id.to_string()]), &[], &TaskFilter::default())
             .await
             .unwrap();
         assert_eq!(view.workspaces.len(), 1);
@@ -1734,7 +1913,7 @@ mod tests {
         ts.save(&child, SnapshotSource::LocalEdit).await.unwrap();
 
         let view = svc
-            .ready_view(Some(&[w2_id.to_string()]), &[])
+            .ready_view(Some(&[w2_id.to_string()]), &[], &TaskFilter::default())
             .await
             .unwrap();
         let w2v = view
@@ -1762,7 +1941,7 @@ mod tests {
         ts.save(&t, SnapshotSource::LocalEdit).await.unwrap();
 
         let view = svc
-            .ready_view(Some(&[w1_id.to_string()]), &[])
+            .ready_view(Some(&[w1_id.to_string()]), &[], &TaskFilter::default())
             .await
             .unwrap();
         assert!(view.workspaces.is_empty());
@@ -1800,7 +1979,10 @@ mod tests {
             ts.save(t, SnapshotSource::LocalEdit).await.unwrap();
         }
 
-        let view = svc.ready_view(Some(&[wid.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[wid.to_string()]), &[], &TaskFilter::default())
+            .await
+            .unwrap();
         let tree = &view.workspaces[0].tree;
         // Roots by subtree priority: parent a (P0), parent b (P2), then the P3
         // tier in title order — "orphan p3" sorts before "parent c".
@@ -1830,7 +2012,11 @@ mod tests {
         ts.save(&t2, SnapshotSource::LocalEdit).await.unwrap();
 
         let view = svc
-            .ready_view(Some(&[wid.to_string()]), &[r1.to_string()])
+            .ready_view(
+                Some(&[wid.to_string()]),
+                &[r1.to_string()],
+                &TaskFilter::default(),
+            )
             .await
             .unwrap();
         let tree = &view.workspaces[0].tree;
@@ -1854,7 +2040,10 @@ mod tests {
         ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
 
         // `None` is the all-workspaces fallback when the cwd isn't a bound repo.
-        let view = svc.ready_view(None, &[]).await.unwrap();
+        let view = svc
+            .ready_view(None, &[], &TaskFilter::default())
+            .await
+            .unwrap();
         assert_eq!(view.workspaces.len(), 2);
         let names: Vec<&str> = view
             .workspaces
@@ -1883,7 +2072,10 @@ mod tests {
         ts.save(&a, SnapshotSource::LocalEdit).await.unwrap();
         ts.save(&b, SnapshotSource::LocalEdit).await.unwrap();
 
-        let view = svc.ready_view(Some(&[wid.to_string()]), &[]).await.unwrap();
+        let view = svc
+            .ready_view(Some(&[wid.to_string()]), &[], &TaskFilter::default())
+            .await
+            .unwrap();
         // Both are ready but neither can be rooted (each has a kept parent), so
         // the workspace renders with an empty tree instead of recursing forever.
         assert_eq!(view.workspaces.len(), 1);

@@ -3614,3 +3614,189 @@ async fn org_issue_types_get_unknown_owner_returns_empty_registry() {
     assert!(got.types.is_empty());
     assert!(!got.is_available());
 }
+
+/// Seed three tasks that differ on every filterable axis, so one workspace can
+/// exercise the whole predicate set.
+async fn seed_filter_fixtures(
+    ws: &SqliteWorkspaceRepository,
+    ts: &SqliteTaskRepository,
+) -> domain_core::WorkspaceId {
+    use chrono::TimeZone;
+
+    let w = Workspace::new(WorkspaceName::new("filters").unwrap(), None, true);
+    ws.save(&w).await.unwrap();
+
+    let at = |day: u32| {
+        domain_core::Timestamp::from_utc(
+            chrono::Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap(),
+        )
+    };
+
+    let mut a = Task::new_draft(w.id, None, "alpha".into()).unwrap();
+    a.priority = Priority::P0;
+    a.assignees = vec!["alice".into(), "alice-bot".into()];
+    a.issue_type = Some(IssueType::Bug);
+    a.created_at = at(1);
+    a.updated_at = at(3);
+
+    let mut b = Task::new_draft(w.id, None, "bravo".into()).unwrap();
+    b.priority = Priority::P1;
+    b.assignees = vec!["bob".into()];
+    b.issue_type = Some(IssueType::from("Epic"));
+    b.created_at = at(2);
+    b.updated_at = at(2);
+
+    let mut c = Task::new_draft(w.id, None, "charlie".into()).unwrap();
+    c.priority = Priority::P3;
+    c.assignees = vec![];
+    c.created_at = at(3);
+    c.updated_at = at(1);
+
+    for t in [&a, &b, &c] {
+        ts.save(t, SnapshotSource::Created).await.unwrap();
+    }
+    w.id
+}
+
+/// Every new predicate is applied by the store, not the caller: priority set,
+/// assignee membership, issue type, and the four date bounds.
+#[tokio::test]
+async fn list_applies_every_filter_in_sql() {
+    use chrono::TimeZone;
+    let (_dir, ws, _rb, ts) = setup().await;
+    let wid = seed_filter_fixtures(&ws, &ts).await;
+    let titles = |rows: &[Task]| rows.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+    let base = || TaskFilter {
+        workspace_id: Some(wid),
+        ..Default::default()
+    };
+    let at = |day: u32| {
+        domain_core::Timestamp::from_utc(
+            chrono::Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap(),
+        )
+    };
+
+    let rows = ts
+        .list(TaskFilter {
+            priorities: vec![Priority::P0, Priority::P1],
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["alpha", "bravo"]);
+
+    // `alice` must not match the separate `alice-bot` entry, nor a task that
+    // merely contains the text — the match is per JSON element.
+    let rows = ts
+        .list(TaskFilter {
+            assignee: Some("alice".into()),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["alpha"]);
+    let rows = ts
+        .list(TaskFilter {
+            assignee: Some("ali".into()),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "a prefix of an assignee must not match");
+
+    let rows = ts
+        .list(TaskFilter {
+            issue_type: Some("Epic".into()),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["bravo"]);
+
+    let rows = ts
+        .list(TaskFilter {
+            created_after: Some(at(2)),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        titles(&rows),
+        ["bravo", "charlie"],
+        "created_after is inclusive"
+    );
+    let rows = ts
+        .list(TaskFilter {
+            created_before: Some(at(2)),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["alpha"], "created_before is exclusive");
+    let rows = ts
+        .list(TaskFilter {
+            updated_after: Some(at(2)),
+            updated_before: Some(at(3)),
+            ..base()
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["bravo"], "the two updated bounds compose");
+}
+
+/// Ordering and paging happen in the store: an explicit sort beats the default
+/// creation order in both directions, and `limit` + `offset` walk the same
+/// order without repeating or skipping a row.
+#[tokio::test]
+async fn list_sorts_and_pages_in_sql() {
+    let (_dir, ws, _rb, ts) = setup().await;
+    let wid = seed_filter_fixtures(&ws, &ts).await;
+    let titles = |rows: &[Task]| rows.iter().map(|t| t.title.clone()).collect::<Vec<_>>();
+    let sorted = |key: ports::TaskSortKey, direction: ports::SortDirection| TaskFilter {
+        workspace_id: Some(wid),
+        sort: Some(ports::TaskSort { key, direction }),
+        ..Default::default()
+    };
+
+    let rows = ts
+        .list(sorted(
+            ports::TaskSortKey::UpdatedAt,
+            ports::SortDirection::Asc,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["charlie", "bravo", "alpha"]);
+
+    let rows = ts
+        .list(sorted(
+            ports::TaskSortKey::Priority,
+            ports::SortDirection::Desc,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["charlie", "bravo", "alpha"], "P3 first");
+
+    let rows = ts
+        .list(sorted(ports::TaskSortKey::Title, ports::SortDirection::Asc))
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["alpha", "bravo", "charlie"]);
+
+    let page = |offset: usize| TaskFilter {
+        limit: Some(2),
+        offset: Some(offset),
+        ..sorted(ports::TaskSortKey::Title, ports::SortDirection::Asc)
+    };
+    assert_eq!(titles(&ts.list(page(0)).await.unwrap()), ["alpha", "bravo"]);
+    assert_eq!(titles(&ts.list(page(2)).await.unwrap()), ["charlie"]);
+
+    // An offset without a limit is still a valid page.
+    let rows = ts
+        .list(TaskFilter {
+            offset: Some(1),
+            ..sorted(ports::TaskSortKey::Title, ports::SortDirection::Asc)
+        })
+        .await
+        .unwrap();
+    assert_eq!(titles(&rows), ["bravo", "charlie"]);
+}
